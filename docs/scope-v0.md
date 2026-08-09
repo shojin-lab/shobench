@@ -64,20 +64,24 @@ Counts measured against the shōgym registry (2026-08-07). Excluded by decision:
 | env | tasks | scoring | keys/infra | held-out leakage risk | v0? |
 |---|---|---|---|---|---|
 | `automationbench` | 600 | pure end-state rubric, offline | none | low (simulated world) | **yes** |
-| `yc_bench` | 16 | deterministic sim | none | low (simulated) | **yes** |
+| `yc_bench` | 16 | deterministic sim | none | low (simulated) | v1 |
 | `tau2_telecom` | ~114 (needs data fetch) | tau2 evaluator + user simulator | OPENAI_API_KEY | low (simulated) | **yes** |
 | `tau2_banking_knowledge` | TBD (needs data fetch) | tau2 evaluator | OPENAI_API_KEY | low | v1 |
 | `frontier_bench` | 5 | container end-state verifier | Docker | low | no: 5 tasks cannot give a held-out split with power |
-| `hle` | 1726 | exact match + model judge | OPENAI_API_KEY + gated HF | **high**: public dataset, answers on the web | deferred until network policy |
+| `hle` | 1726 | exact match + model judge | OPENAI_API_KEY + gated HF | **high**: public dataset, answers on the web | **yes, gated on the egress allowlist** |
 | `browsecomp_plus` | 664 | model judge + retrieval metrics | OPENAI_API_KEY + Java 21 + gated | medium | deferred until network policy |
 | `orca_bench` | 755 | task judge (model) | OPENAI_API_KEY + Docker, ~133 GB/host | medium: the hub RPC returns full ground truth | waits for phase 2 (live backend) |
 
 The leakage column is load-bearing: the sandbox has full internet (harnesses need their
 model APIs), and disallowing web tools does not stop a Bash-capable agent from curling
 answers. Prior work hit exactly this on held-out runs. v0 dodges the problem by choosing
-envs whose answers exist only inside a simulation; hle and browsecomp_plus join when eval
-containers get an egress allowlist (model API endpoints only), which is real infrastructure
-work and its own line item. orca_bench additionally needs its resolver RPC blocked or the
+envs whose answers exist only inside a simulation, with one exception: hle is in v0 by
+owner decision, and its cells are gated on the egress allowlist (model API endpoints only),
+which therefore becomes v0 infrastructure. The eight simulated-env cells can run before the
+allowlist exists; the four hle cells cannot, because a Bash-capable agent can curl the
+public answers on held-out tasks. The fallback, if the allowlist proves heavy, is running
+hle with the leakage documented and measured, which is a decision to take explicitly, not
+a default. browsecomp_plus joins in v1 under the same allowlist. orca_bench additionally needs its resolver RPC blocked or the
 oracle surface is one curl away.
 
 ## The harness matrix
@@ -116,7 +120,7 @@ Known per-harness hazards from prior runs:
 
 ## v0 = 3 envs x 4 harness-model pairs = 12 cells
 
-- **Envs:** `automationbench`, `yc_bench`, `tau2_telecom`.
+- **Envs:** `automationbench`, `tau2_telecom`, `hle` (yc_bench moves to v1; hle swapped in by owner decision).
 - **Harness-model pairs:** claude_code+Opus 5, codex+GPT-5.6-terra, prime_agent+Opus 5,
   prime_agent+GPT-5.6-terra (the 4-way above).
 - **Splits.** Two of the three are not ours to invent, which also answers where the numbers
@@ -130,9 +134,12 @@ Known per-harness hazards from prior runs:
     back. Counts verified against upstream's `split_tasks.json` at that sha. 40 is below the
     N >= 60 power aim; honoring the benchmark's canonical split wins over inventing a larger
     leaky one, and the paired design still detects the large effects.
-  - yc_bench: 8 improvement / 8 held-out, seeded, ours (no canonical split exists).
-    Underpowered on its own; it earns its slot because a task is a year-long survival sim,
-    so it feeds the stopping-behavior question even where its CI is wide.
+  - hle: no canonical split exists upstream (it is an eval set), so ours: seeded,
+    disjoint, published: 120 held-out and an improvement pool of 300 as the serving
+    ceiling (of 1726). 120 matches the automationbench held-out size, and hle's
+    single-turn tasks make the before/after evals cheap relative to the multi-turn envs.
+    With yc_bench in v1, the rollout-phase stopping metrics carry the charter's
+    when-do-they-stop question in v0.
 - **Pool sizes are ceilings, not quotas.** The improvement pool is the maximum the runner
   will serve; the agent may stop on its own long before exhausting it. That early stop is a
   primary reported outcome (tasks attempted before stopping, and how the stop happened), not
@@ -167,5 +174,6 @@ results page on shojin.dev consumes the same JSON later; nothing in v0 blocks on
 3. **How many rollout repetitions per cell:** v0 proposes one rollout per cell (cost), with
    the understanding that a single rollout is one draw; repetitions are the v1 upgrade that
    turns per-cell claims from anecdote into estimate.
-4. **Egress allowlist work:** whether to build it for v1 (unlocks hle, browsecomp_plus,
+4. **Egress allowlist scope:** now v0 infrastructure (the hle gate above); what remains
+   open is v1 reach (browsecomp_plus,
    orca_bench) or keep growing the simulated-env column first.
