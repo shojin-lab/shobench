@@ -82,10 +82,17 @@ oracle surface is one curl away.
 
 ## The harness matrix
 
-The five shōgym quickstart harnesses: `claude_code`, `codex`, `pi`, `hermes`, `prime_agent`.
-Harness-native default models, versions pinned and recorded per run. Rationale: shōbench
-benchmarks agents as shipped; pinning one model across harnesses would measure scaffolds,
-which is a different (also interesting, later) experiment.
+v0 pins models to make the comparison factorial rather than confounded: `claude_code` with
+Opus 5, `codex` with GPT-5.6-terra, and `prime_agent` with each of the two. That 4-way gives
+harness-vs-harness at a fixed model in both directions (claude_code vs prime_agent on Opus 5;
+codex vs prime_agent on GPT-5.6-terra) and model-vs-model inside one scaffold
+(prime_agent x both). `pi` and `hermes` join in v1 once the runner is proven.
+
+Billing: use subscription credentials wherever the harness supports them: Claude Code logs in
+with the Claude subscription, codex with the ChatGPT subscription, and prime_agent's own docs
+say `/login` stores "a subscription or an API key" per provider. Before any cell runs, the
+runner records `prime-agent model list` (and each harness's version and resolved model) in the
+cell manifest, so "which model actually answered" is part of the record, not an assumption.
 
 Known per-harness hazards from prior runs:
 
@@ -95,18 +102,34 @@ Known per-harness hazards from prior runs:
 - `claude_code`: needs `IS_SANDBOX=1` to run bypass-permissions as root in the container;
   memory and skills load only at session start, which is fine here because eval sessions
   are fresh by design.
+- `prime_agent`: no operational history in this program yet; install is the vendor script,
+  not npm (the npm identity in its source tree installs Pi instead, per its own docs). Its
+  model and credential resolution must be verified per cell (`prime-agent model list`)
+  before any rollout spends budget.
 
-## v0 = 3 envs x 2 harnesses = 6 cells
+## v0 = 3 envs x 4 harness-model pairs = 12 cells
 
 - **Envs:** `automationbench`, `yc_bench`, `tau2_telecom`.
-- **Harnesses:** `claude_code`, `codex` first (both have operational history); `pi`,
-  `hermes`, `prime_agent` join in v1 once the runner is proven.
-- **Splits** (seeded, disjoint, published in the repo):
-  - automationbench: 100 improvement / 60 held-out (of 600).
-  - tau2_telecom: 54 improvement / 60 held-out (of ~114; adjust to the real count).
-  - yc_bench: 8 improvement / 8 held-out. Underpowered on its own; it earns its slot
-    because a task is a year-long survival sim, so it feeds the stopping-behavior question
-    even where its CI is wide.
+- **Harness-model pairs:** claude_code+Opus 5, codex+GPT-5.6-terra, prime_agent+Opus 5,
+  prime_agent+GPT-5.6-terra (the 4-way above).
+- **Splits.** Two of the three are not ours to invent, which also answers where the numbers
+  come from:
+  - automationbench: reuse the published conversation-not-memories split exactly: the same
+    **120 held-out tasks** recorded in shōrep, improvement pool drawn from the remaining 480.
+    This keeps every v0 number directly comparable to the registered study.
+  - tau2_telecom: tau2's own declared split at the pinned upstream sha (1d244f5d):
+    **train 74 improvement / test 40 held-out**, served via the port's native
+    `task_split_name` support, which refuses unsupported splits rather than silently falling
+    back. Counts verified against upstream's `split_tasks.json` at that sha. 40 is below the
+    N >= 60 power aim; honoring the benchmark's canonical split wins over inventing a larger
+    leaky one, and the paired design still detects the large effects.
+  - yc_bench: 8 improvement / 8 held-out, seeded, ours (no canonical split exists).
+    Underpowered on its own; it earns its slot because a task is a year-long survival sim,
+    so it feeds the stopping-behavior question even where its CI is wide.
+- **Pool sizes are ceilings, not quotas.** The improvement pool is the maximum the runner
+  will serve; the agent may stop on its own long before exhausting it. That early stop is a
+  primary reported outcome (tasks attempted before stopping, and how the stop happened), not
+  a protocol failure. Nothing re-serves tasks to push an agent to the ceiling.
 - **Budget per cell:** fixed wall-clock for the rollout (proposal: 4 hours), auto-continue
   on, hard token ceiling as a safety stop. Both eval phases run every held-out task exactly
   once.
