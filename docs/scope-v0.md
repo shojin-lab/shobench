@@ -88,11 +88,18 @@ harness-vs-harness at a fixed model in both directions (claude_code vs prime_age
 codex vs prime_agent on GPT-5.6-terra) and model-vs-model inside one scaffold
 (prime_agent x both). `pi` and `hermes` join in v1 once the runner is proven.
 
-Billing: use subscription credentials wherever the harness supports them: Claude Code logs in
-with the Claude subscription, codex with the ChatGPT subscription, and prime_agent's own docs
-say `/login` stores "a subscription or an API key" per provider. Before any cell runs, the
-runner records `prime-agent model list` (and each harness's version and resolved model) in the
-cell manifest, so "which model actually answered" is part of the record, not an assumption.
+Billing: subscription and usage-credit credentials are the PREFERRED mode for every cell,
+and the runner must support both modes (subscription/OAuth and API key) per harness. Claude
+Code logs in with the Claude subscription, codex with the ChatGPT subscription, and both
+prime_agent cells run on the owner's subscription credentials rather than API inference spend
+(prime_agent's `/login` stores "a subscription or an API key" per provider). Validation
+status: the Anthropic OAuth path through prime_agent is verified end to end; the OpenAI
+subscription path through prime_agent is validated so far only with an API key and needs its
+subscription variant proven before the cell runs. Before any cell runs, the runner records
+`prime-agent model list` (and each harness's version and resolved model) in the cell
+manifest, so "which model actually answered" is part of the record, not an assumption.
+Credential isolation per cell is mandatory: ambient logins were shown to mask bogus
+credentials entirely, so every cell runs under an isolated HOME with a negative control.
 
 Known per-harness hazards from prior runs:
 
