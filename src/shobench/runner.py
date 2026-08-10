@@ -50,19 +50,77 @@ from shobench.results import TaskResult, read_phase, write_results
 from shobench.serving import DEFAULT_PORT, SERVER_NAME, build_stream, side_for_phase
 from shobench.splits import Split
 
-# Subtrees of the agent's HOME whose contents change on every run whether or not the agent
-# changed itself. Excluding them is what makes the before-and-after digest answer "did the
-# rollout write anything durable" rather than "did a session happen".
-HOME_DIGEST_SKIP = (
-    "sessions",
-    "backups",
-    "telemetry",
-    "history",
-    "shell-snapshots",
-    "statsig",
-    "logs",
-    "__pycache__",
+# What does not count as the agent's durable self.
+#
+# This list decides what the headline home digest means. A digest that includes session
+# transcripts and caches changes on every run whether or not the agent changed itself, so it
+# answers "did a session happen", which is always yes. Excluding them makes it answer "did the
+# rollout write something the next fresh session can use", which is the benchmark's question,
+# because eval sessions are fresh by design and only the durable channel survives them.
+
+# Directories that hold a session's byproducts rather than the agent's own writing. Matched on
+# any path component, since the three harnesses nest them differently.
+NOISE_DIRS = frozenset(
+    {
+        ".cache",
+        "backups",
+        "daemon-workers",
+        "history",
+        "kernel-venv",
+        "logs",
+        "node_modules",
+        "sessions",
+        "session-artifacts",
+        "session-leases",
+        "shell-snapshots",
+        "shell_snapshots",
+        "statsig",
+        "telemetry",
+        "tmp",
+        "__pycache__",
+    }
 )
+
+# Bookkeeping files a harness rewrites on its own schedule.
+NOISE_FILES = frozenset(
+    {
+        ".last-cleanup",
+        "history.jsonl",
+        "installation_id",
+        "models_cache.json",
+        "policy-limits.json",
+        "remote-settings.json",
+        "session_index.jsonl",
+        "version.json",
+    }
+)
+
+# Credential material. Excluded from the digest and from the inventory both, so no record this
+# runner writes carries anything about a credential beyond the fact that a mode was used.
+# `.claude.json` is included here because it holds the OAuth session alongside per-project
+# trust state, so it is both credential material and harness bookkeeping rather than anything
+# the agent wrote about itself.
+CREDENTIAL_FILES = frozenset({".claude.json", ".credentials.json", "auth.json"})
+
+
+def is_noise(rel_path: str) -> bool:
+    """Is this file a session byproduct rather than part of the durable self?"""
+    parts = rel_path.split("/")
+    name = parts[-1]
+    if name in NOISE_FILES or name in CREDENTIAL_FILES:
+        return True
+    if any(part in NOISE_DIRS for part in parts):
+        return True
+    if name.endswith((".sqlite", ".sqlite-shm", ".sqlite-wal", ".lock", ".log")):
+        return True
+    # A session transcript sits directly under a per-project directory as <uuid>.jsonl, while
+    # what the agent wrote about itself sits in a named subdirectory beside it (memory/,
+    # skills/). Excluding the flat jsonl keeps the transcript out and the memory in.
+    if "projects" in parts and name.endswith(".jsonl"):
+        index = parts.index("projects")
+        if len(parts) - index == 3:
+            return True
+    return False
 
 
 @dataclass
@@ -162,7 +220,7 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
             "home": str(ctx.sandbox.home),
         },
         "home": {
-            "digest_before": home_digest(ctx.sandbox.home, skip=HOME_DIGEST_SKIP),
+            "digest_before": home_digest(ctx.sandbox.home, exclude=is_noise),
             "digest_after": None,
             "inventory_after": [],
         },
@@ -563,8 +621,8 @@ async def run_cell(
         manifest["observed_models"] = sorted(
             {model for leg in ctx.legs for model in leg.observed_models}
         )
-        manifest["home"]["digest_after"] = home_digest(sandbox.home, skip=HOME_DIGEST_SKIP)
-        manifest["home"]["inventory_after"] = home_inventory(sandbox.home, skip=HOME_DIGEST_SKIP)
+        manifest["home"]["digest_after"] = home_digest(sandbox.home, exclude=is_noise)
+        manifest["home"]["inventory_after"] = home_inventory(sandbox.home, exclude=is_noise)
         manifest["home"]["changed"] = (
             manifest["home"]["digest_after"] != manifest["home"]["digest_before"]
         )
@@ -604,8 +662,11 @@ def cleanup(run_id: str) -> None:
 
 
 __all__ = [
-    "HOME_DIGEST_SKIP",
+    "CREDENTIAL_FILES",
+    "NOISE_DIRS",
+    "NOISE_FILES",
     "free_port",
+    "is_noise",
     "LegRecord",
     "RunContext",
     "build_manifest",

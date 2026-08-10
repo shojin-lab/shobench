@@ -13,10 +13,12 @@ from pathlib import Path
 import pytest
 
 from shobench.config import load_all_cells, load_instruction, repo_root
+from shobench.containers import home_digest
 from shobench.harness import StopKind
 from shobench.harnesses import harness_for
 from shobench.report import paired_bootstrap, report_cell
 from shobench.results import TaskResult, eval_summary, pair_evals
+from shobench.runner import is_noise
 from shobench.serving import side_for_phase, task_indices
 from shobench.splits import load_split_by_name, splits_dir
 
@@ -505,3 +507,62 @@ def test_prime_agent_declares_an_http_server_with_a_bearer_token(tmp_path: Path)
 
 def test_the_repo_root_resolves_from_the_package_not_the_cwd() -> None:
     assert (repo_root() / "pyproject.toml").is_file()
+
+
+# ----- what counts as the agent's durable self ------------------------------------------------
+
+
+def test_session_byproducts_are_not_the_durable_self() -> None:
+    """These all change on every run whether or not the agent changed itself. A digest that
+    included them would answer "did a session happen", which is always yes."""
+    for noise in (
+        ".cache/claude-cli-nodejs/-work/mcp-logs-shogym/2026-08-10T19-16-37.jsonl",
+        ".claude/projects/-work/226276c6-9dd1-4a54-af48-942d543d8c6b.jsonl",
+        ".claude/.last-cleanup",
+        ".claude/policy-limits.json",
+        ".claude/remote-settings.json",
+        ".claude/statsig/statsig.cached.evaluations",
+        ".codex/sessions/2026/08/10/rollout-abc.jsonl",
+        ".codex/logs_2.sqlite-wal",
+        ".prime/agent/kernel-venv/lib/python3.11/site-packages/x.py",
+        ".prime/agent/sessions/abc.jsonl",
+    ):
+        assert is_noise(noise), noise
+
+
+def test_credential_material_is_in_no_record_this_runner_writes() -> None:
+    for secret in (
+        ".claude/.credentials.json",
+        ".claude.json",
+        ".codex/auth.json",
+        ".prime/agent/auth.json",
+    ):
+        assert is_noise(secret), secret
+
+
+def test_what_the_agent_writes_about_itself_is_kept() -> None:
+    """Memory and skills are the durable channel the benchmark measures, and they sit beside
+    the transcripts rather than among them."""
+    for durable in (
+        ".claude/projects/-work/memory/MEMORY.md",
+        ".claude/projects/-work/memory/a-note.md",
+        ".claude/skills/my-skill/SKILL.md",
+        ".claude/CLAUDE.md",
+        ".claude/settings.json",
+        ".codex/skills/thing/SKILL.md",
+        ".prime/agent/skills/thing/SKILL.md",
+        "notes.md",
+    ):
+        assert not is_noise(durable), durable
+
+
+def test_the_digest_ignores_a_new_transcript_and_notices_a_new_note(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".claude" / "projects" / "-work" / "memory").mkdir(parents=True)
+    before = home_digest(home, exclude=is_noise)
+
+    (home / ".claude" / "projects" / "-work" / "abc-123.jsonl").write_text("a transcript\n")
+    assert home_digest(home, exclude=is_noise) == before
+
+    (home / ".claude" / "projects" / "-work" / "memory" / "note.md").write_text("a lesson\n")
+    assert home_digest(home, exclude=is_noise) != before

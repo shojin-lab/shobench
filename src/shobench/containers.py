@@ -26,8 +26,13 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Given a POSIX-relative path inside the agent's HOME, is this file noise rather than part of
+# the durable self?
+DurableFilter = Callable[[str], bool]
 
 AGENT_IMAGE = "shobench-agent:v0"
 NETNS_IMAGE = "shobench-netns:v0"
@@ -139,52 +144,55 @@ class CellSandbox:
         return args
 
 
-def home_digest(home: Path, *, skip: tuple[str, ...] = ()) -> str:
-    """A content hash over the agent's HOME, for the before-and-after the manifest records.
+def _digest_file(path: Path) -> str:
+    import hashlib
 
-    Session transcripts and caches are noise: they change on every run whether or not the agent
-    changed itself, so a digest that includes them cannot answer whether the rollout wrote
-    anything durable. Callers pass the subtrees to skip.
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def durable_files(home: Path, *, exclude: DurableFilter) -> list[Path]:
+    """The files under ``home`` that count as the agent's durable self."""
+    if not home.exists():
+        return []
+    out = []
+    for path in sorted(p for p in home.rglob("*") if p.is_file()):
+        if not exclude(path.relative_to(home).as_posix()):
+            out.append(path)
+    return out
+
+
+def home_digest(home: Path, *, exclude: DurableFilter) -> str:
+    """A content hash over the agent's durable self, for the before and after.
+
+    What is excluded decides what the number means. A digest that includes session
+    transcripts, caches and bookkeeping answers "did a session happen", which is always yes
+    and therefore says nothing. A digest over what survives a session boundary answers "did
+    the rollout write anything the next session can use", which is the benchmark's question.
     """
     import hashlib
 
     digest = hashlib.sha256()
-    if not home.exists():
-        return digest.hexdigest()
-    for path in sorted(p for p in home.rglob("*") if p.is_file()):
-        rel = path.relative_to(home).as_posix()
-        if any(part in rel.split("/") for part in skip):
-            continue
-        digest.update(rel.encode("utf-8"))
+    for path in durable_files(home, exclude=exclude):
+        digest.update(path.relative_to(home).as_posix().encode("utf-8"))
         digest.update(b"\0")
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
+        digest.update(bytes.fromhex(_digest_file(path)))
     return digest.hexdigest()
 
 
-def home_inventory(home: Path, *, skip: tuple[str, ...] = ()) -> list[dict[str, object]]:
-    """Every file in the agent's HOME with its size and digest.
+def home_inventory(home: Path, *, exclude: DurableFilter) -> list[dict[str, object]]:
+    """Every durable file with its size and digest.
 
     The digest says whether the home changed; the inventory says what changed, which is what a
     reader of the results wants when a cell reports a nonzero delta.
     """
-    import hashlib
-
-    out: list[dict[str, object]] = []
-    if not home.exists():
-        return out
-    for path in sorted(p for p in home.rglob("*") if p.is_file()):
-        rel = path.relative_to(home).as_posix()
-        if any(part in rel.split("/") for part in skip):
-            continue
-        data = path.read_bytes()
-        out.append(
-            {
-                "path": rel,
-                "bytes": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
-            }
-        )
-    return out
+    return [
+        {
+            "path": path.relative_to(home).as_posix(),
+            "bytes": path.stat().st_size,
+            "sha256": _digest_file(path),
+        }
+        for path in durable_files(home, exclude=exclude)
+    ]
 
 
 def write_json(path: Path, body: object) -> Path:
@@ -202,6 +210,8 @@ __all__ = [
     "build_image",
     "daemon_available",
     "docker",
+    "DurableFilter",
+    "durable_files",
     "home_digest",
     "home_inventory",
     "write_json",
