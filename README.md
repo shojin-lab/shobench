@@ -46,8 +46,15 @@ dataset, no judge key, and no broker credential.
 | env | needs |
 |---|---|
 | automationbench | nothing; the pinned upstream source is fetched once into shogym's cache |
-| tau2_telecom | `TAU2_DATA_DIR` pointing at the tau2-bench `data/` tree at sha `1d244f5d` (about 730 MB), and `OPENAI_API_KEY` for the user simulator |
+| tau2_telecom | the tau2-bench `data/` tree at sha `1d244f5d` (about 730 MB), provisioned once with `uv run python tools/provision_tau2_data.py`; the runner then points `TAU2_DATA_DIR` at it. Plus `OPENAI_API_KEY` for the user simulator |
 | hle | the gated `cais/hle` dataset, so `HF_TOKEN` unless it is already cached, and `OPENAI_API_KEY` for the judge |
+
+shogym provisions each env's upstream *source* at runtime but does not carry tau2's ~730 MB of
+`data/`, so that one subtree is provisioned separately by the command above (idempotent; a
+complete tree is verified and skipped). The runner sets `TAU2_DATA_DIR` itself and refuses a
+tau2 cell whose data is absent, naming the command. `HF_TOKEN` is not blocking today: the
+`cais/hle` dataset is already cached on the run host, so the gate passes without a fresh token;
+it is only needed on a cold cache.
 
 ### How the pieces fit
 
