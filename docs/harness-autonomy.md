@@ -18,7 +18,7 @@ Versions this was established against: Claude Code 2.1.221 and 2.1.226, codex-cl
 
 None of the three harnesses runs for eight hours on its own. Claude Code runs its agentic
 loop until the model emits a turn with no tool calls, then exits. codex exec runs exactly one
-turn. prime-agent runs one turn unless autonomous mode is on, and then runs until one of five
+turn. prime-agent runs one turn unless autonomous mode is on, and then runs until one of four
 host budgets stops it. So the runner owns the outer loop in every case, which is why the
 rollout is a sequence of bounded legs against one live stream rather than one long process.
 That structure was forced by codex, whose unreliability over a single long loop is on record
@@ -277,8 +277,9 @@ benchmark that is fine, because the scope observes leakage rather than gating it
 
 ### Autonomy is a budget problem
 
-Autonomous mode starts disabled, and enabling it brings five defaults that are all far below
-an 8-hour rollout: 3 continuations, 12 turns, 80,000 tokens, and a 30-minute wall clock. The
+Autonomous mode starts disabled, and enabling it brings four budgets whose defaults are all far
+below an 8-hour rollout: 3 continuations, 12 turns, 80,000 tokens, and a 30-minute wall
+clock. The
 30-minute default alone would end every leg. The docs are explicit that reaching a limit
 "does not imply task success", so a run that ends at one has been cut off, not finished.
 Recording that as the agent's own stop is exactly the confound the scope forbids, which is why

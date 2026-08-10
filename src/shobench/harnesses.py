@@ -345,12 +345,12 @@ class PrimeAgent(Harness):
     already provides.
 
     What does need configuring is autonomy's budgets. Autonomous mode starts disabled, and
-    once enabled it carries five defaults far below an 8-hour rollout: 3 continuations, 12
-    turns, 80,000 tokens, and 30 minutes. Leaving any of them would end the rollout on an
-    imposed cutoff, and the docs are explicit that reaching a limit "does not imply task
-    success", so recording it as the agent's own stop would be exactly the confound the scope
-    forbids. The runner raises all of them and reads a limit that was still reached as a
-    cutoff.
+    once enabled it carries four budgets whose defaults are far below an 8-hour rollout: 3
+    continuations, 12 turns, 80,000 tokens, and 30 minutes. Leaving any of them would end the
+    rollout on an imposed cutoff, and the docs are explicit that reaching a limit "does not
+    imply task success", so recording it as the agent's own stop would be exactly the confound
+    the scope forbids. The runner raises all of them and reads a limit that was still reached
+    as a cutoff.
 
     Value-taking autonomous flags take a separate argument; ``--flag=value`` is rejected.
     stdin is closed, because print mode reads piped stdin and merges it into the prompt.
