@@ -143,6 +143,15 @@ class Harness:
     ) -> StopVerdict:
         raise NotImplementedError
 
+    def observed_models(self, trace_path: Path) -> list[str]:
+        """Model identifiers the trace shows actually answered.
+
+        The scope asks the manifest to record which model answered rather than which one was
+        requested. A version probe cannot say that; the trace can, when the harness reports it.
+        Returning nothing is honest for a harness that does not.
+        """
+        return []
+
     # ----- shared helpers -----
 
     def _match_usage_limit(self, texts: dict[str, str]) -> StopVerdict | None:

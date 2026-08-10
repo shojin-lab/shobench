@@ -79,10 +79,12 @@ class LegRecord:
     tasks_consumed_before: int
     tasks_consumed_after: int
     trace_path: str
+    observed_models: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
             "leg": self.leg,
+            "observed_models": list(self.observed_models),
             "phase": self.phase,
             "task_idx": self.task_idx,
             "started_at": self.started_at,
@@ -261,6 +263,7 @@ def run_leg(
         tasks_consumed_before=consumed_before,
         tasks_consumed_after=consumed_before,
         trace_path=str(stdout_path),
+        observed_models=ctx.harness.observed_models(stdout_path),
     )
     ctx.legs.append(record)
     return record
@@ -556,6 +559,10 @@ async def run_cell(
                 phase_rows[phase] = await run_eval_phase(ctx, phase)
             write_json(run_dir / "legs.json", [leg.to_json() for leg in ctx.legs])
 
+        # Which model answered, read off the traces rather than assumed from the config.
+        manifest["observed_models"] = sorted(
+            {model for leg in ctx.legs for model in leg.observed_models}
+        )
         manifest["home"]["digest_after"] = home_digest(sandbox.home, skip=HOME_DIGEST_SKIP)
         manifest["home"]["inventory_after"] = home_inventory(sandbox.home, skip=HOME_DIGEST_SKIP)
         manifest["home"]["changed"] = (

@@ -132,6 +132,16 @@ class ClaudeCode(Harness):
             },
         )
 
+    def observed_models(self, trace_path: Path) -> list[str]:
+        # The result event's modelUsage is keyed by the models that were actually billed,
+        # which includes the small model the harness uses for its own bookkeeping. Reporting
+        # both is the honest answer to "which model answered".
+        seen: set[str] = set()
+        for event in jsonl_events(trace_path, limit=4000):
+            if event.get("type") == "result":
+                seen.update((event.get("modelUsage") or {}).keys())
+        return sorted(seen)
+
     def classify(
         self, *, returncode: int, stdout_path: Path, stderr_path: Path, timed_out: bool
     ) -> StopVerdict:
