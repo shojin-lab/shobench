@@ -48,8 +48,8 @@
       "eval_system": "An MCP server provides a stream of tasks.\nNothing external loops for you - drive yourself:\n\n1. Calling `get_task` pulls the next task.\n   If it returns {done: true}, the stream is exhausted, stop.\n2. The task can be completed using the tools listed.\n   One of them ends the task; call it before pulling the next.\n3. Continue until the stream is exhausted.\n\nThis is a measurement. Do the task as well as you can with what you already have,\nand do not spend effort changing your own setup.\n",
       "eval_system_sha256": "db9ca73c19a6fbb017ee4e32eb7fde9a66611e068e37b6fd27b2e13427e8b5a4",
       "kickoff": "Begin.\n",
-      "continuation": "Continue. Keep calling `get_task` and completing each task it hands you, ending each one\nwith the tool that ends it, and repeat, until `get_task` returns {done: true}, which means\nthe stream is exhausted.\n",
-      "continuation_sha256": "265353a2469cacf427f6915ecf492794c0d549c6c1af260555a24350bb187605"
+      "continuation": "Continue.\n",
+      "continuation_sha256": "e972ecc19111beeb4832d42144b1f9d624b97a96707ddce97adcf0002633c207"
     },
     "substrate": {
       "shogym_repo": "https://github.com/shojin-lab/shogym.git",
