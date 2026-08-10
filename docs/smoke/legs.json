@@ -1,0 +1,142 @@
+[
+  {
+    "leg": 0,
+    "observed_models": [
+      "claude-sonnet-4-5"
+    ],
+    "phase": "eval_before",
+    "task_idx": 558,
+    "started_at": 1786390750.288836,
+    "ended_at": 1786390896.643523,
+    "wall_clock_s": 146.355,
+    "returncode": 0,
+    "verdict": {
+      "kind": "chosen_stop",
+      "reason": "the session ended its turn cleanly",
+      "evidence": {
+        "returncode": 0,
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "api_error_status": null,
+        "num_turns": 42
+      }
+    },
+    "tasks_consumed_before": 0,
+    "tasks_consumed_after": 0,
+    "trace_path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/eval_before/traces/task-00558-leg-0000.stream.jsonl"
+  },
+  {
+    "leg": 1,
+    "observed_models": [
+      "claude-sonnet-4-5"
+    ],
+    "phase": "eval_before",
+    "task_idx": 399,
+    "started_at": 1786390897.047382,
+    "ended_at": 1786391112.313658,
+    "wall_clock_s": 215.266,
+    "returncode": 0,
+    "verdict": {
+      "kind": "chosen_stop",
+      "reason": "the session ended its turn cleanly",
+      "evidence": {
+        "returncode": 0,
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "api_error_status": null,
+        "num_turns": 56
+      }
+    },
+    "tasks_consumed_before": 0,
+    "tasks_consumed_after": 0,
+    "trace_path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/eval_before/traces/task-00399-leg-0001.stream.jsonl"
+  },
+  {
+    "leg": 0,
+    "observed_models": [
+      "claude-sonnet-4-5"
+    ],
+    "phase": "rollout",
+    "task_idx": null,
+    "started_at": 1786391112.777694,
+    "ended_at": 1786391527.420979,
+    "wall_clock_s": 414.643,
+    "returncode": 0,
+    "verdict": {
+      "kind": "chosen_stop",
+      "reason": "the session ended its turn cleanly",
+      "evidence": {
+        "returncode": 0,
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "api_error_status": null,
+        "num_turns": 111
+      }
+    },
+    "tasks_consumed_before": 0,
+    "tasks_consumed_after": 2,
+    "trace_path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/rollout/traces/leg-0000.stream.jsonl"
+  },
+  {
+    "leg": 0,
+    "observed_models": [
+      "claude-sonnet-4-5"
+    ],
+    "phase": "eval_after",
+    "task_idx": 558,
+    "started_at": 1786391527.837169,
+    "ended_at": 1786391729.684582,
+    "wall_clock_s": 201.847,
+    "returncode": 0,
+    "verdict": {
+      "kind": "chosen_stop",
+      "reason": "the session ended its turn cleanly",
+      "evidence": {
+        "returncode": 0,
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "api_error_status": null,
+        "num_turns": 62
+      }
+    },
+    "tasks_consumed_before": 0,
+    "tasks_consumed_after": 0,
+    "trace_path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/eval_after/traces/task-00558-leg-0000.stream.jsonl"
+  },
+  {
+    "leg": 1,
+    "observed_models": [
+      "claude-sonnet-4-5"
+    ],
+    "phase": "eval_after",
+    "task_idx": 399,
+    "started_at": 1786391730.092572,
+    "ended_at": 1786391949.843227,
+    "wall_clock_s": 219.751,
+    "returncode": 0,
+    "verdict": {
+      "kind": "chosen_stop",
+      "reason": "the session ended its turn cleanly",
+      "evidence": {
+        "returncode": 0,
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "api_error_status": null,
+        "num_turns": 67
+      }
+    },
+    "tasks_consumed_before": 0,
+    "tasks_consumed_after": 0,
+    "trace_path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/eval_after/traces/task-00399-leg-0001.stream.jsonl"
+  }
+]
