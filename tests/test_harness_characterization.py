@@ -21,7 +21,13 @@ from pathlib import Path
 import pytest
 
 from shobench.harness import StopKind
-from shobench.harnesses import ClaudeCode, Codex, PrimeAgent, harness_for
+from shobench.harnesses import (
+    ClaudeCode,
+    Codex,
+    PrimeAgent,
+    harness_for,
+    shogym_stream_skill_files,
+)
 
 # One fixed set of launch inputs, reused for every harness so the specs line up column for
 # column. The port in the url is arbitrary; it only has to be stable across the assertions.
@@ -207,7 +213,13 @@ def test_prime_agent_fresh_launch_is_pinned() -> None:
     ]
     assert spec.env == {"NODE_OPTIONS": "", "SHOBENCH_MCP_TOKEN": "local"}
     assert spec.config_files == {}
-    assert spec.home_files == {".prime/agent/settings.json": _PRIME_SETTINGS}
+    # The HOME carries the settings entry and the vendored shogym-stream skill package beside
+    # it; the skill is what actually reaches the server, since prime-agent's client is a
+    # kernel-side import rather than a host-managed tool bridge.
+    assert spec.home_files == {
+        ".prime/agent/settings.json": _PRIME_SETTINGS,
+        **shogym_stream_skill_files(),
+    }
     assert spec.stdin is None
     # The settings entry is well-formed JSON naming the http server and the token variable.
     settings = json.loads(spec.home_files[".prime/agent/settings.json"])

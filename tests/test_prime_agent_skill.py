@@ -1,0 +1,135 @@
+"""The prime-agent skill wiring: the served stream is reachable only if the cell HOME carries
+the ``shogym-stream`` skill, not just the settings entry.
+
+prime-agent hands the model no MCP tools; it reaches a server by importing a Python-backed
+skill in its kernel and calling it. So declaring the HTTP server in ``settings.json`` is half
+the wiring and the skill package is the other half. These prove the vendored skill is a
+well-formed Python-backed skill, that a prime_agent leg installs it into the isolated HOME with
+the same token variable the settings entry names, and that a locally-served stream exposes the
+tools the skill would drive.
+
+The skill's own ``__init__.py`` is the one Python file in this repo written for prime-agent's
+kernel interpreter: it imports ``rlm``, which is not a shobench dependency and is not on PyPI at
+all. It is read with ``ast``, never imported, the same treatment shogym's quickstart gives its
+copy. The credentialed end-to-end check (prime-agent bootstrapping the kernel, installing this
+package, importing it as ``shogym_stream``, and pulling a task) waits on the interactive login
+this host does not have; see ``docs/harness-autonomy.md``.
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import json
+from pathlib import Path
+
+from shobench.config import repo_root
+from shobench.harnesses import SHOGYM_STREAM_SKILL, PrimeAgent, shogym_stream_skill_files
+from shobench.serving import SERVER_NAME
+
+_SKILL = repo_root() / "prime_agent" / "skills" / SHOGYM_STREAM_SKILL
+_INIT = _SKILL / "src" / "shogym_stream" / "__init__.py"
+
+
+def _skill_class_attrs() -> dict[str, str]:
+    """The ``McpIntegration`` subclass's string attributes, read out of the source (no import)."""
+    module = ast.parse(_INIT.read_text())
+    classes = [node for node in module.body if isinstance(node, ast.ClassDef)]
+    assert len(classes) == 1, "the skill is one integration class"
+    return {
+        target.id: node.value.value
+        for node in classes[0].body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+
+
+def test_the_skill_is_discoverable_as_a_python_backed_skill() -> None:
+    """prime-agent's discovery rules: a directory with a SKILL.md whose frontmatter ``name``
+    matches it, a ``pyproject.toml`` (which is what makes it Python-backed), and
+    ``src/<import name>/__init__.py`` where the import name is the directory name with hyphens
+    turned into underscores."""
+    assert _SKILL.name == "shogym-stream"
+    assert (_SKILL / "pyproject.toml").is_file()
+    assert _INIT.is_file()
+    assert _INIT.parent.name == _SKILL.name.replace("-", "_")
+
+    front = (_SKILL / "SKILL.md").read_text().split("---")[1]
+    fields = dict(
+        line.split(":", 1) for line in front.strip().splitlines() if ":" in line and line[0] != " "
+    )
+    assert fields["name"].strip() == _SKILL.name
+    assert fields["description"].strip(), "a skill with no description is not loaded at all"
+
+
+def test_the_skill_names_the_runners_server_and_token_variable() -> None:
+    """The skill talks to the server the runner serves and reads the token variable the runner
+    sets, not the shogym quickstart's ``SHOGYM_MCP_TOKEN``. The url is only a fallback (the host
+    settings entry the runner writes per leg wins), so it is checked for shape, not value."""
+    attrs = _skill_class_attrs()
+    assert attrs["server"] == SERVER_NAME
+    assert attrs["bearer_token_env"] == PrimeAgent.MCP_TOKEN_VAR
+    assert attrs["url"].startswith("http://")
+
+
+def test_launch_installs_the_skill_beside_the_settings_entry(tmp_path: Path) -> None:
+    """The wiring this PR adds: a prime_agent leg's HOME carries the skill package, and the
+    settings entry and the skill agree on the token variable, resolved from one constant."""
+    spec = PrimeAgent().launch(
+        mcp_url="http://host.docker.internal:12345/mcp",
+        system_prompt="s",
+        user_prompt="u",
+        model="m",
+        trace_path=tmp_path / "t",
+    )
+    home = spec.home_files
+    prefix = f".prime/agent/skills/{SHOGYM_STREAM_SKILL}"
+    for rel in ("SKILL.md", "pyproject.toml", "src/shogym_stream/__init__.py"):
+        assert f"{prefix}/{rel}" in home, rel
+
+    # The installed bytes are exactly the vendored ones.
+    for name, body in shogym_stream_skill_files().items():
+        assert home[name] == body
+
+    settings = json.loads(home[".prime/agent/settings.json"])
+    token_var = settings["mcpServers"]["shogym"]["bearerTokenEnvVar"]
+    assert token_var == PrimeAgent.MCP_TOKEN_VAR == _skill_class_attrs()["bearer_token_env"]
+    assert token_var in spec.env  # the token itself is set in the launch environment
+
+
+def test_the_served_stream_exposes_the_tools_the_skill_enumerates(tmp_path: Path) -> None:
+    """As much of the end-to-end as needs no credential: a stream stood up exactly as the runner
+    stands it up, through ``build_stream_server``, hands back the control tools the skill drives
+    (``get_task``, ``queue_info``, the terminal) plus the env's own, and a pulled task carries
+    the well-formed ``{env, instructions, budget, tools}`` the SKILL.md documents. ``wordle_v1``
+    needs no extra, no key and no download, so this stays offline. prime-agent's own client is
+    not installed here (it imports ``rlm``), so the manifest is enumerated with the MCP client
+    shogym ships; what prime-agent adds on top, the kernel install and import, is read from docs
+    rather than run."""
+    import shogym
+    from fastmcp import Client
+    from shogym.serve import Immediate, TaskRef, TaskStream, build_stream_server
+
+    async def _enumerate() -> tuple[set[str], dict]:
+        stream = TaskStream(
+            shogym.make,
+            [TaskRef("wordle_v1", 0)],
+            prov_dir=tmp_path / "prov",
+            feedback=Immediate(),
+        )
+        async with stream:
+            server = build_stream_server(stream, name=SERVER_NAME)
+            async with Client(server) as client:
+                names = {tool.name for tool in await client.list_tools()}
+                pulled = json.loads((await client.call_tool("get_task", {})).content[0].text)
+                await client.call_tool("terminate", {})
+                return names, pulled
+
+    names, task = asyncio.run(_enumerate())
+    assert {"get_task", "queue_info", "terminate"} <= names
+    assert set(task) == {"env", "instructions", "budget", "tools"}
+    assert task["env"] == "wordle_v1"
+    assert task["tools"], "the task must publish the tools the skill will call"
