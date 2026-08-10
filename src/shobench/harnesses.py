@@ -45,6 +45,9 @@ class ClaudeCode(Harness):
     """
 
     name = "claude_code"
+    # Claude Code accepts --session-id, so the runner pins it before launch and an interrupted
+    # leg is resumable even if it died before writing anything.
+    pins_session_id = True
 
     # Established by running the CLI: a clean finish is is_error=false,
     # terminal_reason="completed", api_error_status=null; a bad token gives is_error=true,
@@ -131,6 +134,12 @@ class ClaudeCode(Harness):
                 + "\n"
             },
         )
+
+    def session_id_from_trace(self, trace_path: Path) -> str | None:
+        for event in jsonl_events(trace_path, limit=50):
+            if event.get("type") == "system" and event.get("session_id"):
+                return str(event["session_id"])
+        return None
 
     def observed_models(self, trace_path: Path) -> list[str]:
         # The result event's modelUsage is keyed by the models that were actually billed,
@@ -234,6 +243,11 @@ class Codex(Harness):
 
     def base_env(self) -> dict[str, str]:
         return dict(BASE_ENV)
+
+    def session_id_from_trace(self, trace_path: Path) -> str | None:
+        # codex announces its thread id as the first event and takes no id from the caller.
+        started = _first_event_of_type(trace_path, ("thread.started",))
+        return None if started is None else str(started.get("thread_id") or "") or None
 
     def version_probe(self) -> list[str]:
         return ["codex", "--version"]
@@ -385,6 +399,11 @@ class PrimeAgent(Harness):
     def base_env(self) -> dict[str, str]:
         return {**BASE_ENV, self.MCP_TOKEN_VAR: "local"}
 
+    def session_id_from_trace(self, trace_path: Path) -> str | None:
+        # prime-agent's first line is its session header, which carries the id.
+        header = _first_event_of_type(trace_path, ("session",))
+        return None if header is None else str(header.get("id") or "") or None
+
     def version_probe(self) -> list[str]:
         return ["prime-agent", "--version"]
 
@@ -522,6 +541,14 @@ def _prime_stop_reason(path: Path) -> str | None:
 def _last_result_event(path: Path) -> dict | None:
     """The final ``type: result`` event of a stream-json trace."""
     return _last_event_of_type(path, ("result",))
+
+
+def _first_event_of_type(path: Path, types: tuple[str, ...]) -> dict | None:
+    """The first event of a JSONL trace whose ``type`` is one of ``types``."""
+    for event in jsonl_events(path, limit=50):
+        if event.get("type") in types:
+            return event
+    return None
 
 
 def _last_event_of_type(path: Path, types: tuple[str, ...]) -> dict | None:

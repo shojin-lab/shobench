@@ -143,6 +143,20 @@ class Harness:
     ) -> StopVerdict:
         raise NotImplementedError
 
+    # Can the runner choose the session id before launch? Claude Code accepts one; codex and
+    # prime-agent mint their own and announce it in the trace, so resuming those means reading
+    # the id back rather than assuming it.
+    pins_session_id: bool = False
+
+    def session_id_from_trace(self, trace_path: Path) -> str | None:
+        """The session the leg actually ran under, read off its trace.
+
+        This is what a resume has to target. A runner-chosen id would be wrong for any harness
+        that mints its own, and resuming the wrong id starts a fresh session that has lost
+        everything the rollout had built up in context.
+        """
+        return None
+
     def observed_models(self, trace_path: Path) -> list[str]:
         """Model identifiers the trace shows actually answered.
 

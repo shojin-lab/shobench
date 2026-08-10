@@ -245,6 +245,8 @@ def run_leg(
     consumed_before: int,
 ) -> LegRecord:
     """Run one harness invocation to completion and classify how it ended."""
+    if resume and not session_id:
+        raise RuntimeError("cannot resume without a session id; the previous leg wrote none")
     trace_dir = ctx.run_dir / phase / "traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
     stem = f"leg-{leg:04d}" if task_idx is None else f"task-{task_idx:05d}-leg-{leg:04d}"
@@ -462,7 +464,10 @@ async def run_rollout_phase(ctx: RunContext) -> tuple[list[TaskResult], dict[str
     budget = ctx.cell.budget
     deadline = time.time() + budget.rollout_wall_clock_s
 
-    session_id = str(uuid.uuid4())
+    # A harness that accepts an id gets one chosen up front, so a leg that dies before writing
+    # anything is still resumable. A harness that mints its own gets None here, and the runner
+    # reads the real id off the first leg's trace before it resumes.
+    session_id = str(uuid.uuid4()) if ctx.harness.pins_session_id else None
     stopping: dict[str, Any] = {
         "stop_reason": "unrecorded",
         "usage_limit_resumes": 0,
@@ -504,6 +509,11 @@ async def run_rollout_phase(ctx: RunContext) -> tuple[list[TaskResult], dict[str
             record.tasks_consumed_after = stream.queue_info().consumed
             stopping["legs"].append(record.to_json())
             leg += 1
+            # Whatever the harness says it ran under wins over what the runner guessed.
+            observed_session = ctx.harness.session_id_from_trace(Path(record.trace_path))
+            if observed_session:
+                session_id = observed_session
+                stopping["session_id"] = session_id
 
             advanced = record.tasks_consumed_after > record.tasks_consumed_before
             stalled = 0 if advanced else stalled + 1

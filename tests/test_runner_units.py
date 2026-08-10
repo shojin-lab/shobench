@@ -509,6 +509,36 @@ def test_the_repo_root_resolves_from_the_package_not_the_cwd() -> None:
     assert (repo_root() / "pyproject.toml").is_file()
 
 
+# ----- resuming the session the harness actually ran under ------------------------------------
+
+
+def test_only_claude_code_lets_the_runner_choose_the_session_id() -> None:
+    assert harness_for("claude_code").pins_session_id
+    assert not harness_for("codex").pins_session_id
+    assert not harness_for("prime_agent").pins_session_id
+
+
+def test_each_harness_reads_its_own_session_id_off_its_trace(tmp_path: Path) -> None:
+    """Resuming a runner-chosen id would start a fresh session for the two harnesses that mint
+    their own, losing everything the rollout had built up in context."""
+    cases = {
+        "claude_code": ([{"type": "system", "subtype": "init", "session_id": "cc-1"}], "cc-1"),
+        "codex": ([{"type": "thread.started", "thread_id": "cx-1"}], "cx-1"),
+        "prime_agent": ([{"type": "session", "version": 3, "id": "pa-1"}], "pa-1"),
+    }
+    for name, (events, expected) in cases.items():
+        path = tmp_path / f"{name}.jsonl"
+        path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+        assert harness_for(name).session_id_from_trace(path) == expected
+
+
+def test_a_trace_with_no_session_line_yields_no_id(tmp_path: Path) -> None:
+    path = tmp_path / "empty.jsonl"
+    path.write_text("")
+    for name in ("claude_code", "codex", "prime_agent"):
+        assert harness_for(name).session_id_from_trace(path) is None
+
+
 # ----- what counts as the agent's durable self ------------------------------------------------
 
 
