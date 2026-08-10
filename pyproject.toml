@@ -49,7 +49,7 @@ build-backend = "hatchling.build"
 packages = ["src/shobench"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "cells", "splits", "docs", "README.md", "LICENSE"]
+include = ["src", "cells", "splits", "docs", "prime_agent", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

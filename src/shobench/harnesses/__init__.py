@@ -13,7 +13,11 @@ from __future__ import annotations
 from shobench.harness import BASE_ENV, Harness
 from shobench.harnesses.claude_code import ClaudeCode
 from shobench.harnesses.codex import Codex
-from shobench.harnesses.prime_agent import PrimeAgent
+from shobench.harnesses.prime_agent import (
+    SHOGYM_STREAM_SKILL,
+    PrimeAgent,
+    shogym_stream_skill_files,
+)
 
 _REGISTRY = {h.name: h for h in (ClaudeCode(), Codex(), PrimeAgent())}
 
@@ -24,4 +28,12 @@ def harness_for(name: str) -> Harness:
     return _REGISTRY[name]
 
 
-__all__ = ["BASE_ENV", "ClaudeCode", "Codex", "PrimeAgent", "harness_for"]
+__all__ = [
+    "BASE_ENV",
+    "SHOGYM_STREAM_SKILL",
+    "ClaudeCode",
+    "Codex",
+    "PrimeAgent",
+    "harness_for",
+    "shogym_stream_skill_files",
+]

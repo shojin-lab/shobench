@@ -395,12 +395,21 @@ connection and refuses to open a session without one, even against a server that
 so the variable must be set to some non-empty value in the agent's environment. The runner
 sets it.
 
-**Remaining work, stated rather than papered over:** declaring the server is only half of what
-prime-agent needs. Each integration also requires a Python skill package under
-`.prime/agent/skills/<name>/` that is installed into the kernel venv at session start, and a
-new Python-backed skill needs a fresh session to be picked up. shogym's `examples/prime_agent`
-carries a working `shogym-stream` skill; wiring it into the cell HOME is the last piece before
-a prime_agent cell can run, and it is not done in this PR.
+**The skill, now wired.** Declaring the server is only half of what prime-agent needs. Each
+integration also requires a Python skill package under `.prime/agent/skills/<name>/` that is
+installed into the kernel venv at session start, and a new Python-backed skill needs a fresh
+session to be picked up. The `shogym-stream` skill is vendored under `prime_agent/skills/` and
+installed into each prime_agent cell's isolated HOME beside the settings entry, by the same
+`home_files` mechanism (`harnesses/prime_agent.py`, `shogym_stream_skill_files`). It is vendored
+rather than
+copied verbatim from shogym's `examples/prime_agent` because it has to carry the runner's own
+token variable (`SHOBENCH_MCP_TOKEN`), which the settings entry names too; a test asserts the
+two agree and that the served stream exposes the tools the skill enumerates.
+
+What that leaves is only the credentialed end-to-end check: prime-agent bootstrapping the
+kernel, installing this package, importing it as `shogym_stream`, and pulling a task. That needs
+the interactive login this host does not yet have (see Credentials above), so it waits on the
+same login as the rest of the prime_agent leg, not on more wiring.
 
 ## Docker checklist
 

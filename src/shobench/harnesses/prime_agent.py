@@ -10,6 +10,40 @@ from pathlib import Path
 from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict, UsageLimitRule, tail
 from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
 
+# The prime-agent skill that makes the served stream reachable. Declaring the HTTP server in
+# settings.json is only half of the wiring: prime-agent hands the model no MCP tools, it reaches
+# a server by importing a Python-backed skill in its kernel and calling it, so the cell HOME
+# must also carry the `shogym-stream` skill package. It is vendored under the repo's
+# `prime_agent/skills/` and installed into the isolated HOME exactly as the settings file is.
+SHOGYM_STREAM_SKILL = "shogym-stream"
+_SKILL_HOME_PREFIX = ".prime/agent/skills"
+
+
+def _vendored_skill_dir() -> Path:
+    from shobench.config import repo_root
+
+    return repo_root() / "prime_agent" / "skills" / SHOGYM_STREAM_SKILL
+
+
+def shogym_stream_skill_files() -> dict[str, str]:
+    """The vendored ``shogym-stream`` skill as ``{home-relative path: contents}``.
+
+    Every file under the vendored skill package, keyed by where it lands in the cell HOME, so a
+    prime-agent kernel installs it editable at session start and exposes it as ``shogym_stream``.
+    Vendored rather than fetched from the pinned shogym examples because the package must carry
+    the runner's own token variable (``bearerTokenEnvVar``), not the quickstart's, so a verbatim
+    copy would be wrong here rather than merely drift-prone; the file is a few dozen lines of
+    text either way.
+    """
+    root = _vendored_skill_dir()
+    files: dict[str, str] = {}
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        rel = path.relative_to(root).as_posix()
+        files[f"{_SKILL_HOME_PREFIX}/{SHOGYM_STREAM_SKILL}/{rel}"] = path.read_text(
+            encoding="utf-8"
+        )
+    return files
+
 
 class PrimeAgent(Harness):
     """Prime Intellect's prime-agent, non-interactive.
@@ -132,28 +166,28 @@ class PrimeAgent(Harness):
         # In print mode a resume and its prompt are separated by --, so the id is never read
         # as part of the prompt.
         argv += ["--", prompt]
-        return LaunchSpec(
-            argv=argv,
-            env=self.base_env(),
-            # Global settings live in the isolated HOME, so the endpoint is configured where
-            # every session in this cell sees it and nowhere else. Only http servers are
-            # honored; a stdio entry is dropped without an error.
-            home_files={
-                ".prime/agent/settings.json": json.dumps(
-                    {
-                        "mcpServers": {
-                            "shogym": {
-                                "type": "http",
-                                "url": mcp_url,
-                                "bearerTokenEnvVar": self.MCP_TOKEN_VAR,
-                            }
+        # Global settings live in the isolated HOME, so the endpoint is configured where every
+        # session in this cell sees it and nowhere else. Only http servers are honored; a stdio
+        # entry is dropped without an error. The skill package rides in the same HOME: the
+        # settings entry alone reaches nothing, because prime-agent's client is a kernel-side
+        # import, not a host-managed tool bridge.
+        home_files = {
+            ".prime/agent/settings.json": json.dumps(
+                {
+                    "mcpServers": {
+                        "shogym": {
+                            "type": "http",
+                            "url": mcp_url,
+                            "bearerTokenEnvVar": self.MCP_TOKEN_VAR,
                         }
-                    },
-                    indent=2,
-                )
-                + "\n"
-            },
-        )
+                    }
+                },
+                indent=2,
+            )
+            + "\n"
+        }
+        home_files.update(shogym_stream_skill_files())
+        return LaunchSpec(argv=argv, env=self.base_env(), home_files=home_files)
 
     def classify(
         self, *, returncode: int, stdout_path: Path, stderr_path: Path, timed_out: bool
