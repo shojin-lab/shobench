@@ -6,7 +6,40 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Andrew Jesson", email = "andrew.d.jesson@gmail.com" }]
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
+# shogym is pinned by commit, not by version: PyPI's shogym 0.0.1 predates the serve-layer
+# classes this runner is built on (TaskStream / EvalStream / build_stream_server). The rev lives
+# in [tool.uv.sources] rather than here because PyPI rejects metadata carrying a direct
+# reference; src/shobench/pins.py holds the same sha as the value recorded in every cell
+# manifest, and `shobench doctor` checks the installed shogym against it.
+# The three v0 envs carry their own extras: automationbench pulls `datasets`, hle pulls
+# `datasets` + `openai` for its judge, tau2 pulls upstream's dependency set. The runner serves
+# all three, so it takes all three.
+dependencies = [
+    "shogym[automationbench,hle,tau2]",
+]
+
+[project.optional-dependencies]
+# The reporting script's bootstrap. numpy arrives transitively via shogym, but the dependency is
+# direct here, so it is declared.
+report = ["numpy>=1.26"]
+
+[project.scripts]
+shobench = "shobench.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/shojin-lab/shobench"
+Repository = "https://github.com/shojin-lab/shobench"
+
+[tool.uv.sources]
+shogym = { git = "https://github.com/shojin-lab/shogym.git", rev = "695e21f8ce87b0097cea922bdb70a4c355766a0b" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+    "numpy>=1.26",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -16,4 +49,18 @@ build-backend = "hatchling.build"
 packages = ["src/shobench"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "README.md", "LICENSE"]
+include = ["src", "cells", "splits", "docs", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "docker: needs a live Docker daemon; deselected from the offline suite",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

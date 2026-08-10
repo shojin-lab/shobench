@@ -1,0 +1,3 @@
+Continue. Keep calling `get_task` and completing each task it hands you, ending each one
+with the tool that ends it, and repeat, until `get_task` returns {done: true}, which means
+the stream is exhausted.
