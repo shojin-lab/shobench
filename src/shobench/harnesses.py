@@ -157,22 +157,27 @@ class ClaudeCode(Harness):
         if timed_out:
             return StopVerdict(StopKind.LEG_TIMEOUT, "the runner ended the leg at its budget")
         result = _last_result_event(stdout_path)
-        texts = {
-            "result_json": json.dumps(result) if result else "",
-            "result_text": str(result.get("result", "")) if result else "",
-            "stderr": tail(stderr_path),
-        }
-        limit = self._match_usage_limit(texts)
-        if limit is not None:
-            return limit
+        # The limit rules only apply to a turn that actually failed. A clean turn's `result`
+        # is the agent's own text, and an agent that happened to write about hitting a limit
+        # would otherwise be recorded as having hit one.
+        if result is not None and result.get("is_error"):
+            limit = self._match_usage_limit(
+                {
+                    "result_json": json.dumps(result),
+                    "result_text": str(result.get("result", "")),
+                }
+            )
+            if limit is not None:
+                return limit
         if result is None:
             return StopVerdict(
                 StopKind.ERROR,
                 "no result event in the stream trace",
-                {"returncode": returncode, "stderr_tail": texts["stderr"][-2000:]},
+                {"returncode": returncode, "stderr_tail": tail(stderr_path)[-2000:]},
             )
         evidence = {
             "returncode": returncode,
+            "stderr_tail": tail(stderr_path)[-2000:],
             "subtype": result.get("subtype"),
             "is_error": result.get("is_error"),
             "stop_reason": result.get("stop_reason"),
@@ -477,10 +482,14 @@ class PrimeAgent(Harness):
     ) -> StopVerdict:
         if timed_out:
             return StopVerdict(StopKind.LEG_TIMEOUT, "the runner ended the leg at its budget")
+        stop_reason = _prime_stop_reason(stdout_path)
         texts = {"stdout": tail(stdout_path, lines=300), "stderr": tail(stderr_path)}
-        limit = self._match_usage_limit(texts)
-        if limit is not None:
-            return limit
+        # As with Claude Code, only a turn that ended in an error can be a usage limit; a
+        # clean turn's text is the agent's own and must not be pattern-matched for one.
+        if stop_reason in (None, "error", "aborted"):
+            limit = self._match_usage_limit(texts)
+            if limit is not None:
+                return limit
 
         stderr_text = texts["stderr"].lower()
         if any(marker in stderr_text for marker in self.LIMIT_MARKERS):
@@ -490,7 +499,6 @@ class PrimeAgent(Harness):
                 {"returncode": returncode, "stderr_tail": texts["stderr"][-2000:]},
             )
 
-        stop_reason = _prime_stop_reason(stdout_path)
         ended = _last_event_of_type(stdout_path, ("agent_end",))
         evidence = {
             "returncode": returncode,

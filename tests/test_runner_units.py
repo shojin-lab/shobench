@@ -290,6 +290,28 @@ def test_claude_429_is_a_usage_limit_and_is_resumable(tmp_path: Path) -> None:
     assert verdict.resumable
 
 
+def test_an_agent_writing_about_limits_is_not_a_usage_limit(tmp_path: Path) -> None:
+    """The result text of a clean turn is the agent's own words. Pattern-matching it for a
+    limit message would record an agent that merely discussed one as having hit one."""
+    out = _write(
+        tmp_path / "s.jsonl",
+        [
+            {
+                "type": "result",
+                "is_error": False,
+                "subtype": "success",
+                "terminal_reason": "completed",
+                "api_error_status": None,
+                "result": "I noted that you've hit your session limit before, so I paced myself.",
+            }
+        ],
+    )
+    verdict = harness_for("claude_code").classify(
+        returncode=0, stdout_path=out, stderr_path=tmp_path / "e.txt", timed_out=False
+    )
+    assert verdict.kind is StopKind.CHOSEN
+
+
 def test_claude_context_limit_is_an_error_not_a_usage_limit(tmp_path: Path) -> None:
     """blocking_limit is the prompt token limit. Resuming on it would loop forever."""
     out = _write(
