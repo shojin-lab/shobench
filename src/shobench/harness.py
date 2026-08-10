@@ -101,9 +101,16 @@ class Harness:
     """The interface the runner drives. One subclass per harness."""
 
     name: str = ""
-    # The MCP transport the harness is pointed at, and how the config is spelled. Every v0
-    # harness gets the same HTTP endpoint; only the config file differs.
     usage_limit_rules: Sequence[UsageLimitRule] = ()
+
+    def base_env(self) -> dict[str, str]:
+        """Environment every invocation of this harness needs, credentials excluded.
+
+        The credential probe uses this too, which matters more than it looks: a probe missing
+        one of these fails for a reason that has nothing to do with the credential, and a
+        negative control that fails for the wrong reason proves nothing.
+        """
+        return {}
 
     def version_probe(self) -> list[str]:
         """A command that reports the installed harness version, for the cell manifest."""

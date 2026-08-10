@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import socket
 import subprocess
 import time
 import uuid
@@ -263,6 +264,21 @@ def run_leg(
 # ----- the phases --------------------------------------------------------------------------
 
 
+def free_port() -> int:
+    """Claim a free ephemeral port by binding it and letting go.
+
+    A fixed port is not safe here. A stale server from an unrelated session was found
+    listening on the conventional port during development, and the agent connected to it and
+    was told the queue was exhausted, which would have been recorded as an agent that chose to
+    stop immediately. Asking the kernel for a port it believes is free, and then proving our
+    own server is the one answering, is what makes that impossible rather than unlikely.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 @contextlib.asynccontextmanager
 async def _served(stream, port: int, host: str = "0.0.0.0"):  # noqa: S104 (container-local)
     """Run the stream's HTTP server for the body of the block, then shut it down.
@@ -276,25 +292,32 @@ async def _served(stream, port: int, host: str = "0.0.0.0"):  # noqa: S104 (cont
     server = build_stream_server(stream, name=SERVER_NAME)
     task = asyncio.create_task(server.run_async(transport="http", host=host, port=port))
     try:
-        await _wait_for_port(host, port)
+        await _wait_ready(task, host, port)
         yield
     finally:
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
+        with contextlib.suppress(asyncio.CancelledError, SystemExit, Exception):
             await task
 
 
-async def _wait_for_port(host: str, port: int, *, timeout: float = 60.0) -> None:
-    """Wait until the transport accepts a connection.
+async def _wait_ready(task, host: str, port: int, *, timeout: float = 60.0) -> None:
+    """Wait until OUR server accepts a connection, and raise if it died instead.
 
-    Waiting on the socket rather than sleeping matters: a harness that connects before the
-    queue exists is told the stream is done, and the phase silently records nothing.
+    Two conditions, not one. Waiting only on the socket would accept a foreign listener and
+    hand the agent someone else's queue; waiting only on the task would race the transport.
+    Checking that the task is still alive on every poll is what turns a failed bind into an
+    exception here rather than a silently empty phase later.
     """
     target = "127.0.0.1" if host in ("0.0.0.0", "") else host  # noqa: S104
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if task.done():
+            # Re-raising the transport's own failure is the diagnosis; uvicorn exits with
+            # SystemExit(3) when it cannot bind, which is the common case.
+            task.result()
+            raise RuntimeError(f"the stream server exited before serving on {target}:{port}")
         try:
-            reader, writer = await asyncio.open_connection(target, port)
+            _, writer = await asyncio.open_connection(target, port)
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
@@ -324,6 +347,9 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
             prov_dir,
             deadline=float(ctx.cell.budget.eval_task_timeout_s),
         )
+        # A fresh port per task, so a socket still in TIME_WAIT from the previous task cannot
+        # make the next one look like a server that refused to start.
+        ctx.port = free_port()
         async with stream, _served(stream, ctx.port):
             await asyncio.to_thread(
                 run_leg,
@@ -380,6 +406,7 @@ async def run_rollout_phase(ctx: RunContext) -> tuple[list[TaskResult], dict[str
 
     stream = build_stream(ctx.cell, ctx.split, "rollout", prov_dir)
     queued = stream.queue_info().remaining
+    ctx.port = free_port()
     async with stream, _served(stream, ctx.port):
         leg = 0
         stalled = 0
@@ -566,6 +593,7 @@ def cleanup(run_id: str) -> None:
 
 __all__ = [
     "HOME_DIGEST_SKIP",
+    "free_port",
     "LegRecord",
     "RunContext",
     "build_manifest",

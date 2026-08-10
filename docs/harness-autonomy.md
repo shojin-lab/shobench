@@ -1,0 +1,384 @@
+# Harness autonomy and stop classification
+
+Two questions decide whether a cell is measuring what it claims to. First, is the harness
+autonomous from its first turn, since no cell may depend on a human approving anything
+mid-run. Second, when a run ends, did the agent choose to stop or did something stop it,
+since the scope's stopping metrics count only the agent's own choice.
+
+This document records the answers per harness, the settings the runner uses, and where each
+claim came from. Evidence classes appear inline: **observed** means the behavior was produced
+on this machine and captured, **source** means it was read out of the installed binary or
+bundle, **docs** means official documentation, and **unverified** means it is inferred and
+flagged as such.
+
+Versions this was established against: Claude Code 2.1.221 and 2.1.226, codex-cli 0.145.0 and
+0.147.0, prime-agent 0.7.0 and 0.7.1. The image pins 2.1.226, 0.147.0, and 0.7.1.
+
+## The shape of the problem
+
+None of the three harnesses runs for eight hours on its own. Claude Code runs its agentic
+loop until the model emits a turn with no tool calls, then exits. codex exec runs exactly one
+turn. prime-agent runs one turn unless autonomous mode is on, and then runs until one of five
+host budgets stops it. So the runner owns the outer loop in every case, which is why the
+rollout is a sequence of bounded legs against one live stream rather than one long process.
+That structure was forced by codex, whose unreliability over a single long loop is on record
+from prior runs, but it is the right structure for all three.
+
+None of the three has a usage-limit exit code either. All three need text or event
+classification, and the rules below are what the runner implements.
+
+## claude_code
+
+### Invocation
+
+    claude -p <kickoff> --model <model>
+      --mcp-config /cfg/claude.mcp.json --strict-mcp-config
+      --setting-sources ""
+      --permission-mode bypassPermissions
+      --append-system-prompt <standing instruction>
+      --forward-subagent-text
+      --output-format stream-json --verbose --include-partial-messages
+      [--session-id <uuid> | --resume <uuid>]
+
+`-p` is the headless switch and it also skips the workspace trust dialog. `--setting-sources ""`
+is what keeps the initial conditions honest: without it a settings file the image or the home
+happens to carry changes the run invisibly.
+
+The standing instruction goes in `--append-system-prompt`, not the user turn. A long rollout
+auto-compacts, and anything left in the user turn can be summarized away, which would silently
+drop the objective mid-run. The system prompt survives compaction.
+
+Two flags the runner deliberately does not use. `--bare` never reads OAuth credentials or
+`CLAUDE_CODE_OAUTH_TOKEN` (docs), so it cannot run a subscription cell. `--tools ""` strips MCP
+tools along with the built-ins, so it would remove the task stream itself.
+
+### Permission bypass
+
+`--permission-mode bypassPermissions` is documented as equivalent to
+`--dangerously-skip-permissions`. `dontAsk` is not a substitute: it permits only pre-approved
+tools and silently withholds everything else. `auto` is worse in headless mode, where repeated
+classifier blocks abort the session outright because there is no human to prompt.
+
+The container runs as root, and the CLI refuses bypass as root unless `IS_SANDBOX=1` is set.
+That check is in the binary (source), with the exact stderr line
+`--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons`
+and exit code 1. The variable is **undocumented officially**, so it can change in any release;
+the runner's credential negative control exercises the containerized bypass path on every cell
+start, which is what turns a future removal into a loud failure at the start of a cell rather
+than a confusing one in the middle. During development this check earned its place: the first
+negative control run failed for exactly this reason and would otherwise have looked like a
+credential result.
+
+### Auto-continue and resume
+
+The session id is on the first line of the stream (observed):
+`{"type":"system","subtype":"init","session_id":"...","mcp_servers":[...]}`. The runner pins it
+instead with `--session-id <uuid>` before launch, so a leg that dies immediately is still
+resumable, and resumes with `--resume <uuid>`.
+
+Resume has a trap worth stating plainly (docs): `bypassPermissions` is never restored on
+resume, and a session that depended on `--mcp-config`, `--settings`, or `--add-dir` needs them
+passed again. The runner rebuilds the whole argv on every leg, so every flag is always
+re-passed.
+
+### Usage limit versus chosen stop
+
+A clean finish, observed:
+
+    {"is_error": false, "stop_reason": "end_turn", "terminal_reason": "completed",
+     "subtype": "success", "api_error_status": null, "result": "..."}
+
+exit 0. A bad token, observed:
+
+    {"is_error": true, "stop_reason": "stop_sequence", "terminal_reason": "api_error",
+     "subtype": "success", "api_error_status": 401,
+     "result": "Failed to authenticate. API Error: 401 Invalid bearer token"}
+
+exit 1. **`subtype` is `"success"` in both.** It is not an error discriminator and the runner
+never branches on it. The fields that matter are `is_error`, `terminal_reason`, and
+`api_error_status`, and the last of those carries the HTTP status, which is how a 429 will
+appear.
+
+A subscription limit lands as HTTP 429 and produces a message from a known family (source and
+docs agree): `You've hit your session limit · resets 3:45pm`, and the same shape for the
+weekly, Opus, Sonnet, and usage-credit limits. There is also a mid-stream signal,
+`{"type":"system","subtype":"api_retry", ..., "error":"rate_limit"}`.
+
+One correction worth recording because the guess is natural and wrong: `terminal_reason:
+"blocking_limit"` is **not** the subscription limit. It is the prompt token limit, so it is a
+context problem, and resuming on it would loop. The runner classifies it as an error.
+
+The rule the runner applies, in order:
+
+| Condition | Class |
+|---|---|
+| `api_error_status == 429`, or `result` matches `you've hit your ... limit` | usage limit, resume |
+| exit 0 and `is_error == false` | chosen stop |
+| `terminal_reason` in `max_turns`, `budget_exhausted`, `tool_deferred`, `background_requested` | chosen stop, bounded |
+| `terminal_reason` in `blocking_limit`, `prompt_too_long` | error, context not quota |
+| no result event at all | error |
+| anything else | error |
+
+### Credentials
+
+Precedence (docs): Bedrock and Vertex and Foundry environments, then a gateway, then
+`ANTHROPIC_API_KEY`, then `apiKeyHelper`, then `CLAUDE_CODE_OAUTH_TOKEN`, then the subscription
+OAuth from `/login`. In non-interactive mode an `ANTHROPIC_API_KEY` present in the environment
+is always used, which is why a subscription cell must not carry one.
+
+| Mode | Variable | File |
+|---|---|---|
+| subscription | `CLAUDE_CODE_OAUTH_TOKEN` | Linux `~/.claude/.credentials.json` (0600); macOS keychain |
+| api key | `ANTHROPIC_API_KEY` | none |
+
+`CLAUDE_CONFIG_DIR` relocates the whole configuration surface, which is an alternative to the
+bind mount the runner uses; the bind mount is what has actually been run in this program.
+
+### MCP
+
+    {"mcpServers": {"shogym": {"type": "http", "url": "http://host.docker.internal:PORT/mcp"}}}
+
+The `type` field is load-bearing (docs): an entry with a `url` and no `type` is read as a stdio
+server, skipped, and the run continues toolless and exits cleanly. The `system/init` event
+carries `mcp_servers` with a per-server status, which the runner records; during the smoke run
+this is exactly what showed a leg had connected to nothing.
+
+## codex
+
+### Invocation
+
+    codex exec [resume <thread-id>] --json -m <model>
+      --dangerously-bypass-approvals-and-sandbox
+      --skip-git-repo-check
+      -c mcp_servers.shogym.url="<url>"
+      -c mcp_servers.shogym.default_tools_approval_mode="approve"
+      -c mcp_servers.shogym.required=true
+      -c mcp_servers.shogym.startup_timeout_sec=60
+      -c mcp_servers.shogym.tool_timeout_sec=900
+      -c cli_auth_credentials_store="file"
+      <prompt>
+      </dev/null
+
+codex exec has no separate system-prompt channel, so the standing instruction is prepended to
+the turn. The bytes are identical to every other harness's system prompt and the manifest
+records the digest, so the difference in placement is visible rather than hidden.
+
+### Approvals and sandbox
+
+Approvals need no flag: exec already defaults to never asking (source,
+`// Default to never ask for approvals in headless mode.`). `-a/--ask-for-approval` is not an
+exec flag at all; it exists only on the interactive root command.
+
+The sandbox does need a flag. `codex exec` defaults to a read-only sandbox (docs), so without
+the bypass the agent cannot write anything durable about itself, which would silently make the
+rollout unable to produce the artifact the benchmark measures. In a container the docs endorse
+full access explicitly.
+
+Two settings prevent silent failures. `default_tools_approval_mode = "approve"` is mandatory:
+without it every MCP call comes back cancelled and the agent concludes its tools are broken;
+`"auto"` is not the same thing. `required = true` makes a broker that fails to initialize an
+exit rather than a toolless run.
+
+The default MCP timeouts, 10 seconds to start and 60 seconds per call, are far too tight for a
+first `get_task` that pays for a cold environment and a dataset load, so both are raised.
+
+Project trust fails silently (source and prior art): an untrusted project's `.codex/config.toml`
+is skipped with no error, and `-c projects."<path>".trust_level` does not help because trust is
+resolved before `-c` overrides apply. The runner therefore declares MCP inline with `-c` and
+never relies on a project config file.
+
+### Auto-continue
+
+One invocation is one turn. The runner resumes the same thread with
+`codex exec resume <thread-id>`, which takes the subcommand before the flags and accepts
+neither `-s/--sandbox` nor `-C/--cd`. That is why the sandbox is opened with the bypass flag
+rather than `--sandbox`: the bypass flag is accepted by both forms.
+
+The thread id is the first event (observed): `{"type":"thread.started","thread_id":"..."}`.
+
+### Usage limit versus chosen stop
+
+A clean turn ends with `{"type":"turn.completed","usage":{...}}` and exit 0 (observed). A
+failure ends with `{"type":"turn.failed","error":{"message":"..."}}` and exit 1 (observed
+against a bad key).
+
+The important subtlety: intermediate `{"type":"error"}` events are retry chatter, not
+terminal. codex retries transient failures internally and only a non-retryable one sets the
+failure flag (source, the `!payload.will_retry` guard). A classifier that matched any error
+event would false-positive constantly, so the runner reads only the terminal `turn.failed`
+event's message.
+
+Usage limits arrive in that message. The invariant substring is `You've hit your usage limit`
+(source, `CodexErr::UsageLimitReached`), and the reset time is appended as `Try again at ...`
+or `or try again at ...`, so it is parseable. Related arms cover `out of credits` and
+`spend cap`. The backend discriminator is `error_type == "usage_limit_reached"` with header
+`x-codex-rate-limit-reached-type`. There is no dedicated event type and no distinct exit code.
+
+One more case: an **interrupted** turn emits neither terminal event and still exits 1 (source),
+so a missing terminal event is an interruption, not a stop. The runner classifies it as an
+error.
+
+**Unverified:** no live usage-limit event has been captured for codex. The rules are source
+verified at the pinned tag, and the runner records the full terminal payload unconditionally
+so the first real occurrence documents itself.
+
+### Credentials
+
+`CODEX_HOME` relocates the whole state surface, and the directory must already exist (docs).
+`cli_auth_credentials_store = "file"` is required in a container, which has no OS keyring.
+
+| Mode | Variable | File |
+|---|---|---|
+| api key | `CODEX_API_KEY` (exec only, single run) | none needed |
+| api key, alternative | `OPENAI_API_KEY` piped into `codex login --with-api-key` | `$CODEX_HOME/auth.json` (0600) |
+| subscription | none | `$CODEX_HOME/auth.json`, minted by a browser login and copied in |
+
+`OPENAI_API_KEY` alone does not authenticate codex. The runner uses `CODEX_API_KEY` for api-key
+mode because it needs no login step, and keeps the piped login available for a version that
+drops the variable. A discipline worth inheriting from the prior study: strip `OPENAI_API_KEY`
+from a subscription run's environment so it can never silently fall back to the billed key.
+
+## prime_agent
+
+### Install
+
+The vendor script, never npm. `registry.npmjs.org/prime-agent` returns 404, and
+`@earendil-works/pi-coding-agent` is Pi, a genuinely different agent with different tools and a
+different repository. The docs state the inherited npm workspace names in the source tree are
+implementation details and not the public install path. The script downloads a
+checksum-verified release tarball and hands it to `npm install -g`, so the command still lands
+in `/usr/local` and survives the isolated HOME being mounted over `/root`.
+
+`PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1` bakes the IPython kernel at build time. Without it
+the first session bootstraps a kernel venv and needs the network to do it, which would put a
+package install inside the first measured task.
+
+### Invocation
+
+    prime-agent -p --mode json --model <model>
+      --autonomous
+      --autonomous-max-continuations <large>
+      --autonomous-max-turns <large>
+      --autonomous-max-tokens <large>
+      --autonomous-timeout-ms <past the leg budget>
+      [--resume <id>] -- <prompt>
+      </dev/null
+
+### There is nothing to bypass, and that is the finding
+
+prime-agent has no permission prompt, no approval policy, and no sandbox. Its own docs say
+workers are process-isolated for failure containment and are not security-sandboxed. Approval
+gating exists only as an optional user-written extension. The container is the only boundary,
+which is what this runner already provides.
+
+A consequence worth recording: there is no way to fence affordances either. The MCP stream
+lives inside the single `ipython` tool, so removing tools removes the stream. For this
+benchmark that is fine, because the scope observes leakage rather than gating it.
+
+### Autonomy is a budget problem
+
+Autonomous mode starts disabled, and enabling it brings five defaults that are all far below
+an 8-hour rollout: 3 continuations, 12 turns, 80,000 tokens, and a 30-minute wall clock. The
+30-minute default alone would end every leg. The docs are explicit that reaching a limit
+"does not imply task success", so a run that ends at one has been cut off, not finished.
+Recording that as the agent's own stop is exactly the confound the scope forbids, which is why
+the runner raises all of them and classifies a limit that was still reached as a cutoff.
+
+Value-taking autonomous flags take a separate argument; `--flag=value` is rejected.
+
+### Usage limit versus chosen stop
+
+**The exit code is not usable.** Every model-level failure sets exit 1 only in text mode
+(source), so a `--mode json` run that errored still exits 0. Gate failures and thrown
+exceptions do exit 1 in json mode; model errors do not. The runner classifies from the event
+stream.
+
+The last assistant message carries `stopReason` in `stop`, `length`, `toolUse`, `error`,
+`aborted`, plus a structured diagnostic when a stream failed:
+
+    diagnostics: [{"type": "provider_stream_failure",
+                   "details": {"kind": "rate_limit", "status": 429, ...}}]
+
+with `kind` drawn from `refusal`, `safety`, `overloaded`, `rate_limit`, `server_error`, `auth`,
+`invalid_request`, `malformed_response`, `unknown`, and a 429 or a provider type containing
+`rate_limit` or `throttl` mapping to `rate_limit`. This is the cleanest structured rate-limit
+signal of the three harnesses. prime-agent also auto-retries retryable failures up to three
+attempts, emitting `auto_retry_start` and then `auto_retry_end` with `success: false` and a
+`finalError`, so the runner waits for `agent_end` rather than classifying on a retry.
+
+The rule:
+
+| Condition | Class |
+|---|---|
+| `diagnostics[].details.kind == "rate_limit"`, or `Provider rate limit exceeded` | usage limit, resume |
+| stderr names an autonomous limit (`maxContinuations`, `maxTurns`, `maxTokens`, `timeoutMs`) | cutoff, not a stop |
+| last `stopReason` in `stop`, `toolUse` | chosen stop |
+| last `stopReason == "length"` | chosen stop, output cap |
+| last `stopReason` in `error`, `aborted` | error |
+| `agent_end` with no readable stop reason | unknown, reported as itself |
+| no `agent_end` | error |
+
+### Credentials, and a finding that touches the scope
+
+Environment variables map per provider: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`PRIME_API_KEY`, and so on. `~/.prime/agent/auth.json` holds either api keys or OAuth tokens
+from `/login`, at mode 0600, and **auth file credentials take priority over environment
+variables** (docs). A stale auth.json in a cell HOME would therefore shadow an injected key,
+which a pristine per-cell HOME prevents by construction.
+
+`PRIME_AGENT_CODING_AGENT_DIR` relocates settings, auth, sessions, skills, prompts, logs, and
+models in one move, which is the cleanest isolation knob of the three harnesses.
+
+**The finding the scope should hear:** a `CLAUDE_CODE_OAUTH_TOKEN` is minted for Anthropic's
+own client and is refused when a third-party harness presents it. If that holds, prime-agent
+against an Anthropic model means api spend, not subscription allowance, and the scope's
+statement that both prime_agent cells run on subscription credentials would need revisiting for
+the Anthropic leg as well as the pending OpenAI one. This is **unverified** here; the runner's
+negative control is what will decide it, because it refuses to start a cell whose declared
+credential does not authenticate in the isolated HOME.
+
+### MCP: http only, and a bearer token is mandatory
+
+    {"mcpServers": {"shogym": {"type": "http", "url": "<url>",
+                               "bearerTokenEnvVar": "SHOBENCH_MCP_TOKEN"}}}
+
+Only `http` servers are honored; a stdio entry is dropped with no error, so it produces an
+integration that quietly is not there. The client resolves a bearer token before every
+connection and refuses to open a session without one, even against a server that ignores it,
+so the variable must be set to some non-empty value in the agent's environment. The runner
+sets it.
+
+**Remaining work, stated rather than papered over:** declaring the server is only half of what
+prime-agent needs. Each integration also requires a Python skill package under
+`.prime/agent/skills/<name>/` that is installed into the kernel venv at session start, and a
+new Python-backed skill needs a fresh session to be picked up. shogym's `examples/prime_agent`
+carries a working `shogym-stream` skill; wiring it into the cell HOME is the last piece before
+a prime_agent cell can run, and it is not done in this PR.
+
+## Docker checklist
+
+Applies to every harness:
+
+    </dev/null                    # mandatory for codex and prime-agent, cheap insurance for claude
+    -e NODE_OPTIONS=              # mandatory for prime-agent; an inherited value crashed it outright
+    container name <= 63 chars    # a longer name silently fails DNS and the agent gets no tools
+    credentials injected with -e at runtime, never baked into an image
+    the config mount is read-only and outside the agent's working directory
+
+The stdin rule is not uniform, and the difference is worth knowing. codex blocks forever on an
+open stdin: it reads stdin to end whenever stdin is not a TTY, prompt argument or not, and
+`docker run` without `-t` gives exactly that (observed: no output at all in 12 seconds).
+Claude Code does not block; it warns after 3 seconds and proceeds. prime-agent merges piped
+stdin into the prompt in print mode, which is its own reason to close it. The runner closes
+stdin for all three.
+
+## What is still unverified
+
+1. No live usage-limit event has been observed for any of the three. The rules are source
+   verified, and the runner records the full terminal payload on every leg so the first real
+   occurrence documents itself.
+2. prime-agent has never been exercised end to end against a live provider in a container in
+   this program. It needs its own smoke run before it joins an 8-hour cell.
+3. `IS_SANDBOX` is undocumented and can disappear in any release. The negative control
+   exercises the path at every cell start.
+4. Whether a `CLAUDE_CODE_OAUTH_TOKEN` authenticates prime-agent at all, per the finding above.

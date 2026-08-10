@@ -259,9 +259,16 @@ def run_probe(
     env: dict[str, str],
     timeout_s: int = 180,
 ) -> ControlResult:
-    """Run the credential probe once in an isolated HOME and say whether it authenticated."""
+    """Run the credential probe once in an isolated HOME and say whether it authenticated.
+
+    The harness's own base environment is merged in first, so the probe fails only for
+    credential reasons. A probe that dies on a missing IS_SANDBOX would fail identically with
+    a real credential and a bogus one, which would make the negative control prove nothing.
+    """
+    from shobench.harnesses import harness_for
+
     argv = ["docker", *docker_args]
-    for key, value in env.items():
+    for key, value in {**harness_for(harness).base_env(), **env}.items():
         argv += ["-e", f"{key}={value}"]
     argv += [image, *_probe_argv(harness, model)]
     started = time.time()

@@ -46,25 +46,36 @@ class ClaudeCode(Harness):
 
     name = "claude_code"
 
-    # Established by running `claude -p --output-format json` (2.1.221): a clean finish is
-    # is_error=false, subtype="success", terminal_reason="completed", api_error_status=null.
+    # Established by running the CLI: a clean finish is is_error=false,
+    # terminal_reason="completed", api_error_status=null; a bad token gives is_error=true,
+    # terminal_reason="api_error", api_error_status=401. Note subtype stays "success" in BOTH,
+    # so subtype is never an error discriminator here.
     usage_limit_rules = (
         UsageLimitRule(
             where="result_json",
             pattern=r'"api_error_status"\s*:\s*429',
-            citation="result object field observed in `claude -p --output-format json` output",
+            citation="observed: api_error_status carries the HTTP status (401 on a bad token)",
         ),
         UsageLimitRule(
-            where="result_json",
-            pattern=r"rate[_ ]?limit",
-            citation="`rate_limit` literal present in the 2.1.221 binary",
-        ),
-        UsageLimitRule(
-            where="stderr",
-            pattern=r"usage limit reached|limit will reset|rate.?limit|429",
-            citation="stderr fallback for a limit reported before the result event",
+            where="result_text",
+            pattern=r"you'?ve hit your .{0,40}limit",
+            citation="the CLI's own limit message family: session, weekly, Opus, usage credit",
         ),
     )
+
+    # terminal_reason values that mean a bounded stop rather than a failure: the turn ended
+    # because something the runner or the harness set said so, and resuming is correct.
+    BOUNDED_STOPS = frozenset(
+        {"max_turns", "budget_exhausted", "tool_deferred", "background_requested"}
+    )
+    # Values that are a context problem, not a quota problem. Treating blocking_limit as a
+    # usage limit would be wrong: it is the prompt token limit, and resuming would loop.
+    CONTEXT_ERRORS = frozenset({"blocking_limit", "prompt_too_long"})
+
+    def base_env(self) -> dict[str, str]:
+        # IS_SANDBOX=1 is what lets bypassPermissions run as root, which is what the container
+        # is. Without it the CLI refuses before it ever reaches a credential.
+        return {**BASE_ENV, "IS_SANDBOX": "1"}
 
     def version_probe(self) -> list[str]:
         return ["claude", "--version"]
@@ -112,11 +123,7 @@ class ClaudeCode(Harness):
             argv += ["--session-id", session_id]
         return LaunchSpec(
             argv=argv,
-            env={
-                **BASE_ENV,
-                # The container runs as root; without this the CLI refuses bypassPermissions.
-                "IS_SANDBOX": "1",
-            },
+            env=self.base_env(),
             config_files={
                 "claude.mcp.json": json.dumps(
                     {"mcpServers": {"shogym": {"type": "http", "url": mcp_url}}}, indent=2
@@ -133,6 +140,7 @@ class ClaudeCode(Harness):
         result = _last_result_event(stdout_path)
         texts = {
             "result_json": json.dumps(result) if result else "",
+            "result_text": str(result.get("result", "")) if result else "",
             "stderr": tail(stderr_path),
         }
         limit = self._match_usage_limit(texts)
@@ -153,8 +161,19 @@ class ClaudeCode(Harness):
             "api_error_status": result.get("api_error_status"),
             "num_turns": result.get("num_turns"),
         }
+        reason = str(result.get("terminal_reason") or "")
         if returncode == 0 and not result.get("is_error"):
             return StopVerdict(StopKind.CHOSEN, "the session ended its turn cleanly", evidence)
+        if reason in self.BOUNDED_STOPS:
+            return StopVerdict(
+                StopKind.CHOSEN, f"the turn ended at a bounded limit ({reason})", evidence
+            )
+        if reason in self.CONTEXT_ERRORS:
+            return StopVerdict(
+                StopKind.ERROR,
+                f"the context limit ended the turn ({reason}), which resuming would not fix",
+                evidence,
+            )
         return StopVerdict(StopKind.ERROR, "the session ended with an error result", evidence)
 
 
@@ -182,23 +201,29 @@ class Codex(Harness):
     # codex exec ends a turn with a terminal `turn.completed` or `turn.failed` JSONL event. A
     # usage limit arrives as turn.failed carrying the usage_limit_reached error type, whose
     # message also names the reset time.
+    # Read only from the TERMINAL turn.failed event. Mid-stream {"type":"error"} events are
+    # retry chatter: codex retries transient failures internally and only a non-retryable one
+    # is fatal, so a rule that matched any error event would false-positive constantly.
     usage_limit_rules = (
         UsageLimitRule(
-            where="stdout",
-            pattern=r'"error_type"\s*:\s*"usage_limit_reached"',
-            citation="CodexErr::UsageLimitReached, routed into turn.failed.error",
-        ),
-        UsageLimitRule(
-            where="stdout",
-            pattern=r"you'?ve hit your usage limit|usage limit reached",
+            where="turn_failed",
+            pattern=r"you'?ve hit your usage limit",
             citation="Display text of CodexErr::UsageLimitReached",
         ),
         UsageLimitRule(
-            where="stderr",
-            pattern=r"you'?ve hit your usage limit|usage limit reached|429",
-            citation="stderr fallback for a limit reported outside the event stream",
+            where="turn_failed",
+            pattern=r"out of credits|spend cap|exceeded retry limit, last status: 429",
+            citation="the other CodexErr::UsageLimitReached message arms",
+        ),
+        UsageLimitRule(
+            where="turn_failed",
+            pattern=r"^rate limit: ",
+            citation="the rate-limit error prefix",
         ),
     )
+
+    def base_env(self) -> dict[str, str]:
+        return dict(BASE_ENV)
 
     def version_probe(self) -> list[str]:
         return ["codex", "--version"]
@@ -219,10 +244,16 @@ class Codex(Harness):
         # prepended to the turn. The bytes are the same as every other harness's system prompt
         # and the manifest records the digest, so the difference in placement stays visible.
         prompt = f"{system_prompt}\n\n{user_prompt}"
-        argv = ["codex", "exec", "--json", "-m", model]
+        # `codex exec resume <id>` takes the subcommand before the flags, and accepts neither
+        # -s/--sandbox nor -C/--cd, which is why the sandbox is opened with the bypass flag
+        # rather than with --sandbox: the bypass flag is accepted by both forms.
+        argv = ["codex", "exec"]
         if resume and session_id:
             argv += ["resume", session_id]
         argv += [
+            "--json",
+            "-m",
+            model,
             # Full autonomy: exec's default sandbox is read-only, which would leave the agent
             # unable to write anything durable about itself.
             "--dangerously-bypass-approvals-and-sandbox",
@@ -245,81 +276,104 @@ class Codex(Harness):
             'cli_auth_credentials_store="file"',
             prompt,
         ]
-        return LaunchSpec(argv=argv, env=dict(BASE_ENV))
+        return LaunchSpec(argv=argv, env=self.base_env())
 
     def classify(
         self, *, returncode: int, stdout_path: Path, stderr_path: Path, timed_out: bool
     ) -> StopVerdict:
         if timed_out:
             return StopVerdict(StopKind.LEG_TIMEOUT, "the runner ended the leg at its budget")
-        texts = {"stdout": tail(stdout_path, lines=200), "stderr": tail(stderr_path)}
-        limit = self._match_usage_limit(texts)
+        terminal = _last_event_of_type(stdout_path, ("turn.completed", "turn.failed"))
+        failure = ""
+        if terminal is not None and terminal.get("type") == "turn.failed":
+            failure = str((terminal.get("error") or {}).get("message", ""))
+        limit = self._match_usage_limit({"turn_failed": failure})
         if limit is not None:
             return limit
-        terminal = _last_event_of_type(stdout_path, ("turn.completed", "turn.failed"))
         evidence = {
             "returncode": returncode,
             "terminal_event": None if terminal is None else terminal.get("type"),
-            "stderr_tail": texts["stderr"][-2000:],
+            "error_message": failure,
+            "stderr_tail": tail(stderr_path)[-2000:],
         }
         if terminal is not None and terminal.get("type") == "turn.completed" and returncode == 0:
             return StopVerdict(StopKind.CHOSEN, "codex exec completed its turn", evidence)
         if terminal is None:
-            # An interrupted turn emits no terminal event and still exits 1, so a missing
+            # An interrupted turn emits neither terminal event and still exits 1, so a missing
             # terminal event is an interruption rather than a stop.
             return StopVerdict(
                 StopKind.ERROR, "codex exec emitted no terminal turn event", evidence
             )
-        evidence["error"] = terminal.get("error")
         return StopVerdict(StopKind.ERROR, "codex exec reported a failed turn", evidence)
 
 
 class PrimeAgent(Harness):
     """Prime Intellect's prime-agent, non-interactive.
 
-    prime-agent installs from its vendor script, never from npm: the ``prime-agent`` name does
-    not exist on the npm registry, and the npm identity in its source tree installs Pi, a
-    different agent. The image installs it from the vendor script accordingly.
+    prime-agent installs from its vendor script, never from npm: the ``prime-agent`` name
+    returns 404 on the npm registry, and the inherited npm names in its source tree resolve to
+    Pi, a different agent. Its own docs say the workspace names are implementation details and
+    not the install path.
 
-    Autonomy needs more than a flag here. Autonomous mode starts disabled, and once enabled it
-    carries five default budgets that are all far below an 8-hour rollout: 3 continuations, 12
-    turns, 80,000 tokens, and 30 minutes. Leaving any of them at its default would end the
-    rollout on an imposed cutoff and record it as the agent's own stop, which is exactly the
-    confound the scope forbids. So the runner raises every budget past the cell's wall clock
-    and treats a budget that was nonetheless reached as a cutoff, not a stop.
+    There is nothing to bypass. prime-agent has no permission prompt, no approval policy, and
+    no sandbox; its docs state that workers are process-isolated for failure containment and
+    not security-sandboxed. The container is the only boundary, which is what this runner
+    already provides.
+
+    What does need configuring is autonomy's budgets. Autonomous mode starts disabled, and
+    once enabled it carries five defaults far below an 8-hour rollout: 3 continuations, 12
+    turns, 80,000 tokens, and 30 minutes. Leaving any of them would end the rollout on an
+    imposed cutoff, and the docs are explicit that reaching a limit "does not imply task
+    success", so recording it as the agent's own stop would be exactly the confound the scope
+    forbids. The runner raises all of them and reads a limit that was still reached as a
+    cutoff.
 
     Value-taking autonomous flags take a separate argument; ``--flag=value`` is rejected.
-
-    stdin is closed, because print mode reads piped stdin and merges it into the prompt, so an
-    inherited stdin hangs the process.
+    stdin is closed, because print mode reads piped stdin and merges it into the prompt.
     """
 
     name = "prime_agent"
 
+    # The structured signal, which is the cleanest of the three harnesses: a stream failure is
+    # classified into a kind, and rate_limit is one of them.
     usage_limit_rules = (
         UsageLimitRule(
             where="stdout",
             pattern=r'"kind"\s*:\s*"rate_limit"',
-            citation="diagnostics[].details.kind on the last assistant message",
+            citation="classifyStreamFailure kind, attached as diagnostics[].details.kind",
         ),
         UsageLimitRule(
             where="stdout",
-            pattern=r"usage limit|rate.?limit|quota exceeded|429",
-            citation="auto_retry_end.finalError text",
+            pattern=r"provider rate limit exceeded",
+            citation="the rendered errorMessage for the rate_limit kind",
         ),
         UsageLimitRule(
             where="stderr",
-            pattern=r"usage limit|rate.?limit|quota exceeded|429",
+            pattern=r"provider rate limit exceeded",
             citation="stderr fallback",
         ),
     )
 
-    # The autonomous budgets, raised so far past any leg that reaching one is a real signal.
-    # They are recorded in the manifest through the launch argv, so a reader can check that the
-    # rollout was not silently truncated by a host policy.
+    # Reaching one of these ended the run on a host policy, not on the agent's judgment.
+    LIMIT_MARKERS = (
+        "autonomous run stopped before terminal evidence",
+        "maxcontinuations",
+        "maxturns",
+        "maxtokens",
+        "timeoutms",
+    )
+
     MAX_CONTINUATIONS = 100000
     MAX_TURNS = 100000
     MAX_TOKENS = 1000000000
+
+    # prime-agent's MCP client resolves a bearer token before every connection and refuses to
+    # open a session without one, even against a server that ignores it. The value is a
+    # formality; its absence is a silent no-tools run.
+    MCP_TOKEN_VAR = "SHOBENCH_MCP_TOKEN"
+
+    def base_env(self) -> dict[str, str]:
+        return {**BASE_ENV, self.MCP_TOKEN_VAR: "local"}
 
     def version_probe(self) -> list[str]:
         return ["prime-agent", "--version"]
@@ -363,15 +417,27 @@ class PrimeAgent(Harness):
             argv += ["--resume", session_id]
         elif resume:
             argv += ["--continue"]
-        argv += [prompt]
+        # In print mode a resume and its prompt are separated by --, so the id is never read
+        # as part of the prompt.
+        argv += ["--", prompt]
         return LaunchSpec(
             argv=argv,
-            env=dict(BASE_ENV),
-            # Global settings live in the isolated HOME, so the MCP endpoint is configured
-            # where every session in this cell sees it and nowhere else.
+            env=self.base_env(),
+            # Global settings live in the isolated HOME, so the endpoint is configured where
+            # every session in this cell sees it and nowhere else. Only http servers are
+            # honored; a stdio entry is dropped without an error.
             home_files={
                 ".prime/agent/settings.json": json.dumps(
-                    {"mcpServers": {"shogym": {"type": "http", "url": mcp_url}}}, indent=2
+                    {
+                        "mcpServers": {
+                            "shogym": {
+                                "type": "http",
+                                "url": mcp_url,
+                                "bearerTokenEnvVar": self.MCP_TOKEN_VAR,
+                            }
+                        }
+                    },
+                    indent=2,
                 )
                 + "\n"
             },
@@ -382,23 +448,65 @@ class PrimeAgent(Harness):
     ) -> StopVerdict:
         if timed_out:
             return StopVerdict(StopKind.LEG_TIMEOUT, "the runner ended the leg at its budget")
-        texts = {"stdout": tail(stdout_path, lines=200), "stderr": tail(stderr_path)}
+        texts = {"stdout": tail(stdout_path, lines=300), "stderr": tail(stderr_path)}
         limit = self._match_usage_limit(texts)
         if limit is not None:
             return limit
+
+        stderr_text = texts["stderr"].lower()
+        if any(marker in stderr_text for marker in self.LIMIT_MARKERS):
+            return StopVerdict(
+                StopKind.LEG_TIMEOUT,
+                "an autonomous host limit ended the run, which is a cutoff and not a stop",
+                {"returncode": returncode, "stderr_tail": texts["stderr"][-2000:]},
+            )
+
+        stop_reason = _prime_stop_reason(stdout_path)
         ended = _last_event_of_type(stdout_path, ("agent_end",))
         evidence = {
             "returncode": returncode,
+            "stop_reason": stop_reason,
             "saw_agent_end": ended is not None,
             "stderr_tail": texts["stderr"][-2000:],
         }
-        if returncode == 0 and ended is not None:
-            return StopVerdict(StopKind.CHOSEN, "prime-agent ended its session", evidence)
-        if returncode == 0:
+        # The exit code is not usable here: every model-level failure sets exit 1 only in text
+        # mode, so a json-mode run that errored still exits 0. The event stream is the record.
+        if stop_reason in ("stop", "toolUse"):
+            return StopVerdict(StopKind.CHOSEN, "the last message ended the turn", evidence)
+        if stop_reason == "length":
+            return StopVerdict(StopKind.CHOSEN, "the output cap ended the message", evidence)
+        if stop_reason == "error":
             return StopVerdict(
-                StopKind.UNKNOWN, "prime-agent exited 0 without an agent_end event", evidence
+                StopKind.ERROR, "the last message ended in a provider error", evidence
             )
-        return StopVerdict(StopKind.ERROR, f"prime-agent exited {returncode}", evidence)
+        if stop_reason == "aborted":
+            return StopVerdict(StopKind.ERROR, "the run was aborted", evidence)
+        if ended is not None:
+            return StopVerdict(
+                StopKind.UNKNOWN, "agent_end carried no readable stop reason", evidence
+            )
+        return StopVerdict(StopKind.ERROR, "prime-agent emitted no agent_end event", evidence)
+
+
+def _prime_stop_reason(path: Path) -> str | None:
+    """The stop reason of prime-agent's last assistant message.
+
+    Read off ``agent_end``'s message list when there is one, else off the last ``message_end``,
+    because a run killed before agent_end still leaves the messages it did produce.
+    """
+    ended = _last_event_of_type(path, ("agent_end",))
+    if ended is not None:
+        for message in reversed(ended.get("messages") or []):
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                reason = message.get("stopReason")
+                if reason:
+                    return str(reason)
+    last = _last_event_of_type(path, ("message_end",))
+    if last is not None:
+        reason = (last.get("message") or {}).get("stopReason")
+        if reason:
+            return str(reason)
+    return None
 
 
 def _last_result_event(path: Path) -> dict | None:
