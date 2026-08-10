@@ -215,7 +215,11 @@ def run_leg(
 
     env = dict(spec.env)
     env.update(ctx.credentials)
-    args = ctx.sandbox.docker_args(env=env, mounts={ctx.cfg_dir: "/cfg:ro"})
+    # Named so a leg the runner ends at its budget can actually be removed. Killing the docker
+    # client leaves the container running, and a container that outlives its leg keeps
+    # spending and keeps pulling tasks the runner has stopped watching.
+    container = f"{ctx.sandbox.netns_container}-{phase[:4]}-{leg:04d}"[:63]
+    args = ctx.sandbox.docker_args(env=env, mounts={ctx.cfg_dir: "/cfg:ro"}, name=container)
     argv = ["docker", *args, ctx.agent_image, *spec.argv]
 
     started = time.time()
@@ -238,6 +242,7 @@ def run_leg(
         except subprocess.TimeoutExpired:
             timed_out = True
             returncode = -1
+            docker("rm", "-f", container, check=False)
 
     verdict = ctx.harness.classify(
         returncode=returncode,

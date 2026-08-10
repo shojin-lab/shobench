@@ -103,15 +103,26 @@ class CellSandbox:
         docker("rm", "-f", self.netns_container, check=False)
         docker("network", "rm", self.network, check=False)
 
-    def docker_args(self, *, env: dict[str, str], mounts: dict[Path, str]) -> list[str]:
+    def docker_args(
+        self, *, env: dict[str, str], mounts: dict[Path, str], name: str | None = None
+    ) -> list[str]:
         """The ``docker run`` prefix an agent leg uses.
 
         The leg joins the holder's network namespace rather than the network directly, so the
         observer that attached to that namespace sees the leg's traffic from its first packet.
+
+        ``name`` matters for a leg that has to be killed. Stopping the docker client does not
+        stop the container it started, so a leg the runner ends at its budget would otherwise
+        keep running, keep spending, and keep talking to the stream after the runner had
+        moved on. A named container can be removed.
         """
         args = [
             "run",
             "--rm",
+        ]
+        if name is not None:
+            args += ["--name", name]
+        args += [
             "--network",
             f"container:{self.netns_container}",
             "-v",
