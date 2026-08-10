@@ -197,10 +197,18 @@ def run_leg(
         trace_path=stdout_path,
         session_id=session_id,
         resume=resume,
+        leg_timeout_s=timeout_s,
     )
     ctx.cfg_dir.mkdir(parents=True, exist_ok=True)
     for name, body in spec.config_files.items():
         target = ctx.cfg_dir / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+    # A harness that reads its configuration only from HOME gets it written there once per
+    # leg. Writing every leg rather than once keeps the endpoint correct if the agent edited
+    # it, and the home inventory in the manifest still shows that it did.
+    for name, body in spec.home_files.items():
+        target = ctx.sandbox.home / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body, encoding="utf-8")
 

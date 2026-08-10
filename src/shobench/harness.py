@@ -69,6 +69,11 @@ class LaunchSpec:
     # mount is read-only and lives outside the agent's working directory, so a harness config
     # never becomes part of what the agent thinks of as itself.
     config_files: dict[str, str] = field(default_factory=dict)
+    # Files the runner writes into the cell's isolated HOME, for harnesses that read their
+    # configuration only from there. These land inside what the agent can edit, which is the
+    # cost of the harness having no config flag; the manifest's home inventory records them so
+    # a later edit by the agent is still visible as a change.
+    home_files: dict[str, str] = field(default_factory=dict)
     # Harnesses that hang on an open stdin get /dev/null; ones that read the prompt from stdin
     # get it here.
     stdin: str | None = None
@@ -122,6 +127,7 @@ class Harness:
         trace_path: Path,
         session_id: str | None = None,
         resume: bool = False,
+        leg_timeout_s: int = 3600,
     ) -> LaunchSpec:
         raise NotImplementedError
 

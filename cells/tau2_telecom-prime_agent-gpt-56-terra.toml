@@ -1,0 +1,30 @@
+# tau2_telecom x prime_agent @ gpt-5.6-terra
+#
+# One cell of the v0 matrix. Everything that distinguishes it from another cell is here, so
+# the matrix is reviewable as data and a new experiment arm is a new file. The
+# generation-effect study rides this same runner by varying instruction_arm alone.
+
+[cell]
+name = "tau2_telecom-prime_agent-gpt-56-terra"
+env = "tau2_telecom"
+harness = "prime_agent"
+model = "gpt-5.6-terra"
+split = "tau2_telecom"
+instruction_arm = "get-better"
+# Subscription is the preferred mode for every v0 cell. The runner supports both modes and
+# records which one the cell actually ran under.
+credential_mode = "subscription"
+required_env = ["TAU2_DATA_DIR", "OPENAI_API_KEY"]
+note = "Upstream's declared 74/40 split at the pinned sha. 40 held-out is below the N >= 60 power aim, and honoring the benchmark's canonical split wins over inventing a larger leaky one."
+
+[budget]
+# Wall-clock parity, decided in the scope: identical across harnesses within an env, no token
+# ceiling, because the cells run on subscription billing.
+rollout_wall_clock_s = 28800
+# The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
+pool_ceiling = 74
+eval_task_timeout_s = 1800
+# One leg of the rollout. Bounding it is what keeps a wedged harness from consuming the whole
+# budget in one unrecoverable process; the wall clock is unaffected.
+rollout_leg_timeout_s = 3600
+max_stalled_legs = 3

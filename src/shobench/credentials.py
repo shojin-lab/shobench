@@ -84,32 +84,43 @@ SPECS: dict[tuple[str, str], CredentialSpec] = {
     ("codex", "api_key"): CredentialSpec(
         harness="codex",
         mode="api_key",
-        env_names=("OPENAI_API_KEY",),
+        env_names=("CODEX_API_KEY",),
         home_paths=(".codex/auth.json",),
         login_argv=("codex", "login", "--with-api-key"),
         login_reads_stdin=True,
         notes=(
-            "The environment variable alone does not authenticate codex; the key must be piped "
-            "into `codex login --with-api-key`, which writes ~/.codex/auth.json."
+            "CODEX_API_KEY supplies a key for a single non-interactive run and is supported "
+            "only by `codex exec`, which is the only way this runner invokes codex, so no "
+            "auth.json is minted. OPENAI_API_KEY alone does not authenticate codex; the "
+            "alternative is piping the key into `codex login --with-api-key`, which writes "
+            "~/.codex/auth.json, and the runner keeps that path available for a harness "
+            "version that drops the variable."
         ),
     ),
     ("prime_agent", "subscription"): CredentialSpec(
         harness="prime_agent",
         mode="subscription",
         env_names=("CLAUDE_CODE_OAUTH_TOKEN",),
-        home_paths=(".prime/",),
+        home_paths=(".prime/agent/auth.json",),
         login_argv=("prime-agent", "login"),
         notes=(
-            "The Anthropic OAuth path through prime_agent is the validated one. The OpenAI "
-            "subscription leg is separate and pending; see PENDING_LEGS."
+            "The Anthropic OAuth path through prime_agent is the validated one. Which variable "
+            "carries that subscription into a container is UNVERIFIED here, so the negative "
+            "control is what decides whether the cell may start rather than an assumption. "
+            "prime-agent reads auth.json in preference to the environment, so a cell HOME must "
+            "start without one or an injected key is shadowed; a pristine HOME is exactly what "
+            "this runner provides."
         ),
     ),
     ("prime_agent", "api_key"): CredentialSpec(
         harness="prime_agent",
         mode="api_key",
         env_names=("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),
-        home_paths=(".prime/",),
-        notes="Validated with an API key; the subscription variant is the preferred mode.",
+        home_paths=(".prime/agent/auth.json",),
+        notes=(
+            "Per-provider environment variables are the documented path in a container, "
+            "because there is no keyring and auth.json would otherwise shadow them."
+        ),
     ),
 }
 
@@ -224,7 +235,16 @@ def _probe_argv(harness: str, model: str) -> list[str]:
             "json",
         ]
     if harness == "codex":
-        return ["codex", "exec", "--json", "-m", model, "--skip-git-repo-check", PROBE_PROMPT]
+        return [
+            "codex",
+            "exec",
+            "--json",
+            "-m",
+            model,
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            PROBE_PROMPT,
+        ]
     if harness == "prime_agent":
         return ["prime-agent", "-p", "--mode", "json", PROBE_PROMPT, "--model", model]
     raise ValueError(f"no probe for harness {harness!r}")
