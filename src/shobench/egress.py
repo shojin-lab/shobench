@@ -22,6 +22,7 @@ evidence for a human to read alongside the traces rather than an automatic cheat
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 from collections import Counter
 from dataclasses import dataclass
@@ -70,15 +71,19 @@ def start(
 ) -> EgressCapture:
     """Attach a passive observer to ``netns_container``'s network namespace.
 
-    NET_ADMIN and NET_RAW are what a capture needs and all it needs. The observer holds no
-    credential and mounts nothing: its output is its stdout, harvested by :func:`stop`, so
-    there is no shared path between it and the agent.
+    NET_ADMIN and NET_RAW are what a capture needs and all it needs, and the observer holds no
+    credential.
+
+    The capture is written straight to a file rather than harvested from the container's log
+    at the end. An 8-hour cell produces more log than Docker's rotation keeps, and the part
+    that would be dropped is the beginning, which is exactly where a cell's first unusual
+    request would appear. The output directory is the run directory, which the agent has no
+    mount of: the agent sees only its HOME and its workdir, both children of it, and a bind
+    mount cannot be traversed upward.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.touch()
-    fields: list[str] = []
-    for field in FIELDS:
-        fields += ["-e", field]
+    fields = [f"-e {name}" for name in FIELDS]
     subprocess.run(
         [
             "docker",
@@ -92,21 +97,22 @@ def start(
             "NET_ADMIN",
             "--cap-add",
             "NET_RAW",
+            "-v",
+            f"{log_path.parent}:/out:rw",
             image,
-            "tshark",
-            "-i",
-            "any",
-            "-l",
-            "-n",
-            "-Q",
-            "-Y",
-            DISPLAY_FILTER,
-            "-T",
-            "fields",
-            # tshark spells a tab separator as the two-character escape /t.
-            "-E",
-            "separator=/t",
-            *fields,
+            "sh",
+            "-c",
+            # tee, not a redirect: the file is the durable record and stdout stays live, so a
+            # human can watch the capture with `docker logs -f` while it runs.
+            " ".join(
+                [
+                    "tshark -i any -l -n -Q",
+                    f"-Y {shlex.quote(DISPLAY_FILTER)}",
+                    "-T fields -E separator=/t",
+                    " ".join(fields),
+                    f"| tee {shlex.quote('/out/' + log_path.name)}",
+                ]
+            ),
         ],
         check=True,
         capture_output=True,
@@ -115,10 +121,16 @@ def start(
 
 
 def stop(capture: EgressCapture) -> None:
-    """Stop the observer and flush its output into the cell's egress log."""
+    """Stop the observer, and fall back to its log if the file came out empty.
+
+    The file is the intended record. The fallback exists because an observer that failed to
+    write one should still hand over whatever it saw rather than leaving the cell with no
+    leakage observable at all.
+    """
     subprocess.run(["docker", "stop", "-t", "5", capture.container], capture_output=True)
-    logs = subprocess.run(["docker", "logs", capture.container], capture_output=True, text=True)
-    capture.log_path.write_text(logs.stdout, encoding="utf-8")
+    if not capture.log_path.exists() or capture.log_path.stat().st_size == 0:
+        logs = subprocess.run(["docker", "logs", capture.container], capture_output=True, text=True)
+        capture.log_path.write_text(logs.stdout, encoding="utf-8")
     subprocess.run(["docker", "rm", "-f", capture.container], capture_output=True)
 
 
