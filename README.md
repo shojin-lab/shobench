@@ -58,7 +58,7 @@ dataset, no judge key, and no broker credential.
 | instruction arms | `instructions/<arm>/` | the prompts, hashed into every manifest |
 | serving | `src/shobench/serving.py` | shogym's `TaskStream` and `EvalStream` behind `build_stream_server` |
 | the three phases | `src/shobench/runner.py` | container lifecycle, legs, resume, the manifest |
-| harnesses | `src/shobench/harnesses.py` | autonomous launch, and how a leg ended |
+| harnesses | `src/shobench/harnesses/` | autonomous launch, and how a leg ended, one file per harness |
 | credentials | `src/shobench/credentials.py` | isolated HOME plus the negative control |
 | egress | `src/shobench/egress.py` | passive per-cell capture that restricts nothing |
 | reporting | `src/shobench/report.py` | the paired bootstrap and the summary table |
