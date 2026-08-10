@@ -97,6 +97,12 @@ class UsageLimitRule:
         return found.group(0) if found else None
 
 
+# Every harness runs with a clean NODE_OPTIONS. An inherited one (a debugger port, a loader
+# hook) reaches the harness's own Node runtime and has broken launches before. It is the base
+# env every harness extends rather than replaces, so it lives with the base class.
+BASE_ENV = {"NODE_OPTIONS": ""}
+
+
 class Harness:
     """The interface the runner drives. One subclass per harness."""
 
@@ -106,11 +112,13 @@ class Harness:
     def base_env(self) -> dict[str, str]:
         """Environment every invocation of this harness needs, credentials excluded.
 
-        The credential probe uses this too, which matters more than it looks: a probe missing
-        one of these fails for a reason that has nothing to do with the credential, and a
-        negative control that fails for the wrong reason proves nothing.
+        The default is a clean ``NODE_OPTIONS`` and nothing else, which every harness needs and
+        which a subclass extends rather than replaces (``{**super().base_env(), ...}``). The
+        credential probe uses this too, which matters more than it looks: a probe missing one of
+        these fails for a reason that has nothing to do with the credential, and a negative
+        control that fails for the wrong reason proves nothing.
         """
-        return {}
+        return dict(BASE_ENV)
 
     def version_probe(self) -> list[str]:
         """A command that reports the installed harness version, for the cell manifest."""
@@ -168,6 +176,15 @@ class Harness:
 
     # ----- shared helpers -----
 
+    def _timed_out_verdict(self) -> StopVerdict:
+        """The verdict for a leg the runner ended at its budget.
+
+        Identical for every harness because the decision was the runner's, not the agent's: a
+        leg the runner cut off is a ``LEG_TIMEOUT`` and never a chosen stop, whatever the trace
+        happens to hold. Every ``classify`` returns this first when ``timed_out`` is set.
+        """
+        return StopVerdict(StopKind.LEG_TIMEOUT, "the runner ended the leg at its budget")
+
     def _match_usage_limit(self, texts: dict[str, str]) -> StopVerdict | None:
         for rule in self.usage_limit_rules:
             text = texts.get(rule.where, "")
@@ -216,6 +233,7 @@ def jsonl_events(path: Path, *, limit: int = 400) -> list[dict[str, Any]]:
 
 
 __all__ = [
+    "BASE_ENV",
     "Harness",
     "LaunchSpec",
     "StopKind",

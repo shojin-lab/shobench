@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from shobench.harness import (
+    BASE_ENV,
     Harness,
     LaunchSpec,
     StopKind,
@@ -21,10 +22,6 @@ from shobench.harness import (
     jsonl_events,
     tail,
 )
-
-# Every harness runs with a clean NODE_OPTIONS. An inherited one (a debugger port, a loader
-# hook) reaches the harness's own Node runtime and has broken launches before.
-BASE_ENV = {"NODE_OPTIONS": ""}
 
 
 class ClaudeCode(Harness):
@@ -78,7 +75,7 @@ class ClaudeCode(Harness):
     def base_env(self) -> dict[str, str]:
         # IS_SANDBOX=1 is what lets bypassPermissions run as root, which is what the container
         # is. Without it the CLI refuses before it ever reaches a credential.
-        return {**BASE_ENV, "IS_SANDBOX": "1"}
+        return {**super().base_env(), "IS_SANDBOX": "1"}
 
     def version_probe(self) -> list[str]:
         return ["claude", "--version"]
@@ -155,7 +152,7 @@ class ClaudeCode(Harness):
         self, *, returncode: int, stdout_path: Path, stderr_path: Path, timed_out: bool
     ) -> StopVerdict:
         if timed_out:
-            return StopVerdict(StopKind.LEG_TIMEOUT, "the runner ended the leg at its budget")
+            return self._timed_out_verdict()
         result = _last_result_event(stdout_path)
         # The limit rules only apply to a turn that actually failed. A clean turn's `result`
         # is the agent's own text, and an agent that happened to write about hitting a limit
@@ -221,6 +218,7 @@ class Codex(Harness):
     """
 
     name = "codex"
+    # No base_env override: codex adds nothing to the base's clean NODE_OPTIONS.
 
     # codex exec ends a turn with a terminal `turn.completed` or `turn.failed` JSONL event. A
     # usage limit arrives as turn.failed carrying the usage_limit_reached error type, whose
@@ -245,9 +243,6 @@ class Codex(Harness):
             citation="the rate-limit error prefix",
         ),
     )
-
-    def base_env(self) -> dict[str, str]:
-        return dict(BASE_ENV)
 
     def session_id_from_trace(self, trace_path: Path) -> str | None:
         # codex announces its thread id as the first event and takes no id from the caller.
@@ -311,7 +306,7 @@ class Codex(Harness):
         self, *, returncode: int, stdout_path: Path, stderr_path: Path, timed_out: bool
     ) -> StopVerdict:
         if timed_out:
-            return StopVerdict(StopKind.LEG_TIMEOUT, "the runner ended the leg at its budget")
+            return self._timed_out_verdict()
         terminal = _last_event_of_type(stdout_path, ("turn.completed", "turn.failed"))
         failure = ""
         if terminal is not None and terminal.get("type") == "turn.failed":
@@ -402,7 +397,7 @@ class PrimeAgent(Harness):
     MCP_TOKEN_VAR = "SHOBENCH_MCP_TOKEN"
 
     def base_env(self) -> dict[str, str]:
-        return {**BASE_ENV, self.MCP_TOKEN_VAR: "local"}
+        return {**super().base_env(), self.MCP_TOKEN_VAR: "local"}
 
     def session_id_from_trace(self, trace_path: Path) -> str | None:
         # prime-agent's first line is its session header, which carries the id.
@@ -481,7 +476,7 @@ class PrimeAgent(Harness):
         self, *, returncode: int, stdout_path: Path, stderr_path: Path, timed_out: bool
     ) -> StopVerdict:
         if timed_out:
-            return StopVerdict(StopKind.LEG_TIMEOUT, "the runner ended the leg at its budget")
+            return self._timed_out_verdict()
         stop_reason = _prime_stop_reason(stdout_path)
         texts = {"stdout": tail(stdout_path, lines=300), "stderr": tail(stderr_path)}
         # As with Claude Code, only a turn that ended in an error can be a usage limit; a
