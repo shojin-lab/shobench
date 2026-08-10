@@ -1,0 +1,23 @@
+# What makes `shogym-stream` a Python-backed skill rather than a markdown one: prime-agent
+# installs this package editable into its kernel venv (~/.prime/agent/kernel-venv) during
+# kernel setup, and exposes it in IPython under the import name -- the skill directory name
+# with hyphens turned into underscores, i.e. `shogym_stream`.
+#
+# `mcp` is the only dependency the kernel venv does not already have: its bootstrap installs
+# `prime-agent-runtime` (from the copy bundled with the CLI, not from PyPI, where it does not
+# exist) and `httpx` among its default packages. Declaring all three anyway is what the Prime
+# Agent docs' integration template does, and it costs nothing -- uv leaves an already-installed
+# requirement alone rather than going looking for it.
+
+[project]
+name = "prime-agent-skill-shogym-stream"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["mcp", "httpx", "prime-agent-runtime"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shogym_stream"]
