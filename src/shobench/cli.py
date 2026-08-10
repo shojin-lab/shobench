@@ -22,7 +22,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from shobench import credentials, report, runner
+from shobench import credentials, report, runner, tau2_data
 from shobench.config import load_all_cells, load_cell_by_name, load_instruction, repo_root
 from shobench.containers import AGENT_IMAGE, NETNS_IMAGE, CellSandbox, build_image, daemon_available
 from shobench.egress import EGRESS_IMAGE
@@ -153,6 +153,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     }
     missing_required = [n for n in cell.required_env if not os.environ.get(n)]
     plan["missing_required_env"] = missing_required
+    # tau2 data is provisioned, not operator-set: the runner points TAU2_DATA_DIR at the cache
+    # itself, so it is reported here rather than listed among required_env.
+    if tau2_data.needs_tau2_data(cell.env):
+        plan["tau2_data"] = {
+            "needed": True,
+            "upstream_sha": tau2_data.UPSTREAM_SHA,
+            "data_dir": str(tau2_data.resolve_data_dir()),
+            "present": tau2_data.is_present(),
+            "provision_command": tau2_data.PROVISION_COMMAND,
+        }
     if not args.go:
         print(json.dumps(plan, indent=2))
         print(
@@ -162,8 +172,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     if missing_required:
-        # These are serving-side needs: a dataset checkout, a judge key, a user simulator. The
-        # cell would start, spend, and fail partway, so it does not start.
+        # These are serving-side needs: a judge key, a user simulator key. The cell would start,
+        # spend, and fail partway, so it does not start.
         print(json.dumps(plan, indent=2), file=sys.stderr)
         print(
             f"\nBLOCKED: the cell needs {missing_required} in the environment and they are "
@@ -171,6 +181,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if tau2_data.needs_tau2_data(cell.env):
+        # The dataset checkout is a serving-side need too, but a provisioned one. Resolve it, set
+        # TAU2_DATA_DIR for the in-process serving stream, and fail loudly with the provisioning
+        # command if it is absent rather than starting a cell that would fail partway.
+        try:
+            os.environ["TAU2_DATA_DIR"] = str(tau2_data.require())
+        except tau2_data.Tau2DataError as exc:
+            print(json.dumps(plan, indent=2), file=sys.stderr)
+            print(f"\nBLOCKED: {exc}\nNothing was spent.", file=sys.stderr)
+            return 1
 
     if not args.skip_credential_check:
         sandbox = CellSandbox(

@@ -170,7 +170,7 @@ class Cell:
     budget: Budget
     credential_mode: str
     source: Path
-    # Extra keyword arguments handed to shogym env construction, e.g. tau2's task_split_name.
+    # Extra keyword arguments handed to shogym env construction, e.g. tau2's task_split.
     env_kwargs: dict[str, Any] = field(default_factory=dict)
     # Environment variables the cell's containers need beyond credentials, e.g. HF_TOKEN's
     # presence requirement. Values are never stored here, only names.
