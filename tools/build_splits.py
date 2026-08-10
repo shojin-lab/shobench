@@ -195,7 +195,9 @@ def build_hle(out: Path) -> Path:
     population = split_tasks(load_hle_tasks(text_only=True), "train")
     n = len(population)
     if n != 1726:
-        raise SystemExit(f"hle train slice is {n} tasks, expected 1726, which means the dataset drifted")
+        raise SystemExit(
+            f"hle train slice is {n} tasks and the manifest expects 1726: the dataset drifted"
+        )
 
     order = list(range(n))
     random.Random(SEED).shuffle(order)
