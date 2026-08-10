@@ -42,6 +42,13 @@ class CredentialSpec:
     login_argv: tuple[str, ...] = ()
     # Whether the login step reads the credential from stdin rather than from the environment.
     login_reads_stdin: bool = False
+    # A credential the harness reads from a file rather than the environment. The runner copies
+    # it from the operator's own home into the cell's isolated one, because the login that
+    # mints it is a browser flow that cannot run in a container. Copying it is not a weakening
+    # of the isolation: the cell still gets its own copy in its own HOME, and the negative
+    # control still has to fail against a corrupted one before the real one is trusted.
+    seed_from: str = ""
+    seed_to: str = ""
     # Set when only a human can complete this mode's login. The runner builds the check,
     # marks the cell pending, and does not block other cells on it.
     pending_reason: str = ""
@@ -72,13 +79,13 @@ SPECS: dict[tuple[str, str], CredentialSpec] = {
         env_names=(),
         home_paths=(".codex/auth.json",),
         login_argv=("codex", "login"),
-        pending_reason=(
-            "The ChatGPT subscription login is a browser flow, so the auth.json has to be "
-            "minted once by a human and then copied into the cell's isolated HOME."
-        ),
+        seed_from="~/.codex/auth.json",
+        seed_to=".codex/auth.json",
         notes=(
-            "Once minted, the runner copies auth.json into the isolated HOME rather than "
-            "re-running the browser flow, and the negative control still applies to the copy."
+            "The ChatGPT subscription login is a browser flow that cannot run in a container, "
+            "so the auth.json minted once on the host is copied into the cell's isolated HOME. "
+            "A file whose auth_mode is not chatgpt means the host is logged in with an API key "
+            "and the cell would silently bill it, so the runner checks the mode before copying."
         ),
     ),
     ("codex", "api_key"): CredentialSpec(
@@ -100,16 +107,23 @@ SPECS: dict[tuple[str, str], CredentialSpec] = {
     ("prime_agent", "subscription"): CredentialSpec(
         harness="prime_agent",
         mode="subscription",
-        env_names=("CLAUDE_CODE_OAUTH_TOKEN",),
+        env_names=(),
         home_paths=(".prime/agent/auth.json",),
         login_argv=("prime-agent", "login"),
+        seed_from="~/.prime/agent/auth.json",
+        seed_to=".prime/agent/auth.json",
+        pending_reason=(
+            "prime-agent holds no credential for any provider on this host, and a "
+            "CLAUDE_CODE_OAUTH_TOKEN does not substitute for one. Observed: with that token "
+            "present in the environment, prime-agent answered 'No API key found for "
+            "anthropic. Use /login to log into a provider via OAuth or API key.' Both "
+            "prime_agent legs therefore wait on an interactive login on the host, after which "
+            "the runner copies the resulting auth.json into each cell's isolated HOME."
+        ),
         notes=(
-            "The Anthropic OAuth path through prime_agent is the validated one. Which variable "
-            "carries that subscription into a container is UNVERIFIED here, so the negative "
-            "control is what decides whether the cell may start rather than an assumption. "
             "prime-agent reads auth.json in preference to the environment, so a cell HOME must "
-            "start without one or an injected key is shadowed; a pristine HOME is exactly what "
-            "this runner provides."
+            "start without a stale one or an injected key is shadowed. A pristine per-cell "
+            "HOME is what this runner provides."
         ),
     ),
     ("prime_agent", "api_key"): CredentialSpec(
@@ -131,7 +145,57 @@ PENDING_LEGS = {
         "The OpenAI subscription path through prime_agent needs an interactive login only the "
         "owner can perform. The check is built and runs as soon as the credential exists."
     ),
+    ("prime_agent", "subscription", "anthropic"): (
+        "prime-agent holds no credential for any provider on this host: its auth.json exists "
+        "and declares an empty provider map. Both prime_agent legs therefore wait on a login. "
+        "The Anthropic leg has a second open question on top of that, recorded in "
+        "docs/harness-autonomy.md: a CLAUDE_CODE_OAUTH_TOKEN is minted for Anthropic's own "
+        "client and may be refused when a third-party harness presents it, which would make "
+        "this leg api spend rather than subscription allowance."
+    ),
 }
+
+
+def seed_home(spec: CredentialSpec, home: Path, *, bogus: bool = False) -> str:
+    """Place a file-based credential into the cell's isolated HOME.
+
+    Returns a short description of what was placed, for the record. The bogus arm writes a
+    structurally valid file carrying an unusable token, so the negative control tests the
+    credential rather than the file's existence: a probe that failed merely because the file
+    was missing would prove nothing about isolation.
+    """
+    if not spec.seed_from:
+        return "no file-based credential for this mode"
+    target = home / spec.seed_to
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if bogus:
+        target.write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "OPENAI_API_KEY": None,
+                    "tokens": {
+                        "id_token": BOGUS,
+                        "access_token": BOGUS,
+                        "refresh_token": BOGUS,
+                        "account_id": "shobench-negative-control",
+                    },
+                }
+            )
+        )
+        target.chmod(0o600)
+        return f"wrote a bogus {spec.seed_to}"
+    source = Path(spec.seed_from).expanduser()
+    if not source.is_file():
+        return f"MISSING: no {spec.seed_from} on the host to copy"
+    body = source.read_text(encoding="utf-8")
+    target.write_text(body, encoding="utf-8")
+    target.chmod(0o600)
+    try:
+        mode = json.loads(body).get("auth_mode")
+    except json.JSONDecodeError:
+        mode = None
+    return f"copied {spec.seed_from} (auth_mode={mode})"
 
 
 def spec_for(harness: str, mode: str) -> CredentialSpec:
@@ -257,7 +321,7 @@ def run_probe(
     docker_args: list[str],
     image: str,
     env: dict[str, str],
-    timeout_s: int = 180,
+    timeout_s: int = 300,
 ) -> ControlResult:
     """Run the credential probe once in an isolated HOME and say whether it authenticated.
 
@@ -297,6 +361,7 @@ def validate_isolation(
     docker_args: list[str],
     image: str,
     environ: dict[str, str],
+    home: Path,
 ) -> IsolationVerdict:
     """Run the negative control, then the positive check, and say whether the cell may start.
 
@@ -316,6 +381,15 @@ def validate_isolation(
             env_names_present=present,
         )
     missing = [name for name, ok in present.items() if not ok]
+    if spec.seed_from and not Path(spec.seed_from).expanduser().is_file():
+        return IsolationVerdict(
+            harness=harness,
+            mode=mode,
+            trusted=False,
+            reason=f"no {spec.seed_from} on the host to seed the cell's HOME from",
+            pending="log in on the host once, then rerun; nothing else blocks on this",
+            env_names_present=present,
+        )
     if spec.env_names and len(missing) == len(spec.env_names):
         return IsolationVerdict(
             harness=harness,
@@ -325,6 +399,7 @@ def validate_isolation(
             env_names_present=present,
         )
 
+    seeded_bogus = seed_home(spec, home, bogus=True)
     negative = run_probe(
         harness=harness,
         model=model,
@@ -333,6 +408,7 @@ def validate_isolation(
         env={name: BOGUS for name in spec.env_names},
     )
     negative.arm = "negative_control"
+    negative.detail = f"[{seeded_bogus}] {negative.detail}"
     if negative.succeeded:
         return IsolationVerdict(
             harness=harness,
@@ -347,11 +423,13 @@ def validate_isolation(
             env_names_present=present,
         )
 
+    seeded_real = seed_home(spec, home)
     real = {name: environ[name] for name in spec.env_names if environ.get(name)}
     positive = run_probe(
         harness=harness, model=model, docker_args=docker_args, image=image, env=real
     )
     positive.arm = "positive_check"
+    positive.detail = f"[{seeded_real}] {positive.detail}"
     if not positive.succeeded:
         return IsolationVerdict(
             harness=harness,
@@ -392,6 +470,7 @@ def write_verdict(path: Path, verdict: IsolationVerdict) -> Path:
 
 __all__ = [
     "BOGUS",
+    "seed_home",
     "PENDING_LEGS",
     "SPECS",
     "ControlResult",

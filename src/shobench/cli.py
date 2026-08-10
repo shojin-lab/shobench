@@ -117,6 +117,7 @@ def _cmd_creds(args: argparse.Namespace) -> int:
             docker_args=sandbox.docker_args(env={}, mounts={}),
             image=args.image,
             environ=dict(os.environ),
+            home=sandbox.home,
         )
     finally:
         sandbox.down()
@@ -171,6 +172,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 docker_args=sandbox.docker_args(env={}, mounts={}),
                 image=args.image,
                 environ=dict(os.environ),
+                home=sandbox.home,
             )
         finally:
             sandbox.down()

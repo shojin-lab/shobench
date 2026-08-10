@@ -329,13 +329,25 @@ which a pristine per-cell HOME prevents by construction.
 `PRIME_AGENT_CODING_AGENT_DIR` relocates settings, auth, sessions, skills, prompts, logs, and
 models in one move, which is the cleanest isolation knob of the three harnesses.
 
-**The finding the scope should hear:** a `CLAUDE_CODE_OAUTH_TOKEN` is minted for Anthropic's
-own client and is refused when a third-party harness presents it. If that holds, prime-agent
-against an Anthropic model means api spend, not subscription allowance, and the scope's
-statement that both prime_agent cells run on subscription credentials would need revisiting for
-the Anthropic leg as well as the pending OpenAI one. This is **unverified** here; the runner's
-negative control is what will decide it, because it refuses to start a cell whose declared
-credential does not authenticate in the isolated HOME.
+**The finding the scope should hear, now observed rather than suspected.** A
+`CLAUDE_CODE_OAUTH_TOKEN` does not authenticate prime-agent. Run in the cell's isolated HOME
+with that token present in the environment, prime-agent answered:
+
+    No API key found for anthropic.
+    Use /login to log into a provider via OAuth or API key.
+
+So the Anthropic leg is in the same position as the OpenAI one: it needs an interactive
+`/login` on the host, and the resulting `auth.json` copied into each cell's HOME. Until that
+login happens, the only credential prime-agent would accept is `ANTHROPIC_API_KEY`, which is
+api spend rather than subscription allowance and is therefore not what the scope asked for.
+The runner marks both prime_agent legs pending and blocks neither of the other cells on them.
+
+For contrast, the same protocol on codex passed on the first attempt. `~/.codex/auth.json`
+already carries `auth_mode: "chatgpt"` on this host, so the ChatGPT subscription leg is
+validated end to end today: a bogus auth.json produced repeated 401s against the responses
+endpoint, and the real one produced `SHOBENCH-OK` with exactly the clean-completion event
+sequence this document predicts, `thread.started` then `turn.started` then `item.completed`
+then `turn.completed`.
 
 ### MCP: http only, and a bearer token is mandatory
 
@@ -381,4 +393,6 @@ stdin for all three.
    this program. It needs its own smoke run before it joins an 8-hour cell.
 3. `IS_SANDBOX` is undocumented and can disappear in any release. The negative control
    exercises the path at every cell start.
-4. Whether a `CLAUDE_CODE_OAUTH_TOKEN` authenticates prime-agent at all, per the finding above.
+4. Whether prime-agent's own OAuth `/login` yields a subscription credential or an api key for
+   each provider. That is answerable only after the interactive login, which only the owner can
+   perform.
