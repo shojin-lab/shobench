@@ -15,6 +15,7 @@ import os
 
 import pytest
 
+from shobench import tau2_data
 from shobench.serving import env_factory
 from shobench.splits import load_split_by_name
 
@@ -26,10 +27,13 @@ def _env(name: str, kwargs: dict):
         pytest.skip(f"{name} data not provisioned here: {type(exc).__name__}: {exc}")
 
 
-@pytest.mark.skipif(
-    not os.environ.get("TAU2_DATA_DIR"), reason="needs TAU2_DATA_DIR at the pinned sha"
-)
 def test_tau2_manifest_ids_resolve_to_the_labels_it_records() -> None:
+    # The runner points TAU2_DATA_DIR at the provisioned cache; do the same here so this runs
+    # whenever the data is present, not only when an operator exported the variable. Skips
+    # cleanly on a host that has not provisioned it.
+    if not tau2_data.is_present():
+        pytest.skip(f"tau2 data not provisioned; run {tau2_data.PROVISION_COMMAND}")
+    os.environ["TAU2_DATA_DIR"] = str(tau2_data.resolve_data_dir())
     split = load_split_by_name("tau2_telecom")
     for side in (split.heldout, split.pool):
         env = _env("tau2_telecom", side.env_kwargs)
