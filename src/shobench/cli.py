@@ -148,7 +148,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "rollout_wall_clock_hours": cell.budget.rollout_wall_clock_s / 3600,
         "agent_image": args.image,
         "credentials_present": credentials.inventory(dict(os.environ)),
+        "required_env_present": {name: bool(os.environ.get(name)) for name in cell.required_env},
     }
+    missing_required = [n for n in cell.required_env if not os.environ.get(n)]
+    plan["missing_required_env"] = missing_required
     if not args.go:
         print(json.dumps(plan, indent=2))
         print(
@@ -156,6 +159,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 0
+
+    if missing_required:
+        # These are serving-side needs: a dataset checkout, a judge key, a user simulator. The
+        # cell would start, spend, and fail partway, so it does not start.
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(
+            f"\nBLOCKED: the cell needs {missing_required} in the environment and they are "
+            "not set. Nothing was spent.",
+            file=sys.stderr,
+        )
+        return 1
 
     if not args.skip_credential_check:
         sandbox = CellSandbox(
