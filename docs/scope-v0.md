@@ -18,8 +18,10 @@ power; the full matrix is the target it grows back toward.
 ## Protocol per cell
 
 1. **Initial conditions.** A pristine agent home (no memory, no skills, no prior sessions),
-   pinned harness version, the harness's own default model (recorded), one sandboxed
-   container per cell. Identical container image across harnesses.
+   pinned harness version, the cell's pinned model per the harness-model pairs below
+   (recorded in the manifest), one sandboxed container per cell. Identical container image
+   across harnesses. The improvement instruction text is itself part of the initial
+   conditions: the same env-agnostic prompt, byte-identical in every cell.
 2. **Held-out eval, before.** Serve the held-out split cold: plain task serving, no
    improvement instruction. One fresh session per task, per-task scores recorded from the
    trace.
@@ -68,21 +70,19 @@ Counts measured against the shōgym registry (2026-08-07). Excluded by decision:
 | `tau2_telecom` | ~114 (needs data fetch) | tau2 evaluator + user simulator | OPENAI_API_KEY | low (simulated) | **yes** |
 | `tau2_banking_knowledge` | TBD (needs data fetch) | tau2 evaluator | OPENAI_API_KEY | low | v1 |
 | `frontier_bench` | 5 | container end-state verifier | Docker | low | no: 5 tasks cannot give a held-out split with power |
-| `hle` | 1726 | exact match + model judge | OPENAI_API_KEY + gated HF | **high**: public dataset, answers on the web | **yes, gated on the egress allowlist** |
+| `hle` | 1726 | exact match + model judge | OPENAI_API_KEY + gated HF | **high**: public dataset, answers on the web | **yes (leakage observed, not gated)** |
 | `browsecomp_plus` | 664 | model judge + retrieval metrics | OPENAI_API_KEY + Java 21 + gated | medium | deferred until network policy |
 | `orca_bench` | 755 | task judge (model) | OPENAI_API_KEY + Docker, ~133 GB/host | medium: the hub RPC returns full ground truth | waits for phase 2 (live backend) |
 
-The leakage column is load-bearing: the sandbox has full internet (harnesses need their
-model APIs), and disallowing web tools does not stop a Bash-capable agent from curling
-answers. Prior work hit exactly this on held-out runs. v0 dodges the problem by choosing
-envs whose answers exist only inside a simulation, with one exception: hle is in v0 by
-owner decision, and its cells are gated on the egress allowlist (model API endpoints only),
-which therefore becomes v0 infrastructure. The eight simulated-env cells can run before the
-allowlist exists; the four hle cells cannot, because a Bash-capable agent can curl the
-public answers on held-out tasks. The fallback, if the allowlist proves heavy, is running
-hle with the leakage documented and measured, which is a decision to take explicitly, not
-a default. browsecomp_plus joins in v1 under the same allowlist. orca_bench additionally needs its resolver RPC blocked or the
-oracle surface is one curl away.
+The leakage column is an observable, not a gate. The sandbox has full internet (harnesses
+need their model APIs), and disallowing web tools does not stop a Bash-capable agent from
+curling answers; prior work hit exactly this on held-out runs. The owner call for v0:
+observe rather than pre-empt. If a harness opts to cheat, that is a finding, and the
+record should show it. The runner captures per-cell network egress alongside the traces,
+and held-out answers fetched from the public internet get documented, not prevented. hle
+therefore runs in v0 with no egress allowlist, and its public answers make it the cell
+most worth watching. orca_bench, when it joins, keeps its resolver RPC noted as an oracle
+surface for the same observability treatment.
 
 ## The harness matrix
 
@@ -117,6 +117,10 @@ Known per-harness hazards from prior runs:
   not npm (the npm identity in its source tree installs Pi instead, per its own docs). Its
   model and credential resolution must be verified per cell (`prime-agent model list`)
   before any rollout spends budget.
+- All three harnesses: research the docs and code for settings that promote autonomy from
+  the session's first turn (permission bypass, full-auto modes, auto-continue behavior)
+  and record the chosen settings per harness in the runner configuration; no cell may
+  depend on a human approving anything mid-run.
 
 ## v0 = 3 envs x 4 harness-model pairs = 12 cells
 
@@ -144,9 +148,11 @@ Known per-harness hazards from prior runs:
   will serve; the agent may stop on its own long before exhausting it. That early stop is a
   primary reported outcome (tasks attempted before stopping, and how the stop happened), not
   a protocol failure. Nothing re-serves tasks to push an agent to the ceiling.
-- **Budget per cell:** fixed wall-clock for the rollout (proposal: 4 hours), auto-continue
-  on, hard token ceiling as a safety stop. Both eval phases run every held-out task exactly
-  once.
+- **Budget per cell:** fixed wall-clock for the rollout: 8 hours. No token ceiling; the
+  cells run on subscription billing. Auto-continue on, and a session ended by provider
+  usage limits is resumed automatically, so the stopping metrics count only the agent's
+  own choice to stop, never an imposed cutoff. Both eval phases run every held-out task
+  exactly once.
 
 ## Display
 
@@ -158,22 +164,29 @@ results page on shojin.dev consumes the same JSON later; nothing in v0 blocks on
 ## Infrastructure (what has to exist before cell one runs)
 
 1. A cell runner: container lifecycle, the three phases, trace collection, split
-   enforcement. The selfopt run_agent broker pattern is the starting point (wandb sink
-   broker-side, key injected at runtime, agent keeps zero broker mounts).
-2. Split manifests checked into shōbench (env name, seed, task ids per side).
-3. Paired-bootstrap reporting script.
+   enforcement. Serving uses shōgym's first-class classes (`shogym.serve.TaskStream` for
+   the rollout queue, `EvalStream` for the eval phases, stood up via
+   `build_stream_server`), not bespoke serving code. The original study's broker pattern
+   survives only for what it was good at: container and credential lifecycle (wandb sink
+   broker-side, keys injected at runtime, the agent keeps zero broker mounts).
+2. Split manifests checked into shōbench: for each env, a committed file listing the
+   exact task ids on each side of the split and the seed that produced them, so every
+   rerun serves identical splits and what was held out is reviewable.
+3. The reporting script. Paired bootstrap: resample the held-out tasks with replacement,
+   recompute the mean before-to-after delta on each resample, and report the 2.5th and
+   97.5th percentiles as the 95% CI. Paired because both evals score the same tasks,
+   which cancels per-task difficulty out of the interval.
 4. Per-harness episodic supervision for the rollout (the codex requirement, useful for all).
 
-## Open decisions
+## Decisions
 
-1. **Rollout budget parity:** wall-clock (proposed) vs token vs task-count. Wall-clock is
-   the only one comparable across harnesses with different token accounting.
-2. **The improvement instruction text:** reuse the established env-agnostic "Get Better"
-   prompt verbatim (proposed) or re-derive per harness. Verbatim keeps cells comparable and
-   ties back to the registered study.
-3. **How many rollout repetitions per cell:** v0 proposes one rollout per cell (cost), with
-   the understanding that a single rollout is one draw; repetitions are the v1 upgrade that
-   turns per-cell claims from anecdote into estimate.
-4. **Egress allowlist scope:** now v0 infrastructure (the hle gate above); what remains
-   open is v1 reach (browsecomp_plus,
+1. **Rollout budget parity:** wall-clock. Decided.
+2. **The improvement instruction text:** the established env-agnostic "Get Better" prompt
+   verbatim to start; iterate through PRs against this doc if the runs argue for it.
+3. **Rollout repetitions:** one per cell in v0. A single rollout is one draw; repetitions
+   are the v1 upgrade that turns per-cell claims from anecdote into estimate.
+4. **Egress allowlist:** was a proposed per-cell network restriction (containers reach
+   model API endpoints only) to prevent held-out answer fetching on public-answer envs.
+   Dissolved by the observe-not-preempt decision above; nothing gates on it, and v1
+   revisits it only if observed leakage argues for prevention (browsecomp_plus,
    orca_bench) or keep growing the simulated-env column first.
