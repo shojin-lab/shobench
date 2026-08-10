@@ -12,13 +12,14 @@ from pathlib import Path
 
 import pytest
 
-from shobench.config import load_all_cells, load_instruction, repo_root
-from shobench.containers import home_digest
-from shobench.harness import StopKind
+from shobench import egress
+from shobench.config import load_all_cells, load_cell_by_name, load_instruction, repo_root
+from shobench.containers import CellSandbox, home_digest, write_json
+from shobench.harness import StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.report import paired_bootstrap, report_cell
-from shobench.results import TaskResult, eval_summary, pair_evals
-from shobench.runner import is_noise
+from shobench.results import TaskResult, eval_summary, pair_evals, write_results
+from shobench.runner import LegRecord, RunContext, build_manifest, is_noise
 from shobench.serving import side_for_phase, task_indices
 from shobench.splits import load_split_by_name, splits_dir
 
@@ -618,3 +619,89 @@ def test_the_digest_ignores_a_new_transcript_and_notices_a_new_note(tmp_path: Pa
 
     (home / ".claude" / "projects" / "-work" / "memory" / "note.md").write_text("a lesson\n")
     assert home_digest(home, exclude=is_noise) != before
+
+
+# ----- no durable artifact leaks an absolute host path ----------------------------------------
+
+# The four shapes an absolute host path takes on the machines that run cells. A durable record
+# carrying any of these leaks a username and a machine layout, and is wrong on another checkout.
+_ABSOLUTE_MARKERS = ("/Users/", "/home/", "/private/tmp/", "/var/folders/")
+
+
+def _absolute_path_values(node: object) -> list[str]:
+    """Every string in a parsed JSON tree that reads as an absolute filesystem path.
+
+    A leading slash is the general case; the markers catch an absolute path embedded inside a
+    longer string. Repo paths, run-internal paths, and hostnames are all relative or bare, so an
+    empty result is the invariant the runner's records must hold.
+    """
+    if isinstance(node, str):
+        leaks = node.startswith("/") or any(marker in node for marker in _ABSOLUTE_MARKERS)
+        return [node] if leaks else []
+    if isinstance(node, dict):
+        return [leak for value in node.values() for leak in _absolute_path_values(value)]
+    if isinstance(node, list):
+        return [leak for value in node for leak in _absolute_path_values(value)]
+    return []
+
+
+def test_no_durable_artifact_the_runner_writes_carries_an_absolute_path(tmp_path: Path) -> None:
+    """The manifest and the results JSON, built the way the runner builds them, are free of any
+    absolute host path. This drives the real builders on a synthetic run so a newly added path
+    field that forgets to relativize fails here rather than shipping in a golden.
+    """
+    cell = load_cell_by_name("smoke-automationbench-claude-code")
+    split = load_split_by_name("smoke-automationbench")
+    instruction = load_instruction(cell.instruction_arm)
+    run_id = "guard-run-20260101T000000Z"
+    run_dir = tmp_path / run_id
+    sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
+    ctx = RunContext(
+        cell=cell,
+        split=split,
+        instruction=instruction,
+        harness=harness_for(cell.harness),
+        run_id=run_id,
+        run_dir=run_dir,
+        sandbox=sandbox,
+    )
+
+    manifest = build_manifest(ctx, probes={"version": "2.1.226 (Claude Code)"})
+
+    # A leg whose trace lives under the run dir, recorded the way a phase records it.
+    leg = LegRecord(
+        leg=0,
+        phase="rollout",
+        task_idx=None,
+        started_at=0.0,
+        ended_at=1.0,
+        returncode=0,
+        verdict=StopVerdict(StopKind.CHOSEN, "the session ended its turn cleanly"),
+        tasks_consumed_before=0,
+        tasks_consumed_after=1,
+        trace_path=str(run_dir / "rollout" / "traces" / "leg-0000.stream.jsonl"),
+        run_dir=run_dir,
+    )
+    stopping = {"stop_reason": "agent_chose_to_stop", "legs": [leg.to_json()]}
+    # The leg keeps its absolute trace in-process for the resume read, but records the relative.
+    assert leg.trace_path.startswith("/")
+    assert leg.to_json()["trace_path"] == "rollout/traces/leg-0000.stream.jsonl"
+
+    # An egress summary built from a capture at the run dir root.
+    tsv = run_dir / "egress.tsv"
+    tsv.parent.mkdir(parents=True, exist_ok=True)
+    tsv.write_text("1.0\t203.0.113.7\t443\t\tapi.example.com\t\n", encoding="utf-8")
+    egress_summary = egress.summarize(tsv)
+
+    manifest_path = write_json(run_dir / "manifest.json", manifest)
+    results_path = write_results(
+        run_dir / "results.json",
+        manifest=manifest,
+        phases={"eval_before": [], "rollout": [], "eval_after": []},
+        stopping=stopping,
+        egress=egress_summary,
+    )
+
+    for path in (manifest_path, results_path):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        assert _absolute_path_values(doc) == [], f"{path.name} leaks an absolute path"

@@ -153,7 +153,10 @@ def summarize(log_path: Path) -> dict[str, object]:
                     hosts[host] += 1
     return {
         "available": True,
-        "path": str(log_path),
+        # The capture always lands at the run directory's root, so its basename is its
+        # run-dir-relative path. Recording that rather than the absolute path keeps the summary
+        # portable and free of the operator's layout, like every other path the runner writes.
+        "path": log_path.name,
         "observations": lines,
         "distinct_hosts": len(hosts),
         "hosts": dict(hosts.most_common()),

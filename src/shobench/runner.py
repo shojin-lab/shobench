@@ -41,6 +41,7 @@ from shobench.containers import (
     docker,
     home_digest,
     home_inventory,
+    run_relative,
     write_json,
 )
 from shobench.credentials import seed_home, spec_for
@@ -126,7 +127,13 @@ def is_noise(rel_path: str) -> bool:
 
 @dataclass
 class LegRecord:
-    """One harness invocation inside a phase."""
+    """One harness invocation inside a phase.
+
+    ``trace_path`` is the absolute path to this leg's trace, kept absolute in-process because
+    the rollout reads the leg's real session id back off it before resuming. The durable record
+    the runner writes carries the run-dir-relative form instead, computed in :meth:`to_json`, so
+    no results artifact leaks the operator's absolute layout.
+    """
 
     leg: int
     phase: str
@@ -138,6 +145,7 @@ class LegRecord:
     tasks_consumed_before: int
     tasks_consumed_after: int
     trace_path: str
+    run_dir: Path
     observed_models: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
@@ -153,7 +161,7 @@ class LegRecord:
             "verdict": self.verdict.to_json(),
             "tasks_consumed_before": self.tasks_consumed_before,
             "tasks_consumed_after": self.tasks_consumed_after,
-            "trace_path": self.trace_path,
+            "trace_path": run_relative(self.trace_path, self.run_dir),
         }
 
 
@@ -218,7 +226,7 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
             "agent_image": ctx.agent_image,
             "network": ctx.sandbox.network,
             "netns_container": ctx.sandbox.netns_container,
-            "home": str(ctx.sandbox.home),
+            "home": run_relative(ctx.sandbox.home, ctx.run_dir),
         },
         "home": {
             "digest_before": home_digest(ctx.sandbox.home, exclude=is_noise),
@@ -324,6 +332,7 @@ def run_leg(
         tasks_consumed_before=consumed_before,
         tasks_consumed_after=consumed_before,
         trace_path=str(stdout_path),
+        run_dir=ctx.run_dir,
         observed_models=ctx.harness.observed_models(stdout_path),
     )
     ctx.legs.append(record)

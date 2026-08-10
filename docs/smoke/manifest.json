@@ -19,13 +19,13 @@
       "rollout_leg_timeout_s": 600,
       "max_stalled_legs": 2
     },
-    "config_path": "/Users/andrew/repos/shobench/cells/smoke-automationbench-claude-code.toml",
+    "config_path": "cells/smoke-automationbench-claude-code.toml",
     "config_sha256": "55002bbaf31875df5a159935220ee9abebed131fe050becc29cb8896526fdf27",
     "note": "Machinery proof. Not a measurement, and never reported as one."
   },
   "split": {
     "env": "automationbench",
-    "path": "/Users/andrew/repos/shobench/splits/smoke-automationbench.json",
+    "path": "splits/smoke-automationbench.json",
     "n_heldout": 2,
     "n_pool": 3,
     "heldout_env_kwargs": {},
@@ -61,7 +61,7 @@
     "agent_image": "shobench-agent:v0",
     "network": "shobench-smoke-automationbench-claude-code-2026081-net",
     "netns_container": "shobench-smoke-automationbench-claude-code-2026081-ns",
-    "home": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/home"
+    "home": "home"
   },
   "home": {
     "digest_before": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",

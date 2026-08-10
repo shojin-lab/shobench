@@ -35,6 +35,21 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def repo_relative(path: Path) -> str:
+    """A repo path recorded portably: relative to the checkout root, in POSIX form.
+
+    A durable record must not carry the operator's absolute path, which leaks a username and a
+    machine layout and is wrong on any other checkout anyway. The manifest lives beside the
+    files it names, so the checkout-relative form is what a reader on another machine resolves.
+    A path that somehow lies outside the checkout falls back to its basename rather than leaking
+    the absolute path it came from.
+    """
+    try:
+        return path.resolve().relative_to(repo_root()).as_posix()
+    except ValueError:
+        return path.name
+
+
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -177,7 +192,7 @@ class Cell:
             "env_kwargs": dict(self.env_kwargs),
             "required_env": list(self.required_env),
             "budget": self.budget.to_manifest(),
-            "config_path": str(self.source),
+            "config_path": repo_relative(self.source),
             "config_sha256": _sha256_file(self.source),
             "note": self.note,
         }
@@ -257,5 +272,6 @@ __all__ = [
     "load_cell",
     "load_cell_by_name",
     "load_instruction",
+    "repo_relative",
     "repo_root",
 ]

@@ -1,6 +1,6 @@
 {
   "available": true,
-  "path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/egress.tsv",
+  "path": "egress.tsv",
   "observations": 65,
   "distinct_hosts": 2,
   "hosts": {

@@ -118,9 +118,11 @@ class Split:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def to_manifest(self) -> dict[str, Any]:
+        from shobench.config import repo_relative
+
         return {
             "env": self.env,
-            "path": str(self.source),
+            "path": repo_relative(self.source),
             "n_heldout": len(self.heldout),
             "n_pool": len(self.pool),
             "heldout_env_kwargs": dict(self.heldout.env_kwargs),

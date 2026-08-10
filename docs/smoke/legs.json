@@ -25,7 +25,7 @@
     },
     "tasks_consumed_before": 0,
     "tasks_consumed_after": 0,
-    "trace_path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/eval_before/traces/task-00558-leg-0000.stream.jsonl"
+    "trace_path": "eval_before/traces/task-00558-leg-0000.stream.jsonl"
   },
   {
     "leg": 1,
@@ -53,7 +53,7 @@
     },
     "tasks_consumed_before": 0,
     "tasks_consumed_after": 0,
-    "trace_path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/eval_before/traces/task-00399-leg-0001.stream.jsonl"
+    "trace_path": "eval_before/traces/task-00399-leg-0001.stream.jsonl"
   },
   {
     "leg": 0,
@@ -81,7 +81,7 @@
     },
     "tasks_consumed_before": 0,
     "tasks_consumed_after": 2,
-    "trace_path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/rollout/traces/leg-0000.stream.jsonl"
+    "trace_path": "rollout/traces/leg-0000.stream.jsonl"
   },
   {
     "leg": 0,
@@ -109,7 +109,7 @@
     },
     "tasks_consumed_before": 0,
     "tasks_consumed_after": 0,
-    "trace_path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/eval_after/traces/task-00558-leg-0000.stream.jsonl"
+    "trace_path": "eval_after/traces/task-00558-leg-0000.stream.jsonl"
   },
   {
     "leg": 1,
@@ -137,6 +137,6 @@
     },
     "tasks_consumed_before": 0,
     "tasks_consumed_after": 0,
-    "trace_path": "/private/tmp/claude-501/-Users-andrew-repos-hgym/66cc444c-7d0e-4c58-8c3e-76bb55d32c89/scratchpad/shobench-runner/runs2/smoke-automationbench-claude-code-20260810T193908Z/eval_after/traces/task-00399-leg-0001.stream.jsonl"
+    "trace_path": "eval_after/traces/task-00399-leg-0001.stream.jsonl"
   }
 ]

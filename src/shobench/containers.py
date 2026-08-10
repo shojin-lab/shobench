@@ -195,6 +195,21 @@ def home_inventory(home: Path, *, exclude: DurableFilter) -> list[dict[str, obje
     ]
 
 
+def run_relative(path: Path | str, run_dir: Path) -> str:
+    """A run-internal path recorded portably: relative to the run directory, in POSIX form.
+
+    The manifest and the results JSON are written at the run directory's root, so a path stored
+    relative to it resolves for any reader that has the run directory, and none of them carry
+    the operator's absolute layout. A path that somehow lies outside the run directory falls
+    back to its basename rather than leaking the absolute path it came from.
+    """
+    candidate = Path(path)
+    try:
+        return candidate.relative_to(run_dir).as_posix()
+    except ValueError:
+        return candidate.name
+
+
 def write_json(path: Path, body: object) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
@@ -214,5 +229,6 @@ __all__ = [
     "durable_files",
     "home_digest",
     "home_inventory",
+    "run_relative",
     "write_json",
 ]

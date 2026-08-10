@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from shobench.config import Cell, load_cell_by_name
+from shobench.containers import run_relative
 from shobench.splits import Side, Split, load_split_by_name
 
 # The MCP server name the agent sees. Tool names are built from it (mcp__shogym__get_task under
@@ -149,7 +150,10 @@ async def serve(
                     {
                         "cell": cell.name,
                         "phase": phase,
-                        "prov_dir": str(prov_dir),
+                        # Relative to the run directory (this dir's parent), so the readiness
+                        # file stays resolvable through the caller's --run-dir without writing
+                        # the operator's absolute path.
+                        "prov_dir": run_relative(prov_dir, prov_dir.parent),
                         "url": f"http://{host}:{port}/mcp",
                         "remaining": stream.queue_info().remaining,
                         "pid": os.getpid(),
