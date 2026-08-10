@@ -43,6 +43,7 @@ from shobench.containers import (
     home_inventory,
     write_json,
 )
+from shobench.credentials import seed_home, spec_for
 from shobench.harness import Harness, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REPO, SHOGYM_REV
@@ -583,6 +584,11 @@ async def run_cell(
     )
 
     sandbox.up()
+    # A harness whose credential lives in a file gets it placed in this cell's own HOME. The
+    # negative control validated the same placement in its own sandbox; without this the cell
+    # itself would start with an empty HOME and no credential at all. The durability filter
+    # excludes credential files, so seeding one changes no record.
+    seeded = seed_home(spec_for(cell.harness, cell.credential_mode), sandbox.home)
     capture = None
     try:
         if capture_egress:
@@ -606,6 +612,7 @@ async def run_cell(
                 model_probe, image=agent_image, sandbox=sandbox, env=ctx.credentials
             )
         manifest = build_manifest(ctx, probes=probes)
+        manifest["credential_seed"] = seeded
         write_json(run_dir / "manifest.json", manifest)
 
         phase_rows: dict[str, list[TaskResult]] = {}
