@@ -37,6 +37,18 @@ measurement isolates the durable-artifact channel.
 `--go` is the safety story. Every command that spends prints its plan and exits without it,
 and cells are run one at a time by name; nothing here launches the matrix.
 
+### What each env needs before its cells can run
+
+`shobench run` refuses to start a cell whose serving-side needs are absent, so these are
+checks rather than surprises. All of them live outside the agent container: the agent holds no
+dataset, no judge key, and no broker credential.
+
+| env | needs |
+|---|---|
+| automationbench | nothing; the pinned upstream source is fetched once into shogym's cache |
+| tau2_telecom | `TAU2_DATA_DIR` pointing at the tau2-bench `data/` tree at sha `1d244f5d` (about 730 MB), and `OPENAI_API_KEY` for the user simulator |
+| hle | the gated `cais/hle` dataset, so `HF_TOKEN` unless it is already cached, and `OPENAI_API_KEY` for the judge |
+
 ### How the pieces fit
 
 | Piece | Where | What it owns |
