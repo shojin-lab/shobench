@@ -424,6 +424,17 @@ test pins which side of it each tool falls on. A missing skill package is likewi
 error rather than an empty mapping, because the alternative is a healthy prime-agent that can
 reach nothing and a record that reads as an agent which chose to do no work.
 
+That contract holds only under the MCP version the kernel resolves, which is why the skill pins
+one. The bundled runtime reads the 1.x result model's `structuredContent` and `isError`, and
+mcp 2.0 renamed both to `structured_content` and `is_error` (observed: the 2.0 model handed to
+the pinned runtime's parser returns the text of a structured result, and never raises on a
+result flagged as an error, so a failed call comes back looking like an answer). Nothing else in
+the kernel venv bounds it, since `prime-agent-runtime` declares no MCP dependency at all
+(source), so the skill's own requirement is all that stands between a fresh kernel and the
+newest release. It is pinned to the 1.x line, floored where `structuredContent` first appears
+(1.9 has no such field, 1.10 does). Bumping the harness pin to a runtime that speaks the 2.x
+model is what unpins it.
+
 What that leaves is only the credentialed end-to-end check: prime-agent bootstrapping the
 kernel, installing this package, importing it as `shogym_stream`, and pulling a task. That needs
 the interactive login this host does not yet have (see Credentials above), so it waits on the
