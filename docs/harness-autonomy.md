@@ -249,9 +249,12 @@ implementation details and not the public install path. The script downloads a
 checksum-verified release tarball and hands it to `npm install -g`, so the command still lands
 in `/usr/local` and survives the isolated HOME being mounted over `/root`.
 
-`PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1` bakes the IPython kernel at build time. Without it
-the first session bootstraps a kernel venv and needs the network to do it, which would put a
-package install inside the first measured task.
+`PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1` bakes the IPython kernel at build time, and the
+image sets it. Without it the first session bootstraps a kernel venv and needs the network to
+do it, which would put a package install inside the first measured task. The variable is worth
+setting even though a build would bake the kernel anyway: unset, it is a prompt the installer
+asks, and a build with no terminal takes the yes branch on its own (source). That is the right
+outcome arrived at by default rather than by declaration, so the image declares it.
 
 ### Invocation
 

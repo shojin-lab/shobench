@@ -36,9 +36,17 @@ RUN npm install -g --no-fund --no-audit \
 # the output greppable in a build log. The version is set rather than left empty: the installer
 # reads PRIME_AGENT_VERSION when it has one and resolves the stable channel when it does not, so
 # an empty value pins nothing and two images built a week apart could carry different agents.
+#
+# Both bootstrap variables are set for the same reason. The installer's postinstall preloads the
+# search tools only when TOOLS is 1 and builds the IPython kernel venv only when KERNEL is 1;
+# left unset, KERNEL is a question the installer asks, and a build with no terminal answers it
+# yes on the build's behalf. That default is right and undeclared, which is the same shape of
+# problem as an unpinned version: the image would stop baking the kernel the day the prompt's
+# fallback changes, and the first measured task would pay for a network package install.
 ARG PRIME_AGENT_VERSION=0.7.1
 RUN PRIME_AGENT_INSTALLER_PLAIN=1 \
     PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 \
+    PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1 \
     ${PRIME_AGENT_VERSION:+PRIME_AGENT_VERSION=$PRIME_AGENT_VERSION} \
     sh -c 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
 
