@@ -40,6 +40,9 @@ class ClaudeCode(Harness):
     # Claude Code accepts --session-id, so the runner pins it before launch and an interrupted
     # leg is resumable even if it died before writing anything.
     pins_session_id = True
+    # The result event's modelUsage names every model that was billed.
+    reports_observed_models = True
+    effort_flag = "--effort"
 
     # Established by running the CLI: a clean finish is is_error=false,
     # terminal_reason="completed", api_error_status=null; a bad token gives is_error=true,

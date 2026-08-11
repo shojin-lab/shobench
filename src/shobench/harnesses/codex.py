@@ -32,6 +32,17 @@ class Codex(Harness):
     name = "codex"
     # No base_env override: codex adds nothing to the base's clean NODE_OPTIONS.
 
+    # codex exec's JSONL does not name a model anywhere, and this is declared rather than left
+    # to be inferred from an empty list, because the two read as opposite things. Checked
+    # against the pinned CLI rather than assumed: `thread.started` carries a thread id alone,
+    # the terminal `turn.completed` carries only a token-usage breakdown, and the item types the
+    # stream emits (agent_message, reasoning, command_execution, file_change, mcp_tool_call,
+    # web_search, todo_list) carry none either. There is also no `codex exec` flag or subcommand
+    # that reports the resolved model, so for a codex cell the requested model is all there is
+    # and the manifest says so instead of publishing an empty observed list.
+    reports_observed_models = False
+    effort_flag = "-c model_reasoning_effort"
+
     # codex exec ends a turn with a terminal `turn.completed` or `turn.failed` JSONL event. A
     # usage limit arrives as turn.failed carrying the usage_limit_reached error type, whose
     # message also names the reset time.

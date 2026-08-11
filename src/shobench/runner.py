@@ -55,6 +55,7 @@ from shobench.containers import (
     write_json,
 )
 from shobench.credentials import CredentialSpec, seed_home, spec_for
+from shobench.credentials import effective_mode as credential_effective_mode
 from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REPO, SHOGYM_REV
@@ -314,6 +315,32 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
             "mcp_server_name": SERVER_NAME,
         },
         "harness_probes": probes,
+        # What the cell asked for, and what the harness will actually do with it. These used to
+        # be one field each, copied out of the cell file, which made the manifest a restatement
+        # of the config rather than a record of the run: every prime_agent cell published effort
+        # xhigh for a harness with no effort control, and both codex and prime published an empty
+        # observed_models that reads as "nothing answered" rather than "nothing reports it".
+        # ``observed`` is filled from the traces when the run ends; the rest is knowable now.
+        "axes": {
+            "model": {
+                "requested": ctx.cell.model,
+                "observed": [],
+                "observable": ctx.harness.reports_observed_models,
+                "source": (
+                    "read off the harness trace"
+                    if ctx.harness.reports_observed_models
+                    else f"{ctx.harness.name} names no model in its trace; nothing observes it"
+                ),
+            },
+            "effort": {
+                "requested": ctx.cell.effort,
+                "applied": bool(ctx.cell.effort and ctx.harness.effort_flag),
+                "how": (
+                    ctx.harness.effort_flag
+                    or f"{ctx.harness.name} exposes no reasoning-effort control; it is ignored"
+                ),
+            },
+        },
         "container": {
             "agent_image": ctx.agent_image,
             "network": ctx.sandbox.network,
@@ -1347,6 +1374,9 @@ async def _run_phases(
     manifest["observed_models"] = sorted(
         {model for leg in ctx.leg_records() for model in leg.get("observed_models", [])}
     )
+    manifest.setdefault("axes", {}).setdefault("model", {})["observed"] = manifest[
+        "observed_models"
+    ]
     if manifest["home"]["digest_after"] is None:
         # No rollout ran in this process and none was carried forward, which only happens when
         # an operator asked for a subset of the phases. There is no rollout terminus to have
@@ -1520,6 +1550,13 @@ async def run_cell(
         manifest = build_manifest(ctx, probes=probes)
         manifest["credential_seed"] = seeded
         manifest["home"]["seeded"] = seeds
+        # The mode this cell will actually run under, read from the credential that was just
+        # placed rather than copied from the cell file. Subscription billing is why the scope
+        # sets no token ceiling, so a cell that quietly ran on an API key is a different
+        # experiment and has to be visible as one.
+        manifest["axes"]["credential_mode"] = credential_effective_mode(
+            spec, sandbox.home, env_names=sorted(ctx.credentials)
+        )
         ctx.publish_json(run_dir / "manifest.json", manifest)
         return await _run_phases(
             ctx,

@@ -191,6 +191,19 @@ class Harness:
     # the id back rather than assuming it.
     pins_session_id: bool = False
 
+    # Does this harness's trace say which model answered? Declared rather than inferred from an
+    # empty list, because the two mean opposite things: a harness that reports models and
+    # returned none had none answer, while a harness that reports none has told us nothing. The
+    # manifest published the empty list for both and read as the first.
+    reports_observed_models: bool = False
+
+    # How this harness is told the cell's reasoning effort, empty when it has no such control.
+    # The manifest records the requested effort either way, and records separately whether it
+    # was applied: every prime_agent cell asks for xhigh and prime-agent has no effort control,
+    # so a manifest that reported the request as the setting was claiming a controlled variable
+    # the run did not have.
+    effort_flag: str = ""
+
     def session_id_from_trace(self, trace_path: Path) -> str | None:
         """The session the leg actually ran under, read off its trace.
 
@@ -205,7 +218,8 @@ class Harness:
 
         The scope asks the manifest to record which model answered rather than which one was
         requested. A version probe cannot say that; the trace can, when the harness reports it.
-        Returning nothing is honest for a harness that does not.
+        Returning nothing is honest for a harness that does not, and
+        ``reports_observed_models`` is what tells a reader which of the two an empty list means.
         """
         return []
 

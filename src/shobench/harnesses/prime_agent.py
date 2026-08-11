@@ -7,7 +7,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict, UsageLimitRule, tail
+from shobench.harness import (
+    Harness,
+    LaunchSpec,
+    StopKind,
+    StopVerdict,
+    UsageLimitRule,
+    jsonl_events,
+    tail,
+)
 from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
 
 # The prime-agent skill that makes the served stream reachable. Declaring the HTTP server in
@@ -148,10 +156,44 @@ class PrimeAgent(Harness):
     def home_seed_files(self) -> dict[str, str]:
         return shogym_stream_skill_files()
 
+    # Its assistant messages carry the provider and the model, so the trace answers "which model
+    # answered" directly.
+    reports_observed_models = True
+
     def session_id_from_trace(self, trace_path: Path) -> str | None:
         # prime-agent's first line is its session header, which carries the id.
         header = _first_event_of_type(trace_path, ("session",))
         return None if header is None else str(header.get("id") or "") or None
+
+    def observed_models(self, trace_path: Path) -> list[str]:
+        """Which model actually answered, off prime-agent's own assistant messages.
+
+        Its assistant message carries three related fields: ``provider``, ``model`` (what was
+        asked for) and an optional ``responseModel`` (what the provider says replied). The last
+        is preferred where present, because a provider that silently substitutes a model is
+        exactly the case the manifest is supposed to catch, and the requested model is already
+        recorded from the cell file.
+
+        Both event shapes are read. ``message_end`` fires per message and is what a live run
+        emits; ``agent_end`` carries the whole message list and is what survives when the stream
+        was cut before every message_end landed. A leg that produced neither reports nothing.
+        """
+        seen: set[str] = set()
+        for event in jsonl_events(trace_path, limit=4000):
+            messages = (
+                event.get("messages")
+                if event.get("type") == "agent_end"
+                else [event.get("message")]
+                if event.get("type") in ("message_end", "message_start")
+                else []
+            )
+            for message in messages or ():
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                model = message.get("responseModel") or message.get("model")
+                if model:
+                    seen.add(str(model))
+        return sorted(seen)
 
     def version_probe(self) -> list[str]:
         return ["prime-agent", "--version"]

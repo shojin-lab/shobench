@@ -60,17 +60,26 @@ supply it.
 | `base_env()` | Environment every invocation needs, credentials excluded. Defaults to a clean NODE_OPTIONS; override only to add to it. | default clean NODE_OPTIONS |
 | `model_probe()` | An optional command reporting which model the harness resolved, for the manifest. | optional |
 | `observed_models(...)` | Model identifiers the trace shows actually answered, for the manifest's record of which model answered rather than which was requested. | optional |
+| `reports_observed_models` | Whether the trace names a model at all. Declared rather than inferred, because an empty list from a harness that reports models means none answered, while an empty list from one that does not means nothing was measured; the manifest publishes which of the two it is. | default False |
+| `effort_flag` | How the cell's reasoning effort reaches the harness, empty when it has none. The manifest records the requested effort either way, and records separately whether it was applied, so a cell cannot claim a controlled variable the harness dropped. | default none |
+| `runner_owned_home_files` | The HOME paths the runner rewrites on every leg. They are excluded from the durable-self digest, and must be exactly the keys of the `home_files` a launch returns, which a test holds. | default none |
+| `home_seed_files()` | The HOME assets a cell starts with. The runner places them once, before the baseline digest, and `launch` returns the same mapping. | default none |
 
 Three `LaunchSpec` fields decide where a harness's config lands, and it is a real choice.
 `config_files` go to a read-only mount outside the agent's working directory, so a harness
 config never becomes part of what the agent thinks of as itself. `home_files` go into the
 cell's isolated HOME, for a harness that reads its config only from there; that is inside what
-the agent can edit, which is the cost of the harness having no config flag, and the manifest's
-home inventory records them so a later edit by the agent stays visible. Every leg rewrites
+the agent can edit, which is the cost of the harness having no config flag. Every leg rewrites
 them, so what belongs there is what only the runner knows and what moves between legs, the
-stream endpoint being the example. `home_seed_files` land in the same HOME but are written only
-when absent, an initial condition the agent then owns: an asset the agent may improve belongs
-there, because a rewrite would restore the shipped bytes over the agent's version in the gap
-between the rollout and the evaluation that exists to read it. `stdin` defaults to
-`/dev/null`, which is what every v0 harness needs; set it only for a harness that reads its
+stream endpoint being the example, and for that reason they are excluded from the durable-self
+digest: a file the runner overwrites on every launch cannot carry anything the agent chose to
+keep, and counting it made a cell that wrote nothing publish a changed durable self. Declare the
+same paths in `runner_owned_home_files` so the digest knows about them before any leg has run.
+`home_seed_files` land in the same HOME but are written only when absent, an initial condition
+the agent then owns: an asset the agent may improve belongs there, because a rewrite would
+restore the shipped bytes over the agent's version in the gap between the rollout and the
+evaluation that exists to read it. Return them from `home_seed_files()` as well, because the
+runner places them before it takes the baseline digest; seeded on the first leg instead, they
+land on the far side of the baseline and read as something the rollout wrote. `stdin` defaults
+to `/dev/null`, which is what every v0 harness needs; set it only for a harness that reads its
 prompt from stdin.

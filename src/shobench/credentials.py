@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -575,6 +576,42 @@ def validate_isolation(
     )
 
 
+def effective_mode(spec: CredentialSpec, home: Path, *, env_names: Sequence[str] = ()) -> dict:
+    """What the cell is actually about to run under, read from what was seeded.
+
+    The cell file says ``credential_mode = "subscription"`` and the manifest used to copy that
+    string across as though saying it made it so. It does not: the mode is a property of the
+    credential, and the credential is a file this runner placed a moment ago and can read. A
+    codex auth.json minted by an API-key login bills the key; a prime auth.json whose provider
+    entries are ``api_key`` rather than ``oauth`` does the same. Both would have been published
+    as subscription runs, and subscription billing is the reason the scope allows no token
+    ceiling, so a cell that quietly ran on API spend is a different experiment.
+
+    Names and modes only. No value in the seeded file is read into the returned record.
+    """
+    body = _read_json(home / spec.seed_to) if spec.seed_to else None
+    if spec.seed_schema == "codex_auth":
+        effective = "subscription" if (body or {}).get("auth_mode") == "chatgpt" else "api_key"
+    elif spec.seed_schema == "prime_auth":
+        types = {
+            (entry or {}).get("type")
+            for entry in (body or {}).values()
+            if isinstance(entry, dict)
+        }
+        effective = "subscription" if types == {"oauth"} else ("api_key" if types else "unknown")
+    else:
+        # Nothing was seeded, so the credential is whichever environment variable the spec
+        # names, and the name is the mode. Reported as unknown when none of them arrived.
+        effective = spec.mode if set(env_names) & set(spec.env_names) else "unknown"
+    return {
+        "requested": spec.mode,
+        "effective": effective,
+        "matches_requested": effective == spec.mode,
+        "source": "seeded file" if spec.seed_to else "environment",
+        "evidence": describe_seed(spec, body) if spec.seed_to else f"names={list(spec.env_names)}",
+    }
+
+
 def agent_env(harness: str, mode: str, environ: dict[str, str]) -> dict[str, str]:
     """The credential variables the agent container gets, by name from the spec.
 
@@ -603,6 +640,7 @@ __all__ = [
     "agent_env",
     "credential_available",
     "describe_seed",
+    "effective_mode",
     "inventory",
     "run_probe",
     "spec_for",
