@@ -56,7 +56,15 @@ class StopVerdict:
         return self.kind is StopKind.USAGE_LIMIT
 
     def to_json(self) -> dict[str, Any]:
-        return {"kind": self.kind.value, "reason": self.reason, "evidence": self.evidence}
+        # `resumable` is written down rather than left to be re-derived from `kind` by whoever
+        # reads the record. It is the field an operator acts on, since it says whether a run
+        # that ended early is waiting for a window to clear or is simply over.
+        return {
+            "kind": self.kind.value,
+            "reason": self.reason,
+            "resumable": self.resumable,
+            "evidence": self.evidence,
+        }
 
 
 @dataclass(frozen=True)
