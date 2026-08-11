@@ -182,3 +182,61 @@ def test_a_seeded_file_is_described_by_shape_and_never_by_value(prime_spec, tmp_
 
     assert "providers=['anthropic']" in described
     assert "host-access-token-value" not in described
+
+
+def test_the_probe_expectation_is_not_derivable_from_the_prompt() -> None:
+    """The invariant the negative control rests on: an echo of the prompt can never pass.
+
+    prime-agent echoes its input into its json event stream and exits 0 on an authentication
+    failure, so an expectation that appears in the prompt would make a 401 read as a working
+    credential, and the negative control would report the HOME isolation broken.
+    """
+    assert credentials.PROBE_EXPECT not in credentials.PROBE_PROMPT
+
+
+def test_a_probe_that_only_echoes_the_prompt_is_not_a_success(monkeypatch) -> None:
+    """Exit 0 plus a prompt echo, which is exactly what a failed prime-agent run emits."""
+
+    class _Echo:
+        returncode = 0
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "message", "content": credentials.PROBE_PROMPT}),
+                json.dumps({"type": "auto_retry_end", "success": False}),
+            ]
+        )
+        stderr = ""
+
+    monkeypatch.setattr(credentials.subprocess, "run", lambda *a, **k: _Echo())
+
+    probe = credentials.run_probe(
+        harness="prime_agent",
+        model="claude-opus-5",
+        docker_args=["run", "--rm"],
+        image="img",
+        env={},
+    )
+
+    assert probe.returncode == 0
+    assert not probe.succeeded
+
+
+def test_a_probe_that_answers_is_a_success(monkeypatch) -> None:
+    """The same plumbing recognizes a live model's answer, so the fix cannot overshoot."""
+
+    class _Answer:
+        returncode = 0
+        stdout = json.dumps({"type": "message", "content": credentials.PROBE_EXPECT})
+        stderr = ""
+
+    monkeypatch.setattr(credentials.subprocess, "run", lambda *a, **k: _Answer())
+
+    probe = credentials.run_probe(
+        harness="prime_agent",
+        model="claude-opus-5",
+        docker_args=["run", "--rm"],
+        image="img",
+        env={},
+    )
+
+    assert probe.succeeded

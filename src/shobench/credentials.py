@@ -387,8 +387,14 @@ class IsolationVerdict:
 
 # A probe short enough to cost almost nothing and specific enough that a wrong answer is
 # obvious. It exercises the credential and nothing else: no MCP server, no tools.
-PROBE_PROMPT = "Reply with exactly: SHOBENCH-OK"
-PROBE_EXPECT = "SHOBENCH-OK"
+#
+# The expected reply must never appear in the prompt. A harness can echo its input into its
+# own output stream and still exit 0 on an authentication failure (prime-agent does both), and
+# an echo-derivable expectation would let that failed run pass the negative control, which
+# reads as a broken HOME isolation. So the probe asks for an answer only a live model
+# produces: the sum below never appears as a digit string in the prompt.
+PROBE_PROMPT = "Add 179312 and 41, then reply with only the digits of the sum."
+PROBE_EXPECT = "179353"
 
 
 def _probe_argv(harness: str, model: str) -> list[str]:
