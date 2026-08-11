@@ -21,7 +21,10 @@ instruction_arm = "get-better"
 # Subscription is the preferred mode for every v0 cell. The runner supports both modes and
 # records which one the cell actually ran under.
 credential_mode = "subscription"
-required_env = ["TAU2_DATA_DIR", "OPENAI_API_KEY"]
+# OPENAI_API_KEY is the user simulator's, server-side. TAU2_DATA_DIR is not listed here: the
+# runner provisions the ~730 MB tau2 data into shogym's cache and points TAU2_DATA_DIR at it,
+# rather than requiring the operator to export it. `uv run python tools/provision_tau2_data.py`.
+required_env = ["OPENAI_API_KEY"]
 note = "Upstream's declared 74/40 split at the pinned sha. 40 held-out is below the N >= 60 power aim, and honoring the benchmark's canonical split wins over inventing a larger leaky one."
 
 [budget]
