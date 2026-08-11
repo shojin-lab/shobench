@@ -145,6 +145,42 @@ def _cmd_creds(args: argparse.Namespace) -> int:
     return 0 if verdict.trusted else 1
 
 
+def _tau2_plan(cell) -> dict[str, object] | None:
+    """What a plan says about the provisioned tau2 data, or nothing for an env that reads none.
+
+    tau2 data is provisioned, not operator-set: the runner points TAU2_DATA_DIR at the cache
+    itself, so it is reported in the plan rather than listed among required_env.
+    """
+    if not tau2_data.needs_tau2_data(cell.env):
+        return None
+    return {
+        "needed": True,
+        "upstream_sha": tau2_data.UPSTREAM_SHA,
+        "data_dir": str(tau2_data.resolve_data_dir()),
+        "present": tau2_data.is_present(),
+        "provision_command": tau2_data.PROVISION_COMMAND,
+    }
+
+
+def _set_tau2_data_dir(cell) -> str | None:
+    """Point TAU2_DATA_DIR at the pinned cache for a tau2 cell. Returns why it cannot run, or None.
+
+    Every command that starts a tau2 cell has to do this, and a continuation needs it more than a
+    fresh run does rather than less: the assignment is process-local, and a resume is a new process
+    started in a new shell hours later, so it inherits nothing from the run it continues. Without
+    it the env falls back to shogym's *source* cache, which carries no data at all, and the cell
+    fails partway with an upstream FileNotFoundError that names none of this. Shared between the
+    two commands so the gate cannot hold on one path and be missing from the other.
+    """
+    if not tau2_data.needs_tau2_data(cell.env):
+        return None
+    try:
+        os.environ["TAU2_DATA_DIR"] = str(tau2_data.require())
+    except tau2_data.Tau2DataError as exc:
+        return str(exc)
+    return None
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     cell = load_cell_by_name(args.cell)
     split = load_split_by_name(cell.split)
@@ -172,16 +208,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     }
     missing_required = [n for n in cell.required_env if not os.environ.get(n)]
     plan["missing_required_env"] = missing_required
-    # tau2 data is provisioned, not operator-set: the runner points TAU2_DATA_DIR at the cache
-    # itself, so it is reported here rather than listed among required_env.
-    if tau2_data.needs_tau2_data(cell.env):
-        plan["tau2_data"] = {
-            "needed": True,
-            "upstream_sha": tau2_data.UPSTREAM_SHA,
-            "data_dir": str(tau2_data.resolve_data_dir()),
-            "present": tau2_data.is_present(),
-            "provision_command": tau2_data.PROVISION_COMMAND,
-        }
+    tau2_plan = _tau2_plan(cell)
+    if tau2_plan is not None:
+        plan["tau2_data"] = tau2_plan
     if not args.go:
         print(json.dumps(plan, indent=2))
         print(
@@ -201,16 +230,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         return 1
 
-    if tau2_data.needs_tau2_data(cell.env):
-        # The dataset checkout is a serving-side need too, but a provisioned one. Resolve it, set
-        # TAU2_DATA_DIR for the in-process serving stream, and fail loudly with the provisioning
-        # command if it is absent rather than starting a cell that would fail partway.
-        try:
-            os.environ["TAU2_DATA_DIR"] = str(tau2_data.require())
-        except tau2_data.Tau2DataError as exc:
-            print(json.dumps(plan, indent=2), file=sys.stderr)
-            print(f"\nBLOCKED: {exc}\nNothing was spent.", file=sys.stderr)
-            return 1
+    # The dataset checkout is a serving-side need too, but a provisioned one. Resolve it, set
+    # TAU2_DATA_DIR for the in-process serving stream, and fail loudly with the provisioning
+    # command if it is absent rather than starting a cell that would fail partway.
+    blocked = _set_tau2_data_dir(cell)
+    if blocked:
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(f"\nBLOCKED: {blocked}\nNothing was spent.", file=sys.stderr)
+        return 1
 
     if not args.skip_credential_check:
         sandbox = CellSandbox(
@@ -303,6 +330,12 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         "missing_required_env": missing_required,
         "experiment_drift": drift,
     }
+    # The same provisioned serving-side need a fresh run reports. A continuation is where it goes
+    # missing, because the assignment the first process made lives only in that process, so the
+    # plan says which tree this one will point the stream at.
+    tau2_plan = _tau2_plan(cell)
+    if tau2_plan is not None:
+        plan["tau2_data"] = tau2_plan
     if interrupted_phase == "rollout":
         plan.update(
             {
@@ -375,6 +408,20 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         print(
             "\nBLOCKED: " + "; ".join(drift) + ". Restore the recorded definition, or start a "
             "fresh cell. Nothing was spent, and the run is still resumable.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # The provisioned half of the same serving-side need, and the one a continuation cannot
+    # inherit: the fresh run set TAU2_DATA_DIR in a process that is gone. Set here, last of the
+    # refusals and still before the sandbox comes up, so a tau2 cell a usage limit suspended
+    # continues against the pinned data rather than failing at env construction with a path
+    # nobody configured, and so a refused continuation leaves this process as it found it.
+    blocked = _set_tau2_data_dir(cell)
+    if blocked:
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(
+            f"\nBLOCKED: {blocked}\nNothing was spent, and the run is still resumable.",
             file=sys.stderr,
         )
         return 1
