@@ -13,6 +13,10 @@ model = "gpt-5.6-terra"
 # cell at xhigh so all harnesses sit at the same reasoning tier (codex's own config default
 # is only high).
 effort = "xhigh"
+# How many tasks may be live at once (shogym max_in_flight). Above 1 the agent holds
+# several tasks, every env tool is lease-wrapped, and a pull at the limit displaces the
+# oldest. v0 serves 8 so one-at-a-time is a choice the agent makes, not the only option.
+max_in_flight = 8
 split = "tau2_telecom"
 instruction_arm = "get-better"
 # Subscription is the preferred mode for every v0 cell. The runner supports both modes and

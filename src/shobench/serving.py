@@ -100,6 +100,9 @@ def build_stream(
     refs = [TaskRef(cell.env, idx) for idx in task_indices(side, ceiling=ceiling)]
 
     if phase == "rollout":
+        # The rollout is the only phase that serves the cell's concurrency: above 1, the agent
+        # may hold several tasks at once. The eval phase stays one-session-per-task (its
+        # concurrency is host-level fan-out, not stream-level), so it never reads this.
         return TaskStream(
             env_factory(cell.env, kwargs),
             refs,
@@ -107,6 +110,7 @@ def build_stream(
             resume=resume,
             deadline=deadline,
             feedback=Never(),
+            max_in_flight=cell.max_in_flight,
         )
     return EvalStream(
         env_factory(cell.env, kwargs),

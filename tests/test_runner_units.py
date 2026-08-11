@@ -13,7 +13,13 @@ from pathlib import Path
 import pytest
 
 from shobench import egress
-from shobench.config import load_all_cells, load_cell_by_name, load_instruction, repo_root
+from shobench.config import (
+    load_all_cells,
+    load_cell,
+    load_cell_by_name,
+    load_instruction,
+    repo_root,
+)
 from shobench.containers import CellSandbox, home_digest, write_json
 from shobench.harness import StopKind, StopVerdict
 from shobench.harnesses import harness_for
@@ -132,6 +138,26 @@ def test_every_v0_cell_pins_xhigh_effort_and_the_manifest_records_it() -> None:
             continue
         assert cell.effort == "xhigh", cell.name
         assert cell.to_manifest()["effort"] == "xhigh", cell.name
+
+
+def test_every_v0_cell_serves_concurrent_tasks_and_the_manifest_records_it() -> None:
+    """One-at-a-time serving would make it the only behavior an agent can show; at 8 it is a
+    choice the agent makes, which is the thing the benchmark observes."""
+    for cell in load_all_cells():
+        expected = 2 if cell.name.startswith("smoke") else 8
+        assert cell.max_in_flight == expected, cell.name
+        assert cell.to_manifest()["max_in_flight"] == expected, cell.name
+
+
+def test_a_cell_with_no_concurrency_slots_is_refused(tmp_path: Path) -> None:
+    source = (
+        '[cell]\nname = "bad"\nenv = "automationbench"\nharness = "codex"\nmodel = "m"\n'
+        'split = "automationbench"\nmax_in_flight = 0\n[budget]\nrollout_wall_clock_s = 1\n'
+    )
+    path = tmp_path / "bad.toml"
+    path.write_text(source)
+    with pytest.raises(ValueError, match="max_in_flight"):
+        load_cell(path)
 
 
 def test_the_instruction_is_byte_identical_across_every_cell() -> None:

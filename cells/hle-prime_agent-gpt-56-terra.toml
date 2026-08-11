@@ -13,6 +13,10 @@ model = "gpt-5.6-terra"
 # cell at xhigh. prime_agent exposes no effort control today; the field records the cell's
 # intent and the harness ignores it until one exists.
 effort = "xhigh"
+# How many tasks may be live at once (shogym max_in_flight). Above 1 the agent holds
+# several tasks, every env tool is lease-wrapped, and a pull at the limit displaces the
+# oldest. v0 serves 8 so one-at-a-time is a choice the agent makes, not the only option.
+max_in_flight = 8
 split = "hle"
 instruction_arm = "get-better"
 # Subscription is the preferred mode for every v0 cell. The runner supports both modes and

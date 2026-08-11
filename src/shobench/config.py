@@ -185,6 +185,11 @@ class Cell:
     # stands; pinning it makes effort a controlled variable rather than an inherited one, which
     # is what lets a cell match the effort a registered study ran at.
     effort: str = ""
+    # How many rollout tasks may be live at once (shogym's ``TaskStream(max_in_flight=...)``).
+    # 1 is strictly one-at-a-time; above 1 the agent may hold several tasks, every env tool is
+    # advertised lease-wrapped, and a pull at the limit displaces the oldest. Only the rollout
+    # stream reads it; the eval phase stays one-session-per-task.
+    max_in_flight: int = 1
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -193,6 +198,7 @@ class Cell:
             "harness": self.harness,
             "model": self.model,
             "effort": self.effort,
+            "max_in_flight": self.max_in_flight,
             "split": self.split,
             "instruction_arm": self.instruction_arm,
             "credential_mode": self.credential_mode,
@@ -226,6 +232,9 @@ def load_cell(path: Path) -> Cell:
     mode = cell.get("credential_mode", "subscription")
     if mode not in CREDENTIAL_MODES:
         raise ValueError(f"{path}: credential_mode {mode!r} is not one of {CREDENTIAL_MODES}")
+    max_in_flight = int(cell.get("max_in_flight", 1))
+    if max_in_flight < 1:
+        raise ValueError(f"{path}: max_in_flight must be at least 1, got {max_in_flight}")
 
     budget = Budget(
         rollout_wall_clock_s=int(_require(budget_table, "rollout_wall_clock_s", path)),
@@ -248,6 +257,7 @@ def load_cell(path: Path) -> Cell:
         required_env=tuple(cell.get("required_env", ())),
         note=cell.get("note", ""),
         effort=str(cell.get("effort", "")),
+        max_in_flight=max_in_flight,
     )
 
 
