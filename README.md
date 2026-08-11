@@ -70,9 +70,25 @@ Each eval task gets its own single-task `EvalStream`, so a session that ignores 
 instruction and pulls a second task is told the stream is done rather than quietly consuming
 the next task's measurement.
 
-**The rollout is a sequence of bounded legs against one live stream.** No harness runs for
-eight hours on its own, so the runner owns the outer loop. A leg the provider cut off at a
-usage limit is resumed and does not count as a stop; a leg that ended on the agent's own
-terms while the queue still had tasks is the stop the charter asks about, and the runner
-stops serving there rather than prompting the agent onward. `docs/harness-autonomy.md`
-records how each harness announces which, and where each rule came from.
+**The rollout is one honest run of the harness against one live stream.** A single invocation
+is driven against the pool for the cell's wall clock, and the runner does not relaunch it,
+because whether a harness sustains autonomous operation is one of the things being measured. A
+run that ends on the agent's own terms while the queue still had tasks is the stop the charter
+asks about, and nothing prompts the agent onward.
+
+**A provider usage limit suspends the cell rather than ending it.** That interruption is not
+the agent's doing, so the run stops where it stands and an operator continues it once the
+window resets:
+
+    shobench resume --run runs/<run-id>          # the plan: which cell is waiting, and for how much
+    shobench resume --run runs/<run-id> --go     # continue it
+
+A suspended cell writes `runs/<run-id>/suspended.json` (the session to reattach to, how far the
+pool got, how much of the rollout clock is spent), stops its containers, and keeps every
+directory. It publishes no results and runs no `eval_after`, because that measurement belongs
+after a real rollout terminus and never inside an exhausted window. The continuation reattaches
+to the same session, reopens the same provenance record at the position it was holding, and
+gets only what remained of the one rollout budget; a second limit suspends again with the time
+accumulated. A suspending run exits 75, so a script can tell "waiting for a window" from
+"failed". `docs/harness-autonomy.md` records how each harness announces a usage limit, and
+where each rule came from.
