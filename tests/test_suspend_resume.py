@@ -407,29 +407,32 @@ def test_resume_prints_the_plan_and_refuses_an_exhausted_clock(tmp_path: Path, c
 # everything the continuation does with the record it inherits.
 
 
-def _record_one_scored_task(prov_dir: Path) -> list[TaskResult]:
-    """Leave a real shogym provenance directory behind, the way a finished eval phase does.
+def _record_eval_phase(phase_dir: Path, task_ids: tuple[int, ...]) -> list[TaskResult]:
+    """Record a finished eval phase in the layout ``run_eval_phase`` actually writes.
 
-    Written by an actual stream rather than by hand, because the point of the test is that a
-    continuation reads a provenance record it did not write, and a hand-made file would only
-    prove that the test and the reader agree with each other.
+    Each task gets its own stream under ``<phase>/task-<id>/``, because one fresh session per
+    task is enforced by serving one task per stream, so a phase's rows are spread across those
+    per-task directories and never sit in one ``results.jsonl`` at the phase root. An earlier
+    fixture wrote a single flat directory the runner never produces, and a hydration bug that
+    read only the phase root passed against it: a real run returned zero before rows. This
+    writes the real layout, driven by actual streams, so the continuation is tested against the
+    provenance it will meet.
     """
     import shogym
     from fastmcp import Client
-    from shogym.serve import EvalStream, TaskRef
+    from shogym.serve import EvalStream, TaskRef, build_stream_server
 
-    async def play() -> None:
-        stream = EvalStream(shogym.make, [TaskRef("wordle_v1", 0)], prov_dir=prov_dir)
+    async def play(prov_dir: Path, task_id: int) -> None:
+        stream = EvalStream(shogym.make, [TaskRef("wordle_v1", task_id)], prov_dir=prov_dir)
         async with stream:
-            from shogym.serve import build_stream_server
-
             server = build_stream_server(stream, name="shogym")
             async with Client(server) as client:
                 await client.call_tool("get_task", {})
                 await client.call_tool("terminate", {})
 
-    asyncio.run(play())
-    return runner.read_phase(prov_dir)
+    for task_id in task_ids:
+        asyncio.run(play(phase_dir / f"task-{task_id:05d}", task_id))
+    return runner.read_eval_phase(phase_dir)
 
 
 class _FakeStream:
@@ -490,7 +493,11 @@ def _suspended_run(
     manifest = build_manifest(ctx, probes={"version": "test"})
     runner.write_json(run_dir / "manifest.json", manifest)
 
-    before = _record_one_scored_task(run_dir / "eval_before")
+    # Two tasks, in the per-task layout run_eval_phase writes: the continuation has to gather
+    # rows across the task-<id>/ subdirectories, not from one flat directory the runner never
+    # produces. More than one so the gathering is exercised rather than an accident of a single
+    # directory that happened to be the phase root.
+    before = _record_eval_phase(run_dir / "eval_before", task_ids=(0, 1))
     runner.write_json(
         run_dir / "legs.json",
         [
@@ -590,12 +597,12 @@ def test_a_continuation_publishes_the_measurement_the_first_process_took(
     )
     published = json.loads(results_path.read_text())
 
-    # Both halves of the measurement, and the pairing between them.
-    assert [row["task_idx"] for row in published["eval_before"]["tasks"]] == [
-        row.task_idx for row in before
-    ]
-    assert published["eval_before"]["summary"]["n_requested"] == len(before)
-    assert published["paired"], "a continuation that pairs nothing has measured nothing"
+    # Both halves of the measurement, and the pairing between them. eval_before was recorded
+    # across two per-task directories, so a published before side with fewer than both rows
+    # means the continuation read the wrong directory level and the paired result is lost.
+    assert [row["task_idx"] for row in published["eval_before"]["tasks"]] == [0, 1]
+    assert published["eval_before"]["summary"]["n_requested"] == 2
+    assert len(published["paired"]) == 2, "both recorded tasks must pair against the after side"
     assert not published["unpaired"]
 
     # The whole run's models and legs, not just this process's share.

@@ -498,6 +498,24 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     return rows
 
 
+def read_eval_phase(phase_dir: Path) -> list[TaskResult]:
+    """Every task an eval phase recorded, gathered from its per-task provenance directories.
+
+    An eval phase gives each task its own stream under ``<phase>/task-<id>/``, because one fresh
+    session per task is what serving a single task per stream enforces. So the phase's rows are
+    spread across those subdirectories, and ``read_phase`` cannot find them at the phase root:
+    it reads one directory's ``results.jsonl`` and does not recurse, and neither do the shogym
+    readers under it. This walks the task directories and concatenates in task-id order, which
+    is the same list ``run_eval_phase`` returns for a phase it ran in one process. It is how a
+    continuation reads back the eval that finished before the interruption, so the published
+    result carries the before side of the pair rather than an empty one.
+    """
+    rows: list[TaskResult] = []
+    for task_dir in sorted(p for p in phase_dir.glob("task-*") if p.is_dir()):
+        rows.extend(read_phase(task_dir))
+    return rows
+
+
 def _single_task_split(split: Split, phase: str, task_id: str) -> Split:
     """A one-task view of the split, so the phase's stream can only dispense that task."""
     from dataclasses import replace
@@ -891,9 +909,11 @@ async def _run_phases(
     # A continuation starts from the phases the interrupted run already recorded, not from
     # nothing. eval_before is the half of the paired measurement that ran before the
     # interruption, and a results file without it reports no requested tasks, no deltas, and
-    # every after row unpaired: the benchmark's whole question, silently unanswered.
+    # every after row unpaired: the benchmark's whole question, silently unanswered. It is read
+    # with the eval-phase reader, because those rows live in per-task subdirectories that a
+    # single-directory read would miss, which is the shape an uninterrupted run would publish.
     phase_rows: dict[str, list[TaskResult]] = {
-        phase: read_phase(ctx.run_dir / phase) for phase in recorded_phases
+        phase: read_eval_phase(ctx.run_dir / phase) for phase in recorded_phases
     }
     stopping: dict[str, Any] = {}
     for phase in phases:
@@ -1141,6 +1161,7 @@ __all__ = [
     "Suspension",
     "build_manifest",
     "cleanup",
+    "read_eval_phase",
     "resume_cell",
     "run_cell",
     "run_eval_phase",
