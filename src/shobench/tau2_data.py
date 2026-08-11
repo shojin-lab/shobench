@@ -68,6 +68,10 @@ _MANIFEST: dict[str, dict[str, Any]] = json.loads(
 # without it is still recognized), which is what makes leaving it out free.
 _MARKER = ".shobench-tau2-data.json"
 
+# What a fetch in flight is named while it stages, and therefore what an interrupted one leaves
+# behind. Dotted so it is out of the way, prefixed so an abandoned one is recognizable as ours.
+_STAGING_PREFIX = ".dl-"
+
 # What the runner and the docs tell an operator to run when the data is missing.
 PROVISION_COMMAND = "uv run python tools/provision_tau2_data.py"
 
@@ -188,6 +192,26 @@ def _write_marker(sha_dir: Path, data_dir: Path) -> None:
     )
 
 
+def _sweep_abandoned_staging(sha_dir: Path, log) -> None:
+    """Reclaim staging dirs a killed provisioner left in the managed cache. Best effort.
+
+    ``TemporaryDirectory`` cleans up when Python unwinds, and a signal does not unwind. A run
+    killed mid-fetch therefore leaves its archive and its partly staged tree, most of ~730 MB
+    once extraction is under way, sitting in the cache, and every retry stacks another one.
+    Nothing else ever reclaims them, so the next provision does it before staging its own.
+
+    Deliberately without a lock. A sweep can only harm a second live provisioner, and this
+    module already assumes there is none: a single operator provisions once per host, the same
+    assumption behind publishing without one. Serializing per sha is the upgrade point if that
+    stops holding. Failures are swallowed rather than raised, since reclaiming space is a
+    courtesy on the way to the real work and must not be what fails the command.
+    """
+    for stale in sorted(sha_dir.glob(_STAGING_PREFIX + "*")):
+        if stale.is_dir():
+            log(f"[tau2-data] reclaiming {stale.name}, left by an interrupted fetch")
+            shutil.rmtree(stale, ignore_errors=True)
+
+
 def _extract_data_subtree(archive: Path, staged_data: Path) -> None:
     """Extract only the archive's top-level ``data/`` into ``staged_data``.
 
@@ -259,8 +283,13 @@ def provision(*, force: bool = False, log=print) -> Path:
 
     sha_dir = data_dir.parent
     sha_dir.mkdir(parents=True, exist_ok=True)
+    # Only the managed cache is swept, by the ownership rule that governs everything else here:
+    # a staging dir abandoned beside a tree the operator named is still in their directory, so it
+    # stays for them to remove rather than being deleted by a pattern match on their disk.
+    if override is None:
+        _sweep_abandoned_staging(sha_dir, log)
     log(f"[tau2-data] fetching {_TARBALL_URL}")
-    with tempfile.TemporaryDirectory(dir=str(sha_dir), prefix=".dl-") as tmp:
+    with tempfile.TemporaryDirectory(dir=str(sha_dir), prefix=_STAGING_PREFIX) as tmp:
         tmp_path = Path(tmp)
         archive = tmp_path / "archive.tar.gz"
         with urllib.request.urlopen(_TARBALL_URL, timeout=_DOWNLOAD_TIMEOUT_S) as resp:

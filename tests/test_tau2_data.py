@@ -223,6 +223,23 @@ def test_provision_refuses_an_archive_missing_the_split_file(_cache, monkeypatch
     assert not tau2_data.is_present(tau2_data.resolve_data_dir())
 
 
+def test_provision_reclaims_staging_an_interrupted_run_left(_cache, monkeypatch) -> None:
+    """A killed fetch leaves most of a 730 MB tree in the cache, because TemporaryDirectory
+    unwinds and a signal does not, and every retry stacks another. The next provision reclaims
+    them. The stale dir is pre-created rather than produced by a signal: what is under test is
+    the reclaiming, and a suite that fired signals to get there would test the harness."""
+    monkeypatch.setattr(tau2_data, "_TARBALL_URL", _make_tarball(_cache))
+    sha_dir = tau2_data.resolve_data_dir().parent
+    stale = sha_dir / f"{tau2_data._STAGING_PREFIX}abandoned"
+    (stale / "data" / _TELECOM).mkdir(parents=True)
+    (stale / "data" / _TELECOM / "tasks.json").write_text("half a download\n")
+
+    data_dir = tau2_data.provision(log=lambda *a: None)
+
+    assert not stale.exists()
+    tau2_data.verify(data_dir)
+
+
 def test_force_replaces_the_tree_it_paid_to_download(_cache, monkeypatch) -> None:
     """Forcing is the repair path, so the fetched tree must land. What it repairs is the part of
     the 730 MB the manifest does not gate: the gated files pass verify by definition, and a run

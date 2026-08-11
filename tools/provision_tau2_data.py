@@ -20,6 +20,10 @@ command's. So a failing one is reported and left alone, with everything else liv
 only ``--force`` replaces it. The managed cache carries no such claim: an invalid one is replaced
 without asking, because this command is the only thing that put it there.
 
+Interrupting a fetch is safe and leaves nothing published, but it does leave a ``.dl-*`` staging
+dir in the cache, since a killed process runs no cleanup. It can be left alone: the next run of
+this command reclaims it before staging its own.
+
 The runner names this command when a tau2 cell is asked to run without the data present.
 """
 
