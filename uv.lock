@@ -1633,7 +1633,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", marker = "extra == 'report'", specifier = ">=1.26" },
-    { name = "shogym", extras = ["automationbench", "hle", "tau2"], git = "https://github.com/shojin-lab/shogym.git?rev=695e21f8ce87b0097cea922bdb70a4c355766a0b" },
+    { name = "shogym", extras = ["automationbench", "hle", "tau2"], git = "https://github.com/shojin-lab/shogym.git?rev=9eb9edb88087af9a08520482a2d1de5831870944" },
 ]
 provides-extras = ["report"]
 
@@ -1647,7 +1647,7 @@ dev = [
 [[package]]
 name = "shogym"
 version = "0.0.1"
-source = { git = "https://github.com/shojin-lab/shogym.git?rev=695e21f8ce87b0097cea922bdb70a4c355766a0b#695e21f8ce87b0097cea922bdb70a4c355766a0b" }
+source = { git = "https://github.com/shojin-lab/shogym.git?rev=9eb9edb88087af9a08520482a2d1de5831870944#9eb9edb88087af9a08520482a2d1de5831870944" }
 dependencies = [
     { name = "fastmcp" },
     { name = "jsonschema" },

@@ -32,7 +32,7 @@ Homepage = "https://github.com/shojin-lab/shobench"
 Repository = "https://github.com/shojin-lab/shobench"
 
 [tool.uv.sources]
-shogym = { git = "https://github.com/shojin-lab/shogym.git", rev = "695e21f8ce87b0097cea922bdb70a4c355766a0b" }
+shogym = { git = "https://github.com/shojin-lab/shogym.git", rev = "9eb9edb88087af9a08520482a2d1de5831870944" }
 
 [dependency-groups]
 dev = [

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 # shogym, the environment substrate. Pinned by commit because PyPI's shogym 0.0.1 predates the
 # serve layer this runner uses. `[tool.uv.sources]` in pyproject.toml installs this exact rev.
-SHOGYM_REV = "695e21f8ce87b0097cea922bdb70a4c355766a0b"
+SHOGYM_REV = "9eb9edb88087af9a08520482a2d1de5831870944"
 SHOGYM_REPO = "https://github.com/shojin-lab/shogym.git"
 
 # Upstream data pins the envs themselves carry, recorded here so a manifest reader does not have
