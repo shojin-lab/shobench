@@ -27,6 +27,7 @@ from shobench.scrub import (
     ScrubReport,
     assert_publishable,
     find_reasoning_material,
+    safe_location_key,
     scrub_file,
     scrub_jsonl_text,
     scrub_text,
@@ -249,6 +250,44 @@ def test_a_signature_escaped_inside_an_outer_json_string_is_scrubbed(tmp_path: P
     assert verify_run_dir(run) == {}
 
 
+def test_an_embedded_signature_is_found_whatever_order_the_keys_were_written_in(
+    tmp_path: Path,
+) -> None:
+    # Nothing says a harness serialises `type` before `signature`. A matcher that scans from
+    # the type token to the field only sees one of the two orders, so the other order
+    # publishes: the CLI reports success, the token is still in the file, and the gate's own
+    # re-read agrees it is clean. Recognition has to come from parsing the object, where key
+    # order is not a fact about the object at all.
+    inner = f'{{"signature":"{FAKE_SIG}","type":"thinking"}}'
+    record = {
+        "type": "result",
+        "is_error": True,
+        "verdict": {"evidence": {"stderr_tail": f"request failed: {inner}"}},
+    }
+    run = tmp_path / "run"
+    trace = run / "eval_before" / "traces" / "task-00003-leg-0000.stream.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text(json.dumps(record, separators=(",", ":")) + "\n")
+
+    assert scrub_main([str(run)]) == 0
+    assert FAKE_SIG not in trace.read_text(), "reversed keys are the same carrier"
+    assert verify_run_dir(run) == {}, "and the gate agrees once, not by never looking"
+
+
+def test_a_brace_inside_an_earlier_string_value_does_not_hide_a_signature() -> None:
+    # `}` is an ordinary character inside a JSON string, so a bound that stops at the first
+    # one walks out of the object before reaching the carrier and calls the line clean. The
+    # decoder knows the difference between a closing brace and a byte in a string.
+    block = json.dumps(
+        {"type": "thinking", "thinking": "weigh } this", "signature": FAKE_SIG},
+        separators=(",", ":"),
+    )
+    tail = f"request failed: {block}"
+    scrubbed = scrub_text(tail)
+    assert FAKE_SIG not in scrubbed
+    assert '"thinking":"weigh } this"' in scrubbed, "only the carrier value moves"
+
+
 # ----- byte fidelity ----------------------------------------------------------------
 
 
@@ -276,6 +315,56 @@ def test_scrub_file_leaves_an_empty_trace_at_zero_bytes(tmp_path: Path) -> None:
     assert trace.read_text() == ""
 
 
+def test_an_ordinary_json_null_in_a_list_survives_byte_identically() -> None:
+    # A null in a content list is the trace's own data. It looked like a dropped block only
+    # because the scrub used one value for both "this block is gone" and "the caller wrote a
+    # null here", and the list rebuild then filtered the caller's nulls out with it. This
+    # line has no reasoning carrier anywhere, so the whole thing must come back unchanged.
+    line = '{"type":"tool_result","items":[null],"signature":"domain"}'
+    report = ScrubReport()
+    assert scrub_jsonl_text(line + "\n", report) == line + "\n"
+    assert report.lines_rewritten == 0
+
+
+def test_a_null_beside_a_dropped_block_survives_the_drop() -> None:
+    # The two meanings meet in one list: the emptied thinking block goes, the null stays.
+    content = [None, {"type": "thinking", "thinking": "", "signature": FAKE_SIG}]
+    record = {"type": "assistant", "message": {"role": "assistant", "content": content}}
+    assert scrub_value(record)["message"]["content"] == [None]
+
+
+def test_crlf_terminators_survive_a_rewrite(tmp_path: Path) -> None:
+    # Reading a trace as text translates newlines on the way in and writes the translation
+    # back out, so scrubbing line 1 silently rewrote the terminator of every other line in
+    # the file. Byte fidelity is a claim about the bytes, and a line ending is bytes.
+    trace = tmp_path / "traces" / "leg-0000.stream.jsonl"
+    trace.parent.mkdir(parents=True)
+    clean = b'{"type":"result","is_error":false}'
+    dirty = f'{{"type":"thinking","thinking":"x","signature":"{FAKE_SIG}"}}'.encode()
+    trace.write_bytes(dirty + b"\r\n" + clean + b"\r\n")
+
+    scrub_file(trace)
+
+    after = trace.read_bytes()
+    assert after == b'{"type":"thinking","thinking":"x"}\r\n' + clean + b"\r\n"
+    assert after.split(b"\r\n")[1] == clean, "the untouched line keeps its exact bytes"
+
+
+def test_bytes_that_are_not_utf8_survive_a_rewrite(tmp_path: Path) -> None:
+    # A trace is captured stdout from somebody else's process and can hold bytes that are not
+    # UTF-8 at all. Decoding with errors="replace" turns them into replacement characters and
+    # writing the result back makes that loss permanent, on a line the scrub never touched.
+    trace = tmp_path / "traces" / "leg-0000.stream.jsonl"
+    trace.parent.mkdir(parents=True)
+    noise = b"warning: \xff\xfe truncated"
+    dirty = f'{{"type":"thinking","thinking":"x","signature":"{FAKE_SIG}"}}'.encode()
+    trace.write_bytes(dirty + b"\n" + noise + b"\n")
+
+    scrub_file(trace)
+
+    assert trace.read_bytes() == b'{"type":"thinking","thinking":"x"}\n' + noise + b"\n"
+
+
 # ----- precision: ordinary content outside a reasoning block survives ---------------
 
 
@@ -296,6 +385,20 @@ def test_a_generic_serialised_data_value_is_kept() -> None:
     assert scrub_text(payload) == payload
     assert scrub_value({"observation": payload}) == {"observation": payload}
     assert find_reasoning_material({"observation": payload}) == []
+
+
+def test_a_signature_nested_under_another_object_is_not_the_blocks_signature() -> None:
+    # The negative case that sits beside the generic top-level one: here the reasoning type
+    # and the `signature` really are close together in the text, and they still belong to two
+    # different objects, so the `metadata` signature is domain content. Deciding this by
+    # proximity blanks a clean field; deciding it per object, the way the structural pass
+    # already does, gets it right in both directions.
+    block = {"type": "thinking", "thinking": "public", "metadata": {"signature": "sha256=domain"}}
+    assert scrub_value(block) == block, "structurally, the nested field is not a carrier"
+    serialised = json.dumps(block, separators=(",", ":"))
+    assert scrub_text(serialised) == serialised, "and the same holds once it is serialised"
+    assert find_reasoning_material({"stderr_tail": serialised}) == []
+    assert find_reasoning_material(block) == []
 
 
 # ----- the verifier is independent of the scrubber ----------------------------------
@@ -330,3 +433,62 @@ def test_a_drifted_reasoning_type_makes_the_cli_fail_closed(tmp_path: Path) -> N
     )
     assert scrub_main([str(run)]) == 1
     assert verify_run_dir(run) != {}
+
+
+def test_the_verifier_doubts_embedded_material_the_scrubber_declines_to_rewrite(
+    tmp_path: Path,
+) -> None:
+    # An stderr tail is a bounded tail, so the request body in it can be cut mid-carrier. The
+    # scrubber will not edit bytes it cannot parse, because a guessed repair is a corruption
+    # of somebody's diagnostic. The verifier has the opposite job and sweeps exactly the text
+    # no parse accounted for, so the two sides disagree here on purpose and the disagreement
+    # resolves the safe way: nothing is published.
+    truncated = f'replay failed: {{"type":"thinking","signature":"{FAKE_SIG}'
+    assert scrub_text(truncated) == truncated, "the scrubber leaves unparseable bytes alone"
+    assert find_reasoning_material({"stderr_tail": truncated}) != [], "the gate still refuses"
+
+    run = tmp_path / "run"
+    trace = run / "eval_before" / "traces" / "task-00004-leg-0000.stream.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text(json.dumps({"stderr_tail": truncated}, separators=(",", ":")) + "\n")
+    assert scrub_main([str(run)]) == 1, "a scrub that cannot finish must not report success"
+
+
+# ----- a report never carries somebody else's text ----------------------------------
+
+
+def test_an_untrusted_mapping_key_never_reaches_the_refusal() -> None:
+    # Keys in a trace are other people's data. A harness that keys a map by request URL puts
+    # the query string in the key, credentials and all, so a location built by interpolating
+    # the key publishes the very class of value the gate exists to withhold, in the exception
+    # message and in any tracker that catches it.
+    key = "https://service.invalid/?token=credential-value"
+    record = {key: {"type": "thinking", "thinking": "", "signature": FAKE_SIG}}
+
+    with pytest.raises(ReasoningSignatureFound) as excinfo:
+        assert_publishable(record, "results")
+
+    reported = [str(excinfo.value), *excinfo.value.locations]
+    for text in reported:
+        assert "credential-value" not in text
+        assert "service.invalid" not in text
+        assert FAKE_SIG not in text
+    # And the location is still a location: the key's position in its object plus a digest an
+    # operator can recompute from a candidate key to say which one it was.
+    assert any(safe_location_key(key) in loc for loc in excinfo.value.locations)
+    assert any(loc.endswith(".signature") for loc in excinfo.value.locations)
+
+
+def test_a_run_dir_report_names_lines_and_not_keys(tmp_path: Path) -> None:
+    # Same rule on the path the CLI actually takes, where the finding comes off disk.
+    key = "authorization: Bearer credential-value"
+    run = tmp_path / "run"
+    trace = run / "eval_before" / "traces" / "task-00005-leg-0000.stream.jsonl"
+    trace.parent.mkdir(parents=True)
+    record = {key: {"type": "interleaved_thinking", "thinking": "", "signature": FAKE_SIG}}
+    trace.write_text(json.dumps(record, separators=(",", ":")) + "\n")
+
+    locations = verify_run_dir(run)[str(trace)]
+    assert locations, "the drifted type is still refused"
+    assert all("credential-value" not in loc for loc in locations)
+    assert all(loc.startswith("line 1 ") for loc in locations)
