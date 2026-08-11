@@ -38,6 +38,14 @@ verdict from the bytes about to ship. Scrubbing and verifying are separate on pu
 scrubber that certified its own output would keep passing on the day it grows a blind
 spot.
 
+The scrub treats structured content and free text differently, and deliberately so. A
+line that parses is judged precisely: named carriers only, decided per object, everything
+else byte-for-byte as it arrived. A string value, and a captured stderr tail, is judged
+by suspicion instead: any sign of reasoning material takes the whole region, log line and
+all. Locating a carrier inside arbitrary text loses to the next way of spelling it, an
+extra escaping layer or a line break or a truncated tail, and a lost diagnostic line
+costs less than a published signature.
+
 Scrub a run directory, or check one without touching it:
 
 ```
@@ -47,5 +55,6 @@ python -m shobench.scrub <run-dir> --check    # report only, non-zero exit if an
 
 `scrub.assert_publishable(value, what)` is the gate itself. It raises rather than
 repairs, because a published signature cannot be unpublished whereas a blocked artifact
-costs one rerun. Reports and exceptions carry counts and field paths only, never the
-value that tripped them.
+costs one rerun. Reports and exceptions carry counts, structural positions and digests
+only: never the value that tripped them, never a key read out of the trace, and never a
+path or label somebody else chose, since any of those can be named after a credential.
