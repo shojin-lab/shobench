@@ -9,6 +9,7 @@ the shape the reporting script and the results page consume.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -200,8 +201,16 @@ def write_results(
     phases: dict[str, list[TaskResult]],
     stopping: dict[str, Any],
     egress: dict[str, Any] | None = None,
+    redact: Callable[[Any], Any] | None = None,
 ) -> Path:
-    """Write the cell's results JSON: the manifest, the per-task scores, and the summaries."""
+    """Write the cell's results JSON: the manifest, the per-task scores, and the summaries.
+
+    ``redact`` is applied to the whole assembled body immediately before it is serialized. It
+    takes the body rather than each part because this file is the one artifact assembled from
+    every other: stop evidence carrying a stderr tail, per-task diagnostics carrying whatever a
+    harness said, and the manifest's probe output. Redacting once at the end covers all of them
+    and cannot be forgotten for a field added later.
+    """
     before = phases.get("eval_before", [])
     after = phases.get("eval_after", [])
     paired, unpaired = pair_evals(before, after)
@@ -225,6 +234,8 @@ def write_results(
         "unpaired": unpaired,
         "egress": egress or {},
     }
+    if redact is not None:
+        body = redact(body)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")

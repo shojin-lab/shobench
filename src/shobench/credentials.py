@@ -322,14 +322,19 @@ def run_probe(
     image: str,
     env: dict[str, str],
     timeout_s: int = 300,
+    credential_file: Path | None = None,
 ) -> ControlResult:
     """Run the credential probe once in an isolated HOME and say whether it authenticated.
 
     The harness's own base environment is merged in first, so the probe fails only for
     credential reasons. A probe that dies on a missing IS_SANDBOX would fail identically with
     a real credential and a bogus one, which would make the negative control prove nothing.
+
+    ``credential_file`` is the file this probe was seeded with, named so the secrets inside it
+    can be redacted out of the recorded detail alongside the environment values.
     """
     from shobench.harnesses import harness_for
+    from shobench.redact import redactor_for
 
     argv = ["docker", *docker_args]
     for key, value in {**harness_for(harness).base_env(), **env}.items():
@@ -341,9 +346,16 @@ def run_probe(
     )
     combined = f"{result.stdout}\n{result.stderr}"
     succeeded = result.returncode == 0 and PROBE_EXPECT in combined
-    # The detail is the tail of the output, which is where an auth failure names itself. It is
-    # never a place a credential value appears: the probe echoes a fixed string, not its env.
+    # The detail is the tail of the output, which is where an auth failure names itself. The
+    # probe echoes a fixed string rather than its environment, so a credential should never
+    # reach it, but this detail is written to a durable verdict file and a harness that dumps
+    # its config on an auth failure would put one there. Redacted against exactly what this
+    # probe was handed, which is the same rule the runner applies to a leg's trace.
     detail = "\n".join(combined.strip().splitlines()[-6:])[-1200:]
+    detail = redactor_for(
+        environment=env,
+        credential_files=() if credential_file is None else (credential_file,),
+    ).text(detail)
     return ControlResult(
         arm="",
         returncode=result.returncode,
@@ -406,6 +418,7 @@ def validate_isolation(
         docker_args=docker_args,
         image=image,
         env={name: BOGUS for name in spec.env_names},
+        credential_file=(home / spec.seed_to) if spec.seed_to else None,
     )
     negative.arm = "negative_control"
     negative.detail = f"[{seeded_bogus}] {negative.detail}"
@@ -426,7 +439,12 @@ def validate_isolation(
     seeded_real = seed_home(spec, home)
     real = {name: environ[name] for name in spec.env_names if environ.get(name)}
     positive = run_probe(
-        harness=harness, model=model, docker_args=docker_args, image=image, env=real
+        harness=harness,
+        model=model,
+        docker_args=docker_args,
+        image=image,
+        env=real,
+        credential_file=(home / spec.seed_to) if spec.seed_to else None,
     )
     positive.arm = "positive_check"
     positive.detail = f"[{seeded_real}] {positive.detail}"

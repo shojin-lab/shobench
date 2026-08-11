@@ -54,10 +54,12 @@ from shobench.containers import (
     run_relative,
     write_json,
 )
-from shobench.credentials import seed_home, spec_for
+from shobench.credentials import CredentialSpec, seed_home, spec_for
 from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REPO, SHOGYM_REV
+from shobench.redact import MARKER as redact_marker
+from shobench.redact import Redactor, redactor_for
 from shobench.results import TaskResult, dispensed_positions, read_phase, write_results
 from shobench.serving import DEFAULT_PORT, SERVER_NAME, build_stream, side_for_phase, warm_env
 from shobench.splits import Split, load_split_by_name
@@ -203,6 +205,19 @@ class RunContext:
     # outlive a phase (the sandbox, an egress capture), and a suspension has to stop them
     # without unwinding to where they are held, so it is handed a way to do it.
     teardown: Callable[[], None] | None = None
+    # The exact credential values this cell provisioned, replaced by a marker in everything
+    # durable this runner writes. Empty is valid and makes every call below a no-op.
+    redactor: Redactor = field(default_factory=Redactor)
+
+    def publish_json(self, path: Path, body: Any) -> Path:
+        """Write one of this run's durable JSON artifacts, redacted.
+
+        Every JSON file the runner writes into the run directory goes through here rather than
+        through ``write_json`` directly. Routing them all through one method is what makes the
+        guarantee checkable: the boundary is a single call site per artifact, so a new artifact
+        that skips it is visible in a diff instead of being a silent hole.
+        """
+        return write_json(path, self.redactor.json(body))
 
     def leg_records(self) -> list[dict[str, Any]]:
         """Every leg of this run, in a deterministic order, inherited ones included.
@@ -230,13 +245,27 @@ class RunContext:
 # ----- the manifest ------------------------------------------------------------------------
 
 
-def _probe(argv: list[str], *, image: str, sandbox: CellSandbox, env: dict[str, str]) -> str:
-    """Run a short command in the agent image and return its output, for the manifest."""
+def _probe(
+    argv: list[str],
+    *,
+    image: str,
+    sandbox: CellSandbox,
+    env: dict[str, str],
+    redactor: Redactor | None = None,
+) -> str:
+    """Run a short command in the agent image and return its output, for the manifest.
+
+    ``env`` is what this particular probe needs and nothing more. A version probe needs no
+    credential at all, so it is not given one: a token in a child's environment is a token an
+    inherited process can read and a crash report can echo, and the manifest is a published
+    artifact. The output is redacted on the way back for the same reason a trace is.
+    """
     args = sandbox.docker_args(env=env, mounts={})
     result = subprocess.run(
         ["docker", *args, image, *argv], capture_output=True, text=True, timeout=180
     )
-    return (result.stdout + result.stderr).strip()
+    output = (result.stdout + result.stderr).strip()
+    return output if redactor is None else redactor.text(output)
 
 
 def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]:
@@ -264,6 +293,15 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
             "network": ctx.sandbox.network,
             "netns_container": ctx.sandbox.netns_container,
             "home": run_relative(ctx.sandbox.home, ctx.run_dir),
+        },
+        # That redaction ran, and over how many distinct forms, never over which. A reader of an
+        # artifact that carries the marker needs to know it came from here; a reader of one that
+        # does not needs to know whether that means clean or unwatched. Zero is the honest
+        # answer for a cell whose credential this runner could not name, and it is visible.
+        "redaction": {
+            "marker": redact_marker,
+            "forms_watched": ctx.redactor.count,
+            "applied_to": ["traces", "legs.json", "manifest.json", "results", "suspension"],
         },
         "home": {
             "digest_before": home_digest(ctx.sandbox.home, exclude=is_noise),
@@ -394,6 +432,20 @@ def run_leg(
             timed_out = True
             returncode = -1
             docker("rm", "-f", container, check=False)
+
+    # The credential values out of the leg's own output, before anything reads it. Order is the
+    # whole point: `classify` lifts a 2KB tail of stderr into the verdict, the verdict goes into
+    # legs.json and into the results JSON, and `observed_models` and the session id are read off
+    # the trace as well. Redacting here means every one of those downstream copies is taken from
+    # bytes that no longer hold the secret, rather than each of them having to remember to.
+    #
+    # The window this leaves is the leg itself: while the harness runs, its raw output is on
+    # disk in the run directory, on the same machine that holds the credential it came from.
+    # Closing that too would mean pumping an eight-hour stream through this process, and a
+    # redactor that can stall a rollout is a worse trade than a window inside the operator's own
+    # run directory. Nothing publishes from inside a leg.
+    ctx.redactor.file(stdout_path)
+    ctx.redactor.file(stderr_path)
 
     verdict = ctx.harness.classify(
         returncode=returncode,
@@ -663,8 +715,10 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                     # closes admission for every task still waiting on the gate.
                     usage_limit["verdict"] = record.verdict
             except Exception as exc:  # one task's failure is unscored, never fatal to the batch
+                # Redacted like every other durable file: a docker failure's message carries the
+                # command it ran, and that command carries the leg's `-e` arguments.
                 (prov_dir / "runner-error.txt").write_text(
-                    f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+                    ctx.redactor.text(f"{type(exc).__name__}: {exc}\n"), encoding="utf-8"
                 )
             finally:
                 # Discard the task's home and /work the moment it is done, so N concurrent copies
@@ -887,9 +941,9 @@ def _finalize_suspension(ctx: RunContext, suspension: dict[str, Any], *, message
     # The record first, and outside the guard below. Everything after it is best-effort, but
     # this is not: a suspension nobody can read is not a suspension, and if it cannot be written
     # then failing through the normal path, which at least publishes, beats exiting into silence.
-    write_json(run_dir / SUSPENSION_FILE, suspension)
+    ctx.publish_json(run_dir / SUSPENSION_FILE, suspension)
     try:
-        write_json(run_dir / "legs.json", ctx.leg_records())
+        ctx.publish_json(run_dir / "legs.json", ctx.leg_records())
         # The agent's container is already gone, its process being what ended, so this stops the
         # network namespace and the egress observer.
         if ctx.teardown is not None:
@@ -1229,10 +1283,10 @@ async def _run_phases(
             phase_rows[phase], stopping = await run_rollout_phase(ctx, suspended=suspended)
             # Persist the stop classification the moment the rollout ends, so an eval_after
             # suspension that follows can republish it: only the runner saw how the leg ended.
-            write_json(ctx.run_dir / ROLLOUT_STOPPING_FILE, stopping)
+            ctx.publish_json(ctx.run_dir / ROLLOUT_STOPPING_FILE, stopping)
         else:
             phase_rows[phase] = await run_eval_phase(ctx, phase)
-        write_json(ctx.run_dir / "legs.json", ctx.leg_records())
+        ctx.publish_json(ctx.run_dir / "legs.json", ctx.leg_records())
 
     # How many times a provider limit suspended and resumed this cell, counted off the one
     # place that record lives: a resumption entry is appended per continuation. Set whenever the
@@ -1252,7 +1306,7 @@ async def _run_phases(
         manifest["home"]["digest_after"] != manifest["home"]["digest_before"]
     )
     manifest["ended_at"] = time.time()
-    write_json(ctx.run_dir / "manifest.json", manifest)
+    ctx.publish_json(ctx.run_dir / "manifest.json", manifest)
 
     egress_summary = observer.stop()
     results_path = results_dir / f"{ctx.cell.name}.json"
@@ -1262,8 +1316,21 @@ async def _run_phases(
         phases=phase_rows,
         stopping=stopping,
         egress=egress_summary,
+        redact=ctx.redactor.json,
     )
     return results_path
+
+
+def _cell_redactor(ctx: RunContext, spec: CredentialSpec) -> Redactor:
+    """The redactor for this cell: the values it passes as ``-e`` and the file it copied in.
+
+    Built after the seeding, because the seeded file is half of what it protects. The other half
+    is ``ctx.credentials``, which is the token the harness reads from its environment. Neither
+    is stored anywhere else and neither is ever printed; what is recorded about this, in the
+    manifest, is how many distinct forms are being watched for and not one of them.
+    """
+    seeded = (ctx.sandbox.home / spec.seed_to,) if spec.seed_to else ()
+    return redactor_for(environment=ctx.credentials, credential_files=seeded)
 
 
 async def run_cell(
@@ -1301,25 +1368,34 @@ async def run_cell(
     # negative control validated the same placement in its own sandbox; without this the cell
     # itself would start with an empty HOME and no credential at all. The durability filter
     # excludes credential files, so seeding one changes no record.
-    seeded = seed_home(spec_for(cell.harness, cell.credential_mode), sandbox.home)
+    spec = spec_for(cell.harness, cell.credential_mode)
+    seeded = seed_home(spec, sandbox.home)
+    ctx.redactor = _cell_redactor(ctx, spec)
     observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
     try:
         probes = {
+            # No credential: a version probe reports what the image installed, which no harness
+            # needs to authenticate to answer. The model probe is the one that does.
             "version": _probe(
                 ctx.harness.version_probe(),
                 image=agent_image,
                 sandbox=sandbox,
-                env=ctx.credentials,
+                env={},
+                redactor=ctx.redactor,
             )
         }
         model_probe = ctx.harness.model_probe()
         if model_probe:
             probes["model"] = _probe(
-                model_probe, image=agent_image, sandbox=sandbox, env=ctx.credentials
+                model_probe,
+                image=agent_image,
+                sandbox=sandbox,
+                env=ctx.credentials,
+                redactor=ctx.redactor,
             )
         manifest = build_manifest(ctx, probes=probes)
         manifest["credential_seed"] = seeded
-        write_json(run_dir / "manifest.json", manifest)
+        ctx.publish_json(run_dir / "manifest.json", manifest)
         return await _run_phases(
             ctx,
             manifest=manifest,
@@ -1392,6 +1468,13 @@ async def resume_cell(
         agent_image=agent_image,
         credentials=dict(credentials or {}),
     )
+    # The credential is placed again because the sandbox is new even though the home is not;
+    # credential files are excluded from every digest, so re-seeding changes no record. It is
+    # placed here rather than after the manifest is rewritten because the redactor is built from
+    # it, and a continuation writes durable artifacts from its very first line.
+    spec = spec_for(cell.harness, cell.credential_mode)
+    seed_home(spec, sandbox.home)
+    ctx.redactor = _cell_redactor(ctx, spec)
     legs_path = run_dir / "legs.json"
     if legs_path.is_file():
         # The legs the suspended run recorded. This process appends to that record rather than
@@ -1428,11 +1511,8 @@ async def resume_cell(
         resumption["elapsed_rollout_s_before"] = record["elapsed_rollout_s"]
         resumption["session_id"] = record["session_id"]
     manifest.setdefault("resumptions", []).append(resumption)
-    write_json(run_dir / "manifest.json", manifest)
+    ctx.publish_json(run_dir / "manifest.json", manifest)
     sandbox.up()
-    # The credential is placed again because the sandbox is new even though the home is not;
-    # credential files are excluded from every digest, so re-seeding changes no record.
-    seed_home(spec_for(cell.harness, cell.credential_mode), sandbox.home)
     observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
     try:
         results_path = await _run_phases(
