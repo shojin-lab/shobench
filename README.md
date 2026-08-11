@@ -77,12 +77,22 @@ it is only needed on a cold cache.
 | egress | `src/shobench/egress.py` | passive per-cell capture that restricts nothing |
 | reporting | `src/shobench/report.py` | the paired bootstrap and the summary table |
 
-### Two things worth knowing before reading the code
+### A few things worth knowing before reading the code
 
 **One fresh session per eval task is enforced by the server, not requested of the agent.**
 Each eval task gets its own single-task `EvalStream`, so a session that ignores its
 instruction and pulls a second task is told the stream is done rather than quietly consuming
 the next task's measurement.
+
+**Every published number is counted against the committed held-out set.** A held-out task can
+produce no row at all: its harness dies, or exits before it ever asks for a task. Counted by
+rows, that is not a failure but an absence, and an absence moves the denominator, so the ids
+come from the split manifest rather than from whatever arrived. An id with nothing recorded for
+it is published as an explicit unscored row saying why, it is paired against and reported as
+unpaired, and the cell is written to `results/<cell>.incomplete.json` rather than to
+`results/<cell>.json`. Its numbers stay readable and the ids it lost are named under
+`heldout.missing_task_ids`, but nothing reaching for a cell's result finds a measurement with a
+hole in it standing in for one.
 
 **The rollout is one honest run of the harness against one live stream.** A single invocation
 is driven against the pool for the cell's wall clock, and the runner does not relaunch it,

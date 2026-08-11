@@ -62,7 +62,14 @@ from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REPO, SHOGYM_REV
 from shobench.redact import MARKER as redact_marker
 from shobench.redact import Redactor, redactor_for, secrets_in_file
-from shobench.results import TaskResult, dispensed_positions, read_phase, write_results
+from shobench.results import (
+    TaskResult,
+    dispensed_positions,
+    fill_missing,
+    heldout_accounting,
+    read_phase,
+    write_results,
+)
 from shobench.serving import DEFAULT_PORT, SERVER_NAME, build_stream, side_for_phase, warm_env
 from shobench.splits import Split, load_split_by_name
 
@@ -842,11 +849,27 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
         _suspend_eval_and_exit(ctx, phase=phase, verdict=usage_limit["verdict"])
     # Every task's rows, the finished-earlier ones included, gathered across the per-task
     # directories in task-id order, which is the list an uninterrupted phase would publish.
-    return read_eval_phase(phase_dir)
+    return read_eval_phase(phase_dir, side.task_ids)
 
 
-def read_eval_phase(phase_dir: Path) -> list[TaskResult]:
-    """Every task an eval phase recorded, gathered from its per-task provenance directories.
+def _no_row_diagnostic(phase_dir: Path, idx: int) -> str:
+    """Why a held-out id has no row, in whatever words the runner managed to record.
+
+    The runner writes ``runner-error.txt`` beside the task when its own attempt to run it raised,
+    which is the common case and the informative one. The other case has nothing to read: a
+    harness that exited before it ever called ``get_task`` raised nowhere and left the broker no
+    dispense to reconcile, so the honest diagnostic says exactly that.
+    """
+    error = phase_dir / f"task-{idx:05d}" / "runner-error.txt"
+    if error.is_file():
+        # Redacted where it was written, so it can be read back verbatim here.
+        body = error.read_text(encoding="utf-8", errors="replace").strip()
+        return f"the task did not run: {body}"
+    return "no row: nothing recorded an outcome for this held-out id"
+
+
+def read_eval_phase(phase_dir: Path, task_ids: Sequence[str] | Sequence[int]) -> list[TaskResult]:
+    """Every requested held-out id of an eval phase, read from its per-task provenance directories.
 
     An eval phase gives each task its own stream under ``<phase>/task-<id>/``, because one fresh
     session per task is what serving a single task per stream enforces. So the phase's rows are
@@ -856,11 +879,22 @@ def read_eval_phase(phase_dir: Path) -> list[TaskResult]:
     is the same list ``run_eval_phase`` returns for a phase it ran in one process. It is how a
     continuation reads back the eval that finished before the interruption, so the published
     result carries the before side of the pair rather than an empty one.
+
+    ``task_ids`` is the committed held-out set, and the phase is filled out against it. A task
+    can leave the record holding nothing at all: the runner caught its exception and wrote only a
+    breadcrumb, or the harness exited before calling ``get_task`` and nothing raised anywhere.
+    Read by directory alone, that id is simply not in the list, and an id in neither phase's list
+    disappears from the measurement while the manifest goes on saying it was requested. So an id
+    with no row of its own gets an explicit unscored one carrying why it has none.
     """
     rows: list[TaskResult] = []
     for task_dir in sorted(p for p in phase_dir.glob("task-*") if p.is_dir()):
         rows.extend(read_phase(task_dir))
-    return rows
+    return fill_missing(
+        rows,
+        task_ids=[int(task_id) for task_id in task_ids],
+        diagnostic=lambda idx: _no_row_diagnostic(phase_dir, idx),
+    )
 
 
 def _single_task_split(split: Split, phase: str, task_id: str) -> Split:
@@ -1368,13 +1402,20 @@ async def _run_phases(
             ctx.sandbox.down()
 
     ctx.teardown = teardown
+    # The ids this cell committed to measuring. Both eval phases serve this one side, and every
+    # published count is against it rather than against whatever arrived.
+    heldout_ids = [int(task_id) for task_id in side_for_phase(ctx.split, "eval_before").task_ids]
     # A continuation starts from the phases the interrupted run already recorded, not from
     # nothing. A recorded eval phase (eval_before) is read with the eval-phase reader, because
     # its rows live in per-task subdirectories a single-directory read would miss; a recorded
     # rollout is read flat. Omitting a recorded phase publishes a file missing half the
     # measurement: no requested eval tasks, no deltas, every after row unpaired.
     phase_rows: dict[str, list[TaskResult]] = {
-        phase: (read_phase if phase == "rollout" else read_eval_phase)(ctx.run_dir / phase)
+        phase: (
+            read_phase(ctx.run_dir / phase)
+            if phase == "rollout"
+            else read_eval_phase(ctx.run_dir / phase, heldout_ids)
+        )
         for phase in recorded_phases
     }
     stopping: dict[str, Any] = {}
@@ -1434,15 +1475,30 @@ async def _run_phases(
     ctx.publish_json(ctx.run_dir / "manifest.json", manifest)
 
     egress_summary = observer.stop()
-    results_path = results_dir / f"{ctx.cell.name}.json"
-    write_results(
-        results_path,
+    results_path = write_results(
+        results_dir / f"{ctx.cell.name}.json",
         manifest=manifest,
         phases=phase_rows,
         stopping=stopping,
+        heldout_ids=heldout_ids,
         egress=egress_summary,
         redact=ctx.redactor.json,
     )
+    # Said out loud as well as written down. A cell that cannot account for every held-out id is
+    # not this cell's result, and the operator who ran it is the one who can decide what to do
+    # about the ids it lost; the path alone is easy to read past.
+    for phase in ("eval_before", "eval_after"):
+        # Both phases, whether or not this process produced one, because that is the rule the
+        # published file is judged by: a phase that recorded nothing accounts for nothing either.
+        entry = heldout_accounting(phase_rows.get(phase, []), task_ids=heldout_ids)
+        if not entry["complete"]:
+            print(
+                f"[shobench] {ctx.cell.name}: INCOMPLETE. {phase} cannot account for "
+                f"{len(entry['missing_task_ids'])} of {len(heldout_ids)} held-out task(s) "
+                f"{entry['missing_task_ids']}; published as {results_path.name}, which is not "
+                "a finished measurement.",
+                file=sys.stderr,
+            )
     return results_path
 
 

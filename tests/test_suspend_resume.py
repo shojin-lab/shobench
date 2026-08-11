@@ -432,7 +432,7 @@ def _record_eval_phase(phase_dir: Path, task_ids: tuple[int, ...]) -> list[TaskR
 
     for task_id in task_ids:
         asyncio.run(play(phase_dir / f"task-{task_id:05d}", task_id))
-    return runner.read_eval_phase(phase_dir)
+    return runner.read_eval_phase(phase_dir, task_ids)
 
 
 class _FakeStream:
@@ -518,11 +518,14 @@ def _suspended_run(
         "".join(json.dumps(record) + "\n" for record in dispenses), encoding="utf-8"
     )
 
-    # Two tasks, in the per-task layout run_eval_phase writes: the continuation has to gather
-    # rows across the task-<id>/ subdirectories, not from one flat directory the runner never
-    # produces. More than one so the gathering is exercised rather than an accident of a single
-    # directory that happened to be the phase root.
-    before = _record_eval_phase(run_dir / "eval_before", task_ids=(0, 1))
+    # The cell's own held-out ids, in the per-task layout run_eval_phase writes: the continuation
+    # has to gather rows across the task-<id>/ subdirectories, not from one flat directory the
+    # runner never produces. More than one so the gathering is exercised rather than an accident
+    # of a single directory that happened to be the phase root. They are the committed ids rather
+    # than a convenient 0 and 1 because the published result is counted against that set: rows for
+    # ids nobody requested are as wrong as ids with no rows.
+    heldout = tuple(int(task_id) for task_id in split.heldout.task_ids)
+    before = _record_eval_phase(run_dir / "eval_before", task_ids=heldout)
     runner.write_json(
         run_dir / "legs.json",
         [
@@ -579,6 +582,7 @@ def test_a_continuation_publishes_the_measurement_the_first_process_took(
     """
     run_dir, _, before = _suspended_run(tmp_path)
     cell = load_cell_by_name(_SMOKE_CELL)
+    split = load_split_by_name(cell.split)
     seen: dict[str, object] = {}
 
     def leg(ctx, *, phase, leg, session_id, resume, timeout_s, user_prompt, **kw) -> LegRecord:
@@ -625,7 +629,9 @@ def test_a_continuation_publishes_the_measurement_the_first_process_took(
     # Both halves of the measurement, and the pairing between them. eval_before was recorded
     # across two per-task directories, so a published before side with fewer than both rows
     # means the continuation read the wrong directory level and the paired result is lost.
-    assert [row["task_idx"] for row in published["eval_before"]["tasks"]] == [0, 1]
+    assert [row["task_idx"] for row in published["eval_before"]["tasks"]] == sorted(
+        int(task_id) for task_id in split.heldout.task_ids
+    )
     assert published["eval_before"]["summary"]["n_requested"] == 2
     assert len(published["paired"]) == 2, "both recorded tasks must pair against the after side"
     assert not published["unpaired"]

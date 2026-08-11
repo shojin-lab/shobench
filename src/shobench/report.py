@@ -37,6 +37,12 @@ class CellReport:
     model: str
     n_paired: int
     n_unpaired: int
+    # What the cell asked for, and whether the file can account for it. A paired mean over 118
+    # of 120 held-out tasks is a different number from a paired mean over 120, and a table that
+    # shows only the first reads as the second.
+    n_requested: int
+    n_missing: int
+    complete: bool
     mean_before: float | None
     mean_after: float | None
     mean_delta: float | None
@@ -57,6 +63,9 @@ class CellReport:
             "model": self.model,
             "n_paired": self.n_paired,
             "n_unpaired": self.n_unpaired,
+            "n_requested": self.n_requested,
+            "n_missing": self.n_missing,
+            "complete": self.complete,
             "mean_before": self.mean_before,
             "mean_after": self.mean_after,
             "mean_delta": self.mean_delta,
@@ -121,13 +130,29 @@ def report_cell(
 
     rollout = doc.get("rollout", {})
     stopping = rollout.get("stopping", {})
+    # Read from the published accounting rather than recomputed from the rows: the ids a cell
+    # never measured are exactly what its own rows cannot show. A file carrying no accounting at
+    # all is from some other version of this writer, so it is marked rather than trusted, and its
+    # ratio falls back to the ids it does know about instead of reading as a denominator of zero.
+    heldout = doc.get("heldout", {})
+    unpaired = doc.get("unpaired", [])
+    missing = sorted(
+        {
+            idx
+            for phase in ("eval_before", "eval_after")
+            for idx in heldout.get(phase, {}).get("missing_task_ids", [])
+        }
+    )
     return CellReport(
         cell=cell.get("name", "?"),
         env=cell.get("env", "?"),
         harness=cell.get("harness", "?"),
         model=cell.get("model", "?"),
         n_paired=len(paired),
-        n_unpaired=len(doc.get("unpaired", [])),
+        n_unpaired=len(unpaired),
+        n_requested=heldout.get("n_requested", len(paired) + len(unpaired)),
+        n_missing=len(missing),
+        complete=bool(heldout.get("complete", False)),
         mean_before=_mean([p.get("reward_before") for p in paired]),
         mean_after=_mean([p.get("reward_after") for p in paired]),
         mean_delta=mean_delta,
@@ -153,6 +178,7 @@ def render_table(reports: Sequence[CellReport]) -> str:
         "harness",
         "model",
         "N",
+        "missing",
         "before",
         "after",
         "delta",
@@ -163,11 +189,16 @@ def render_table(reports: Sequence[CellReport]) -> str:
     )
     rows = [
         (
-            r.cell,
+            # A cell that cannot account for every held-out task is marked where its name is,
+            # because every other number on its line is a mean over a subset of what it asked for.
+            r.cell if r.complete else f"{r.cell} *",
             r.env,
             r.harness,
             r.model,
-            str(r.n_paired),
+            # Paired over requested, so the denominator the number is a mean over is in the
+            # table rather than in the file the table came from.
+            f"{r.n_paired}/{r.n_requested}",
+            str(r.n_missing),
             _fmt(r.mean_before),
             _fmt(r.mean_after),
             _fmt(r.mean_delta),
@@ -187,6 +218,14 @@ def render_table(reports: Sequence[CellReport]) -> str:
         "  ".join(str(cell).ljust(width) for cell, width in zip(row, widths, strict=True))
         for row in rows
     ]
+    if any(not r.complete for r in reports):
+        lines += [
+            "",
+            "* INCOMPLETE: this cell could not account for every held-out task it requested (or "
+            "its results file carries no such accounting at all), so its numbers may be over a "
+            "subset. The ids it lost are named in its results file, under "
+            "heldout.missing_task_ids, and that file is a .incomplete.json.",
+        ]
     return "\n".join(lines)
 
 

@@ -325,6 +325,97 @@ def test_eval_after_resume_republishes_the_rollout_and_eval_before_intact(
     assert not published["unpaired"]
 
 
+# ----- a held-out id that produced no row at all ----------------------------------------------
+#
+# The failure this section exists for is not a task that scored badly. It is a task that left the
+# record holding nothing: the runner caught its exception and wrote a breadcrumb, or the harness
+# exited before ever calling get_task and nothing raised anywhere. Counted by rows, that id is not
+# a failure but an absence, and an absence used to leave the published file entirely, taking the
+# denominator with it: a paired mean and a bootstrap over a silently selected subset, under a
+# manifest still saying 120 or 40 tasks were requested.
+
+
+def _publish(ctx: RunContext, tmp_path: Path) -> Path:
+    """Publish this run through the real tail: eval_after runs, the recorded phases carry over."""
+    return asyncio.run(
+        _run_phases(
+            ctx,
+            manifest=build_manifest(ctx, probes={"version": "test"}),
+            phases=("eval_after",),
+            results_dir=tmp_path / "results",
+            observer=runner._Egress(None, ctx.run_dir),
+            recorded_phases=("eval_before", "rollout"),
+        )
+    )
+
+
+def test_a_held_out_id_with_no_row_is_published_and_loses_the_finished_name(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The whole of the fix, through the real publish path.
+
+    eval_before recorded one of its two committed ids and nothing at all for the other, which is
+    what a task that never ran leaves behind. The published file has to say so: the lost id
+    present and unscored, the requested count still two, the pair it cannot form in the unpaired
+    list, and the file itself under a name no reader mistakes for a finished measurement.
+    """
+    ctx = _wordle_ctx(tmp_path, heldout=("0", "1"), pool=("3", "4"))
+    monkeypatch.setattr(runner, "warm_env", lambda cell: None)
+
+    _play_eval_task(ctx.run_dir / "eval_before" / "task-00000", 0, terminate=True)
+    # Held-out id 1 has no directory and no row: nothing recorded an outcome for it.
+    _play_rollout(ctx.run_dir / "rollout", ("3", "4"))
+    runner.write_json(ctx.run_dir / ROLLOUT_STOPPING_FILE, {"stop_reason": "pool_exhausted"})
+    monkeypatch.setattr(runner, "run_leg", _http_leg(dispatched=[]))
+
+    results_path = _publish(ctx, tmp_path)
+    published = json.loads(results_path.read_text())
+
+    # The requested count is the committed set, and the id that recorded nothing is in the file
+    # rather than absent from it.
+    assert published["eval_before"]["summary"]["n_requested"] == 2
+    assert [r["task_idx"] for r in published["eval_before"]["tasks"]] == [0, 1]
+    lost = published["eval_before"]["tasks"][1]
+    assert lost["closure"] == "missing"
+    assert lost["reward"] is None and lost["success"] is None
+    # It cannot pair, and the pair it cannot form is reported rather than dropped.
+    assert [p["task_idx"] for p in published["paired"]] == [0]
+    assert [u["task_idx"] for u in published["unpaired"]] == [1]
+    # And the cell is not a finished measurement, by field and by name.
+    assert published["heldout"]["complete"] is False
+    assert published["heldout"]["eval_before"]["missing_task_ids"] == [1]
+    assert results_path.name.endswith(".incomplete.json")
+    assert not (tmp_path / "results" / f"{ctx.cell.name}.json").exists()
+    assert "INCOMPLETE" in capsys.readouterr().err
+
+
+def test_a_cell_that_accounts_for_every_id_publishes_under_its_own_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The sibling assertion: the same path with nothing lost keeps the finished name.
+
+    Without it, a rule that called every cell incomplete would look exactly like one that calls
+    the right ones incomplete.
+    """
+    ctx = _wordle_ctx(tmp_path, heldout=("0", "1"), pool=("3", "4"))
+    monkeypatch.setattr(runner, "warm_env", lambda cell: None)
+
+    _play_eval_task(ctx.run_dir / "eval_before" / "task-00000", 0, terminate=True)
+    _play_eval_task(ctx.run_dir / "eval_before" / "task-00001", 1, terminate=True)
+    _play_rollout(ctx.run_dir / "rollout", ("3", "4"))
+    runner.write_json(ctx.run_dir / ROLLOUT_STOPPING_FILE, {"stop_reason": "pool_exhausted"})
+    monkeypatch.setattr(runner, "run_leg", _http_leg(dispatched=[]))
+
+    results_path = _publish(ctx, tmp_path)
+    published = json.loads(results_path.read_text())
+
+    assert results_path.name == f"{ctx.cell.name}.json"
+    assert published["heldout"]["complete"] is True
+    assert published["eval_before"]["summary"]["n_missing"] == 0
+    assert len(published["paired"]) == 2
+    assert not published["unpaired"]
+
+
 # ----- resume_cell routes each interrupted phase to the phases that remain --------------------
 
 

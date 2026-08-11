@@ -280,10 +280,16 @@ def test_the_eval_phase_runs_in_parallel_keys_every_result_and_survives_a_failur
 
     rows = asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
 
-    # Every task but the failing one is present, keyed to its id, and reported in ascending id
-    # order regardless of the shuffled input order or the order the tasks finished in.
-    assert [r.task_idx for r in rows] == [1, 2, 3, 4, 6, 7, 8]
-    assert failing not in {r.task_idx for r in rows}
+    # Every requested task is present, keyed to its id, and reported in ascending id order
+    # regardless of the shuffled input order or the order the tasks finished in. The failing one
+    # included: it produced no row of its own, and an id that is simply absent from this list is
+    # an id that disappears from the published measurement while the manifest goes on saying it
+    # was requested. It is here, unscored, saying why.
+    assert [r.task_idx for r in rows] == [1, 2, 3, 4, 5, 6, 7, 8]
+    lost = next(r for r in rows if r.task_idx == failing)
+    assert lost.closure == "missing" and not lost.scored
+    assert lost.reward is None and lost.success is None
+    assert "this task could not be run" in lost.diagnostic
     # The batch really ran in parallel, and never past the knob.
     assert 2 <= max_in_flight <= limit
     assert max_in_flight == limit

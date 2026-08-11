@@ -174,6 +174,7 @@ def test_the_results_json_is_redacted_through_its_own_write_path(tmp_path) -> No
         manifest=manifest,
         phases={"eval_before": [], "rollout": [], "eval_after": []},
         stopping=stopping,
+        heldout_ids=(),
         redact=ctx.redactor.json,
     )
 
@@ -189,6 +190,7 @@ def test_the_results_json_is_redacted_through_its_own_write_path(tmp_path) -> No
         manifest=manifest,
         phases={"eval_before": [], "rollout": [], "eval_after": []},
         stopping=stopping,
+        heldout_ids=(),
     )
     assert raw.read_text(encoding="utf-8").count(TOKEN) == 2
 

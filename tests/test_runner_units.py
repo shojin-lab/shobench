@@ -23,7 +23,7 @@ from shobench.config import (
 from shobench.containers import CellSandbox, home_digest, write_json
 from shobench.harness import LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
-from shobench.report import paired_bootstrap, report_cell
+from shobench.report import paired_bootstrap, render_table, report_cell
 from shobench.results import TaskResult, eval_summary, pair_evals, write_results
 from shobench.runner import LegRecord, RunContext, build_manifest, is_noise, write_home_files
 from shobench.serving import side_for_phase, task_indices
@@ -197,26 +197,51 @@ def _row(idx: int, reward: float | None, *, closure: str = "sealed") -> TaskResu
 
 
 def test_pairing_keys_on_the_task_index() -> None:
-    paired, unpaired = pair_evals([_row(1, 0.2), _row(2, 0.4)], [_row(2, 0.9), _row(1, 0.5)])
+    paired, unpaired = pair_evals(
+        [_row(1, 0.2), _row(2, 0.4)], [_row(2, 0.9), _row(1, 0.5)], task_ids=[1, 2]
+    )
     assert [p["task_idx"] for p in paired] == [1, 2]
     assert [p["reward_delta"] for p in paired] == pytest.approx([0.3, 0.5])
     assert unpaired == []
 
 
 def test_a_task_scored_in_only_one_phase_is_reported_not_dropped() -> None:
-    paired, unpaired = pair_evals([_row(1, 0.2), _row(2, 0.4)], [_row(1, 0.5)])
+    paired, unpaired = pair_evals(
+        [_row(1, 0.2), _row(2, 0.4)], [_row(1, 0.5)], task_ids=[1, 2]
+    )
     assert len(paired) == 1
     assert len(unpaired) == 1
     assert unpaired[0]["task_idx"] == 2
 
 
+def test_a_task_that_produced_no_row_in_either_phase_is_still_paired_against() -> None:
+    """The id that used to vanish. It is in neither phase's rows, so a pairing over the union of
+    what arrived left it out of both outputs: no pair, no unpaired entry, and a paired mean over
+    a subset nobody chose. Walking the committed ids is what makes the loss visible."""
+    paired, unpaired = pair_evals([_row(1, 0.2)], [_row(1, 0.5)], task_ids=[1, 2])
+
+    assert [p["task_idx"] for p in paired] == [1]
+    assert [u["task_idx"] for u in unpaired] == [2]
+    assert unpaired[0] == {"task_idx": 2, "before": None, "after": None}
+
+
 def test_an_unscored_closure_never_counts_as_a_zero() -> None:
     rows = [_row(1, 0.5), _row(2, None, closure="timeout")]
-    summary = eval_summary(rows)
+    summary = eval_summary(rows, task_ids=[1, 2])
     assert summary["n_requested"] == 2
     assert summary["n_scored"] == 1
     assert summary["mean_reward"] == pytest.approx(0.5)
     assert summary["closures"] == {"sealed": 1, "timeout": 1}
+
+
+def test_the_requested_count_is_the_committed_set_and_not_the_rows_that_arrived() -> None:
+    """A phase that lost a task must not publish as a smaller phase that lost nothing."""
+    summary = eval_summary([_row(1, 0.5)], task_ids=[1, 2, 3])
+
+    assert summary["n_requested"] == 3
+    assert summary["n_scored"] == 1
+    assert summary["n_missing"] == 2
+    assert summary["complete"] is False
 
 
 def test_the_bootstrap_interval_brackets_the_mean_and_is_reproducible() -> None:
@@ -253,6 +278,37 @@ def test_report_cell_reads_a_results_document_end_to_end() -> None:
     assert out.mean_delta == pytest.approx(0.15)
     assert out.stop_reason == "agent_chose_to_stop"
     assert out.resumes == 2
+
+
+def test_the_report_says_which_cell_could_not_account_for_every_held_out_task() -> None:
+    """A row whose numbers are over a subset says so where the numbers are, not only in the file
+    they came from. Read off the published accounting rather than recomputed, since the ids a
+    cell never measured are exactly what its own rows cannot show."""
+    doc = {
+        "schema": "shobench.results/1",
+        "manifest": {"cell": {"name": "c", "env": "e", "harness": "h", "model": "m"}},
+        "heldout": {
+            "n_requested": 4,
+            "complete": False,
+            "eval_before": {"missing_task_ids": [3]},
+            "eval_after": {"missing_task_ids": [2, 3]},
+        },
+        "paired": [{"task_idx": 1, "reward_before": 0.2, "reward_after": 0.5, "reward_delta": 0.3}],
+        "unpaired": [{"task_idx": 2}, {"task_idx": 3}],
+        "eval_before": {"summary": {}},
+        "eval_after": {"summary": {}},
+        "rollout": {"summary": {}, "stopping": {}},
+    }
+
+    out = report_cell(doc, resamples=100, seed=7)
+
+    assert out.complete is False
+    assert out.n_requested == 4
+    assert out.n_missing == 2, "the ids lost in either phase, counted once each"
+    table = render_table([out])
+    assert "c *" in table and "INCOMPLETE" in table
+    # The denominator the delta is a mean over is in the table, not only in the file.
+    assert "1/4" in table
 
 
 # ----- stop classification -------------------------------------------------------------------
@@ -807,9 +863,50 @@ def test_no_durable_artifact_the_runner_writes_carries_an_absolute_path(tmp_path
         manifest=manifest,
         phases={"eval_before": [], "rollout": [], "eval_after": []},
         stopping=stopping,
+        heldout_ids=(),
         egress=egress_summary,
     )
 
     for path in (manifest_path, results_path):
         doc = json.loads(path.read_text(encoding="utf-8"))
         assert _absolute_path_values(doc) == [], f"{path.name} leaks an absolute path"
+
+
+def test_a_cell_leaves_one_results_file_whichever_way_its_run_ended(tmp_path: Path) -> None:
+    """A results directory holds one artifact per cell.
+
+    A rerun already replaces what the last run of that cell wrote, so the name the new run did
+    not take has to go with it. Two files describing one cell from two runs is how a reader ends
+    up quoting whichever of them reads better.
+    """
+    results = tmp_path / "results"
+    ids = [1, 2]
+
+    def publish(rows: list[TaskResult]) -> Path:
+        return write_results(
+            results / "cell.json",
+            manifest={},
+            phases={"eval_before": rows, "eval_after": rows, "rollout": []},
+            stopping={},
+            heldout_ids=ids,
+        )
+
+    lost_one = publish([_row(1, 0.5)])
+    assert lost_one.name == "cell.incomplete.json"
+    assert sorted(p.name for p in results.glob("*.json")) == ["cell.incomplete.json"]
+    # The rows went in raw, the way a caller that assembled a phase itself would hand them over,
+    # and the id with none is still in the published file: this boundary fills too, so no caller
+    # can publish a hole by not filling first.
+    doc = json.loads(lost_one.read_text(encoding="utf-8"))
+    assert [r["task_idx"] for r in doc["eval_before"]["tasks"]] == ids
+    assert doc["eval_before"]["tasks"][1]["closure"] == "missing"
+
+    # The rerun that lost nothing takes the finished name, and the incomplete file it supersedes
+    # does not survive beside it.
+    complete = publish([_row(1, 0.5), _row(2, 0.5)])
+    assert complete.name == "cell.json"
+    assert sorted(p.name for p in results.glob("*.json")) == ["cell.json"]
+
+    # And back again, so neither direction is the special case.
+    assert publish([_row(2, 0.5)]).name == "cell.incomplete.json"
+    assert sorted(p.name for p in results.glob("*.json")) == ["cell.incomplete.json"]
