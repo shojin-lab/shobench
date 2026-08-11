@@ -18,16 +18,29 @@ and verifying are deliberately two functions: a scrubber that also certified its
 output would fail silently the day it grows a blind spot, so the verifier re-derives the
 answer from the bytes that are actually about to ship.
 
-**What is removed.** The `signature` off every thinking block, the ciphertext `data` off
-every `redacted_thinking` block, and any block that carries nothing else once those are
-gone. Everything else survives, including the block's text when it has any: the goal is
-to publish reasoning without publishing the means to forge or extract it.
+**What is removed, and only what is removed.** The `signature` off every thinking block,
+the ciphertext `data` off every `redacted_thinking` block, the `signature` off a streamed
+`signature_delta`, and any block that carries nothing else once those are gone. A carrier
+serialised into a free-text string (a request body dumped into an error tail) is blanked in
+place. Nothing else is: a `signature` field on a tool result, or a `data` value in an
+observation, is domain content and is left exactly as found. The goal is to publish
+reasoning without publishing the means to forge or extract it, not to rewrite the trace.
 
-**What is preserved, and why it is not negotiable.** Line count and line order. The
-runner reads a finished trace back to recover the session id, the observed models and
-the stop classification, and it does so from a bounded tail of the file. Dropping lines
-would slide that window and change what a re-read concludes, so a record whose content
-empties out is written back with an empty content list rather than deleted.
+**What is preserved, and why it is not negotiable.** Byte-for-byte the whole trace except
+the carrier bytes, and above all line count and line order. The runner reads a finished
+trace back to recover the session id, the observed models and the stop classification, and
+it does so from a bounded tail of the file. Dropping lines would slide that window and
+change what a re-read concludes, so a record whose content empties out is written back with
+an empty content list rather than deleted, and a clean line comes through as its exact
+input bytes.
+
+**The contract, stated once.** Scrubbed output is byte-identical to its input except that
+the named reasoning carriers are removed or blanked. The scrubber is precise: it touches
+only those named carriers. The verifier is independent and fail-closed: it re-derives what
+a carrier looks like from its own rules, raises rather than repairs, and errs toward
+flagging more than the scrubber removes, because a false refusal costs one rerun while a
+false pass ships an attack input. No signature or credential value ever reaches a report,
+an exception or a log: those carry counts and field paths only.
 """
 
 from __future__ import annotations
@@ -40,24 +53,41 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# --- Scrubber-side carrier definitions ------------------------------------------------
+# These name exactly what the repairing scrubber removes, and nothing else reads them: the
+# verifier further down re-derives its own, so a gap in one definition cannot blind both.
+
 # Blocks whose payload is provider ciphertext rather than research content.
 # `redacted_thinking` is included because it carries its ciphertext under `data` rather
 # than `signature`, so a scrubber that only knew the field name would pass it through.
 THINKING_TYPES = ("thinking", "redacted_thinking")
 
-# The fields to take off such a block. Named per type would be tidier, but a trace is
+# The streamed event that carries the same replayable ciphertext under `signature` without
+# ever declaring itself a thinking block, so it has to be named on its own.
+SIGNATURE_DELTA_TYPE = "signature_delta"
+
+# The fields to take off a thinking block. Named per type would be tidier, but a trace is
 # other people's JSON and block shapes drift between harness versions, so both names are
-# stripped from both types.
+# stripped from both thinking types.
 CIPHERTEXT_FIELDS = ("signature", "data")
 
 # What makes a block still worth keeping once the ciphertext is off it.
 TEXT_FIELDS = ("thinking", "text")
 
-# A signature that has been serialised into free text rather than left as JSON structure.
-# The stop-classification evidence embeds a tail of raw harness stderr, and a harness that
-# logs a failed request logs the request, so structural scrubbing alone would miss it.
-# Only a non-empty value matches: an already-scrubbed `"signature":""` is not a finding.
-EMBEDDED = re.compile(r'("(?:signature|data)"\s*:\s*")([^"]+)(")')
+# A reasoning carrier serialised into free text rather than left as JSON structure: the
+# stop-classification evidence embeds a tail of raw harness stderr, and a harness that logs
+# a failed request logs the request body, so structural scrubbing alone would miss it. The
+# value is blanked ONLY when the same serialised object also declares a reasoning `type`,
+# so an ordinary `"data":"..."` in a tool payload or a domain `"signature":"..."` on an
+# unrelated record survives untouched. `[^}]*?` keeps the match inside one object, and
+# `[^"]+` matches only a non-empty value, so an already-blanked `""` is not a finding.
+_EMBEDDED_SIGNATURE = re.compile(
+    r'("type"\s*:\s*"(?:thinking|redacted_thinking|signature_delta)"'
+    r'[^}]*?"signature"\s*:\s*")([^"]+)(")'
+)
+_EMBEDDED_DATA = re.compile(
+    r'("type"\s*:\s*"redacted_thinking"[^}]*?"data"\s*:\s*")([^"]+)(")'
+)
 
 # Traces are JSONL, and their stderr siblings are not JSON at all. Both leave the machine
 # together, so both are scrubbed; a gate that only knew about `*.stream.jsonl` would
@@ -118,11 +148,14 @@ class ScrubReport:
 
 
 def scrub_text(text: str, report: ScrubReport | None = None) -> str:
-    """Blank out signature values that were serialised into a free-text string.
+    """Blank the value of a reasoning carrier serialised into a free-text string.
 
     The value is replaced rather than the whole field deleted, because this runs on
     captured stderr where the surrounding characters are somebody's log line and cutting
-    into it would corrupt the diagnostic that the tail was captured for.
+    into it would corrupt the diagnostic that the tail was captured for. Only the named
+    carriers are touched: a `signature` or `data` inside a serialised reasoning object. A
+    bare `"data":"..."` in a tool payload carries no reasoning `type` beside it and is left
+    as found, so ordinary content is never mistaken for ciphertext.
     """
 
     def replace(match: re.Match[str]) -> str:
@@ -130,7 +163,9 @@ def scrub_text(text: str, report: ScrubReport | None = None) -> str:
             report.text_redactions += 1
         return f"{match.group(1)}{match.group(3)}"
 
-    return EMBEDDED.sub(replace, text)
+    text = _EMBEDDED_SIGNATURE.sub(replace, text)
+    text = _EMBEDDED_DATA.sub(replace, text)
+    return text
 
 
 def scrub_value(value: Any, report: ScrubReport | None = None) -> Any:
@@ -146,7 +181,8 @@ def scrub_value(value: Any, report: ScrubReport | None = None) -> Any:
     live in a given harness's schema.
     """
     if isinstance(value, dict):
-        if value.get("type") in THINKING_TYPES:
+        block_type = value.get("type")
+        if block_type in THINKING_TYPES:
             kept = {k: v for k, v in value.items() if k not in CIPHERTEXT_FIELDS}
             if report is not None:
                 report.fields_removed += sum(1 for f in CIPHERTEXT_FIELDS if f in value)
@@ -155,17 +191,19 @@ def scrub_value(value: Any, report: ScrubReport | None = None) -> Any:
                     report.blocks_dropped += 1
                 return None
             return {k: scrub_value(v, report) for k, v in kept.items()}
-        # A `signature_delta` in a streamed partial message carries the same ciphertext
-        # under the same key without ever declaring itself a thinking block, so the key is
-        # also stripped wherever it appears on its own.
-        out: dict[str, Any] = {}
-        for key, item in value.items():
-            if key == "signature" and isinstance(item, str):
-                if report is not None:
-                    report.fields_removed += 1
-                continue
-            out[key] = scrub_value(item, report)
-        return out
+        if block_type == SIGNATURE_DELTA_TYPE:
+            # A streamed `signature_delta` carries the same replayable ciphertext under
+            # `signature` without ever declaring itself a thinking block. Strip that one
+            # key and keep the event marker; the strip is scoped to this type so a
+            # `signature` on anything else is never mistaken for it.
+            kept = {k: v for k, v in value.items() if not (k == "signature" and isinstance(v, str))}
+            if report is not None and isinstance(value.get("signature"), str):
+                report.fields_removed += 1
+            return {k: scrub_value(v, report) for k, v in kept.items()}
+        # Any other dict is not a reasoning block. Recurse into it, but do NOT strip a
+        # generic `signature` or `data` key: those belong to tool results, observations and
+        # diagnostics, and blanking them would corrupt the trace the gate promises to keep.
+        return {k: scrub_value(v, report) for k, v in value.items()}
     if isinstance(value, list):
         scrubbed = [scrub_value(v, report) for v in value]
         return [v for v in scrubbed if v is not None]
@@ -174,27 +212,59 @@ def scrub_value(value: Any, report: ScrubReport | None = None) -> Any:
     return value
 
 
+# --- Verifier-side carrier definitions, derived independently -------------------------
+# The gate does not import the scrubber's tuples or regexes, on purpose. If a carrier name
+# drifts and only one side learns the new name, the other must still catch it: that split
+# is the whole reason scrubbing and verifying are two functions. So the rules below are
+# written from scratch and deliberately err broad. They stop short of treating a bare
+# domain `data`/`signature` as ciphertext, since rejecting clean tool payloads would be its
+# own contract breach; broad here means "recognise a reasoning type the scrubber's exact
+# tuple would walk past", not "flag every field that shares a name".
+
+
+def _is_reasoning_block(block_type: object) -> bool:
+    """True for any block whose type reads as reasoning ciphertext.
+
+    Independent of `THINKING_TYPES` on purpose, and deliberately broader: any type that
+    mentions `thinking` (so a drifted `interleaved_thinking` is caught, not walked past)
+    plus the streamed `signature_delta`. The literals are repeated here rather than
+    imported so that narrowing the scrubber's tuple cannot quietly narrow the gate.
+    """
+    if not isinstance(block_type, str):
+        return False
+    return "thinking" in block_type or block_type == "signature_delta"
+
+
+# A reasoning-typed object still carrying a non-empty signature/data value, serialised into
+# free text. Written from scratch, not the scrubber's `_EMBEDDED_*`, and broadened to any
+# type token that mentions thinking. Anchored to a reasoning type, so an ordinary
+# serialised `data` value never trips it.
+_VERIFY_EMBEDDED = re.compile(
+    r'"type"\s*:\s*"[^"]*(?:thinking|signature_delta)[^"]*"'
+    r'[^}]*?"(?:signature|data)"\s*:\s*"[^"]+"'
+)
+
+
 def find_reasoning_material(value: Any, path: str = "$") -> list[str]:
     """Locate every place ciphertext survives, as paths. Never returns the values.
 
     This is the gate's evidence, so it is written independently of :func:`scrub_value`
-    rather than by calling it and diffing. A verifier that shares the scrubber's notion of
-    where to look inherits the scrubber's blind spots and will certify them.
+    rather than by calling it and diffing, and it uses the verifier-side rules above rather
+    than the scrubber's. A verifier that shares the scrubber's notion of where to look
+    inherits the scrubber's blind spots and will certify them.
     """
     found: list[str] = []
     if isinstance(value, dict):
-        if value.get("type") in THINKING_TYPES:
-            for f in CIPHERTEXT_FIELDS:
-                if value.get(f):
+        if _is_reasoning_block(value.get("type")):
+            for f in ("signature", "data"):
+                if isinstance(value.get(f), str) and value[f]:
                     found.append(f"{path}.{f}")
-        if isinstance(value.get("signature"), str) and value["signature"]:
-            found.append(f"{path}.signature")
         for key, item in value.items():
             found.extend(find_reasoning_material(item, f"{path}.{key}"))
     elif isinstance(value, list):
         for i, item in enumerate(value):
             found.extend(find_reasoning_material(item, f"{path}[{i}]"))
-    elif isinstance(value, str) and EMBEDDED.search(value):
+    elif isinstance(value, str) and _VERIFY_EMBEDDED.search(value):
         found.append(f"{path}<embedded>")
     return sorted(set(found))
 
@@ -212,21 +282,32 @@ def assert_publishable(value: Any, what: str) -> None:
 
 
 def scrub_jsonl_text(body: str, report: ScrubReport) -> str:
-    """Scrub a JSONL body, preserving line count and line order exactly.
+    """Scrub a JSONL body, changing only carrier bytes and never a line's count or order.
 
-    Lines that name nothing interesting are never parsed, so their bytes come through
-    untouched; that is what keeps the diff attributable to the scrub. Lines that fail to
-    parse are passed through too, because a trace is a captured stdout and may hold
-    harness chatter that was never JSON, and the runner's own reader tolerates them.
+    Every non-empty line is parsed rather than prefiltered on a raw `"signature"` needle,
+    because a carrier can ride inside an outer JSON string: a serialised thinking block
+    dumped into a result's stderr tail has its quotes escaped, so no bare needle survives to
+    catch it, and a needle-gated prefilter would pass it through unscrubbed for the verifier
+    to reject. A parsed line is rewritten only when it actually carries a reasoning secret,
+    and the rewrite is kept byte-attributable. A clean line is re-emitted as its exact input
+    bytes. A dirty line is reserialised only when an unmodified parse already reserialises to
+    the input verbatim, so the one byte difference is the removed carrier; otherwise (a
+    line whose formatting is not the canonical compact form) the carrier value is blanked in
+    the raw bytes in place, and anything the surgical pass cannot reach is left for the
+    verifier to refuse rather than rewritten blind. Lines that are not JSON are captured
+    stdout or stderr and are text-scrubbed, never dropped, since the runner's reader
+    tolerates them and dropping one would slide the tail it reads back.
     """
-    needles = ('"signature"', '"thinking"', '"redacted_thinking"')
+    if body == "":
+        # An empty trace is a clean zero-byte trace; a lone newline would be a byte change.
+        return ""
+    has_trailing = body.endswith("\n")
     lines = body.split("\n")
-    trailing = lines and lines[-1] == ""
-    if trailing:
+    if has_trailing:
         lines.pop()
     out: list[str] = []
     for line in lines:
-        if not any(n in line for n in needles):
+        if line.strip() == "":
             out.append(line)
             continue
         try:
@@ -239,13 +320,20 @@ def scrub_jsonl_text(body: str, report: ScrubReport) -> str:
             report.unparsed_lines += 1
             out.append(redacted)
             continue
-        rewritten = json.dumps(
-            scrub_value(parsed, report), ensure_ascii=False, separators=(",", ":")
-        )
-        if rewritten != line:
-            report.lines_rewritten += 1
-        out.append(rewritten)
-    return "\n".join(out) + ("\n" if trailing else "")
+        scrubbed = scrub_value(parsed, report)
+        if scrubbed == parsed:
+            out.append(line)  # nothing to remove: the input bytes are the output bytes
+            continue
+        report.lines_rewritten += 1
+        canonical = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        if canonical == line:
+            out.append(json.dumps(scrubbed, ensure_ascii=False, separators=(",", ":")))
+        else:
+            # Reserialising a non-canonical line would rewrite bytes we promised to keep, so
+            # blank the carrier value in the raw line and let the verifier refuse if a
+            # carrier is beyond a surgical reach.
+            out.append(scrub_text(line))
+    return "\n".join(out) + ("\n" if has_trailing else "")
 
 
 def scrub_file(path: Path) -> ScrubReport:
@@ -294,7 +382,7 @@ def verify_run_dir(root: Path) -> dict[str, list[str]]:
             try:
                 parsed = json.loads(line)
             except (ValueError, TypeError):
-                if EMBEDDED.search(line):
+                if _VERIFY_EMBEDDED.search(line):
                     locations.append(f"line {number}<embedded>")
                 continue
             locations.extend(f"line {number} {loc}" for loc in find_reasoning_material(parsed))

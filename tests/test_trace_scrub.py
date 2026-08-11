@@ -24,9 +24,12 @@ import pytest
 
 from shobench.scrub import (
     ReasoningSignatureFound,
+    ScrubReport,
     assert_publishable,
     find_reasoning_material,
     scrub_file,
+    scrub_jsonl_text,
+    scrub_text,
     scrub_value,
     verify_run_dir,
 )
@@ -42,8 +45,10 @@ def _assistant(*blocks: dict) -> dict:
 
 
 def _write(path: Path, events: list[dict]) -> Path:
+    # Compact, no spaces: this is the form the harness (node's JSON.stringify) actually
+    # writes, and the form the byte-fidelity property is defined against.
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    path.write_text("\n".join(json.dumps(e, separators=(",", ":")) for e in events) + "\n")
     return path
 
 
@@ -170,7 +175,9 @@ def _run_dir(tmp_path: Path) -> Path:
         ],
     )
     err = run / "eval_before" / "traces" / "task-00007-leg-0000.err.txt"
-    err.write_text(f'boom {{"signature":"{FAKE_SIG}"}}\n')
+    # A failed request logged to stderr carries the whole block, type and all, which is what
+    # lets the text scrub tell a reasoning signature from an unrelated domain one.
+    err.write_text(f'stream error while replaying {{"type":"thinking","signature":"{FAKE_SIG}"}}\n')
     return run
 
 
@@ -209,3 +216,117 @@ def test_scrubbing_is_idempotent(tmp_path: Path) -> None:
 def test_a_missing_directory_is_an_error_not_a_pass(tmp_path: Path) -> None:
     # A gate that returns success on a path it could not read is worse than no gate.
     assert scrub_main([str(tmp_path / "nope")]) == 2
+
+
+# ----- a carrier escaped inside an outer JSON string --------------------------------
+
+
+def test_a_signature_escaped_inside_an_outer_json_string_is_scrubbed(tmp_path: Path) -> None:
+    # The carrier rides inside a result's stderr tail as serialised JSON, so its quotes are
+    # escaped in the JSONL bytes and no bare `"signature"` needle survives to prefilter on.
+    # A needle-gated shortcut would pass the line through for the verifier to reject; the
+    # gate must instead parse it, scrub the embedded value, and round-trip the directory.
+    inner = json.dumps({"type": "thinking", "thinking": "", "signature": FAKE_SIG})
+    record = {
+        "type": "result",
+        "is_error": True,
+        "verdict": {"evidence": {"stderr_tail": f"replay failed: {inner}"}},
+    }
+    line = json.dumps(record, separators=(",", ":"))
+    assert '"signature"' not in line, "the needle is escaped away; that is the whole point"
+
+    report = ScrubReport()
+    scrubbed = scrub_jsonl_text(line + "\n", report)
+    assert FAKE_SIG not in scrubbed
+    assert report.text_redactions == 1
+
+    run = tmp_path / "run"
+    trace = run / "eval_before" / "traces" / "task-00001-leg-0000.stream.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text(line + "\n")
+    assert scrub_main([str(run)]) == 0, "the CLI must round-trip, not report incomplete"
+    assert FAKE_SIG not in trace.read_text()
+    assert verify_run_dir(run) == {}
+
+
+# ----- byte fidelity ----------------------------------------------------------------
+
+
+def test_a_scrubbed_dirty_line_differs_from_its_input_only_in_the_carrier() -> None:
+    # The block keeps its text so it is not dropped, which means the sole byte change is the
+    # removed `,"signature":"..."`. Pin the complete output to prove nothing else shifted.
+    line = f'{{"type":"thinking","thinking":"weighing it up","signature":"{FAKE_SIG}"}}'
+    report = ScrubReport()
+    out = scrub_jsonl_text(line + "\n", report)
+    assert out == '{"type":"thinking","thinking":"weighing it up"}\n'
+    assert report.lines_rewritten == 1
+
+
+def test_an_empty_trace_stays_empty() -> None:
+    # A clean zero-byte trace must round-trip to zero bytes, not gain a newline, or a
+    # re-read of a bounded tail would see a line that was never written.
+    assert scrub_jsonl_text("", ScrubReport()) == ""
+
+
+def test_scrub_file_leaves_an_empty_trace_at_zero_bytes(tmp_path: Path) -> None:
+    trace = tmp_path / "traces" / "leg-0000.stream.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("")
+    scrub_file(trace)
+    assert trace.read_text() == ""
+
+
+# ----- precision: ordinary content outside a reasoning block survives ---------------
+
+
+def test_a_generic_signature_field_outside_a_reasoning_block_is_kept(tmp_path: Path) -> None:
+    # A tool result can legitimately carry its own `signature`. It is not reasoning
+    # ciphertext, so neither the scrubber may strip it nor the verifier reject it.
+    record = {"type": "tool_result", "name": "verify_webhook", "signature": "sha256=deadbeef"}
+    assert scrub_value(record) == record
+    assert find_reasoning_material(record) == []
+    assert_publishable(record, "results")  # does not raise
+
+
+def test_a_generic_serialised_data_value_is_kept() -> None:
+    # `data` is ciphertext only inside a redacted_thinking block. A base64 `data` in an
+    # ordinary observation is domain content and must survive verbatim, structurally and
+    # as embedded text, and must not trip the verifier either.
+    payload = 'HTTP 200 {"data":"eyJhbGciOiJIUzI1NiJ9"} received'
+    assert scrub_text(payload) == payload
+    assert scrub_value({"observation": payload}) == {"observation": payload}
+    assert find_reasoning_material({"observation": payload}) == []
+
+
+# ----- the verifier is independent of the scrubber ----------------------------------
+
+
+def test_the_verifier_catches_a_reasoning_type_the_scrubber_does_not_name() -> None:
+    # The scrubber removes only its exact named types; the verifier re-derives "reasoning"
+    # from its own rules and errs broad. A harness that renames the block to
+    # `interleaved_thinking` is left by the scrubber yet still refused by the gate, the
+    # fail-closed direction, which proves the two sides do not share one blind spot: this
+    # test still fails (the verifier still catches it) even though the scrubber's tuple does
+    # not mention the drifted type.
+    drifted = _assistant({"type": "interleaved_thinking", "thinking": "", "signature": FAKE_SIG})
+    assert FAKE_SIG in json.dumps(scrub_value(drifted)), "scrubber's exact tuple walks past it"
+    assert find_reasoning_material(drifted) != [], "independent verifier still catches it"
+    with pytest.raises(ReasoningSignatureFound):
+        assert_publishable(drifted, "results")
+
+
+def test_a_drifted_reasoning_type_makes_the_cli_fail_closed(tmp_path: Path) -> None:
+    # End to end: the scrub leaves the drifted carrier, but the gate's own re-read refuses
+    # to call the directory publishable, so the CLI reports incomplete rather than shipping.
+    run = tmp_path / "run"
+    trace = run / "eval_before" / "traces" / "task-00002-leg-0000.stream.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text(
+        json.dumps(
+            _assistant({"type": "interleaved_thinking", "thinking": "", "signature": FAKE_SIG}),
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    assert scrub_main([str(run)]) == 1
+    assert verify_run_dir(run) != {}
