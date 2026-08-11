@@ -5,6 +5,7 @@
     shobench creds --cell <name>            # the negative-control protocol for one cell
     shobench build                          # build the three images
     shobench run --cell <name> --go         # run one cell (real spend without --go: a plan)
+    shobench resume --run <run-dir> --go    # continue a cell a usage limit suspended
     shobench report [results/]              # the summary table
 
 ``--go`` is the whole safety story: every command that spends prints its plan and exits unless
@@ -21,12 +22,12 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from shobench import credentials, report
+from shobench import credentials, report, runner
 from shobench.config import load_all_cells, load_cell_by_name, load_instruction, repo_root
 from shobench.containers import AGENT_IMAGE, NETNS_IMAGE, CellSandbox, build_image, daemon_available
 from shobench.egress import EGRESS_IMAGE
 from shobench.pins import SHOGYM_REV
-from shobench.runner import run_cell
+from shobench.runner import SUSPENSION_FILE, resume_cell, run_cell
 from shobench.serving import DEFAULT_PORT
 from shobench.splits import load_split_by_name
 
@@ -215,6 +216,112 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_resume(args: argparse.Namespace) -> int:
+    """Continue a cell a provider usage limit suspended, and let it finish.
+
+    The suspension record is the plan: which cell is waiting, how far the rollout got, and how
+    much of its wall clock is left. Printing that and stopping is what happens without ``--go``,
+    exactly as for a fresh run, because a continuation spends the same way a run does.
+    """
+    run_dir = Path(args.run)
+    record_path = run_dir / SUSPENSION_FILE
+    if not record_path.is_file():
+        print(
+            f"no suspension record at {record_path}. A cell that was not suspended is either "
+            "still running or already finished, and there is nothing to continue.",
+            file=sys.stderr,
+        )
+        return 1
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    cell = load_cell_by_name(record["cell"])
+    manifest_path = run_dir / "manifest.json"
+    manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+    )
+    drift = runner.experiment_drift(
+        manifest,
+        cell=cell,
+        split=load_split_by_name(cell.split),
+        instruction=load_instruction(cell.instruction_arm),
+    )
+    missing_required = [n for n in cell.required_env if not os.environ.get(n)]
+    plan = {
+        "run_dir": str(run_dir),
+        "cell": record["cell"],
+        "harness": record["harness"],
+        "session_id": record["session_id"],
+        "tasks_dispensed_so_far": record["tasks_dispensed"],
+        "pool_queued": record["pool_queued"],
+        "elapsed_rollout_s": record["elapsed_rollout_s"],
+        "remaining_rollout_s": record["remaining_rollout_s"],
+        "suspended_at": record["suspended_at"],
+        "stop_evidence": record["stop_evidence"],
+        "phases_left": ["rollout", "eval_after"],
+        "credentials_present": credentials.inventory(dict(os.environ)),
+        "required_env_present": {name: bool(os.environ.get(name)) for name in cell.required_env},
+        "missing_required_env": missing_required,
+        "experiment_drift": drift,
+    }
+    if not args.go:
+        print(json.dumps(plan, indent=2))
+        print(
+            "\n[plan only] continuing this cell spends real budget. Re-run with --go.",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Everything below refuses before anything spends, and before the suspension record is
+    # touched. A continuation is normally started in a new shell hours later, which is exactly
+    # where a serving-side variable goes missing, and a failure past this point used to consume
+    # the record that made another attempt possible.
+    if record["remaining_rollout_s"] <= 0:
+        # The clock the rollout was given is gone. Continuing would hand it a second budget,
+        # which is the one thing a continuation must not do, so this stops and says so rather
+        # than running a rollout nobody budgeted.
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(
+            "\nBLOCKED: the rollout wall clock is already spent, so there is nothing to "
+            "continue into. Nothing was spent.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if missing_required:
+        # The same serving-side needs a fresh run checks. They are absent far more often here,
+        # since a continuation is typically a new shell, and the stream would fail to build
+        # after the containers were already up.
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(
+            f"\nBLOCKED: the cell needs {missing_required} in the environment and they are "
+            "not set. Nothing was spent, and the run is still resumable.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if drift:
+        # The cell, split, or instruction moved while this run waited. Continuing under an
+        # edited definition would publish one run id describing two experiments.
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(
+            "\nBLOCKED: " + "; ".join(drift) + ". Restore the recorded definition, or start a "
+            "fresh cell. Nothing was spent, and the run is still resumable.",
+            file=sys.stderr,
+        )
+        return 1
+
+    results_path = asyncio.run(
+        resume_cell(
+            run_dir,
+            results_dir=Path(args.results),
+            agent_image=args.image,
+            credentials=credentials.agent_env(cell.harness, cell.credential_mode, dict(os.environ)),
+            capture_egress=not args.no_egress,
+        )
+    )
+    print(f"results: {results_path}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="shobench", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -248,6 +355,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="skip the negative control; never appropriate for a reported cell",
     )
     run.set_defaults(func=_cmd_run)
+
+    res = sub.add_parser("resume", help="continue a cell a usage limit suspended")
+    res.add_argument("--run", required=True, help="the run directory holding suspended.json")
+    res.add_argument("--go", action="store_true", help="actually continue it (real spend)")
+    res.add_argument("--results", default="results")
+    res.add_argument("--image", default=AGENT_IMAGE)
+    res.add_argument("--no-egress", action="store_true")
+    res.set_defaults(func=_cmd_resume)
 
     rep = sub.add_parser("report", help="the summary table")
     rep.add_argument("results", nargs="?", default="results")

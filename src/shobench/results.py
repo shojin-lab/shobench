@@ -68,23 +68,68 @@ def read_phase(prov_dir: Path) -> list[TaskResult]:
     return out
 
 
+def collapse_replays(rows: list[TaskResult]) -> list[TaskResult]:
+    """One row per queue position: the settled outcome when there is one, else the abandonment.
+
+    A rollout resumed after a usage limit redispenses the position its suspension left in flight,
+    so shogym's record holds two rows for that one position: the reconciled ``broker_abort`` for
+    the abandoned dispense, which it keeps as provenance, and the replay's real closure. Counting
+    both would turn one queue position into two headline tasks and inflate every closure tally, so
+    a resumed cell would publish a different measurement than the uninterrupted run it is meant to
+    match. Collapsing by position is what makes the two agree: the settled closure supersedes the
+    abandonment it replaced, and a position that only ever aborted keeps its ``broker_abort`` as
+    its single row. The raw rows, abandonment included, stay in the published ``tasks`` list for
+    audit; only the counts derived here are per position.
+
+    ``rows`` arrive in seq order (see :func:`read_phase`), so a later real closure is seen after
+    the earlier ``broker_abort`` it supersedes and replaces it, and a second abandonment of a
+    still-unfinished position does not displace the first.
+    """
+    chosen: dict[int, TaskResult] = {}
+    for row in rows:
+        current = chosen.get(row.position)
+        if current is None or (
+            current.closure == "broker_abort" and row.closure != "broker_abort"
+        ):
+            chosen[row.position] = row
+    return [chosen[position] for position in sorted(chosen)]
+
+
 def rollout_summary(rows: list[TaskResult]) -> dict[str, Any]:
     """The stopping metrics, which are the charter's own question.
 
-    ``tasks_attempted`` counts tasks the stream dispensed and sealed, so a rollout that stopped
-    early reads as a smaller number rather than as a truncated one. The runner supplies the
-    stop classification separately, because only it saw how each harness leg ended.
+    ``tasks_attempted`` counts queue positions the stream dispensed and sealed, so a rollout that
+    stopped early reads as a smaller number rather than as a truncated one. The count is per
+    position rather than per row (see :func:`collapse_replays`), so a position a resume replayed
+    is one attempt here even though the record keeps both its abandonment and its replay. The
+    runner supplies the stop classification separately, because only it saw how each harness leg
+    ended.
     """
-    scored = [r for r in rows if r.scored]
+    collapsed = collapse_replays(rows)
+    scored = [r for r in collapsed if r.scored]
     rewards = [r.reward for r in scored if r.reward is not None]
     successes = [r.success for r in scored if r.success is not None]
     return {
-        "tasks_attempted": len(rows),
+        "tasks_attempted": len(collapsed),
         "tasks_scored": len(scored),
         "mean_reward": (sum(rewards) / len(rewards)) if rewards else None,
         "full_solve_rate": (sum(successes) / len(successes)) if successes else None,
-        "closures": _closure_counts(rows),
+        "closures": _closure_counts(collapsed),
     }
+
+
+def dispensed_positions(prov_dir: Path) -> int:
+    """How many distinct queue positions this rollout ever dispensed, across every process.
+
+    A rollout resumed after a usage limit redispenses the position its suspension abandoned, so
+    that position is written to ``dispenses.jsonl`` twice: once for the abandoned attempt, once
+    for the replay. Summing each process's own dispense counter double-counts it and reports a
+    two-position pool as three dispensed. Counting distinct positions instead makes a resumed run
+    report the total an uninterrupted one does, one dispense per position it reached.
+    """
+    from shogym.serve import read_dispenses
+
+    return len({int(record["position"]) for record in read_dispenses(prov_dir)})
 
 
 def _closure_counts(rows: list[TaskResult]) -> dict[str, int]:
@@ -190,6 +235,8 @@ __all__ = [
     "SCHEMA",
     "SCORED_CLOSURES",
     "TaskResult",
+    "collapse_replays",
+    "dispensed_positions",
     "eval_summary",
     "pair_evals",
     "read_phase",

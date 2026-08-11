@@ -12,28 +12,37 @@ single-task ``EvalStream``, so a session that ignores its instruction and pulls 
 is told the stream is done rather than quietly consuming the next task's measurement. The
 serving process is this one, so the dataset loads once per phase rather than once per task.
 
-**The rollout is a sequence of legs against one live stream.** The stream and its HTTP server
-outlive each harness invocation, so the queue advances monotonically across legs and one
-provenance directory covers the phase. A leg that ends at a provider usage limit is resumed
-and does not count as a stop; a leg that ends on the agent's own terms while the queue still
-had tasks is the stop the charter asks about, and the runner stops serving there rather than
-prompting the agent onward.
+**The rollout is one honest run of the harness against one live stream.** A single harness
+invocation is driven against the pool for the cell's wall clock, and the runner does not
+relaunch it: whether a harness sustains autonomous operation is one of the things being
+measured. A run that ends on the agent's own terms while the queue still had tasks is the stop
+the charter asks about, and the runner does not prompt the agent onward.
+
+**A provider usage limit suspends the cell instead of ending it.** That stop is not the
+agent's, so the cell keeps everything it has, writes what a continuation needs, and leaves the
+process without unwinding the stream. :func:`resume_cell` picks it up when the window resets
+and finishes through the same ending an uninterrupted run reaches, so the eval that follows the
+rollout still follows a real rollout terminus.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
 import socket
 import subprocess
+import sys
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from shobench import egress
-from shobench.config import Cell, Instruction, load_instruction
+from shobench.config import Cell, Instruction, load_cell_by_name, load_instruction
 from shobench.containers import (
     AGENT_IMAGE,
     HOST_ALIAS,
@@ -48,9 +57,9 @@ from shobench.credentials import seed_home, spec_for
 from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REPO, SHOGYM_REV
-from shobench.results import TaskResult, read_phase, write_results
+from shobench.results import TaskResult, dispensed_positions, read_phase, write_results
 from shobench.serving import DEFAULT_PORT, SERVER_NAME, build_stream, side_for_phase
-from shobench.splits import Split
+from shobench.splits import Split, load_split_by_name
 
 # What does not count as the agent's durable self.
 #
@@ -147,12 +156,17 @@ class LegRecord:
     trace_path: str
     run_dir: Path
     observed_models: list[str] = field(default_factory=list)
+    # The session this leg actually ran under, read back off its own trace. A rollout a usage
+    # limit suspended is continued by naming this id to the harness, so it belongs in the
+    # durable record rather than only in a live object the suspension takes with it.
+    session_id: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
             "leg": self.leg,
             "observed_models": list(self.observed_models),
             "phase": self.phase,
+            "session_id": self.session_id,
             "task_idx": self.task_idx,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
@@ -180,6 +194,18 @@ class RunContext:
     agent_image: str = AGENT_IMAGE
     credentials: dict[str, str] = field(default_factory=dict)
     legs: list[LegRecord] = field(default_factory=list)
+    # Legs this process did not run: the record a suspended run left behind. A continuation is
+    # a second process writing the same run directory, so it carries the earlier legs forward
+    # rather than replacing them with its own.
+    prior_legs: list[dict[str, Any]] = field(default_factory=list)
+    # What to stop before a suspension leaves the process. The caller owns the pieces that
+    # outlive a phase (the sandbox, an egress capture), and a suspension has to stop them
+    # without unwinding to where they are held, so it is handed a way to do it.
+    teardown: Callable[[], None] | None = None
+
+    def leg_records(self) -> list[dict[str, Any]]:
+        """Every leg of this run, the ones inherited from a suspension included."""
+        return [*self.prior_legs, *(leg.to_json() for leg in self.legs)]
 
     @property
     def mcp_url(self) -> str:
@@ -356,6 +382,9 @@ def run_leg(
         trace_path=str(stdout_path),
         run_dir=ctx.run_dir,
         observed_models=ctx.harness.observed_models(stdout_path),
+        # The id the harness really used: the one the runner pinned when it may pin one, and
+        # otherwise the one the harness minted and wrote into its own trace.
+        session_id=ctx.harness.session_id_from_trace(stdout_path) or session_id,
     )
     ctx.legs.append(record)
     return record
@@ -469,6 +498,24 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     return rows
 
 
+def read_eval_phase(phase_dir: Path) -> list[TaskResult]:
+    """Every task an eval phase recorded, gathered from its per-task provenance directories.
+
+    An eval phase gives each task its own stream under ``<phase>/task-<id>/``, because one fresh
+    session per task is what serving a single task per stream enforces. So the phase's rows are
+    spread across those subdirectories, and ``read_phase`` cannot find them at the phase root:
+    it reads one directory's ``results.jsonl`` and does not recurse, and neither do the shogym
+    readers under it. This walks the task directories and concatenates in task-id order, which
+    is the same list ``run_eval_phase`` returns for a phase it ran in one process. It is how a
+    continuation reads back the eval that finished before the interruption, so the published
+    result carries the before side of the pair rather than an empty one.
+    """
+    rows: list[TaskResult] = []
+    for task_dir in sorted(p for p in phase_dir.glob("task-*") if p.is_dir()):
+        rows.extend(read_phase(task_dir))
+    return rows
+
+
 def _single_task_split(split: Split, phase: str, task_id: str) -> Split:
     """A one-task view of the split, so the phase's stream can only dispense that task."""
     from dataclasses import replace
@@ -482,106 +529,331 @@ def _single_task_split(split: Split, phase: str, task_id: str) -> Split:
     return replace(split, heldout=one)
 
 
-async def run_rollout_phase(ctx: RunContext) -> tuple[list[TaskResult], dict[str, Any]]:
-    """Serve the improvement pool for the cell's wall clock, as a sequence of legs.
+SUSPENSION_FILE = "suspended.json"
+# The run's whole egress capture. One process writes it and any continuation appends to it, so
+# the published summary covers the cell rather than only its last stretch.
+EGRESS_LOG = "egress.tsv"
+# The exit status a suspended cell leaves. `run` cannot return it, because a suspension is the
+# one path that must not unwind, so the status is how a shell or a supervising script tells a
+# cell that is waiting for a window from one that failed. 75 is the conventional "temporary
+# failure, try the same thing again later", which is exactly what this is.
+SUSPENDED_EXIT_CODE = 75
 
-    A leg that hits a usage limit is resumed into the same session, because the scope's
-    stopping metrics count only the agent's own choice to stop. A leg that ends on the agent's
-    own terms ends the rollout: nothing re-serves tasks to push the agent toward the ceiling,
-    and where it stopped is the reported outcome.
+
+@dataclass(frozen=True)
+class Suspension:
+    """A rollout stopped by a provider limit, with everything a continuation needs.
+
+    Everything here is read back from disk by ``shobench resume``, so it holds inputs rather
+    than objects: the session to reattach to, how much of the one rollout wall clock is already
+    spent, and where the record stood. The provenance directory and the harness are not in it
+    twice, since the manifest beside it already names them.
+    """
+
+    run_id: str
+    session_id: str | None
+    elapsed_rollout_s: float
+    tasks_dispensed: int
+    pool_queued: int
+    legs_before: int
+    suspended_at: float
+    # The clock the interrupted rollout was actually given. It rides in the record instead of
+    # being re-read from the cell file, because a cell file is a working document and a running
+    # experiment is not: a budget edited while the run waited for its window would otherwise
+    # change the length of a rollout that is already half spent.
+    rollout_wall_clock_s: int
+
+    @property
+    def remaining_rollout_s(self) -> int:
+        """What is left of the one wall clock the rollout was given, never a fresh one.
+
+        A continuation inherits the run's remaining time. Handing it a budget again would make
+        the measured rollout as long as its interruptions were frequent, and a cell suspended
+        twice would quietly be a longer experiment than one that ran straight through. Repeated
+        suspensions accumulate into ``elapsed_rollout_s``, so this shrinks monotonically to zero
+        and the operator is told when there is nothing left.
+        """
+        return int(max(0.0, self.rollout_wall_clock_s - self.elapsed_rollout_s))
+
+    @classmethod
+    def read(cls, run_dir: Path) -> Suspension:
+        record = json.loads((run_dir / SUSPENSION_FILE).read_text(encoding="utf-8"))
+        return cls(
+            run_id=record["run_id"],
+            session_id=record["session_id"],
+            elapsed_rollout_s=float(record["elapsed_rollout_s"]),
+            tasks_dispensed=int(record["tasks_dispensed"]),
+            pool_queued=int(record["pool_queued"]),
+            legs_before=int(record["legs_before"]),
+            suspended_at=float(record["suspended_at"]),
+            rollout_wall_clock_s=int(record["rollout_wall_clock_s"]),
+        )
+
+
+def experiment_drift(
+    manifest: dict[str, Any], *, cell: Cell, split: Split, instruction: Instruction
+) -> list[str]:
+    """What the checkout now says that the recorded run does not, as human-readable lines.
+
+    A suspended cell can wait hours, and a repository is edited in hours. A continuation runs
+    against whatever the files say today, so anything that moved between the two is a different
+    experiment wearing the first one's run id: a re-tuned budget, a regenerated split whose
+    positions no longer mean what the record says they mean, a reworded instruction the second
+    half of the rollout would be run under. The digests to compare are already in the manifest,
+    written before anything spent, so this is a comparison rather than a new mechanism.
+
+    Returned rather than raised, so a caller can report every difference at once. An operator
+    told about the budget, only to be told about the split on the next attempt, learns to stop
+    reading.
+    """
+    recorded_cell = manifest.get("cell", {})
+    recorded_split = manifest.get("split", {})
+    recorded_instruction = manifest.get("instruction", {})
+    checks = (
+        (
+            "cell config",
+            recorded_cell.get("config_sha256"),
+            cell.to_manifest().get("config_sha256"),
+        ),
+        ("split ids", recorded_split.get("id_digest"), split.to_manifest().get("id_digest")),
+        (
+            "rollout instruction",
+            recorded_instruction.get("rollout_system_sha256"),
+            instruction.rollout_system_sha256,
+        ),
+        (
+            "eval instruction",
+            recorded_instruction.get("eval_system_sha256"),
+            instruction.eval_system_sha256,
+        ),
+    )
+    return [
+        f"{what} changed since the run started (recorded {was}, now {now})"
+        for what, was, now in checks
+        if was is not None and now is not None and was != now
+    ]
+
+
+def _fresh_session_id(ctx: RunContext) -> str | None:
+    """The id a fresh rollout runs under: pinned when the harness lets the runner choose one.
+
+    Pinning matters more than it looks. A harness that mints its own id writes it into its
+    trace, and a leg that dies before writing anything leaves nothing to resume; one the runner
+    pinned is resumable from the moment it launches.
+    """
+    return str(uuid.uuid4()) if ctx.harness.pins_session_id else None
+
+
+def _suspend_and_exit(
+    ctx: RunContext,
+    *,
+    record: LegRecord,
+    session_id: str | None,
+    elapsed_rollout_s: float,
+    tasks_dispensed: int,
+    pool_queued: int,
+    rollout_wall_clock_s: int,
+) -> None:
+    """Write the suspension, stop the containers, and leave without unwinding. Never returns.
+
+    Three things have to be true at once, and only this order gets all three. The record has to
+    be on disk before anything else, because it is what a continuation reads. The cell's
+    containers have to stop, because a suspended cell may wait hours for a window and a running
+    container is a running bill. And the process has to leave without unwinding the stream: an
+    orderly close drains whatever task is in flight into a scored row, and shogym replays only
+    positions with no row, so the tidy exit is the one that would cost the agent the task it was
+    working on. Exiting hard leaves the claim on disk and the position row-less, which is
+    precisely the state ``resume=True`` is for.
+
+    Nothing else in the runner exits the process. It is confined here because this is the one
+    place where the correct behavior and the tidy behavior are not the same.
+    """
+    run_dir = ctx.run_dir
+    suspension = {
+        "schema": "shobench.suspension/1",
+        "run_id": ctx.run_id,
+        "cell": ctx.cell.name,
+        "harness": ctx.cell.harness,
+        "phase": "rollout",
+        "session_id": session_id,
+        "legs_before": len(ctx.leg_records()),
+        "tasks_dispensed": tasks_dispensed,
+        "pool_queued": pool_queued,
+        "elapsed_rollout_s": round(elapsed_rollout_s, 3),
+        # The clock this rollout was given, carried forward rather than re-read: a second
+        # suspension has to hand on the same budget the first one was measured against.
+        "rollout_wall_clock_s": rollout_wall_clock_s,
+        "remaining_rollout_s": round(max(0.0, rollout_wall_clock_s - elapsed_rollout_s), 3),
+        "stop_evidence": record.verdict.to_json(),
+        "suspended_at": time.time(),
+        "resume_with": f"uv run shobench resume --run {run_dir} --go",
+    }
+    # The record first, and outside the guard below. Everything after it is best-effort, but
+    # this is not: a suspension nobody can read is not a suspension, and if it cannot be written
+    # then failing through the normal path, which at least publishes, beats exiting into silence.
+    write_json(run_dir / SUSPENSION_FILE, suspension)
+    try:
+        write_json(run_dir / "legs.json", ctx.leg_records())
+        # The agent's container is already gone, its process being what ended, so this stops the
+        # network namespace and the egress observer.
+        if ctx.teardown is not None:
+            ctx.teardown()
+        print(
+            f"[shobench] {ctx.cell.name}: suspended on a usage limit after "
+            f"{tasks_dispensed} task(s); resume with: {suspension['resume_with']}",
+            file=sys.stderr,
+        )
+        sys.stderr.flush()
+        sys.stdout.flush()
+    finally:
+        # Reporting and cleanup are courtesies; the exit is the correctness property, so it sits
+        # in a finally where nothing above it can prevent it. A closed output pipe or a docker
+        # daemon that will not answer must not propagate from here: the exception would unwind
+        # the stream this was called from, shogym would drain the task in flight into a scored
+        # row, and the position the suspension exists to preserve would be spent. Leaving on the
+        # way out of a failure is also what discards it, since os._exit runs no handlers.
+        os._exit(SUSPENDED_EXIT_CODE)
+
+
+async def run_rollout_phase(
+    ctx: RunContext, *, suspended: Suspension | None = None
+) -> tuple[list[TaskResult], dict[str, Any]]:
+    """Serve the improvement pool as one honest run of the harness. No automatic restart.
+
+    Whether a harness sustains autonomous operation is one of the things this measures, so the
+    runner does not relaunch a harness that stops. A single invocation is driven against the
+    pool; where it ends is the outcome:
+
+    - it exhausts the pool: sustained autonomy, the success case;
+    - it ends its run with tasks still available: it stopped on its own, and that is the
+      finding, recorded with how far it got;
+    - it wedges past the run's time cap: timed out, a different finding;
+    - it hits a provider usage limit: the environment stopped it, not the agent, so the cell
+      suspends where it stands and an operator continues it when the window resets (windows can
+      run to hours, and nothing here waits or auto-retries).
+
+    Restarting the harness to push it further would launder "gave up after N tasks" into "ran
+    the whole pool", which is the one thing this must not do. Continuing the same session after
+    a provider cut it off is the opposite: without it, the pool ends where the subscription
+    window did.
+
+    ``suspended`` is the record of an earlier usage limit, and passing one continues that run:
+    the stream reopens on the same provenance directory, the harness resumes the same session,
+    and the clock carries the time already spent.
     """
     prov_dir = ctx.run_dir / "rollout"
     prov_dir.mkdir(parents=True, exist_ok=True)
     budget = ctx.cell.budget
-    deadline = time.time() + budget.rollout_wall_clock_s
+    resuming = suspended is not None
 
-    # A harness that accepts an id gets one chosen up front, so a leg that dies before writing
-    # anything is still resumable. A harness that mints its own gets None here, and the runner
-    # reads the real id off the first leg's trace before it resumes.
-    session_id = str(uuid.uuid4()) if ctx.harness.pins_session_id else None
+    # Claude Code accepts a pinned id, so a run that is later resumed by hand has one to name.
+    session_id = suspended.session_id if resuming else _fresh_session_id(ctx)
     stopping: dict[str, Any] = {
         "stop_reason": "unrecorded",
-        "usage_limit_resumes": 0,
-        "legs": [],
-        "wall_clock_budget_s": budget.rollout_wall_clock_s,
+        "legs": [leg for leg in ctx.prior_legs if leg.get("phase") == "rollout"],
         "session_id": session_id,
     }
 
-    stream = build_stream(ctx.cell, ctx.split, "rollout", prov_dir)
-    queued = stream.queue_info().remaining
+    # A resumed rollout reopens the record it already wrote. That is the only way shogym will
+    # point a stream at a directory holding rows, and it is what replays the position the
+    # suspended run held: resume walks queue positions with no result row, and the suspension
+    # left the in-flight one row-less on purpose.
+    #
+    # The resume semantics, stated plainly, because the continuation cue is written to them and
+    # the result shaping below depends on them. Pinned shogym reopens with an EMPTY live registry
+    # and empty settled-lease set, so the old lease the resumed harness session still holds for
+    # its interrupted task denotes nothing here: its next task-tool call under that lease is
+    # refused as `unknown_lease`, and above max_in_flight 1 (every v0 cell) there is no other
+    # routing to fall back on. The runner cannot make the agent's tool calls, so nothing here can
+    # re-mint or re-attach that lease. The honest model is therefore that the in-flight task is
+    # abandoned and replayed as a fresh dispense: shogym re-offers the row-less position on the
+    # next `get_task`, minting a new lease, and the continuation cue is what drives the resumed
+    # session to pull it instead of retrying its dead one, so no position is lost or stalled. The
+    # abandoned dispense stays in the record as a `broker_abort`, which the result shaping below
+    # collapses by position (see `dispensed_positions` and `collapse_replays`) so a resumed cell
+    # publishes the one attempt per position an uninterrupted run does.
+    stream = build_stream(ctx.cell, ctx.split, "rollout", prov_dir, resume=resuming)
+    queued = suspended.pool_queued if resuming else stream.queue_info().remaining
+    spent_before = suspended.elapsed_rollout_s if resuming else 0.0
+    # A continuation's clock comes off the record, which carries the budget the interrupted
+    # rollout was given. Subtracting from today's cell file instead would let a budget edited
+    # while the run waited change the length of a rollout that is already half spent.
+    clock_s = suspended.rollout_wall_clock_s if resuming else budget.rollout_wall_clock_s
+    remaining_s = suspended.remaining_rollout_s if resuming else clock_s
     ctx.port = free_port()
     async with stream, _served(stream, ctx.port):
-        leg = 0
-        stalled = 0
-        resume = False
-        while True:
-            remaining = max(0.0, deadline - time.time())
-            if remaining <= 0:
-                stopping["stop_reason"] = "wall_clock_exhausted"
-                break
-            if stream.queue_info().remaining == 0:
-                stopping["stop_reason"] = "pool_exhausted"
-                break
-
-            consumed_before = stream.queue_info().consumed
-            record = await asyncio.to_thread(
-                run_leg,
-                ctx,
-                phase="rollout",
-                leg=leg,
-                system_prompt=ctx.instruction.rollout_system,
-                user_prompt=(ctx.instruction.continuation if resume else ctx.instruction.kickoff),
-                session_id=None if resume else session_id,
-                resume=resume,
-                timeout_s=int(min(remaining, budget.rollout_leg_timeout_s)),
-                task_idx=None,
-                consumed_before=consumed_before,
-            )
-            record.tasks_consumed_after = stream.queue_info().consumed
-            stopping["legs"].append(record.to_json())
-            leg += 1
-            # Whatever the harness says it ran under wins over what the runner guessed.
-            observed_session = ctx.harness.session_id_from_trace(Path(record.trace_path))
-            if observed_session:
-                session_id = observed_session
-                stopping["session_id"] = session_id
-
-            advanced = record.tasks_consumed_after > record.tasks_consumed_before
-            stalled = 0 if advanced else stalled + 1
-
-            if record.verdict.kind is StopKind.USAGE_LIMIT:
-                # Not a stop. Resume the same session; the queue is where the agent left it.
-                stopping["usage_limit_resumes"] += 1
-                resume = True
-                continue
-            if record.verdict.kind is StopKind.CHOSEN:
-                stopping["stop_reason"] = "agent_chose_to_stop"
-                stopping["stop_evidence"] = record.verdict.to_json()
-                break
-            if record.verdict.kind is StopKind.LEG_TIMEOUT:
-                # The leg budget, not the agent, ended this one. Resume and keep the clock.
-                resume = True
-                if stalled >= budget.max_stalled_legs:
-                    stopping["stop_reason"] = "stalled"
-                    stopping["stop_evidence"] = record.verdict.to_json()
-                    break
-                continue
-            # ERROR or UNKNOWN: retry into the same session while the clock allows, but never
-            # more than max_stalled_legs times without the queue advancing.
-            resume = True
-            if stalled >= budget.max_stalled_legs:
-                stopping["stop_reason"] = "harness_error"
-                stopping["stop_evidence"] = record.verdict.to_json()
-                break
+        consumed_before = stream.queue_info().consumed
+        record = await asyncio.to_thread(
+            run_leg,
+            ctx,
+            phase="rollout",
+            leg=suspended.legs_before if resuming else 0,
+            system_prompt=ctx.instruction.rollout_system,
+            # A resumed rollout is continued, not begun. The arm defines two user turns for
+            # exactly this: kickoff opens a fresh run, continuation resumes one. Sending the
+            # opener again would run a suspended cell under a different intervention than the
+            # one its record names.
+            user_prompt=ctx.instruction.continuation if resuming else ctx.instruction.kickoff,
+            session_id=session_id,
+            resume=resuming,
+            timeout_s=remaining_s,
+            task_idx=None,
+            consumed_before=consumed_before,
+        )
+        record.tasks_consumed_after = stream.queue_info().consumed
+        stopping["legs"].append(record.to_json())
+        if record.session_id:
+            stopping["session_id"] = record.session_id
 
         info = stream.queue_info()
-        stopping["tasks_dispensed"] = info.consumed
+        if record.verdict.kind is StopKind.USAGE_LIMIT:
+            # The provider stopped it, not the agent, so the cell suspends here rather than
+            # finishing. This call does not return: the record is written, the containers are
+            # stopped, and the process exits without unwinding the stream, because an orderly
+            # close would drain the task in flight into a scored row and shogym's resume skips
+            # a position that already has one. Crash semantics are what keep the position
+            # replayable, and they are only available before this block exits.
+            _suspend_and_exit(
+                ctx,
+                record=record,
+                session_id=stopping["session_id"],
+                elapsed_rollout_s=spent_before + (record.ended_at - record.started_at),
+                # Distinct positions dispensed across the whole record, not this process's share
+                # plus the suspension's counter: the position this suspension is abandoning may be
+                # a replay of one an earlier suspension already counted, and adding the counters
+                # would count it twice. The in-flight dispense is durable before the task is
+                # handed out, so it is already on disk and in this count.
+                tasks_dispensed=dispensed_positions(prov_dir),
+                pool_queued=queued,
+                rollout_wall_clock_s=clock_s,
+            )
+        elif info.remaining == 0:
+            stopping["stop_reason"] = "pool_exhausted"
+        elif record.verdict.kind is StopKind.CHOSEN:
+            # It ended its run with work still on the queue: it stopped on its own.
+            stopping["stop_reason"] = "agent_stopped_early"
+        elif record.verdict.kind is StopKind.LEG_TIMEOUT:
+            stopping["stop_reason"] = "timed_out"
+        else:
+            stopping["stop_reason"] = "harness_error"
+        stopping["stop_evidence"] = record.verdict.to_json()
+        # Dispensed counts distinct queue positions across the whole rollout, not this process's
+        # share of it. A resumed stream numbers its own dispenses from zero while the record it
+        # continues already holds the earlier ones, and it redispenses the position the suspension
+        # abandoned, so summing each process's counter would count that position twice (the exact
+        # overcount a two-position pool published as three). Counting distinct positions makes a
+        # resumed run report the total an uninterrupted one does.
+        stopping["tasks_dispensed"] = dispensed_positions(prov_dir)
         stopping["tasks_remaining_in_pool"] = info.remaining
         stopping["pool_queued"] = queued
-        # The charter's question is whether the agent stopped with work still available. A stop
-        # with an empty queue is not evidence about stopping behavior at all.
+        stopping["rollout_wall_clock_s"] = round(
+            spent_before + (record.ended_at - record.started_at), 3
+        )
+        if resuming:
+            stopping["resumed_from_suspension_at"] = suspended.suspended_at
+        # The charter's question is whether it stopped with work still available.
         stopping["stopped_with_tasks_available"] = (
-            stopping["stop_reason"] == "agent_chose_to_stop" and info.remaining > 0
+            stopping["stop_reason"] == "agent_stopped_early" and info.remaining > 0
         )
 
     return read_phase(prov_dir), stopping
@@ -592,6 +864,115 @@ async def run_rollout_phase(ctx: RunContext) -> tuple[list[TaskResult], dict[str
 
 def _run_id(cell: Cell) -> str:
     return f"{cell.name}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+
+
+class _Egress:
+    """One cell's egress observer, stopped exactly once from whichever path gets there first.
+
+    A cell now has two endings. The ordinary one stops the observer on its way out; a suspension
+    stops it from inside the rollout, because a cell waiting hours for a provider window must
+    not leave containers running. Both call this, and only the first call does anything, so the
+    summary is written once no matter which ending happened.
+    """
+
+    def __init__(self, capture: egress.EgressCapture | None, run_dir: Path) -> None:
+        self._capture = capture
+        self._run_dir = run_dir
+        self.summary: dict[str, Any] = {}
+
+    def stop(self) -> dict[str, Any]:
+        if self._capture is None:
+            return self.summary
+        capture, self._capture = self._capture, None
+        egress.stop(capture)
+        record = self._run_dir / EGRESS_LOG
+        if capture.log_path != record:
+            # A continuation's observer writes its own segment, because the capture command
+            # truncates whatever file it is pointed at. Its traffic is appended to the run's
+            # record here, so the published summary covers the whole cell rather than only the
+            # last continuation: the eval that ran before the interruption is evidence too.
+            with record.open("a", encoding="utf-8") as whole:
+                whole.write(capture.log_path.read_text(encoding="utf-8", errors="ignore"))
+        self.summary = dict(egress.write_summary(record, self._run_dir / "egress.json"))
+        return self.summary
+
+
+async def _run_phases(
+    ctx: RunContext,
+    *,
+    manifest: dict[str, Any],
+    phases: tuple[str, ...],
+    results_dir: Path,
+    observer: _Egress,
+    suspended: Suspension | None = None,
+    recorded_phases: tuple[str, ...] = (),
+) -> Path:
+    """Run this cell's phases, then finalize the manifest and publish the results.
+
+    Shared by a fresh cell and a resumed one, and that sharing is the point rather than a
+    convenience: a continuation has to end exactly the way an uninterrupted run ends. eval_after
+    is the measurement the rollout is supposed to precede, so it belongs on the far side of a
+    real rollout terminus and nowhere else. A suspension never reaches this code at all, since
+    it leaves the process from inside the rollout, which is what keeps a half-finished rollout
+    from publishing an ending and from spending an exhausted window on the measurement.
+    """
+
+    def teardown() -> None:
+        # Independent best-effort steps, with the sandbox in a finally. This runs on the way out
+        # of a suspension, where an observer that will not stop must not leave a namespace
+        # container and a network running for the hours a cell waits for its window.
+        try:
+            observer.stop()
+        finally:
+            ctx.sandbox.down()
+
+    ctx.teardown = teardown
+    # A continuation starts from the phases the interrupted run already recorded, not from
+    # nothing. eval_before is the half of the paired measurement that ran before the
+    # interruption, and a results file without it reports no requested tasks, no deltas, and
+    # every after row unpaired: the benchmark's whole question, silently unanswered. It is read
+    # with the eval-phase reader, because those rows live in per-task subdirectories that a
+    # single-directory read would miss, which is the shape an uninterrupted run would publish.
+    phase_rows: dict[str, list[TaskResult]] = {
+        phase: read_eval_phase(ctx.run_dir / phase) for phase in recorded_phases
+    }
+    stopping: dict[str, Any] = {}
+    for phase in phases:
+        if phase == "rollout":
+            phase_rows[phase], stopping = await run_rollout_phase(ctx, suspended=suspended)
+        else:
+            phase_rows[phase] = await run_eval_phase(ctx, phase)
+        write_json(ctx.run_dir / "legs.json", ctx.leg_records())
+
+    # How many times a provider limit suspended and resumed this cell, counted off the one
+    # place that record lives: a resumption entry is appended per continuation. The report reads
+    # this field, so a resumed cell that omitted it was published as one that never paused.
+    if "rollout" in phases:
+        stopping["usage_limit_resumes"] = len(manifest.get("resumptions", []))
+
+    # Which model answered, read off the traces rather than assumed from the config, and off
+    # every leg of the run rather than the ones this process happened to launch.
+    manifest["observed_models"] = sorted(
+        {model for leg in ctx.leg_records() for model in leg.get("observed_models", [])}
+    )
+    manifest["home"]["digest_after"] = home_digest(ctx.sandbox.home, exclude=is_noise)
+    manifest["home"]["inventory_after"] = home_inventory(ctx.sandbox.home, exclude=is_noise)
+    manifest["home"]["changed"] = (
+        manifest["home"]["digest_after"] != manifest["home"]["digest_before"]
+    )
+    manifest["ended_at"] = time.time()
+    write_json(ctx.run_dir / "manifest.json", manifest)
+
+    egress_summary = observer.stop()
+    results_path = results_dir / f"{ctx.cell.name}.json"
+    write_results(
+        results_path,
+        manifest=manifest,
+        phases=phase_rows,
+        stopping=stopping,
+        egress=egress_summary,
+    )
+    return results_path
 
 
 async def run_cell(
@@ -630,15 +1011,8 @@ async def run_cell(
     # itself would start with an empty HOME and no credential at all. The durability filter
     # excludes credential files, so seeding one changes no record.
     seeded = seed_home(spec_for(cell.harness, cell.credential_mode), sandbox.home)
-    capture = None
+    observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
     try:
-        if capture_egress:
-            capture = egress.start(
-                netns_container=sandbox.netns_container,
-                name=f"{sandbox.netns_container}-egress"[:63],
-                log_path=run_dir / "egress.tsv",
-            )
-
         probes = {
             "version": _probe(
                 ctx.harness.version_probe(),
@@ -655,50 +1029,136 @@ async def run_cell(
         manifest = build_manifest(ctx, probes=probes)
         manifest["credential_seed"] = seeded
         write_json(run_dir / "manifest.json", manifest)
-
-        phase_rows: dict[str, list[TaskResult]] = {}
-        stopping: dict[str, Any] = {}
-        for phase in phases:
-            if phase == "rollout":
-                phase_rows[phase], stopping = await run_rollout_phase(ctx)
-            else:
-                phase_rows[phase] = await run_eval_phase(ctx, phase)
-            write_json(run_dir / "legs.json", [leg.to_json() for leg in ctx.legs])
-
-        # Which model answered, read off the traces rather than assumed from the config.
-        manifest["observed_models"] = sorted(
-            {model for leg in ctx.legs for model in leg.observed_models}
-        )
-        manifest["home"]["digest_after"] = home_digest(sandbox.home, exclude=is_noise)
-        manifest["home"]["inventory_after"] = home_inventory(sandbox.home, exclude=is_noise)
-        manifest["home"]["changed"] = (
-            manifest["home"]["digest_after"] != manifest["home"]["digest_before"]
-        )
-        manifest["ended_at"] = time.time()
-        write_json(run_dir / "manifest.json", manifest)
-
-        egress_summary: dict[str, Any] = {}
-        if capture is not None:
-            egress.stop(capture)
-            capture = None
-            egress_summary = dict(
-                egress.write_summary(run_dir / "egress.tsv", run_dir / "egress.json")
-            )
-
-        results_path = results_dir / f"{cell.name}.json"
-        write_results(
-            results_path,
+        return await _run_phases(
+            ctx,
             manifest=manifest,
-            phases=phase_rows,
-            stopping=stopping,
-            egress=egress_summary,
+            phases=phases,
+            results_dir=results_dir,
+            observer=observer,
         )
+    finally:
+        with contextlib.suppress(Exception):
+            observer.stop()
+        sandbox.down()
+
+
+async def resume_cell(
+    run_dir: Path,
+    *,
+    results_dir: Path,
+    agent_image: str = AGENT_IMAGE,
+    credentials: dict[str, str] | None = None,
+    capture_egress: bool = True,
+) -> Path:
+    """Continue a cell a provider limit suspended, and finish it. Returns the results path.
+
+    Everything this needs is on disk, because the process that wrote it is gone: the suspension
+    record names the session and the time already spent, and the manifest beside it names the
+    cell. The run directory is reused rather than copied, so the agent continues in the home it
+    built, against the provenance record it already wrote, in a stream reopened on the position
+    it was holding when the window closed.
+
+    What it must not do is start a second measurement of a different thing. The cell is the one
+    the manifest recorded, checked against it rather than trusted; the clock is what remained of
+    the budget that run was given, read from the record and not from today's cell file; the
+    phases already measured are carried into the published result; and the ending is the shared
+    one, so a continued cell publishes the same result shape as a cell that was never
+    interrupted.
+    """
+    suspension = Suspension.read(run_dir)
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    cell = load_cell_by_name(manifest["cell"]["name"])
+    split = load_split_by_name(cell.split)
+    instruction = load_instruction(cell.instruction_arm)
+    drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)
+    if drift:
+        # Refused rather than reconciled. Continuing under an edited definition would publish
+        # one run id describing two experiments, and the operator is the only one who can say
+        # whether the edit was meant for this run or for the next one.
+        raise RuntimeError(
+            "the checkout no longer matches the run being continued: "
+            + "; ".join(drift)
+            + ". Restore the recorded definition, or start a fresh cell."
+        )
+    sandbox = CellSandbox(
+        run_id=suspension.run_id, home=run_dir / "home", workdir=run_dir / "work"
+    )
+    ctx = RunContext(
+        cell=cell,
+        split=split,
+        instruction=instruction,
+        harness=harness_for(cell.harness),
+        run_id=suspension.run_id,
+        run_dir=run_dir,
+        sandbox=sandbox,
+        agent_image=agent_image,
+        credentials=dict(credentials or {}),
+    )
+    legs_path = run_dir / "legs.json"
+    if legs_path.is_file():
+        # The legs the suspended run recorded. This process appends to that record rather than
+        # replacing it, so a finished cell shows its whole rollout and not just the last stretch.
+        ctx.prior_legs = json.loads(legs_path.read_text(encoding="utf-8"))
+    # Written before anything can suspend again, because a manifest that lives only in memory
+    # loses every resumption to the next hard exit, and a cell continued three times would
+    # publish as though it had been continued once.
+    manifest.setdefault("resumptions", []).append(
+        {
+            "suspended_at": suspension.suspended_at,
+            "resumed_at": time.time(),
+            "elapsed_rollout_s_before": suspension.elapsed_rollout_s,
+            "session_id": suspension.session_id,
+        }
+    )
+    write_json(run_dir / "manifest.json", manifest)
+    sandbox.up()
+    # The credential is placed again because the sandbox is new even though the home is not;
+    # credential files are excluded from every digest, so re-seeding changes no record.
+    seed_home(spec_for(cell.harness, cell.credential_mode), sandbox.home)
+    observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
+    try:
+        results_path = await _run_phases(
+            ctx,
+            manifest=manifest,
+            phases=("rollout", "eval_after"),
+            results_dir=results_dir,
+            observer=observer,
+            suspended=suspension,
+            # The measurement that ran before the interruption, read back off the run's own
+            # provenance so the published result carries both halves of the pair.
+            recorded_phases=("eval_before",),
+        )
+        # Only now is the record spent. It is this run's one retry handle, and everything
+        # between here and the top of this function can fail: a stream that will not open, a
+        # server that will not bind, a leg that dies. Removing it earlier turned any of those
+        # into a cell that could neither finish nor be tried again. A second usage limit never
+        # reaches this line, having already replaced the record with its own.
+        (run_dir / SUSPENSION_FILE).unlink(missing_ok=True)
         return results_path
     finally:
-        if capture is not None:
-            with contextlib.suppress(Exception):
-                egress.stop(capture)
+        with contextlib.suppress(Exception):
+            observer.stop()
         sandbox.down()
+
+
+def _start_egress(sandbox: CellSandbox, run_dir: Path) -> egress.EgressCapture:
+    """Attach the observer, writing to its own segment when the run already has a capture.
+
+    The capture command truncates the file it writes, so pointing a continuation's observer at
+    the existing record would erase the traffic from before the interruption. Each process gets
+    a segment of its own instead, and the segments are folded into the record as they stop.
+    """
+    log_path = run_dir / EGRESS_LOG
+    if log_path.exists():
+        segment = 2
+        while (run_dir / f"egress.{segment}.tsv").exists():
+            segment += 1
+        log_path = run_dir / f"egress.{segment}.tsv"
+    return egress.start(
+        netns_container=sandbox.netns_container,
+        name=f"{sandbox.netns_container}-egress"[:63],
+        log_path=log_path,
+    )
 
 
 def cleanup(run_id: str) -> None:
@@ -717,10 +1177,16 @@ __all__ = [
     "is_noise",
     "LegRecord",
     "RunContext",
+    "SUSPENDED_EXIT_CODE",
+    "SUSPENSION_FILE",
+    "Suspension",
     "build_manifest",
     "cleanup",
+    "read_eval_phase",
+    "resume_cell",
     "run_cell",
     "run_eval_phase",
     "run_leg",
     "run_rollout_phase",
+    "write_home_files",
 ]

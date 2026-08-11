@@ -25,5 +25,3 @@ note = "Machinery proof. Not a measurement, and never reported as one."
 rollout_wall_clock_s = 900
 pool_ceiling = 2
 eval_task_timeout_s = 600
-rollout_leg_timeout_s = 600
-max_stalled_legs = 2

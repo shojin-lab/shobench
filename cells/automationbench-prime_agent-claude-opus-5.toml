@@ -33,7 +33,3 @@ rollout_wall_clock_s = 28800
 # Capped at 200 for automationbench to keep a rollout inside a practical wall clock.
 pool_ceiling = 200
 eval_task_timeout_s = 1800
-# One leg of the rollout. Bounding it is what keeps a wedged harness from consuming the whole
-# budget in one unrecoverable process; the wall clock is unaffected.
-rollout_leg_timeout_s = 3600
-max_stalled_legs = 3

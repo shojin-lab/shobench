@@ -19,13 +19,41 @@ Versions this was established against: Claude Code 2.1.221 and 2.1.226, codex-cl
 None of the three harnesses runs for eight hours on its own. Claude Code runs its agentic
 loop until the model emits a turn with no tool calls, then exits. codex exec runs exactly one
 turn. prime-agent runs one turn unless autonomous mode is on, and then runs until one of four
-host budgets stops it. So the runner owns the outer loop in every case, which is why the
-rollout is a sequence of bounded legs against one live stream rather than one long process.
-That structure was forced by codex, whose unreliability over a single long loop is on record
-from prior runs, but it is the right structure for all three.
+host budgets stops it. Where each one ends is not a gap to paper over: it is the measurement.
+So the rollout is one invocation against one live stream and the runner never relaunches a
+harness that stopped, because a relaunch would turn "gave up after four tasks" into "worked
+through the pool".
 
-None of the three has a usage-limit exit code either. All three need text or event
-classification, and the rules below are what the runner implements.
+The one interruption that is not the agent's own is a provider usage limit, and it gets the
+one exception. The cell **suspends**: a record says where the rollout stood, the containers
+stop, every directory stays, and `uv run shobench resume --run <run-dir> --go` continues the
+same session against the same stream for what is left of the rollout clock. `eval_after` waits
+for a real terminus, so no measurement is ever taken inside an exhausted window.
+
+Suspending has to leave the process without unwinding, and that is the one place in the runner
+where the tidy thing is the wrong thing. shogym's orderly close drains the task in flight into
+a scored row, and its resume replays only queue positions that hold no row, so closing politely
+would spend the task the agent was working on and no continuation could serve it again. Ending
+hard leaves the claim on disk and the position row-less, which is exactly the state `resume`
+exists to reclaim (observed, against the pinned shogym: a stream ended without unwinding leaves
+no row and replays the position, while the same stream closed in an orderly way leaves a
+`drained` row and the position is gone for good). The exit itself is in a `finally`, so a
+console that will not take the message and a daemon that will not stop a container cannot turn
+the suspension back into the orderly close it exists to avoid.
+
+What a continuation is allowed to be is the other half of the design, because the point of
+resuming is a comparable measurement rather than a finished job. Its clock is the budget the
+interrupted rollout was given, read from the record, so a cell file edited while the run waited
+cannot lengthen a rollout that is already half spent. Its cell, split, and instruction are
+checked against the digests the manifest recorded before anything spent, and a difference is
+refused by name rather than reconciled. The phases already measured are read back off the run
+directory and published with the new ones, so a continued cell reports the same paired
+before-and-after as one that ran straight through. And the suspension record is spent only once
+the results are written, so a continuation that fails on a missing dataset variable leaves the
+cell exactly as resumable as it found it.
+
+None of the three has a usage-limit exit code. All three need text or event classification,
+and the rules below are what the runner implements.
 
 ## claude_code
 
@@ -69,17 +97,18 @@ than a confusing one in the middle. During development this check earned its pla
 negative control run failed for exactly this reason and would otherwise have looked like a
 credential result.
 
-### Auto-continue and resume
+### Resuming a suspended run
 
 The session id is on the first line of the stream (observed):
 `{"type":"system","subtype":"init","session_id":"...","mcp_servers":[...]}`. The runner pins it
-instead with `--session-id <uuid>` before launch, so a leg that dies immediately is still
-resumable, and resumes with `--resume <uuid>`.
+with `--session-id <uuid>` before launch instead, so a run that dies immediately is still
+resumable, and continues it with `--resume <uuid>`. The id is written into the run's record as
+well as the suspension, since the process that knew it is gone by the time anyone resumes.
 
 Resume has a trap worth stating plainly (docs): `bypassPermissions` is never restored on
 resume, and a session that depended on `--mcp-config`, `--settings`, or `--add-dir` needs them
-passed again. The runner rebuilds the whole argv on every leg, so every flag is always
-re-passed.
+passed again. The runner rebuilds the whole argv every time it launches, so every flag is
+always re-passed.
 
 ### Usage limit versus chosen stop
 
@@ -187,12 +216,14 @@ is skipped with no error, and `-c projects."<path>".trust_level` does not help b
 resolved before `-c` overrides apply. The runner therefore declares MCP inline with `-c` and
 never relies on a project config file.
 
-### Auto-continue
+### Resuming a suspended run
 
-One invocation is one turn. The runner resumes the same thread with
-`codex exec resume <thread-id>`, which takes the subcommand before the flags and accepts
-neither `-s/--sandbox` nor `-C/--cd`. That is why the sandbox is opened with the bypass flag
-rather than `--sandbox`: the bypass flag is accepted by both forms.
+One invocation is one turn, so codex is the harness whose rollout ends earliest on its own,
+and that ending is the finding rather than something to loop around. A run a usage limit
+suspended is continued on the same thread with `codex exec resume <thread-id>`, which takes the
+subcommand before the flags and accepts neither `-s/--sandbox` nor `-C/--cd`. That is why the
+sandbox is opened with the bypass flag rather than `--sandbox`: the bypass flag is accepted by
+both forms.
 
 The thread id is the first event (observed): `{"type":"thread.started","thread_id":"..."}`.
 
@@ -263,7 +294,7 @@ outcome arrived at by default rather than by declaration, so the image declares 
       --autonomous-max-continuations <large>
       --autonomous-max-turns <large>
       --autonomous-max-tokens <large>
-      --autonomous-timeout-ms <past the leg budget>
+      --autonomous-timeout-ms <past the run's own wall clock>
       [--resume <id>] -- <prompt>
       </dev/null
 
@@ -281,12 +312,12 @@ benchmark that is fine, because the scope observes leakage rather than gating it
 ### Autonomy is a budget problem
 
 Autonomous mode starts disabled, and enabling it brings four budgets whose defaults are all far
-below an 8-hour rollout: 3 continuations, 12 turns, 80,000 tokens, and a 30-minute wall
-clock. The
-30-minute default alone would end every leg. The docs are explicit that reaching a limit
-"does not imply task success", so a run that ends at one has been cut off, not finished.
-Recording that as the agent's own stop is exactly the confound the scope forbids, which is why
-the runner raises all of them and classifies a limit that was still reached as a cutoff.
+below an 8-hour rollout: 3 continuations, 12 turns, 80,000 tokens, and a 30-minute wall clock.
+The 30-minute default alone would end every rollout. The docs are explicit that reaching a
+limit "does not imply task success", so a run that ends at one has been cut off rather than
+finished. Recording that as the agent's own stop is exactly the confound the scope forbids,
+which is why the runner raises all of them and classifies a limit that was still reached as a
+cutoff.
 
 Value-taking autonomous flags take a separate argument; `--flag=value` is rejected.
 
