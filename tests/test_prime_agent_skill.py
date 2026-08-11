@@ -7,7 +7,8 @@ the wiring and the skill package is the other half. These prove the vendored ski
 well-formed Python-backed skill, that a prime_agent leg installs it into the isolated HOME with
 the same token variable the settings entry names, and that a locally-served stream exposes the
 tools the skill would drive and hands them back in the shapes SKILL.md tells the model to
-expect.
+expect. A skill that is not installable at all is a launch error here, since the alternative is
+a leg that runs to completion having reached nothing.
 
 The skill's own ``__init__.py`` is the one Python file in this repo written for prime-agent's
 kernel interpreter: it imports ``rlm``, which is not a shobench dependency and is not on PyPI at
@@ -195,3 +196,25 @@ def test_the_control_tools_arrive_parsed_and_a_task_tool_as_a_json_string(tmp_pa
         json.loads(task)  # what the old "every tool returns a JSON string" wording produced
     assert isinstance(ended, str), "a task's tools are text, so the model parses them"
     assert isinstance(json.loads(ended), dict)
+
+
+def test_a_missing_or_partial_skill_fails_the_launch_loudly(tmp_path: Path, monkeypatch) -> None:
+    """The skill is a runtime asset, so its absence is an error and never an empty mapping.
+
+    A leg launched with the settings entry and no skill package starts a healthy prime-agent
+    that can reach nothing, and the record of that run is indistinguishable from an agent that
+    chose to do no work. Partial counts as missing: a directory without the pyproject is a
+    markdown skill, and the model gets a document instead of a client."""
+    from shobench.harnesses import prime_agent
+
+    monkeypatch.setattr(prime_agent, "_vendored_skill_dir", lambda: tmp_path / "not-installed")
+    with pytest.raises(FileNotFoundError, match="reaches no tools"):
+        _launch_spec(tmp_path)
+
+    partial = tmp_path / "partial"
+    (partial / "src" / "shogym_stream").mkdir(parents=True)
+    (partial / "SKILL.md").write_text("---\nname: shogym-stream\n---\n")
+    (partial / "src" / "shogym_stream" / "__init__.py").write_text("")
+    monkeypatch.setattr(prime_agent, "_vendored_skill_dir", lambda: partial)
+    with pytest.raises(FileNotFoundError, match="pyproject.toml"):
+        _launch_spec(tmp_path)

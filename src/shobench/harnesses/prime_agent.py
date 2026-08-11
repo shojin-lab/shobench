@@ -17,6 +17,17 @@ from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
 # `prime_agent/skills/` and installed into the isolated HOME exactly as the settings file is.
 SHOGYM_STREAM_SKILL = "shogym-stream"
 _SKILL_HOME_PREFIX = ".prime/agent/skills"
+# What prime-agent's discovery requires of a Python-backed skill: the frontmatter that makes it
+# loadable at all, the pyproject that makes it Python-backed rather than markdown, and the module
+# the kernel imports, whose name is the skill's with hyphens turned into underscores. A directory
+# missing any one of them is skipped or installed without the client, and either way the leg runs
+# with no reachable tools.
+_SKILL_IMPORT_NAME = SHOGYM_STREAM_SKILL.replace("-", "_")
+_SKILL_REQUIRED_FILES = (
+    "SKILL.md",
+    "pyproject.toml",
+    f"src/{_SKILL_IMPORT_NAME}/__init__.py",
+)
 
 
 def _vendored_skill_dir() -> Path:
@@ -34,6 +45,13 @@ def shogym_stream_skill_files() -> dict[str, str]:
     the runner's own token variable (``bearerTokenEnvVar``), not the quickstart's, so a verbatim
     copy would be wrong here rather than merely drift-prone; the file is a few dozen lines of
     text either way.
+
+    Absent or incomplete, the skill is an error and not an empty mapping. A leg launched with
+    the settings entry alone is the failure this wiring exists to prevent: prime-agent starts,
+    the model has nothing to import, and the run looks like an agent that chose to do nothing
+    rather than a harness that was never connected. The asset is resolved from the checkout, so
+    the way it goes missing is an install that is not one, which must fail here rather than
+    twelve serving hours later.
     """
     root = _vendored_skill_dir()
     files: dict[str, str] = {}
@@ -41,6 +59,13 @@ def shogym_stream_skill_files() -> dict[str, str]:
         rel = path.relative_to(root).as_posix()
         files[f"{_SKILL_HOME_PREFIX}/{SHOGYM_STREAM_SKILL}/{rel}"] = path.read_text(
             encoding="utf-8"
+        )
+    prefix = f"{_SKILL_HOME_PREFIX}/{SHOGYM_STREAM_SKILL}"
+    missing = [name for name in _SKILL_REQUIRED_FILES if f"{prefix}/{name}" not in files]
+    if missing:
+        raise FileNotFoundError(
+            f"the vendored {SHOGYM_STREAM_SKILL} skill at {root} is missing "
+            f"{', '.join(missing)}; a prime_agent leg without it reaches no tools"
         )
     return files
 

@@ -412,7 +412,9 @@ declares an output schema for its own control tools and none for the tools an en
 strings (observed, against a live stream over http with the runtime's own parser). The
 inherited quickstart wording, "every one of them returns a JSON string", would have made the
 first line of the documented loop raise `TypeError`; SKILL.md now documents the split and a
-test pins which side of it each tool falls on.
+test pins which side of it each tool falls on. A missing skill package is likewise a launch
+error rather than an empty mapping, because the alternative is a healthy prime-agent that can
+reach nothing and a record that reads as an agent which chose to do no work.
 
 What that leaves is only the credentialed end-to-end check: prime-agent bootstrapping the
 kernel, installing this package, importing it as `shogym_stream`, and pulling a task. That needs
