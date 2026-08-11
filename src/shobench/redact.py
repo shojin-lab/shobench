@@ -127,10 +127,12 @@ class Redactor:
     """
 
     def __init__(self, values: Iterable[str] = ()) -> None:
+        # The values are kept as well as their forms, so a later one can be folded in without the
+        # caller having to remember what this was built from. They are never read back out.
+        self._values = frozenset(value for value in values if _is_secret_shaped(value))
         needles: set[str] = set()
-        for value in values:
-            if _is_secret_shaped(value):
-                needles.update(_encodings(value))
+        for value in self._values:
+            needles.update(_encodings(value))
         # Longest first, so a form that contains a shorter form is replaced whole rather than
         # left holding a marker in the middle of itself.
         self._needles = sorted(needles, key=len, reverse=True)
@@ -143,6 +145,24 @@ class Redactor:
     def count(self) -> int:
         """How many distinct forms this will replace. Never the forms themselves."""
         return len(self._needles)
+
+    def extended(self, values: Iterable[str]) -> Redactor:
+        """A redactor watching everything this one watches, plus whatever ``values`` names.
+
+        A credential is not a constant for the life of a cell. A file-backed OAuth client
+        refreshes an expired token and writes the new one back over the file the runner seeded,
+        so the value that has to be replaced at the end of a leg is not always the value that
+        existed when the cell started. Both have to be covered: the old one is still in whatever
+        was written before the refresh, and the new one is what everything after it will carry.
+        Extending rather than replacing is what keeps the first of those true.
+
+        A new object rather than a mutation, because a cell's eval phase redacts from several
+        threads at once. Swapping a reference is atomic and every needle either object holds is a
+        needle already in use, so a leg finishing against the older one is redacted by it in full
+        rather than against a list being rebuilt underneath it.
+        """
+        fresh = {value for value in values if _is_secret_shaped(value)} - self._values
+        return self if not fresh else Redactor(self._values | fresh)
 
     def text(self, body: str) -> str:
         for needle in self._needles:

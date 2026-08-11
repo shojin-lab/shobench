@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import shutil
 import urllib.parse
 from pathlib import Path
 
@@ -289,9 +290,215 @@ def test_the_cell_redactor_watches_both_the_environment_and_the_seeded_file(tmp_
         encoding="utf-8",
     )
 
-    redactor = runner._cell_redactor(ctx, spec)
+    runner._watch_cell_credential(ctx, spec)
 
-    assert redactor.text(f"env={TOKEN} file=file-{TOKEN}") == f"env={MARKER} file={MARKER}"
+    assert ctx.redactor.text(f"env={TOKEN} file=file-{TOKEN}") == f"env={MARKER} file={MARKER}"
+    # And it keeps the path, because the file is the harness's to rewrite while the cell runs.
+    assert ctx.credential_home_paths == (spec.seed_to,)
+
+
+# ----- a credential the harness mints after the cell started -----------------------------------
+#
+# The seeded value is not the only value a cell ever holds. Every file-backed OAuth client in v0
+# refreshes an expired token and persists the new one back over the same file: prime-agent does
+# it under a lock in AuthStorage, codex rewrites ~/.codex/auth.json with a new access token and
+# last_refresh, and Claude Code mints its own .credentials.json from the OAuth token it is given.
+# A redactor built once at seeding time cannot match any of those, so what a later shell or
+# config inspection printed used to go through every redaction untouched.
+
+_REFRESHED = "sk-ant-oat01-REFRESHEDbutlongenoughtolookreal-987654321"
+
+
+def _claude_credentials(token: str) -> str:
+    """The shape Claude Code writes into ``~/.claude/.credentials.json``."""
+    return json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": token,
+                "refreshToken": f"refresh-{token}",
+                "expiresAt": 1800000000000,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max",
+            }
+        }
+    )
+
+
+def _agent_that_refreshes_its_token(monkeypatch, home: Path) -> None:
+    """A leg that does what a refresh does: rewrite the auth file, then print what it now holds.
+
+    The two halves are the whole failure. The value is minted after the cell built its redactor,
+    and it reaches the trace the ordinary way, through an agent reading its own configuration.
+    """
+    import subprocess as real_subprocess
+
+    def fake_run(argv, **kwargs):
+        credentials = home / ".claude" / ".credentials.json"
+        credentials.parent.mkdir(parents=True, exist_ok=True)
+        credentials.write_text(_claude_credentials(_REFRESHED), encoding="utf-8")
+        out = kwargs["stdout"]
+        err = kwargs["stderr"]
+        for event in (
+            {"type": "system", "subtype": "init", "session_id": "sess-1"},
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "content": credentials.read_text(encoding="utf-8")}
+                    ],
+                },
+            },
+            {
+                "type": "result",
+                "is_error": False,
+                "subtype": "success",
+                "terminal_reason": "completed",
+                "api_error_status": None,
+                "result": "read my own credentials file",
+                "modelUsage": {"claude-opus-5": {"inputTokens": 10}},
+            },
+        ):
+            out.write(json.dumps(event) + "\n")
+        err.write(f"warning: refreshed the session token to {_REFRESHED}\n")
+        out.flush()
+        err.flush()
+        return real_subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+
+def test_a_token_minted_during_the_leg_is_redacted_like_the_one_the_cell_provisioned(
+    tmp_path, monkeypatch
+) -> None:
+    """The refreshed value is covered, and so is the one the cell started with.
+
+    Both halves matter. The new value is what everything after the refresh carries, and the old
+    one is still in whatever was written before it, so a redactor that swapped rather than grew
+    would trade one leak for another.
+    """
+    ctx = _context(tmp_path, redactor=Redactor())
+    runner._watch_cell_credential(ctx, spec_for("claude_code", "subscription"))
+    watched_before = ctx.redactor.count
+    _agent_that_refreshes_its_token(monkeypatch, ctx.sandbox.home)
+
+    record = _run_one_leg(ctx)
+
+    traces = ctx.run_dir / "rollout" / "traces"
+    stream = (traces / "leg-0000.stream.jsonl").read_text(encoding="utf-8")
+    stderr = (traces / "leg-0000.err.txt").read_text(encoding="utf-8")
+    for body in (stream, stderr, json.dumps(record.verdict.to_json())):
+        assert _REFRESHED not in body
+        assert TOKEN not in body
+    assert MARKER in stream and MARKER in stderr
+    # The provisioned value is still watched for alongside the minted one.
+    assert ctx.redactor.count > watched_before
+    assert ctx.redactor.text(TOKEN) == MARKER
+
+
+def test_a_leg_whose_harness_keeps_no_credential_file_is_left_alone(tmp_path, monkeypatch) -> None:
+    """The sibling assertion: with nothing to re-read, the refreshed value is on disk in full.
+
+    Without it, the test above would pass against a fixture that never produced the leak, and a
+    redaction that quietly stopped extending would look identical to one that worked.
+    """
+    ctx = _context(tmp_path, redactor=Redactor())
+    _agent_that_refreshes_its_token(monkeypatch, ctx.sandbox.home)
+
+    _run_one_leg(ctx)
+
+    stream = (ctx.run_dir / "rollout" / "traces" / "leg-0000.stream.jsonl").read_text()
+    assert _REFRESHED in stream
+
+
+def test_an_eval_task_credential_is_read_before_its_home_is_discarded(
+    tmp_path, monkeypatch
+) -> None:
+    """An eval task runs against a private copy of the HOME that is deleted the moment it ends.
+
+    So a token refreshed inside that copy can be learned then or never, and a redactor that only
+    looked at the cell's own HOME would never see it. The leg is handed the task's home exactly as
+    the eval phase hands it one.
+    """
+    ctx = _context(tmp_path, redactor=Redactor())
+    runner._watch_cell_credential(ctx, spec_for("claude_code", "subscription"))
+    task_home = tmp_path / "eval_before" / "homes" / "task-00007"
+    task_home.mkdir(parents=True)
+    _agent_that_refreshes_its_token(monkeypatch, task_home)
+
+    run_leg(
+        ctx,
+        phase="eval_before",
+        leg=7,
+        system_prompt="SYS",
+        user_prompt="USR",
+        session_id="sess-7",
+        resume=False,
+        timeout_s=60,
+        task_idx=7,
+        consumed_before=0,
+        home=task_home,
+        workdir=tmp_path / "work",
+    )
+    shutil.rmtree(task_home)  # what the phase does the moment the task is done
+
+    trace = ctx.run_dir / "eval_before" / "traces" / "task-00007-leg-0007.stream.jsonl"
+    assert _REFRESHED not in trace.read_text(encoding="utf-8")
+    # And the value is watched from here on, for every artifact the cell has left to publish.
+    assert ctx.redactor.text(_REFRESHED) == MARKER
+
+
+def test_a_token_minted_outside_a_leg_is_covered_before_anything_is_published(
+    tmp_path, monkeypatch
+) -> None:
+    """A refresh does not only happen inside a leg: the model probe authenticates, and so does
+    anything else a harness leaves running. So the credential file is read once more immediately
+    before the manifest and the results are written, and the count the manifest publishes is the
+    one the whole run watched rather than the one it started with."""
+
+    class _Observer:
+        summary: dict = {}
+
+        def stop(self) -> dict:
+            return {}
+
+    ctx = _context(tmp_path, redactor=Redactor())
+    runner._watch_cell_credential(ctx, spec_for("claude_code", "subscription"))
+    manifest = build_manifest(ctx, probes={"version": f"2.1.226 (token {_REFRESHED})"})
+    watched_before = manifest["redaction"]["forms_watched"]
+    # No leg runs here: the file simply holds a value now that it did not hold before.
+    credentials = ctx.sandbox.home / ".claude" / ".credentials.json"
+    credentials.parent.mkdir(parents=True, exist_ok=True)
+    credentials.write_text(_claude_credentials(_REFRESHED), encoding="utf-8")
+
+    results = asyncio.run(
+        runner._run_phases(
+            ctx,
+            manifest=manifest,
+            phases=(),
+            results_dir=tmp_path / "results",
+            observer=_Observer(),
+        )
+    )
+
+    published = (ctx.run_dir / "manifest.json").read_text(encoding="utf-8")
+    assert _REFRESHED not in published and MARKER in published
+    assert _REFRESHED not in results.read_text(encoding="utf-8")
+    assert json.loads(published)["redaction"]["forms_watched"] > watched_before
+
+
+def test_extending_a_redactor_never_forgets_what_it_already_watched() -> None:
+    """The property the cell's growing redactor rests on, at the unit it lives in."""
+    first = Redactor([TOKEN])
+    grown = first.extended([_REFRESHED])
+
+    assert grown.text(f"{TOKEN} {_REFRESHED}") == f"{MARKER} {MARKER}"
+    assert grown.count > first.count
+    # A value it already watches changes nothing, and a value too short to be a secret is refused.
+    assert grown.extended([TOKEN]) is grown
+    assert grown.extended(["oauth"]) is grown
+    # The original is untouched, which is what makes the swap safe while other threads redact.
+    assert first.text(_REFRESHED) == _REFRESHED
 
 
 def test_the_version_probe_is_handed_no_credential(tmp_path, monkeypatch) -> None:

@@ -35,6 +35,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
@@ -60,7 +61,7 @@ from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REPO, SHOGYM_REV
 from shobench.redact import MARKER as redact_marker
-from shobench.redact import Redactor, redactor_for
+from shobench.redact import Redactor, redactor_for, secrets_in_file
 from shobench.results import TaskResult, dispensed_positions, read_phase, write_results
 from shobench.serving import DEFAULT_PORT, SERVER_NAME, build_stream, side_for_phase, warm_env
 from shobench.splits import Split, load_split_by_name
@@ -222,8 +223,38 @@ class RunContext:
     # without unwinding to where they are held, so it is handed a way to do it.
     teardown: Callable[[], None] | None = None
     # The exact credential values this cell provisioned, replaced by a marker in everything
-    # durable this runner writes. Empty is valid and makes every call below a no-op.
+    # durable this runner writes. Empty is valid and makes every call below a no-op. It grows
+    # over the run: see :meth:`watch_credentials`.
     redactor: Redactor = field(default_factory=Redactor)
+    # Where this harness keeps a credential inside a HOME, relative to it. Read from the
+    # credential spec rather than guessed, and read again after every leg, because the file is
+    # the harness's to rewrite.
+    credential_home_paths: tuple[str, ...] = ()
+    # Eval tasks run their legs from several threads at once, and each of them may learn a new
+    # credential value at the same moment. The swap below is what they serialize on.
+    redactor_lock: Any = field(default_factory=threading.Lock, repr=False)
+
+    def watch_credentials(self, home: Path) -> None:
+        """Fold whatever the credential files hold *now* into the redactor, keeping what it had.
+
+        The values a cell provisions are not the only values it ever holds. A file-backed OAuth
+        client refreshes an expired token during a run and persists the new access, refresh, and
+        expiry back to the same auth file, and the pinned prime-agent and codex both do exactly
+        that. A redactor built once at seeding time cannot match what a refresh minted, so an
+        ordinary shell or config inspection later in the run would put a live token through
+        every redaction untouched and into a published artifact.
+
+        Called with the HOME a leg actually ran against, since an eval task's HOME is a private
+        copy that is deleted moments after the leg ends: what it minted can be learned then or
+        never. Nothing here reads a value back out or reports one; only the count changes.
+        """
+        values: set[str] = set()
+        for rel in self.credential_home_paths:
+            values |= secrets_in_file(home / rel)
+        if not values:
+            return
+        with self.redactor_lock:
+            self.redactor = self.redactor.extended(values)
 
     def publish_json(self, path: Path, body: Any) -> Path:
         """Write one of this run's durable JSON artifacts, redacted.
@@ -272,21 +303,22 @@ def _probe(
     image: str,
     sandbox: CellSandbox,
     env: dict[str, str],
-    redactor: Redactor | None = None,
 ) -> str:
-    """Run a short command in the agent image and return its output, for the manifest.
+    """Run a short command in the agent image and return its raw output, for the manifest.
 
     ``env`` is what this particular probe needs and nothing more. A version probe needs no
     credential at all, so it is not given one: a token in a child's environment is a token an
     inherited process can read and a crash report can echo, and the manifest is a published
-    artifact. The output is redacted on the way back for the same reason a trace is.
+    artifact. The output comes back unredacted and stays in memory, because a probe that
+    authenticates can itself refresh a file-backed credential: the caller folds in whatever the
+    file holds afterwards and only then redacts, so a value the probe just minted is covered by
+    the redaction of the probe's own output rather than published in the manifest it feeds.
     """
     args = sandbox.docker_args(env=env, mounts={})
     result = subprocess.run(
         ["docker", *args, image, *argv], capture_output=True, text=True, timeout=180
     )
-    output = (result.stdout + result.stderr).strip()
-    return output if redactor is None else redactor.text(output)
+    return (result.stdout + result.stderr).strip()
 
 
 def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]:
@@ -500,6 +532,13 @@ def run_leg(
             timed_out = True
             returncode = -1
             docker("rm", "-f", container, check=False)
+
+    # What this leg's credential file holds now, before a byte of its output is read. A harness
+    # that refreshes an expired OAuth token writes the new one back over the file in this HOME
+    # while the leg runs, so the value to be replaced below can be one that did not exist when
+    # the cell built its redactor. It is also the last moment an eval task's value can be learned
+    # at all: its HOME is a private copy discarded the moment this returns.
+    ctx.watch_credentials(home)
 
     # The credential values out of the leg's own output, before anything reads it. Order is the
     # whole point: `classify` lifts a 2KB tail of stderr into the verdict, the verdict goes into
@@ -1384,6 +1423,13 @@ async def _run_phases(
         _snapshot_durable_state(ctx, manifest, measured_at="publish")
     else:
         _check_evals_left_the_snapshot_alone(ctx, manifest)
+    # One last read of the live credential file, immediately before anything is published. Every
+    # leg already folded in what it minted, so this covers the rest: a probe, a container this
+    # process did not launch, a refresh that landed after the final leg. The count is republished
+    # with it, because a manifest written before the phases would otherwise report how many forms
+    # were watched at the start rather than how many were watched over the run.
+    ctx.watch_credentials(ctx.sandbox.home)
+    manifest.setdefault("redaction", {})["forms_watched"] = ctx.redactor.count
     manifest["ended_at"] = time.time()
     ctx.publish_json(ctx.run_dir / "manifest.json", manifest)
 
@@ -1472,16 +1518,32 @@ def _place_runner_files(ctx: RunContext) -> list[str]:
     return sorted(placed)
 
 
-def _cell_redactor(ctx: RunContext, spec: CredentialSpec) -> Redactor:
-    """The redactor for this cell: the values it passes as ``-e`` and the file it copied in.
+def _credential_home_paths(spec: CredentialSpec) -> tuple[str, ...]:
+    """Where inside a cell's HOME this harness's credential can live, as the spec declares it.
 
-    Built after the seeding, because the seeded file is half of what it protects. The other half
-    is ``ctx.credentials``, which is the token the harness reads from its environment. Neither
-    is stored anywhere else and neither is ever printed; what is recorded about this, in the
-    manifest, is how many distinct forms are being watched for and not one of them.
+    The file the runner seeded, plus every path the spec already names for the isolation check.
+    Both, because the two are not the same set: a mode whose token arrives in the environment
+    still mints a file of its own from it, and that file is one the harness rewrites.
     """
+    seeded = (spec.seed_to,) if spec.seed_to else ()
+    return tuple(dict.fromkeys([*spec.home_paths, *seeded]))
+
+
+def _watch_cell_credential(ctx: RunContext, spec: CredentialSpec) -> None:
+    """Point this cell's redaction at the credential it provisioned, and at where it can move to.
+
+    Set after the seeding, because the seeded file is half of what is protected. The other half
+    is ``ctx.credentials``, which is the token the harness reads from its environment. Neither is
+    stored anywhere else and neither is ever printed; what is recorded about this, in the
+    manifest, is how many distinct forms are being watched for and not one of them.
+
+    The paths are kept because the file is not a constant: a harness that refreshes an expired
+    OAuth token rewrites it mid-run, and :meth:`RunContext.watch_credentials` re-reads them after
+    every leg and before anything is published so the values a refresh minted are covered too.
+    """
+    ctx.credential_home_paths = _credential_home_paths(spec)
     seeded = (ctx.sandbox.home / spec.seed_to,) if spec.seed_to else ()
-    return redactor_for(environment=ctx.credentials, credential_files=seeded)
+    ctx.redactor = redactor_for(environment=ctx.credentials, credential_files=seeded)
 
 
 async def run_cell(
@@ -1521,29 +1583,25 @@ async def run_cell(
     # excludes credential files, so seeding one changes no record.
     spec = spec_for(cell.harness, cell.credential_mode)
     seeded = seed_home(spec, sandbox.home)
-    ctx.redactor = _cell_redactor(ctx, spec)
+    _watch_cell_credential(ctx, spec)
     observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
     try:
         probes = {
             # No credential: a version probe reports what the image installed, which no harness
             # needs to authenticate to answer. The model probe is the one that does.
-            "version": _probe(
-                ctx.harness.version_probe(),
-                image=agent_image,
-                sandbox=sandbox,
-                env={},
-                redactor=ctx.redactor,
+            "version": ctx.redactor.text(
+                _probe(ctx.harness.version_probe(), image=agent_image, sandbox=sandbox, env={})
             )
         }
         model_probe = ctx.harness.model_probe()
         if model_probe:
-            probes["model"] = _probe(
-                model_probe,
-                image=agent_image,
-                sandbox=sandbox,
-                env=ctx.credentials,
-                redactor=ctx.redactor,
-            )
+            # The first thing in the run that authenticates, so the first thing that can refresh
+            # a file-backed credential. What the file holds after it is folded in before its own
+            # output is redacted, or a token this probe minted would be published in the manifest
+            # the probe feeds.
+            output = _probe(model_probe, image=agent_image, sandbox=sandbox, env=ctx.credentials)
+            ctx.watch_credentials(sandbox.home)
+            probes["model"] = ctx.redactor.text(output)
         # Everything the runner owns goes in before the baseline digest is taken, so what the
         # rollout starts from and what the manifest calls the starting point are the same thing.
         seeds = _place_runner_files(ctx)
@@ -1636,7 +1694,7 @@ async def resume_cell(
     # it, and a continuation writes durable artifacts from its very first line.
     spec = spec_for(cell.harness, cell.credential_mode)
     seed_home(spec, sandbox.home)
-    ctx.redactor = _cell_redactor(ctx, spec)
+    _watch_cell_credential(ctx, spec)
     legs_path = run_dir / "legs.json"
     if legs_path.is_file():
         # The legs the suspended run recorded. This process appends to that record rather than
