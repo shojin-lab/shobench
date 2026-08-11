@@ -6,6 +6,3 @@ Nothing external loops for you - drive yourself:
 2. The task can be completed using the tools listed.
    One of them ends the task; call it before pulling the next.
 3. Continue until the stream is exhausted.
-
-This is a measurement. Do the task as well as you can with what you already have,
-and do not spend effort changing your own setup.
