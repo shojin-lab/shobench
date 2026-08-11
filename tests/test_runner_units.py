@@ -21,11 +21,11 @@ from shobench.config import (
     repo_root,
 )
 from shobench.containers import CellSandbox, home_digest, write_json
-from shobench.harness import StopKind, StopVerdict
+from shobench.harness import LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.report import paired_bootstrap, report_cell
 from shobench.results import TaskResult, eval_summary, pair_evals, write_results
-from shobench.runner import LegRecord, RunContext, build_manifest, is_noise
+from shobench.runner import LegRecord, RunContext, build_manifest, is_noise, write_home_files
 from shobench.serving import side_for_phase, task_indices
 from shobench.splits import load_split_by_name, splits_dir
 
@@ -590,6 +590,36 @@ def test_prime_agent_declares_an_http_server_with_a_bearer_token(tmp_path: Path)
 
 def test_the_repo_root_resolves_from_the_package_not_the_cwd() -> None:
     assert (repo_root() / "pyproject.toml").is_file()
+
+
+def test_a_seeded_home_file_survives_the_next_leg_and_a_per_leg_one_does_not(
+    tmp_path: Path,
+) -> None:
+    """The two HOME channels differ only in what the second leg does to them.
+
+    Per-leg files carry what the runner alone knows and what moves between legs (the stream
+    endpoint is different for every phase and every concurrent eval task), so a leg rewrites
+    them even over an edit. A seed is the agent's from the moment it exists: the rollout is a
+    measurement of what the agent made durable, and the eval-after home is a copy of the one the
+    rollout accumulated, so a leg that restored a seed would erase the improvement it is about
+    to measure."""
+    home = tmp_path / "home"
+    per_leg = {"cfg/endpoint.json": '{"port": 1}'}
+    seed = {"skills/thing/SKILL.md": "vendored"}
+    write_home_files(home, LaunchSpec(argv=[], env={}, home_files=per_leg, home_seed_files=seed))
+    assert (home / "cfg/endpoint.json").read_text() == '{"port": 1}'
+    assert (home / "skills/thing/SKILL.md").read_text() == "vendored"
+
+    # The agent edits both between legs; only one of them is its business.
+    (home / "cfg/endpoint.json").write_text('{"port": 99}')
+    (home / "skills/thing/SKILL.md").write_text("improved by the agent")
+
+    second_leg = {"cfg/endpoint.json": '{"port": 2}'}
+    write_home_files(
+        home, LaunchSpec(argv=[], env={}, home_files=second_leg, home_seed_files=seed)
+    )
+    assert (home / "cfg/endpoint.json").read_text() == '{"port": 2}'
+    assert (home / "skills/thing/SKILL.md").read_text() == "improved by the agent"
 
 
 # ----- resuming the session the harness actually ran under ------------------------------------

@@ -86,8 +86,10 @@ class TemplateHarness(Harness):
         # This is genuinely per-harness; there is no shared body. Handle the three launch modes:
         # fresh, resume with an id, and resume without one (--continue). Put the standing
         # instruction in the harness's system-prompt channel if it has one, else prepend it to
-        # the turn (Codex, PrimeAgent). Use config_files for a read-only config mount and
-        # home_files for config the harness reads only from HOME. Crib the closest of the three.
+        # the turn (Codex, PrimeAgent). Use config_files for a read-only config mount,
+        # home_files for config the harness reads only from HOME and the runner refreshes every
+        # leg, and home_seed_files for a HOME asset the agent is then free to change. Crib the
+        # closest of the three.
         raise NotImplementedError
 
     def session_id_from_trace(self, trace_path: Path) -> str | None:

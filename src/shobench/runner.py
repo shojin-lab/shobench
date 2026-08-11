@@ -45,7 +45,7 @@ from shobench.containers import (
     write_json,
 )
 from shobench.credentials import seed_home, spec_for
-from shobench.harness import Harness, StopKind, StopVerdict
+from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REPO, SHOGYM_REV
 from shobench.results import TaskResult, read_phase, write_results
@@ -239,6 +239,33 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
 # ----- running one harness leg -------------------------------------------------------------
 
 
+def write_home_files(home: Path, spec: LaunchSpec) -> None:
+    """Put a leg's HOME files in place: the per-leg ones always, the seeds only when absent.
+
+    A harness that reads its configuration only from HOME gets it written there once per leg,
+    because the endpoint changes between phases and between concurrent eval tasks and the runner
+    is the only party that knows it. Rewriting also repairs an entry the agent edited, and the
+    home inventory in the manifest still shows that it did.
+
+    Seeds are the opposite and need the opposite rule. They are assets the agent may improve
+    (a skill package is the case that forced this), and the rollout exists to measure exactly
+    such improvements: the eval-after home is a copy of the accumulated rollout home, so a leg
+    that rewrote a seed would restore the vendored bytes over the agent's version in the moment
+    before the session meant to read it starts. Absent means never installed; present means the
+    agent's, whether it wrote those bytes or merely kept them.
+    """
+    for name, body in spec.home_files.items():
+        target = home / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+    for name, body in spec.home_seed_files.items():
+        target = home / name
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+
+
 def run_leg(
     ctx: RunContext,
     *,
@@ -277,13 +304,7 @@ def run_leg(
         target = ctx.cfg_dir / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body, encoding="utf-8")
-    # A harness that reads its configuration only from HOME gets it written there once per
-    # leg. Writing every leg rather than once keeps the endpoint correct if the agent edited
-    # it, and the home inventory in the manifest still shows that it did.
-    for name, body in spec.home_files.items():
-        target = ctx.sandbox.home / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body, encoding="utf-8")
+    write_home_files(ctx.sandbox.home, spec)
 
     env = dict(spec.env)
     env.update(ctx.credentials)

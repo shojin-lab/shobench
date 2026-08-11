@@ -61,11 +61,16 @@ supply it.
 | `model_probe()` | An optional command reporting which model the harness resolved, for the manifest. | optional |
 | `observed_models(...)` | Model identifiers the trace shows actually answered, for the manifest's record of which model answered rather than which was requested. | optional |
 
-Two `LaunchSpec` fields decide where a harness's config lands, and it is a real choice.
+Three `LaunchSpec` fields decide where a harness's config lands, and it is a real choice.
 `config_files` go to a read-only mount outside the agent's working directory, so a harness
 config never becomes part of what the agent thinks of as itself. `home_files` go into the
 cell's isolated HOME, for a harness that reads its config only from there; that is inside what
 the agent can edit, which is the cost of the harness having no config flag, and the manifest's
-home inventory records them so a later edit by the agent stays visible. `stdin` defaults to
+home inventory records them so a later edit by the agent stays visible. Every leg rewrites
+them, so what belongs there is what only the runner knows and what moves between legs, the
+stream endpoint being the example. `home_seed_files` land in the same HOME but are written only
+when absent, an initial condition the agent then owns: an asset the agent may improve belongs
+there, because a rewrite would restore the shipped bytes over the agent's version in the gap
+between the rollout and the evaluation that exists to read it. `stdin` defaults to
 `/dev/null`, which is what every v0 harness needs; set it only for a harness that reads its
 prompt from stdin.

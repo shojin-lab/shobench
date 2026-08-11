@@ -72,8 +72,16 @@ class LaunchSpec:
     # Files the runner writes into the cell's isolated HOME, for harnesses that read their
     # configuration only from there. These land inside what the agent can edit, which is the
     # cost of the harness having no config flag; the manifest's home inventory records them so
-    # a later edit by the agent is still visible as a change.
+    # a later edit by the agent is still visible as a change. Every leg rewrites them, so what
+    # belongs here is what only the runner can know and what changes between legs, an endpoint
+    # being the example.
     home_files: dict[str, str] = field(default_factory=dict)
+    # HOME files the runner creates when they are absent and never rewrites afterwards. These
+    # are an initial condition rather than a per-leg setting: what the agent starts with, and
+    # then owns. A harness asset the agent is free to edit belongs here, because the rollout
+    # measures what the agent made durable, and a later leg that restored the original bytes
+    # would erase exactly that between the rollout and the evaluation meant to read it.
+    home_seed_files: dict[str, str] = field(default_factory=dict)
     # Harnesses that hang on an open stdin get /dev/null; ones that read the prompt from stdin
     # get it here.
     stdin: str | None = None
