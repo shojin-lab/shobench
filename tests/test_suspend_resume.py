@@ -493,6 +493,31 @@ def _suspended_run(
     manifest = build_manifest(ctx, probes={"version": "test"})
     runner.write_json(run_dir / "manifest.json", manifest)
 
+    # The four dispenses the first process durably wrote before the window closed, one per queue
+    # position it reached. The published dispense count is read back from these records rather
+    # than summed off a counter (see `dispensed_positions`), so the fake continuation needs a real
+    # dispenses file to count even though its stand-in stream hands out nothing more. Distinct
+    # positions, because the count is of positions and a resumed run's whole hazard is a position
+    # that appears twice.
+    rollout_dir = run_dir / "rollout"
+    rollout_dir.mkdir(parents=True)
+    dispenses = [
+        {
+            "lease": f"lease-{position}",
+            "seq": position + 1,
+            "position": position,
+            "env": cell.env,
+            "task_idx": position,
+            "dispensed_at": 1.0,
+            "feedback_regime": "never",
+            "extensions": {},
+        }
+        for position in range(4)
+    ]
+    (rollout_dir / "dispenses.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in dispenses), encoding="utf-8"
+    )
+
     # Two tasks, in the per-task layout run_eval_phase writes: the continuation has to gather
     # rows across the task-<id>/ subdirectories, not from one flat directory the runner never
     # produces. More than one so the gathering is exercised rather than an accident of a single
@@ -621,6 +646,10 @@ def test_a_continuation_publishes_the_measurement_the_first_process_took(
         "user_prompt": instruction.continuation,
     }
     assert instruction.continuation != instruction.kickoff, "the two cues must be distinct"
+    # The published count is the distinct positions in the record's real dispenses file, which is
+    # the four the first process wrote. That the overcount a resume introduces is collapsed away
+    # is the real-stream test's job below; this one only pins that the count is read from the
+    # record rather than from a counter the stand-in stream cannot move.
     assert published["rollout"]["stopping"]["tasks_dispensed"] == 4
     assert published["manifest"]["resumptions"][0]["session_id"] == "sess-1"
     # The record was this run's retry handle, and the continuation owns the ending now.
@@ -672,3 +701,198 @@ def test_a_continuation_refuses_an_experiment_that_changed_under_it(
     with pytest.raises(RuntimeError, match="no longer matches"):
         asyncio.run(resume_cell(run_dir, results_dir=tmp_path / "results", capture_egress=False))
     assert (run_dir / SUSPENSION_FILE).is_file()
+
+
+# ----- resume against a REAL TaskStream, the boundary the stand-in cannot reach ---------------
+#
+# The stand-in stream above has no live registry and no leases, so it cannot show either way a
+# resumed rollout differs from an uninterrupted one: the interrupted task's lease going dead when
+# the stream reopens, and the replayed position landing twice in the record. Both are properties
+# of pinned shogym, so these drive the real thing. Every v0 cell serves max_in_flight 8, so the
+# stream is lease-wrapped and this is the path they take, not a hypothetical one. No Docker: the
+# stream and its record are the real code, and the harness leg is stood in for by pulling and
+# terminating tasks directly, which is all the leg's process does over MCP anyway.
+
+# A child that leaves a real max_in_flight-8 rollout stream the way a suspension leaves it: one
+# task pulled, its lease written out, and a hard exit with no unwinding so the position stays
+# row-less. Never() because the rollout serves under that regime, and a resume refuses a
+# directory recorded under any other.
+_ABANDON_A_TASK = """
+import asyncio, os, sys
+from pathlib import Path
+import shogym
+from shogym.serve import Never, TaskRef, TaskStream
+
+async def main():
+    prov = Path(sys.argv[1])
+    stream = TaskStream(
+        shogym.make,
+        [TaskRef("wordle_v1", 0), TaskRef("wordle_v1", 1)],
+        prov_dir=prov,
+        feedback=Never(),
+        max_in_flight=8,
+    )
+    async with stream:
+        task = await stream.get_task()
+        (prov / "OLD_LEASE").write_text(task.lease)
+        sys.stdout.flush()
+        os._exit({code})
+
+asyncio.run(main())
+"""
+
+
+def _abandon_a_task(prov: Path) -> str:
+    """Run the child and return the lease it was holding when it was cut off."""
+    program = _ABANDON_A_TASK.format(code=SUSPENDED_EXIT_CODE)
+    ended = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(program), str(prov)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert ended.returncode == SUSPENDED_EXIT_CODE, ended.stderr[-2000:]
+    assert _rows(prov) == [], "the interrupted position must reach no result row"
+    return (prov / "OLD_LEASE").read_text().strip()
+
+
+def _answer(result: object) -> str:
+    """The text an env/stream tool result carries, however the transport wrapped it."""
+    parts = getattr(result, "content", None) or []
+    return "".join(getattr(part, "text", "") for part in parts) or str(result)
+
+
+async def _resume_and_drain(prov: Path, old_lease: str) -> dict:
+    """Reopen the abandoned record with resume=True and drive it to the end by re-pulling.
+
+    This is what a resumed harness session has to do once its old lease is refused: pull the next
+    task rather than retry the one it was holding. It records the facts each finding asserts on.
+    """
+    import shogym
+    from shogym.serve import Never, TaskRef, TaskStream
+
+    stream = TaskStream(
+        shogym.make,
+        [TaskRef("wordle_v1", 0), TaskRef("wordle_v1", 1)],
+        prov_dir=prov,
+        feedback=Never(),
+        max_in_flight=8,
+        resume=True,
+    )
+    facts: dict = {}
+    async with stream:
+        facts["remaining_on_open"] = stream.queue_info().remaining
+        # The stale lease from before the suspension: the reopened stream has an empty live
+        # registry, so it denotes no episode and cannot continue the interrupted task.
+        facts["stale_lease_answer"] = _answer(
+            await stream.dispatch("terminate", {}, lease=old_lease)
+        )
+        pulled: list[str] = []
+        while (task := await stream.get_task()) is not None:
+            pulled.append(task.lease)
+            await stream.dispatch("terminate", {}, lease=task.lease)
+        facts["pulled_leases"] = pulled
+        facts["remaining_after"] = stream.queue_info().remaining
+    return facts
+
+
+async def _play_two_tasks(prov: Path) -> None:
+    """An uninterrupted two-position rollout, played straight through, for the baseline."""
+    import shogym
+    from shogym.serve import Never, TaskRef, TaskStream
+
+    stream = TaskStream(
+        shogym.make,
+        [TaskRef("wordle_v1", 0), TaskRef("wordle_v1", 1)],
+        prov_dir=prov,
+        feedback=Never(),
+        max_in_flight=8,
+    )
+    async with stream:
+        while (task := await stream.get_task()) is not None:
+            await stream.dispatch("terminate", {}, lease=task.lease)
+
+
+def test_a_resumed_stream_recovers_the_interrupted_position_by_re_pulling(tmp_path: Path) -> None:
+    """The interrupted task is abandoned and replayed, and re-pulling is what recovers it.
+
+    Pinned shogym reopens with an empty live registry, so the lease the suspended session was
+    holding denotes nothing: at max_in_flight above 1 (every v0 cell) its next call under that
+    lease is refused as ``unknown_lease``, and the runner cannot make a tool call to re-attach it.
+    What recovers the position is the resumed session pulling again: shogym re-offers the row-less
+    position on the next ``get_task`` under a fresh lease, and once both positions play the queue
+    is exhausted, so nothing is lost or left stalled. The continuation cue is the runner's only
+    lever on a real agent, so it must tell it to do exactly this rather than retry a dead handle.
+    """
+    prov = tmp_path / "rollout"
+    prov.mkdir()
+    old_lease = _abandon_a_task(prov)
+
+    facts = asyncio.run(_resume_and_drain(prov, old_lease))
+
+    # The interrupted position is still to serve when the stream reopens, and so is the whole
+    # two-position pool: the suspension left it row-less on purpose.
+    assert facts["remaining_on_open"] == 2
+    # The old lease is dead here, so continuing the in-flight task through it is impossible.
+    assert "unknown_lease" in facts["stale_lease_answer"]
+    # Re-pulling recovers the position under a new lease, never the old one, and both positions
+    # play out to an exhausted queue: the resume mechanism loses no task and stalls on none.
+    assert old_lease not in facts["pulled_leases"]
+    assert len(facts["pulled_leases"]) == 2
+    assert facts["remaining_after"] == 0
+
+    # The cue must carry the instruction that makes a real agent re-pull rather than retry its
+    # dead lease; a bare "Continue." would leave it acting on the interrupted task.
+    instruction = load_instruction("get-better")
+    assert "get_task" in instruction.continuation
+    assert instruction.continuation != instruction.kickoff, "the two cues must be distinct"
+
+
+def test_a_resumed_cell_publishes_the_uninterrupted_counts(tmp_path: Path) -> None:
+    """A resumed two-position pool publishes the counts an uninterrupted one does.
+
+    The replay leaves the record holding both the abandoned dispense (kept as a ``broker_abort``
+    for audit) and the replay's real closure for one position, so the raw rows outnumber the
+    positions. The published counts collapse that chain by position, and the dispensed total is
+    the distinct positions rather than each process's counter summed, so the resumed run reports
+    the two an uninterrupted run reports instead of three.
+    """
+    from shobench.results import (
+        collapse_replays,
+        dispensed_positions,
+        read_phase,
+        rollout_summary,
+    )
+
+    baseline = tmp_path / "uninterrupted"
+    baseline.mkdir()
+    asyncio.run(_play_two_tasks(baseline))
+    base_summary = rollout_summary(read_phase(baseline))
+    assert base_summary["tasks_attempted"] == 2
+    assert dispensed_positions(baseline) == 2
+
+    resumed = tmp_path / "resumed"
+    resumed.mkdir()
+    old_lease = _abandon_a_task(resumed)
+    asyncio.run(_resume_and_drain(resumed, old_lease))
+    rows = read_phase(resumed)
+
+    # The abandoned dispense survives in the raw record for audit: three rows for two positions,
+    # one position carrying both its abandonment and the replay that superseded it.
+    assert [r.closure for r in rows] == ["broker_abort", "aborted", "aborted"]
+    assert sorted(r.position for r in rows) == [0, 0, 1]
+    assert len(collapse_replays(rows)) == 2
+
+    # Collapsed, the resumed run matches the uninterrupted one exactly: one attempt per position,
+    # both scored, no broker_abort in the tally, and the same distinct-position dispense total.
+    summary = rollout_summary(rows)
+    assert summary["tasks_attempted"] == base_summary["tasks_attempted"] == 2
+    assert summary["tasks_scored"] == base_summary["tasks_scored"] == 2
+    assert "broker_abort" not in summary["closures"]
+    assert summary["closures"] == base_summary["closures"]
+    assert dispensed_positions(resumed) == 2
+
+    # Mutation guard: the pre-fix shaping counted rows and summed counters, both of which are
+    # three for this record. That the raw rows outnumber the collapsed count is the overcount.
+    assert len(rows) == 3
+    assert len(rows) != summary["tasks_attempted"]

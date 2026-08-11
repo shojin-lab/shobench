@@ -57,7 +57,7 @@ from shobench.credentials import seed_home, spec_for
 from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REPO, SHOGYM_REV
-from shobench.results import TaskResult, read_phase, write_results
+from shobench.results import TaskResult, dispensed_positions, read_phase, write_results
 from shobench.serving import DEFAULT_PORT, SERVER_NAME, build_stream, side_for_phase
 from shobench.splits import Split, load_split_by_name
 
@@ -758,10 +758,23 @@ async def run_rollout_phase(
     # point a stream at a directory holding rows, and it is what replays the position the
     # suspended run held: resume walks queue positions with no result row, and the suspension
     # left the in-flight one row-less on purpose.
+    #
+    # The resume semantics, stated plainly, because the continuation cue is written to them and
+    # the result shaping below depends on them. Pinned shogym reopens with an EMPTY live registry
+    # and empty settled-lease set, so the old lease the resumed harness session still holds for
+    # its interrupted task denotes nothing here: its next task-tool call under that lease is
+    # refused as `unknown_lease`, and above max_in_flight 1 (every v0 cell) there is no other
+    # routing to fall back on. The runner cannot make the agent's tool calls, so nothing here can
+    # re-mint or re-attach that lease. The honest model is therefore that the in-flight task is
+    # abandoned and replayed as a fresh dispense: shogym re-offers the row-less position on the
+    # next `get_task`, minting a new lease, and the continuation cue is what drives the resumed
+    # session to pull it instead of retrying its dead one, so no position is lost or stalled. The
+    # abandoned dispense stays in the record as a `broker_abort`, which the result shaping below
+    # collapses by position (see `dispensed_positions` and `collapse_replays`) so a resumed cell
+    # publishes the one attempt per position an uninterrupted run does.
     stream = build_stream(ctx.cell, ctx.split, "rollout", prov_dir, resume=resuming)
     queued = suspended.pool_queued if resuming else stream.queue_info().remaining
     spent_before = suspended.elapsed_rollout_s if resuming else 0.0
-    dispensed_before = suspended.tasks_dispensed if resuming else 0
     # A continuation's clock comes off the record, which carries the budget the interrupted
     # rollout was given. Subtracting from today's cell file instead would let a budget edited
     # while the run waited change the length of a rollout that is already half spent.
@@ -805,7 +818,12 @@ async def run_rollout_phase(
                 record=record,
                 session_id=stopping["session_id"],
                 elapsed_rollout_s=spent_before + (record.ended_at - record.started_at),
-                tasks_dispensed=dispensed_before + info.consumed,
+                # Distinct positions dispensed across the whole record, not this process's share
+                # plus the suspension's counter: the position this suspension is abandoning may be
+                # a replay of one an earlier suspension already counted, and adding the counters
+                # would count it twice. The in-flight dispense is durable before the task is
+                # handed out, so it is already on disk and in this count.
+                tasks_dispensed=dispensed_positions(prov_dir),
                 pool_queued=queued,
                 rollout_wall_clock_s=clock_s,
             )
@@ -819,10 +837,13 @@ async def run_rollout_phase(
         else:
             stopping["stop_reason"] = "harness_error"
         stopping["stop_evidence"] = record.verdict.to_json()
-        # Dispensed counts the whole rollout, not this process's share of it: a resumed stream
-        # numbers its own dispenses from zero while the record it continues already holds the
-        # earlier ones.
-        stopping["tasks_dispensed"] = dispensed_before + info.consumed
+        # Dispensed counts distinct queue positions across the whole rollout, not this process's
+        # share of it. A resumed stream numbers its own dispenses from zero while the record it
+        # continues already holds the earlier ones, and it redispenses the position the suspension
+        # abandoned, so summing each process's counter would count that position twice (the exact
+        # overcount a two-position pool published as three). Counting distinct positions makes a
+        # resumed run report the total an uninterrupted one does.
+        stopping["tasks_dispensed"] = dispensed_positions(prov_dir)
         stopping["tasks_remaining_in_pool"] = info.remaining
         stopping["pool_queued"] = queued
         stopping["rollout_wall_clock_s"] = round(
