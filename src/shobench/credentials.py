@@ -388,13 +388,70 @@ class IsolationVerdict:
 # A probe short enough to cost almost nothing and specific enough that a wrong answer is
 # obvious. It exercises the credential and nothing else: no MCP server, no tools.
 #
-# The expected reply must never appear in the prompt. A harness can echo its input into its
-# own output stream and still exit 0 on an authentication failure (prime-agent does both), and
-# an echo-derivable expectation would let that failed run pass the negative control, which
-# reads as a broken HOME isolation. So the probe asks for an answer only a live model
-# produces: the sum below never appears as a digit string in the prompt.
+# Two defences keep a failed run from reading as an authenticated one, and both are needed.
+# The expectation never appears in the prompt, because a harness can echo its input into its
+# own output stream and still exit 0 on an authentication failure (prime-agent does both).
+# And the expectation is matched only against the model's own answer text, extracted from the
+# harness's structured stream by ``_probe_answer``, because the surrounding stream carries
+# incidental numerics (prime-agent stamps millisecond timestamps on every message, and every
+# epoch millisecond in a three-hour window of late 2026 begins with this sum's digits).
 PROBE_PROMPT = "Add 179312 and 41, then reply with only the digits of the sum."
 PROBE_EXPECT = "179353"
+
+
+def _probe_answer(harness: str, stdout: str) -> str:
+    """The model's own words in the probe output, and nothing else.
+
+    Each harness's stream wraps the answer differently, and everything outside the answer
+    (event metadata, tool results, echoed input, timestamps) is exactly what the probe must
+    not match against. An output this cannot parse yields no answer, so an unrecognized
+    stream fails the probe rather than passing it.
+    """
+    texts: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if harness == "claude_code":
+            # `claude -p --output-format json`: one terminal object whose `result` is the text.
+            if event.get("type") == "result":
+                texts.append(str(event.get("result") or ""))
+        elif harness == "codex":
+            # `codex exec --json`: item.completed events, the answer is an agent_message item.
+            item = event.get("item")
+            if (
+                event.get("type") == "item.completed"
+                and isinstance(item, dict)
+                and item.get("type") == "agent_message"
+            ):
+                texts.append(str(item.get("text") or ""))
+        elif harness == "prime_agent":
+            # `prime-agent -p --mode json`: assistant text parts inside message_end, with
+            # agent_end's message list as the shape that survives a cut stream. The same dual
+            # read the harness uses for observed_models.
+            messages = (
+                event.get("messages")
+                if event.get("type") == "agent_end"
+                else [event.get("message")]
+                if event.get("type") == "message_end"
+                else []
+            )
+            for message in messages or ():
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    texts.append(content)
+                for part in content if isinstance(content, list) else ():
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        texts.append(str(part.get("text") or ""))
+    return "\n".join(texts)
 
 
 def _probe_argv(harness: str, model: str) -> list[str]:
@@ -461,7 +518,7 @@ def run_probe(
         argv, capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL
     )
     combined = f"{result.stdout}\n{result.stderr}"
-    succeeded = result.returncode == 0 and PROBE_EXPECT in combined
+    succeeded = result.returncode == 0 and PROBE_EXPECT in _probe_answer(harness, result.stdout)
     # The detail is the tail of the output, which is where an auth failure names itself. The
     # probe echoes a fixed string rather than its environment, so a credential should never
     # reach it, but this detail is written to a durable verdict file and a harness that dumps

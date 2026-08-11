@@ -194,49 +194,121 @@ def test_the_probe_expectation_is_not_derivable_from_the_prompt() -> None:
     assert credentials.PROBE_EXPECT not in credentials.PROBE_PROMPT
 
 
-def test_a_probe_that_only_echoes_the_prompt_is_not_a_success(monkeypatch) -> None:
-    """Exit 0 plus a prompt echo, which is exactly what a failed prime-agent run emits."""
+def _run_probe_with(monkeypatch, harness: str, stdout: str, returncode: int = 0):
+    class _Result:
+        pass
 
-    class _Echo:
-        returncode = 0
-        stdout = "\n".join(
-            [
-                json.dumps({"type": "message", "content": credentials.PROBE_PROMPT}),
-                json.dumps({"type": "auto_retry_end", "success": False}),
-            ]
-        )
-        stderr = ""
-
-    monkeypatch.setattr(credentials.subprocess, "run", lambda *a, **k: _Echo())
-
-    probe = credentials.run_probe(
-        harness="prime_agent",
+    _Result.returncode = returncode
+    _Result.stdout = stdout
+    _Result.stderr = ""
+    monkeypatch.setattr(credentials.subprocess, "run", lambda *a, **k: _Result())
+    return credentials.run_probe(
+        harness=harness,
         model="claude-opus-5",
         docker_args=["run", "--rm"],
         image="img",
         env={},
     )
+
+
+def test_a_prime_401_stream_with_echo_and_timestamps_is_not_a_success(monkeypatch) -> None:
+    """The two ways a failed exit-0 prime-agent run can carry the expectation anyway.
+
+    The user message echoes the prompt, and every message is stamped with an epoch-millisecond
+    timestamp. In a three-hour window of late 2026 those timestamps begin with the probe sum's
+    digits, so a match against anything but the assistant's own words would deterministically
+    pass the negative control and block a good cell.
+    """
+    stream = "\n".join(
+        [
+            json.dumps({"type": "session", "id": "s", "timestamp": 1793530000000}),
+            json.dumps(
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": credentials.PROBE_PROMPT}],
+                        "timestamp": 1793530000000,
+                    },
+                }
+            ),
+            json.dumps({"type": "auto_retry_end", "success": False, "attempt": 1}),
+        ]
+    )
+
+    probe = _run_probe_with(monkeypatch, "prime_agent", stream)
 
     assert probe.returncode == 0
     assert not probe.succeeded
 
 
-def test_a_probe_that_answers_is_a_success(monkeypatch) -> None:
-    """The same plumbing recognizes a live model's answer, so the fix cannot overshoot."""
-
-    class _Answer:
-        returncode = 0
-        stdout = json.dumps({"type": "message", "content": credentials.PROBE_EXPECT})
-        stderr = ""
-
-    monkeypatch.setattr(credentials.subprocess, "run", lambda *a, **k: _Answer())
-
-    probe = credentials.run_probe(
-        harness="prime_agent",
-        model="claude-opus-5",
-        docker_args=["run", "--rm"],
-        image="img",
-        env={},
+def test_a_prime_assistant_answer_is_a_success(monkeypatch) -> None:
+    """The real shape a live prime-agent run emits, so the fix cannot overshoot."""
+    stream = json.dumps(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": credentials.PROBE_EXPECT}],
+                "timestamp": 1754955000000,
+            },
+        }
     )
 
-    assert probe.succeeded
+    assert _run_probe_with(monkeypatch, "prime_agent", stream).succeeded
+
+
+def test_a_prime_answer_surviving_only_in_agent_end_is_a_success(monkeypatch) -> None:
+    """A cut stream keeps its messages only in the terminal agent_end event."""
+    stream = json.dumps(
+        {
+            "type": "agent_end",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": credentials.PROBE_PROMPT}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": credentials.PROBE_EXPECT}],
+                },
+            ],
+        }
+    )
+
+    assert _run_probe_with(monkeypatch, "prime_agent", stream).succeeded
+
+
+def test_a_codex_answer_counts_only_from_its_agent_message(monkeypatch) -> None:
+    """The expectation in a tool result or metadata is not the model answering."""
+    answer = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": credentials.PROBE_EXPECT},
+        }
+    )
+    noise = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": f"t-{credentials.PROBE_EXPECT}"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "mcp_tool_call", "result": credentials.PROBE_EXPECT},
+                }
+            ),
+        ]
+    )
+
+    assert _run_probe_with(monkeypatch, "codex", answer).succeeded
+    assert not _run_probe_with(monkeypatch, "codex", noise).succeeded
+
+
+def test_a_claude_answer_counts_only_from_its_result_text(monkeypatch) -> None:
+    """Same scope rule for claude: the result field is the answer, other fields are not."""
+    answer = json.dumps({"type": "result", "result": credentials.PROBE_EXPECT})
+    noise = json.dumps({"type": "system", "session_id": credentials.PROBE_EXPECT})
+
+    assert _run_probe_with(monkeypatch, "claude_code", answer).succeeded
+    assert not _run_probe_with(monkeypatch, "claude_code", noise).succeeded
+
+
+def test_an_unparseable_probe_output_fails_closed(monkeypatch) -> None:
+    """A stream shape this code does not recognize blocks the cell rather than passing it."""
+    assert not _run_probe_with(monkeypatch, "prime_agent", "plain text, no json events").succeeded
