@@ -59,6 +59,17 @@ def _cmd_cells(args: argparse.Namespace) -> int:
     return 0
 
 
+def _credential_status(spec: credentials.CredentialSpec) -> dict[str, object]:
+    """Whether one file-based credential is usable on this host, named but never valued."""
+    available, why_not = credentials.credential_available(spec)
+    return {
+        "path": spec.seed_from,
+        "available": available,
+        "blocked_by": why_not,
+        "hint": "" if available else spec.pending_hint,
+    }
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     import shutil
 
@@ -67,7 +78,15 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         "docker_available": daemon_available(),
         "docker_cli": bool(shutil.which("docker")),
         "credentials": credentials.inventory(dict(os.environ)),
-        "pending_legs": {"/".join(k): v for k, v in credentials.PENDING_LEGS.items()},
+        # Whether a file-based credential is on this host is read from the host every time this
+        # runs, rather than from a note. A mode that needed a login last week does not need one
+        # after the login, and a doctor that says otherwise is how a cell stays unrunnable.
+        "file_credentials": {
+            f"{spec.harness}/{spec.mode}": _credential_status(spec)
+            for spec in credentials.SPECS.values()
+            if spec.seed_from
+        },
+        "open_questions": {"/".join(k): v for k, v in credentials.OPEN_QUESTIONS.items()},
     }
     try:
         import shogym
