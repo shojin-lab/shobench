@@ -3,11 +3,17 @@
 shogym provisions the tau2 *source* at runtime but deliberately does not carry the ~730 MB of
 benchmark ``data/``. The three tau2_telecom cells need it, so this fetches exactly that subtree,
 once, into ``<SHOGYM_CACHE or ~/.cache/shogym>/tau2-data/<sha>/data`` -- the path the runner
-points ``TAU2_DATA_DIR`` at. It is idempotent: a complete tree is verified and skipped.
+points ``TAU2_DATA_DIR`` at. It is idempotent: a tree that already is the pinned data is verified
+and skipped.
 
     uv run python tools/provision_tau2_data.py            # fetch if missing, else verify
-    uv run python tools/provision_tau2_data.py --force    # re-fetch even if present
+    uv run python tools/provision_tau2_data.py --force    # re-fetch and replace what is there
     uv run python tools/provision_tau2_data.py --check     # verify only, never fetch
+
+Verification is against a committed manifest of the pinned commit's sizes and sha256s, so it
+answers "is this that commit's data", not merely "are some files here". A tree that fails it is
+named file by file, which is what makes ``--force`` the repair: it replaces the tree it fetched
+over.
 
 The runner names this command when a tau2 cell is asked to run without the data present.
 """
@@ -25,9 +31,11 @@ from shobench import tau2_data  # noqa: E402
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--force", action="store_true", help="re-fetch even if already present")
     parser.add_argument(
-        "--check", action="store_true", help="verify the data is complete; never fetch"
+        "--force", action="store_true", help="re-fetch and replace the tree that is there"
+    )
+    parser.add_argument(
+        "--check", action="store_true", help="verify the data is the pinned tree; never fetch"
     )
     args = parser.parse_args(argv)
 
@@ -36,10 +44,14 @@ def main(argv: list[str] | None = None) -> int:
         try:
             tau2_data.verify(data_dir)
         except tau2_data.Tau2DataError as exc:
-            print(f"MISSING: {exc}", file=sys.stderr)
-            print(f"provision it with: {tau2_data.PROVISION_COMMAND}", file=sys.stderr)
+            print(f"UNUSABLE: {exc}", file=sys.stderr)
+            print(
+                f"provision it with: {tau2_data.PROVISION_COMMAND}"
+                " (add --force to replace a tree that is already there)",
+                file=sys.stderr,
+            )
             return 1
-        print(f"complete: {data_dir}")
+        print(f"verified against upstream {tau2_data.UPSTREAM_SHA}: {data_dir}")
         return 0
 
     data_dir = tau2_data.provision(force=args.force)

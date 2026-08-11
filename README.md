@@ -50,9 +50,14 @@ dataset, no judge key, and no broker credential.
 | hle | the gated `cais/hle` dataset, so `HF_TOKEN` unless it is already cached, and `OPENAI_API_KEY` for the judge |
 
 shogym provisions each env's upstream *source* at runtime but does not carry tau2's ~730 MB of
-`data/`, so that one subtree is provisioned separately by the command above (idempotent; a
-complete tree is verified and skipped). The runner sets `TAU2_DATA_DIR` itself and refuses a
-tau2 cell whose data is absent, naming the command. `HF_TOKEN` is not blocking today: the
+`data/`, so that one subtree is provisioned separately by the command above (idempotent: a tree
+that already is the pinned data is verified and skipped, and `--force` re-fetches and replaces
+what is there). What "is the pinned data" means is settled by a committed digest manifest, not by
+a file list: every file a tau2_telecom run reads has to match the size and sha256 the pinned
+commit has, so a stale checkout handed in through `TAU2_DATA_DIR`, or an edited policy or DB, is
+refused by name instead of quietly moving the numbers. The runner sets `TAU2_DATA_DIR` itself and
+refuses a tau2 cell whose data is not that tree, naming the command. `HF_TOKEN` is not blocking
+today: the
 `cais/hle` dataset is already cached on the run host, so the gate passes without a fresh token;
 it is only needed on a cold cache.
 

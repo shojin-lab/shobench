@@ -8,14 +8,20 @@ runner points ``TAU2_DATA_DIR`` at.
 
 The data is ~730 MB, so it is provisioned rather than committed. It is fetched from the same
 SHA-pinned GitHub archive the source comes from, so the data's identity is the same pin as the
-source (a test asserts the two shas agree). The provisioning is idempotent: a complete tree is
-recognized and skipped; a partial one is not trusted, because completeness is decided by the
-files a tau2_telecom construction actually reads, checked present and non-empty, and the
-published tree is renamed into place atomically after that check passes.
+source (a test asserts the two shas agree). The provisioning is idempotent: a tree that already
+is the pinned data is recognized and skipped, and a freshly fetched one is renamed into place
+only after it validates, so an interrupted fetch leaves nothing that would be accepted.
+
+What "is the pinned data" means is a byte question, not a structural one, so a committed manifest
+of sizes and sha256s answers it. Existence and non-emptiness would accept an older checkout handed
+in through ``TAU2_DATA_DIR``, or a tree whose policy or DB was edited, and either changes what the
+benchmark measures while every gate still reports green. Digests of the pinned commit's own bytes
+cannot be talked into that: a tree either is that commit's data or it is refused by name.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -23,6 +29,7 @@ import tarfile
 import tempfile
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 # The pinned upstream commit whose data these cells use. This is the full sha; a test asserts it
 # equals shogym's own tau2 source pin (``shogym.envs.tau2.adapter.UPSTREAM_SHA``) and begins with
@@ -35,21 +42,27 @@ _TARBALL_URL = f"https://github.com/sierra-research/tau2-bench/archive/{UPSTREAM
 # resolves its tasks from this tree, so the gate is by prefix rather than by an explicit list.
 _TAU2_PREFIX = "tau2"
 
-# The files a tau2_telecom env reads at construction time (task ids come out of these). If any is
-# absent or empty the tree is a partial fetch, not a usable one. Relative to the ``data/`` dir
-# ``TAU2_DATA_DIR`` names; upstream reads ``DATA_DIR / "tau2" / "domains" / <domain>`` from there.
-_REQUIRED_FILES = (
-    "tau2/domains/telecom/tasks.json",
-    "tau2/domains/telecom/split_tasks.json",
-    "tau2/domains/telecom/db.toml",
-    "tau2/domains/telecom/user_db.toml",
-    "tau2/domains/telecom/main_policy.md",
-)
+# The manifest: every file the pinned tau2_telecom runtime reads, with the size and sha256 of the
+# pinned commit's bytes. It is committed data and it is both halves of the gate at once. The file
+# list says what has to exist, and it was traced rather than guessed (every ``open`` under
+# ``TAU2_DATA_DIR`` recorded across env construction, session start, and a user turn), which is
+# why it carries the tech support manual the env reads unconditionally and the guidelines the user
+# simulator reads when it builds its system prompt, and carries no voice or other-domain bulk. The
+# digests say what those files have to *be*. Paths are relative to the ``data/`` dir
+# ``TAU2_DATA_DIR`` names; upstream reads ``DATA_DIR / "tau2" / ...`` from there.
+#
+# The digests come from the pinned commit itself, each file fetched from upstream at
+# ``UPSTREAM_SHA`` and hashed, so they are independent of whatever a local cache happens to hold;
+# moving the pin means re-recording them, and a test holds the manifest to the sha so a bumped pin
+# cannot keep checking the old commit's bytes. What the manifest does not do is digest all
+# ~730 MB: that would gate files no cell touches at a cost on every check, so ``--force`` is what
+# replaces a tree whose ungated bulk is suspect.
+_MANIFEST_PATH = Path(__file__).with_name("tau2_data_manifest.json")
+_MANIFEST: dict[str, dict[str, Any]] = json.loads(
+    _MANIFEST_PATH.read_text(encoding="utf-8")
+)["files"]
 
-# How a partial-fetch's split file is caught: it must parse and be non-empty, not merely exist.
-_PARSE_CHECK = "tau2/domains/telecom/split_tasks.json"
-
-# The record written next to a completed tree. Its presence is not what completeness is judged on
+# The record written next to a validated tree. Its presence is not what the tree is judged on
 # (an externally provisioned tree without it is still recognized), but it carries provenance.
 _MARKER = ".shobench-tau2-data.json"
 
@@ -60,7 +73,7 @@ _DOWNLOAD_TIMEOUT_S = 300.0
 
 
 class Tau2DataError(RuntimeError):
-    """The tau2 data is missing or incomplete. The message names the fix."""
+    """The tau2 data is missing, incomplete, or not the pinned bytes. The message names the fix."""
 
 
 def _cache_root() -> Path:
@@ -83,34 +96,40 @@ def resolve_data_dir() -> Path:
 
 
 def verify(data_dir: Path) -> None:
-    """Raise :class:`Tau2DataError` unless ``data_dir`` is a complete tau2 data tree.
+    """Raise :class:`Tau2DataError` unless ``data_dir`` is the pinned commit's tau2 data.
 
-    Completeness is the files a tau2_telecom construction reads, present and non-empty, with the
-    split file additionally required to parse -- so a download truncated mid-file is caught rather
-    than trusted. This is the identity check too: the required files are the pinned commit's
-    telecom data, and the cache path carries the sha.
+    Every manifest file must be present and byte-identical to the pinned commit. That is one
+    check doing two jobs. Completeness: a tree missing a file the runtime reads is refused here
+    rather than at env setup, or later still, after a spending run has begun. Identity: a tree of
+    the right shape but the wrong bytes (a stale checkout pointed at by ``TAU2_DATA_DIR``, an
+    edited policy or DB, a fetch truncated mid-file) is data drift that would move the benchmark's
+    numbers silently, so it is refused by name too. The size is compared before the digest only
+    because it makes the common failure, a partial fetch, say so.
     """
     if not data_dir.is_dir():
         raise Tau2DataError(f"no tau2 data at {data_dir}")
-    for rel in _REQUIRED_FILES:
+    for rel, pinned in _MANIFEST.items():
         path = data_dir / rel
         if not path.is_file():
             raise Tau2DataError(f"tau2 data at {data_dir} is incomplete: missing {rel}")
-        if path.stat().st_size == 0:
-            raise Tau2DataError(f"tau2 data at {data_dir} is incomplete: {rel} is empty")
-    parse_path = data_dir / _PARSE_CHECK
-    try:
-        parsed = json.loads(parse_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise Tau2DataError(
-            f"tau2 data at {data_dir}: {_PARSE_CHECK} did not parse ({exc})"
-        ) from exc
-    if not parsed:
-        raise Tau2DataError(f"tau2 data at {data_dir}: {_PARSE_CHECK} is empty")
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            raise Tau2DataError(f"tau2 data at {data_dir}: {rel} is unreadable ({exc})") from exc
+        if len(body) != pinned["size"]:
+            raise Tau2DataError(
+                f"tau2 data at {data_dir}: {rel} is {len(body)} bytes, the pinned commit's is "
+                f"{pinned['size']} (a partial fetch, or not the pinned data)"
+            )
+        if hashlib.sha256(body).hexdigest() != pinned["sha256"]:
+            raise Tau2DataError(
+                f"tau2 data at {data_dir}: {rel} is not the bytes of upstream {UPSTREAM_SHA} "
+                "(right size, different content), so this tree is not the pinned data"
+            )
 
 
 def is_present(data_dir: Path | None = None) -> bool:
-    """Whether a complete tau2 data tree is where the runner would look for it."""
+    """Whether the pinned tau2 data is where the runner would look for it."""
     try:
         verify(data_dir if data_dir is not None else resolve_data_dir())
     except Tau2DataError:
@@ -119,7 +138,7 @@ def is_present(data_dir: Path | None = None) -> bool:
 
 
 def require() -> Path:
-    """Return the data dir if complete, else raise with the provisioning command.
+    """Return the data dir if it is the pinned data, else raise with the provisioning command.
 
     This is the runner's loud failure: a tau2 cell that reached serving with no data would build,
     spend, and fail partway with an upstream message that names none of this. So the check is made
@@ -148,7 +167,7 @@ def _write_marker(sha_dir: Path, data_dir: Path) -> None:
                 "upstream_sha": UPSTREAM_SHA,
                 "tarball": _TARBALL_URL,
                 "data_dir": str(data_dir),
-                "required_files": list(_REQUIRED_FILES),
+                "verified_files": sorted(_MANIFEST),
             },
             indent=2,
         )
@@ -183,10 +202,13 @@ def _extract_data_subtree(archive: Path, staged_data: Path) -> None:
 def provision(*, force: bool = False, log=print) -> Path:
     """Fetch tau2's ``data/`` at the pinned sha into the cache; return the data dir.
 
-    Idempotent: an already-complete tree is verified and its marker refreshed, and no network is
-    touched, unless ``force``. Otherwise the tarball is downloaded, the ``data/`` subtree is
-    extracted to a staging dir, verified, and only then renamed into place, so an interrupted run
-    leaves no tree that :func:`verify` would accept.
+    Idempotent: a tree that already is the pinned data is verified, has its marker refreshed, and
+    touches no network, unless ``force``. Otherwise the tarball is downloaded, the ``data/``
+    subtree is extracted to a staging dir, verified, and only then renamed into place, so an
+    interrupted run leaves no tree that :func:`verify` would accept.
+
+    ``force`` is the repair path, so it replaces what is there. Paying for a download and then
+    keeping the tree the operator asked to be rid of would make the flag do nothing at full price.
     """
     data_dir = resolve_data_dir()
     if not force and is_present(data_dir):
@@ -210,15 +232,17 @@ def provision(*, force: bool = False, log=print) -> Path:
         _extract_data_subtree(archive, staged_data)
         archive.unlink()
         verify(staged_data)
-        # Publish atomically. If a concurrent provisioner already published a complete tree, adopt
-        # it rather than fail on the non-empty rename.
-        if data_dir.exists():
-            if is_present(data_dir):
-                log(f"[tau2-data] another tree is already in place at {data_dir}; keeping it")
-            else:
-                shutil.rmtree(data_dir)
-                staged_data.replace(data_dir)
+        # Publish by rename. An unforced run adopts a tree that is already the pinned data rather
+        # than fail on the non-empty rename, which is how a concurrent provisioner that got there
+        # first is accepted. A forced run replaces whatever is there, because that is what forcing
+        # asked for. The prior tree moves aside into the staging dir first (same filesystem, so it
+        # is a rename) and leaves with it, so the moment nothing is published is a rename rather
+        # than a recursive delete.
+        if data_dir.exists() and not force and is_present(data_dir):
+            log(f"[tau2-data] another tree is already in place at {data_dir}; keeping it")
         else:
+            if data_dir.exists():
+                data_dir.replace(tmp_path / "superseded")
             staged_data.replace(data_dir)
     verify(data_dir)
     _write_marker(sha_dir, data_dir)
