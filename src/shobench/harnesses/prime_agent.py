@@ -14,7 +14,8 @@ from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
 # settings.json is only half of the wiring: prime-agent hands the model no MCP tools, it reaches
 # a server by importing a Python-backed skill in its kernel and calling it, so the cell HOME
 # must also carry the `shogym-stream` skill package. It is vendored under the repo's
-# `prime_agent/skills/` and installed into the isolated HOME exactly as the settings file is.
+# `prime_agent/skills/` and seeded into the isolated HOME beside the settings file, which is
+# written per leg while this is written once and then belongs to the agent.
 SHOGYM_STREAM_SKILL = "shogym-stream"
 _SKILL_HOME_PREFIX = ".prime/agent/skills"
 # What prime-agent's discovery requires of a Python-backed skill: the frontmatter that makes it
@@ -193,9 +194,9 @@ class PrimeAgent(Harness):
         argv += ["--", prompt]
         # Global settings live in the isolated HOME, so the endpoint is configured where every
         # session in this cell sees it and nowhere else. Only http servers are honored; a stdio
-        # entry is dropped without an error. The skill package rides in the same HOME: the
-        # settings entry alone reaches nothing, because prime-agent's client is a kernel-side
-        # import, not a host-managed tool bridge.
+        # entry is dropped without an error. This is per-leg because the endpoint is: the
+        # rollout and each concurrent eval task serve on their own port, and an eval task's HOME
+        # is a copy of the rollout's, so its inherited url points at a server that is gone.
         home_files = {
             ".prime/agent/settings.json": json.dumps(
                 {
@@ -211,8 +212,17 @@ class PrimeAgent(Harness):
             )
             + "\n"
         }
-        home_files.update(shogym_stream_skill_files())
-        return LaunchSpec(argv=argv, env=self.base_env(), home_files=home_files)
+        # The skill package rides in the same HOME, because the settings entry alone reaches
+        # nothing: prime-agent's client is a kernel-side import, not a host-managed tool bridge.
+        # It seeds rather than rewrites. The vendored bytes are only a starting point, the
+        # rollout may improve them like any other durable artifact, and the eval that follows
+        # has to read what the rollout left rather than what this file shipped.
+        return LaunchSpec(
+            argv=argv,
+            env=self.base_env(),
+            home_files=home_files,
+            home_seed_files=shogym_stream_skill_files(),
+        )
 
     def classify(
         self, *, returncode: int, stdout_path: Path, stderr_path: Path, timed_out: bool

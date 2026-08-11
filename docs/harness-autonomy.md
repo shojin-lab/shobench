@@ -399,11 +399,19 @@ sets it.
 integration also requires a Python skill package under `.prime/agent/skills/<name>/` that is
 installed into the kernel venv at session start, and a new Python-backed skill needs a fresh
 session to be picked up. The `shogym-stream` skill is vendored under `prime_agent/skills/` and
-installed into each prime_agent cell's isolated HOME beside the settings entry, by the same
-`home_files` mechanism (`harnesses/prime_agent.py`, `shogym_stream_skill_files`). It is vendored
-rather than copied verbatim from shogym's `examples/prime_agent` because it has to carry the
-runner's own token variable (`SHOBENCH_MCP_TOKEN`), which the settings entry names too; a test
-asserts the two agree and that the served stream exposes the tools the skill enumerates.
+installed into each prime_agent cell's isolated HOME beside the settings entry
+(`harnesses/prime_agent.py`, `shogym_stream_skill_files`). It is vendored rather than copied
+verbatim from shogym's `examples/prime_agent` because it has to carry the runner's own token
+variable (`SHOBENCH_MCP_TOKEN`), which the settings entry names too; a test asserts the two
+agree and that the served stream exposes the tools the skill enumerates.
+
+The two files land on different HOME channels, and the difference is measurement rather than
+plumbing. The settings entry is per-leg: the endpoint moves between phases and between
+concurrent eval tasks, and an eval task's HOME is a copy of the rollout's, so its inherited url
+names a server that is gone. The skill package is seeded once and never rewritten, because a
+rollout is free to improve it like any other durable artifact and the eval that follows has to
+read what the rollout left. A leg that restored the vendored bytes would delete the improvement
+in the moment before the session meant to measure it.
 
 **What a tool call returns, since the natural guess is wrong.** `McpIntegration._parse_result`
 prefers a result's `structuredContent` over its text content (source), and shogym's stream

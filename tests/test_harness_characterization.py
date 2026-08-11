@@ -215,11 +215,10 @@ def test_prime_agent_fresh_launch_is_pinned() -> None:
     assert spec.config_files == {}
     # The HOME carries the settings entry and the vendored shogym-stream skill package beside
     # it; the skill is what actually reaches the server, since prime-agent's client is a
-    # kernel-side import rather than a host-managed tool bridge.
-    assert spec.home_files == {
-        ".prime/agent/settings.json": _PRIME_SETTINGS,
-        **shogym_stream_skill_files(),
-    }
+    # kernel-side import rather than a host-managed tool bridge. They ride different channels:
+    # the endpoint is the runner's to refresh every leg, the skill is the agent's to keep.
+    assert spec.home_files == {".prime/agent/settings.json": _PRIME_SETTINGS}
+    assert spec.home_seed_files == shogym_stream_skill_files()
     assert spec.stdin is None
     # The settings entry is well-formed JSON naming the http server and the token variable.
     settings = json.loads(spec.home_files[".prime/agent/settings.json"])

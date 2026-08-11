@@ -51,10 +51,10 @@ def _as_the_kernel_sees_it(result: Any) -> Any:
     return "\n".join(block.text for block in result.content if hasattr(block, "text"))
 
 
-def _launch_spec(tmp_path: Path):
-    """A prime_agent leg's launch spec, with inputs that do not matter to these assertions."""
+def _launch_spec(tmp_path: Path, mcp_url: str = "http://host.docker.internal:12345/mcp"):
+    """A prime_agent leg's launch spec. Only the url ever matters to these assertions."""
     return PrimeAgent().launch(
-        mcp_url="http://host.docker.internal:12345/mcp",
+        mcp_url=mcp_url,
         system_prompt="s",
         user_prompt="u",
         model="m",
@@ -110,19 +110,47 @@ def test_launch_installs_the_skill_beside_the_settings_entry(tmp_path: Path) -> 
     """The wiring: a prime_agent leg's HOME carries the skill package, and the settings entry
     and the skill agree on the token variable, resolved from one constant."""
     spec = _launch_spec(tmp_path)
-    home = spec.home_files
+    seeded = spec.home_seed_files
     prefix = f".prime/agent/skills/{SHOGYM_STREAM_SKILL}"
     for rel in ("SKILL.md", "pyproject.toml", "src/shogym_stream/__init__.py"):
-        assert f"{prefix}/{rel}" in home, rel
+        assert f"{prefix}/{rel}" in seeded, rel
 
-    # The installed bytes are exactly the vendored ones.
-    for name, body in shogym_stream_skill_files().items():
-        assert home[name] == body
+    # The installed bytes are exactly the vendored ones, and the skill goes in as a seed while
+    # the endpoint stays per-leg, since one of the two is the agent's to change.
+    assert seeded == shogym_stream_skill_files()
+    assert set(spec.home_files) == {".prime/agent/settings.json"}
 
-    settings = json.loads(home[".prime/agent/settings.json"])
+    settings = json.loads(spec.home_files[".prime/agent/settings.json"])
     token_var = settings["mcpServers"]["shogym"]["bearerTokenEnvVar"]
     assert token_var == PrimeAgent.MCP_TOKEN_VAR == _skill_class_attrs()["bearer_token_env"]
     assert token_var in spec.env  # the token itself is set in the launch environment
+
+
+def test_the_eval_after_session_reads_the_skill_the_rollout_left(tmp_path: Path) -> None:
+    """The whole point of seeding, walked with the runner's own two pieces.
+
+    An eval-after task copies the home the rollout accumulated and then runs a leg against that
+    copy. A leg that rewrote the skill would restore the vendored bytes in the moment between
+    the improvement and the session meant to read it, and the cell would report the durable
+    effect of an artifact the runner had just deleted. The endpoint has to be refreshed in the
+    same breath, because the task serves on a port of its own that its inherited settings entry
+    knows nothing about, which is why the two files ride different channels."""
+    from shobench.runner import _copy_task_home, write_home_files
+
+    rollout_home = tmp_path / "rollout-home"
+    write_home_files(rollout_home, _launch_spec(tmp_path, "http://host:1/mcp"))
+    skill = rollout_home / f".prime/agent/skills/{SHOGYM_STREAM_SKILL}/SKILL.md"
+    improved = skill.read_text() + "\n## What worked\n\nGuess a vowel-heavy opener.\n"
+    skill.write_text(improved)
+
+    task_home = tmp_path / "eval-task-home"
+    _copy_task_home(rollout_home, task_home)
+    write_home_files(task_home, _launch_spec(tmp_path, "http://host:2/mcp"))
+
+    kept = task_home / f".prime/agent/skills/{SHOGYM_STREAM_SKILL}/SKILL.md"
+    assert kept.read_text() == improved, "the eval session must read what the rollout wrote"
+    settings = json.loads((task_home / ".prime/agent/settings.json").read_text())
+    assert settings["mcpServers"]["shogym"]["url"] == "http://host:2/mcp"
 
 
 def test_the_served_stream_exposes_the_tools_the_skill_enumerates(tmp_path: Path) -> None:
