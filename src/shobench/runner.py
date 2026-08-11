@@ -758,7 +758,11 @@ async def run_rollout_phase(
             phase="rollout",
             leg=suspended.legs_before if resuming else 0,
             system_prompt=ctx.instruction.rollout_system,
-            user_prompt=ctx.instruction.kickoff,
+            # A resumed rollout is continued, not begun. The arm defines two user turns for
+            # exactly this: kickoff opens a fresh run, continuation resumes one. Sending the
+            # opener again would run a suspended cell under a different intervention than the
+            # one its record names.
+            user_prompt=ctx.instruction.continuation if resuming else ctx.instruction.kickoff,
             session_id=session_id,
             resume=resuming,
             timeout_s=remaining_s,
@@ -898,6 +902,12 @@ async def _run_phases(
         else:
             phase_rows[phase] = await run_eval_phase(ctx, phase)
         write_json(ctx.run_dir / "legs.json", ctx.leg_records())
+
+    # How many times a provider limit suspended and resumed this cell, counted off the one
+    # place that record lives: a resumption entry is appended per continuation. The report reads
+    # this field, so a resumed cell that omitted it was published as one that never paused.
+    if "rollout" in phases:
+        stopping["usage_limit_resumes"] = len(manifest.get("resumptions", []))
 
     # Which model answered, read off the traces rather than assumed from the config, and off
     # every leg of the run rather than the ones this process happened to launch.

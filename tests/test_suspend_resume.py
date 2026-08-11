@@ -30,6 +30,7 @@ from shobench.cli import main as cli_main
 from shobench.config import Budget, load_cell_by_name, load_instruction
 from shobench.containers import CellSandbox
 from shobench.harness import StopKind, StopVerdict
+from shobench.report import report_cell
 from shobench.results import TaskResult
 from shobench.runner import (
     SUSPENDED_EXIT_CODE,
@@ -548,8 +549,13 @@ def test_a_continuation_publishes_the_measurement_the_first_process_took(
     cell = load_cell_by_name(_SMOKE_CELL)
     seen: dict[str, object] = {}
 
-    def leg(ctx, *, phase, leg, session_id, resume, timeout_s, **kw) -> LegRecord:
-        seen[phase] = {"session_id": session_id, "resume": resume, "timeout_s": timeout_s}
+    def leg(ctx, *, phase, leg, session_id, resume, timeout_s, user_prompt, **kw) -> LegRecord:
+        seen[phase] = {
+            "session_id": session_id,
+            "resume": resume,
+            "timeout_s": timeout_s,
+            "user_prompt": user_prompt,
+        }
         record = LegRecord(
             leg=leg,
             phase=phase,
@@ -598,16 +604,25 @@ def test_a_continuation_publishes_the_measurement_the_first_process_took(
     legs = json.loads((run_dir / "legs.json").read_text())
     assert [leg["phase"] for leg in legs] == ["eval_before", "rollout", "rollout"]
 
-    # The rollout continued the recorded session on what was left of the recorded clock.
+    # The rollout continued the recorded session on what was left of the recorded clock, and
+    # sent the continuation cue rather than the opener: a resumed run is continued, not begun.
+    instruction = load_instruction(cell.instruction_arm)
     assert seen["rollout"] == {
         "session_id": "sess-1",
         "resume": True,
         "timeout_s": cell.budget.rollout_wall_clock_s - 300,
+        "user_prompt": instruction.continuation,
     }
+    assert instruction.continuation != instruction.kickoff, "the two cues must be distinct"
     assert published["rollout"]["stopping"]["tasks_dispensed"] == 4
     assert published["manifest"]["resumptions"][0]["session_id"] == "sess-1"
     # The record was this run's retry handle, and the continuation owns the ending now.
     assert not (run_dir / SUSPENSION_FILE).exists()
+
+    # The published number an operator reads: a resumed cell says it resumed once, not never.
+    assert published["rollout"]["stopping"]["usage_limit_resumes"] == 1
+    report = report_cell(published)
+    assert report.resumes == 1, "report_cell must see the resume the run actually took"
 
 
 def test_a_continuation_that_fails_can_still_be_tried_again(tmp_path: Path, monkeypatch) -> None:
