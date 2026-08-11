@@ -31,6 +31,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -58,7 +59,7 @@ from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REPO, SHOGYM_REV
 from shobench.results import TaskResult, dispensed_positions, read_phase, write_results
-from shobench.serving import DEFAULT_PORT, SERVER_NAME, build_stream, side_for_phase
+from shobench.serving import DEFAULT_PORT, SERVER_NAME, build_stream, side_for_phase, warm_env
 from shobench.splits import Split, load_split_by_name
 
 # What does not count as the agent's durable self.
@@ -204,8 +205,18 @@ class RunContext:
     teardown: Callable[[], None] | None = None
 
     def leg_records(self) -> list[dict[str, Any]]:
-        """Every leg of this run, the ones inherited from a suspension included."""
-        return [*self.prior_legs, *(leg.to_json() for leg in self.legs)]
+        """Every leg of this run, in a deterministic order, inherited ones included.
+
+        Two things decide that order. Eval legs finish in whatever order concurrency produced
+        them, so they are sorted by phase, then task, then leg rather than left in completion
+        order. And a continuation's legs follow the ones a suspension left behind, because the
+        run is one record written by two processes.
+        """
+
+        def key(leg: LegRecord) -> tuple[str, int, int]:
+            return (leg.phase, -1 if leg.task_idx is None else leg.task_idx, leg.leg)
+
+        return [*self.prior_legs, *(leg.to_json() for leg in sorted(self.legs, key=key))]
 
     @property
     def mcp_url(self) -> str:
@@ -304,10 +315,24 @@ def run_leg(
     timeout_s: int,
     task_idx: int | None,
     consumed_before: int,
+    mcp_url: str | None = None,
+    cfg_dir: Path | None = None,
+    home: Path | None = None,
+    container_name: str | None = None,
 ) -> LegRecord:
-    """Run one harness invocation to completion and classify how it ended."""
+    """Run one harness invocation to completion and classify how it ended.
+
+    ``mcp_url``, ``cfg_dir``, ``home`` and ``container_name`` default to the cell-wide values on
+    the context, which is what the single rollout leg uses. An eval task overrides all four so
+    it reaches its own stream on its own port, writes its own config, mounts its own throwaway
+    home, and names its own container, which is what lets many tasks run at once without sharing
+    any of that mutable state.
+    """
     if resume and not session_id:
         raise RuntimeError("cannot resume without a session id; the previous leg wrote none")
+    mcp_url = ctx.mcp_url if mcp_url is None else mcp_url
+    cfg_dir = ctx.cfg_dir if cfg_dir is None else cfg_dir
+    home = ctx.sandbox.home if home is None else home
     trace_dir = ctx.run_dir / phase / "traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
     stem = f"leg-{leg:04d}" if task_idx is None else f"task-{task_idx:05d}-leg-{leg:04d}"
@@ -315,7 +340,7 @@ def run_leg(
     stderr_path = trace_dir / f"{stem}.err.txt"
 
     spec = ctx.harness.launch(
-        mcp_url=ctx.mcp_url,
+        mcp_url=mcp_url,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         model=ctx.cell.model,
@@ -325,20 +350,26 @@ def run_leg(
         leg_timeout_s=timeout_s,
         effort=ctx.cell.effort,
     )
-    ctx.cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg_dir.mkdir(parents=True, exist_ok=True)
     for name, body in spec.config_files.items():
-        target = ctx.cfg_dir / name
+        target = cfg_dir / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body, encoding="utf-8")
-    write_home_files(ctx.sandbox.home, spec)
+    write_home_files(home, spec)
 
     env = dict(spec.env)
     env.update(ctx.credentials)
     # Named so a leg the runner ends at its budget can actually be removed. Killing the docker
     # client leaves the container running, and a container that outlives its leg keeps
     # spending and keeps pulling tasks the runner has stopped watching.
-    container = f"{ctx.sandbox.netns_container}-{phase[:4]}-{leg:04d}"[:63]
-    args = ctx.sandbox.docker_args(env=env, mounts={ctx.cfg_dir: "/cfg:ro"}, name=container)
+    container = (
+        container_name
+        if container_name is not None
+        else f"{ctx.sandbox.netns_container}-{phase[:4]}-{leg:04d}"[:63]
+    )
+    args = ctx.sandbox.docker_args(
+        env=env, mounts={cfg_dir: "/cfg:ro"}, name=container, home=home
+    )
     argv = ["docker", *args, ctx.agent_image, *spec.argv]
 
     started = time.time()
@@ -456,45 +487,121 @@ async def _wait_ready(task, host: str, port: int, *, timeout: float = 60.0) -> N
     raise TimeoutError(f"stream server did not accept connections on {target}:{port}")
 
 
-async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
-    """Serve the held-out split, one fresh session per task.
+def _eval_container_name(netns_container: str, phase: str, idx: int) -> str:
+    """A unique, id-preserving container name for one concurrent eval task.
 
-    Each task gets its own single-task stream, so the one-session-per-task rule is enforced by
-    the server rather than requested of the agent.
+    Docker names are capped at 63 characters. The task id is what distinguishes the containers
+    that are alive at once, so it must survive the cap: this truncates the run-id prefix rather
+    than the suffix, because a truncated id would let two live containers collide and a timeout's
+    ``docker rm -f`` could then remove the wrong task's container.
+    """
+    suffix = f"-{phase[:4]}-t{idx:05d}"
+    return f"{netns_container[: 63 - len(suffix)]}{suffix}"
+
+
+def _copy_task_home(base: Path, dst: Path) -> None:
+    """Copy one eval task's working HOME off the phase's base home.
+
+    The task reads the accumulated durable self the phase is measuring (whatever the rollout
+    wrote: memory, skills, notes) plus the harness credential, and writes only into this copy,
+    which is discarded when the task ends. Two properties make that the isolation the eval needs:
+    a task's writes never reach the base home or a sibling's copy, and nothing but the durable
+    channel and the credential crosses into the fresh session.
+
+    What is left behind is exactly the noise the durability filter already names: caches,
+    session transcripts, logs, and per-harness bookkeeping. Leaving it keeps the copy small
+    (memory and skills are kilobytes; a ``.cache`` or ``node_modules`` is not) and keeps the
+    session fresh, since a task that wants a cache rebuilds its own. Credential files are noise
+    for the digest but the harness cannot authenticate without them, so those alone cross even
+    though the rest of the noise does not.
+    """
+    dst.mkdir(parents=True, exist_ok=True)
+    if not base.exists():
+        return
+    for path in base.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(base).as_posix()
+        if is_noise(rel) and path.name not in CREDENTIAL_FILES:
+            continue
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+
+
+async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
+    """Serve the held-out split, one fresh session per task, up to N tasks at once.
+
+    Each task gets its own single-task stream on its own port, its own fresh session, and its own
+    throwaway copy of the phase's home, so the one-session-per-task rule is enforced by the server
+    and nothing a task does can reach another task or the base home. Concurrency is bounded by
+    ``budget.eval_concurrency``; the tasks are independent, so a task that fails to run lands
+    unscored (``reconcile`` records the dispense-without-seal) rather than sinking the batch, and
+    the reported rows are sorted by task id regardless of the order the tasks finished in.
     """
     side = side_for_phase(ctx.split, phase)
-    rows: list[TaskResult] = []
-    leg = 0
-    for task_id in side.task_ids:
+    # The home every task copies from: pristine-plus-credential for eval_before, the rollout's
+    # accumulated home for eval_after. It is read only from here on, since tasks write to copies.
+    base_home = ctx.sandbox.home
+    # Provision the env's upstream once, before the fan-out, so the first wave of streams reuses
+    # the on-disk cache instead of racing to fetch it. Read-only serving-side data, safe to share.
+    await asyncio.to_thread(warm_env, ctx.cell)
+    limit = max(1, ctx.cell.budget.eval_concurrency)
+    gate = asyncio.Semaphore(limit)
+
+    async def one_task(task_id: str) -> tuple[int, list[TaskResult]]:
         idx = int(task_id)
         prov_dir = ctx.run_dir / phase / f"task-{idx:05d}"
         prov_dir.mkdir(parents=True, exist_ok=True)
-        stream = build_stream(
-            ctx.cell,
-            _single_task_split(ctx.split, phase, task_id),
-            phase,
-            prov_dir,
-            deadline=float(ctx.cell.budget.eval_task_timeout_s),
-        )
-        # A fresh port per task, so a socket still in TIME_WAIT from the previous task cannot
-        # make the next one look like a server that refused to start.
-        ctx.port = free_port()
-        async with stream, _served(stream, ctx.port):
-            await asyncio.to_thread(
-                run_leg,
-                ctx,
-                phase=phase,
-                leg=leg,
-                system_prompt=ctx.instruction.eval_system,
-                user_prompt=ctx.instruction.kickoff,
-                session_id=str(uuid.uuid4()),
-                resume=False,
-                timeout_s=ctx.cell.budget.eval_task_timeout_s,
-                task_idx=idx,
-                consumed_before=0,
-            )
-        rows.extend(read_phase(prov_dir))
-        leg += 1
+        task_home = ctx.run_dir / phase / "homes" / f"task-{idx:05d}"
+        task_cfg = ctx.run_dir / phase / "cfg" / f"task-{idx:05d}"
+        async with gate:
+            try:
+                _copy_task_home(base_home, task_home)
+                # A fresh port per task, so a socket still in TIME_WAIT from a finished task
+                # cannot make another look like a server that refused to start.
+                port = free_port()
+                mcp_url = f"http://{HOST_ALIAS}:{port}/mcp"
+                container = _eval_container_name(ctx.sandbox.netns_container, phase, idx)
+                stream = build_stream(
+                    ctx.cell,
+                    _single_task_split(ctx.split, phase, task_id),
+                    phase,
+                    prov_dir,
+                    deadline=float(ctx.cell.budget.eval_task_timeout_s),
+                )
+                async with stream, _served(stream, port):
+                    await asyncio.to_thread(
+                        run_leg,
+                        ctx,
+                        phase=phase,
+                        leg=idx,
+                        system_prompt=ctx.instruction.eval_system,
+                        user_prompt=ctx.instruction.kickoff,
+                        session_id=str(uuid.uuid4()),
+                        resume=False,
+                        timeout_s=ctx.cell.budget.eval_task_timeout_s,
+                        task_idx=idx,
+                        consumed_before=0,
+                        mcp_url=mcp_url,
+                        cfg_dir=task_cfg,
+                        home=task_home,
+                        container_name=container,
+                    )
+            except Exception as exc:  # one task's failure is unscored, never fatal to the batch
+                (prov_dir / "runner-error.txt").write_text(
+                    f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+                )
+            finally:
+                # Discard the task's home the moment it is done, so N concurrent copies is the
+                # ceiling on disk and nothing a task wrote survives to be read by anything.
+                shutil.rmtree(task_home, ignore_errors=True)
+        return idx, read_phase(prov_dir)
+
+    completed = await asyncio.gather(*(one_task(task_id) for task_id in side.task_ids))
+    rows: list[TaskResult] = []
+    for _idx, task_rows in sorted(completed, key=lambda pair: pair[0]):
+        rows.extend(task_rows)
     return rows
 
 
