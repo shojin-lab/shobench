@@ -483,27 +483,32 @@ def _single_task_split(split: Split, phase: str, task_id: str) -> Split:
 
 
 async def run_rollout_phase(ctx: RunContext) -> tuple[list[TaskResult], dict[str, Any]]:
-    """Serve the improvement pool for the cell's wall clock, as a sequence of legs.
+    """Serve the improvement pool as one honest run of the harness. No automatic restart.
 
-    A leg that hits a usage limit is resumed into the same session, because the scope's
-    stopping metrics count only the agent's own choice to stop. A leg that ends on the agent's
-    own terms ends the rollout: nothing re-serves tasks to push the agent toward the ceiling,
-    and where it stopped is the reported outcome.
+    Whether a harness sustains autonomous operation is one of the things this measures, so the
+    runner does not relaunch a harness that stops. A single invocation is driven against the
+    pool; where it ends is the outcome:
+
+    - it exhausts the pool: sustained autonomy, the success case;
+    - it ends its run with tasks still available: it stopped on its own, and that is the
+      finding, recorded with how far it got;
+    - it wedges past the run's time cap: timed out, a different finding;
+    - it hits a provider usage limit: the environment stopped it, not the agent, so the run
+      ends but is marked resumable. A human relaunches it when the window resets (windows can
+      run to hours, and nothing here waits or auto-retries).
+
+    Restarting the harness to push it further would launder "gave up after N tasks" into "ran
+    the whole pool", which is the one thing this must not do.
     """
     prov_dir = ctx.run_dir / "rollout"
     prov_dir.mkdir(parents=True, exist_ok=True)
     budget = ctx.cell.budget
-    deadline = time.time() + budget.rollout_wall_clock_s
 
-    # A harness that accepts an id gets one chosen up front, so a leg that dies before writing
-    # anything is still resumable. A harness that mints its own gets None here, and the runner
-    # reads the real id off the first leg's trace before it resumes.
+    # Claude Code accepts a pinned id, so a run that is later resumed by hand has one to name.
     session_id = str(uuid.uuid4()) if ctx.harness.pins_session_id else None
     stopping: dict[str, Any] = {
         "stop_reason": "unrecorded",
-        "usage_limit_resumes": 0,
         "legs": [],
-        "wall_clock_budget_s": budget.rollout_wall_clock_s,
         "session_id": session_id,
     }
 
@@ -511,77 +516,47 @@ async def run_rollout_phase(ctx: RunContext) -> tuple[list[TaskResult], dict[str
     queued = stream.queue_info().remaining
     ctx.port = free_port()
     async with stream, _served(stream, ctx.port):
-        leg = 0
-        stalled = 0
-        resume = False
-        while True:
-            remaining = max(0.0, deadline - time.time())
-            if remaining <= 0:
-                stopping["stop_reason"] = "wall_clock_exhausted"
-                break
-            if stream.queue_info().remaining == 0:
-                stopping["stop_reason"] = "pool_exhausted"
-                break
-
-            consumed_before = stream.queue_info().consumed
-            record = await asyncio.to_thread(
-                run_leg,
-                ctx,
-                phase="rollout",
-                leg=leg,
-                system_prompt=ctx.instruction.rollout_system,
-                user_prompt=(ctx.instruction.continuation if resume else ctx.instruction.kickoff),
-                session_id=None if resume else session_id,
-                resume=resume,
-                timeout_s=int(min(remaining, budget.rollout_leg_timeout_s)),
-                task_idx=None,
-                consumed_before=consumed_before,
-            )
-            record.tasks_consumed_after = stream.queue_info().consumed
-            stopping["legs"].append(record.to_json())
-            leg += 1
-            # Whatever the harness says it ran under wins over what the runner guessed.
-            observed_session = ctx.harness.session_id_from_trace(Path(record.trace_path))
-            if observed_session:
-                session_id = observed_session
-                stopping["session_id"] = session_id
-
-            advanced = record.tasks_consumed_after > record.tasks_consumed_before
-            stalled = 0 if advanced else stalled + 1
-
-            if record.verdict.kind is StopKind.USAGE_LIMIT:
-                # Not a stop. Resume the same session; the queue is where the agent left it.
-                stopping["usage_limit_resumes"] += 1
-                resume = True
-                continue
-            if record.verdict.kind is StopKind.CHOSEN:
-                stopping["stop_reason"] = "agent_chose_to_stop"
-                stopping["stop_evidence"] = record.verdict.to_json()
-                break
-            if record.verdict.kind is StopKind.LEG_TIMEOUT:
-                # The leg budget, not the agent, ended this one. Resume and keep the clock.
-                resume = True
-                if stalled >= budget.max_stalled_legs:
-                    stopping["stop_reason"] = "stalled"
-                    stopping["stop_evidence"] = record.verdict.to_json()
-                    break
-                continue
-            # ERROR or UNKNOWN: retry into the same session while the clock allows, but never
-            # more than max_stalled_legs times without the queue advancing.
-            resume = True
-            if stalled >= budget.max_stalled_legs:
-                stopping["stop_reason"] = "harness_error"
-                stopping["stop_evidence"] = record.verdict.to_json()
-                break
+        consumed_before = stream.queue_info().consumed
+        record = await asyncio.to_thread(
+            run_leg,
+            ctx,
+            phase="rollout",
+            leg=0,
+            system_prompt=ctx.instruction.rollout_system,
+            user_prompt=ctx.instruction.kickoff,
+            session_id=session_id,
+            resume=False,
+            timeout_s=budget.rollout_leg_timeout_s,
+            task_idx=None,
+            consumed_before=consumed_before,
+        )
+        record.tasks_consumed_after = stream.queue_info().consumed
+        stopping["legs"].append(record.to_json())
+        observed_session = ctx.harness.session_id_from_trace(Path(record.trace_path))
+        if observed_session:
+            stopping["session_id"] = observed_session
 
         info = stream.queue_info()
+        if record.verdict.kind is StopKind.USAGE_LIMIT:
+            # The provider stopped it, not the agent. Resumable by hand when the window clears.
+            stopping["stop_reason"] = "usage_limit"
+            stopping["resumable"] = True
+        elif info.remaining == 0:
+            stopping["stop_reason"] = "pool_exhausted"
+        elif record.verdict.kind is StopKind.CHOSEN:
+            # It ended its run with work still on the queue: it stopped on its own.
+            stopping["stop_reason"] = "agent_stopped_early"
+        elif record.verdict.kind is StopKind.LEG_TIMEOUT:
+            stopping["stop_reason"] = "timed_out"
+        else:
+            stopping["stop_reason"] = "harness_error"
+        stopping["stop_evidence"] = record.verdict.to_json()
         stopping["tasks_dispensed"] = info.consumed
         stopping["tasks_remaining_in_pool"] = info.remaining
         stopping["pool_queued"] = queued
-        # The charter's question is whether the agent stopped with work still available. A stop
-        # with an empty queue is not evidence about stopping behavior at all.
+        # The charter's question is whether it stopped with work still available.
         stopping["stopped_with_tasks_available"] = (
-            stopping["stop_reason"] == "agent_chose_to_stop" and info.remaining > 0
+            stopping["stop_reason"] == "agent_stopped_early" and info.remaining > 0
         )
 
     return read_phase(prov_dir), stopping
