@@ -55,9 +55,10 @@ that already is the pinned data is verified and skipped, and `--force` re-fetche
 what is there). What "is the pinned data" means is settled by a committed digest manifest, not by
 a file list: every file a tau2_telecom run reads has to match the size and sha256 the pinned
 commit has, so a stale checkout handed in through `TAU2_DATA_DIR`, or an edited policy or DB, is
-refused by name instead of quietly moving the numbers. The runner sets `TAU2_DATA_DIR` itself and
-refuses a tau2 cell whose data is not that tree, naming the command. `HF_TOKEN` is not blocking
-today: the
+refused by name instead of quietly moving the numbers. A refused tree that the operator named
+through `TAU2_DATA_DIR` is then left exactly as it was, along with everything else living in it:
+only `--force` replaces that one. The runner sets `TAU2_DATA_DIR` itself and refuses a tau2 cell
+whose data is not that tree, naming the command. `HF_TOKEN` is not blocking today: the
 `cais/hle` dataset is already cached on the run host, so the gate passes without a fresh token;
 it is only needed on a cold cache.
 

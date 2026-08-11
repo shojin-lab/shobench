@@ -81,6 +81,16 @@ def _cache_root() -> Path:
     return Path(base) if base else Path.home() / ".cache" / "shogym"
 
 
+def _override_data_dir() -> Path | None:
+    """The operator's explicit ``TAU2_DATA_DIR``, if any: a tree this module may read, not own.
+
+    Whether the path was named by an operator or derived by this module is what decides who may
+    delete it, so the two cases are distinguishable rather than collapsed into one resolved path.
+    """
+    override = os.environ.get("TAU2_DATA_DIR")
+    return Path(override).expanduser() if override else None
+
+
 def resolve_data_dir() -> Path:
     """Where ``TAU2_DATA_DIR`` should point: an operator override, else the pinned cache path.
 
@@ -89,9 +99,9 @@ def resolve_data_dir() -> Path:
     path is ``<SHOGYM_CACHE or ~/.cache/shogym>/tau2-data/<sha>/data`` -- a sibling of shogym's
     own ``tau2/<sha>`` source cache, never the same directory.
     """
-    override = os.environ.get("TAU2_DATA_DIR")
-    if override:
-        return Path(override).expanduser()
+    override = _override_data_dir()
+    if override is not None:
+        return override
     return _cache_root() / "tau2-data" / UPSTREAM_SHA / "data"
 
 
@@ -207,16 +217,36 @@ def provision(*, force: bool = False, log=print) -> Path:
     subtree is extracted to a staging dir, verified, and only then renamed into place, so an
     interrupted run leaves no tree that :func:`verify` would accept.
 
-    ``force`` is the repair path, so it replaces what is there. Paying for a download and then
+    ``force`` is the repair path, so it replaces the managed cache. Paying for a download and then
     keeping the tree the operator asked to be rid of would make the flag do nothing at full price.
+    It is also the only thing that replaces a tree under an explicit ``TAU2_DATA_DIR``: that one
+    belongs to the operator, so an unforced run refuses it rather than overwrites it.
     """
     data_dir = resolve_data_dir()
-    if not force and is_present(data_dir):
-        sha_dir = data_dir.parent
-        if sha_dir.is_dir() and not (sha_dir / _MARKER).is_file():
-            _write_marker(sha_dir, data_dir)
-        log(f"[tau2-data] already provisioned at {data_dir}")
-        return data_dir
+    override = _override_data_dir()
+    if not force:
+        try:
+            verify(data_dir)
+        except Tau2DataError as exc:
+            # An explicit TAU2_DATA_DIR names a tree the operator owns, and the only way to be
+            # here is that the tree is not the pinned data. Replacing it would take everything
+            # else living in it too: a checkout's other domains, notes, unfinished work. So it is
+            # refused, and only --force accepts that cost on the operator's say-so. Refusing here
+            # rather than after publishing costs nothing, because nothing has been fetched yet.
+            # The managed cache gets no such protection and needs none: this module created it,
+            # and replacing our own cache destroys no one's work.
+            if override is not None and data_dir.exists():
+                raise Tau2DataError(
+                    f"{exc}. TAU2_DATA_DIR names a tree this command did not create, so it is "
+                    f"left alone: fix it, unset TAU2_DATA_DIR to provision the managed cache "
+                    f"instead, or re-run with --force to replace {data_dir}"
+                ) from exc
+        else:
+            sha_dir = data_dir.parent
+            if sha_dir.is_dir() and not (sha_dir / _MARKER).is_file():
+                _write_marker(sha_dir, data_dir)
+            log(f"[tau2-data] already provisioned at {data_dir}")
+            return data_dir
 
     sha_dir = data_dir.parent
     sha_dir.mkdir(parents=True, exist_ok=True)
@@ -232,18 +262,31 @@ def provision(*, force: bool = False, log=print) -> Path:
         _extract_data_subtree(archive, staged_data)
         archive.unlink()
         verify(staged_data)
-        # Publish by rename. An unforced run adopts a tree that is already the pinned data rather
-        # than fail on the non-empty rename, which is how a concurrent provisioner that got there
-        # first is accepted. A forced run replaces whatever is there, because that is what forcing
-        # asked for. The prior tree moves aside into the staging dir first (same filesystem, so it
-        # is a rename) and leaves with it, so the moment nothing is published is a rename rather
-        # than a recursive delete.
+        # Publish by rename, with two questions settled first. Is what is there already the
+        # pinned data: then adopt it, which is how a provisioner that published while this one
+        # downloaded is accepted, since two provisioners of one pin want the same bytes. If not,
+        # may this run delete it: what may be deleted is what forcing authorized, plus the managed
+        # cache, which this module owns and reached here only by being absent or invalid. A tree
+        # under an unforced override never is, having been refused above if it existed and still
+        # being the operator's if it appeared since. What is deleted moves aside into the staging
+        # dir first (same filesystem, so it is a rename) and leaves with it, so the moment nothing
+        # is published is a rename rather than a recursive delete.
         if data_dir.exists() and not force and is_present(data_dir):
             log(f"[tau2-data] another tree is already in place at {data_dir}; keeping it")
         else:
-            if data_dir.exists():
+            if data_dir.exists() and (force or override is None):
                 data_dir.replace(tmp_path / "superseded")
-            staged_data.replace(data_dir)
+            try:
+                staged_data.replace(data_dir)
+            except OSError:
+                # The same race one step later: a directory arrived between that check and this
+                # rename. Adopt it for the same reason, on the verify below this block rather than
+                # on trust, and without retrying, because a second failure is a real problem and
+                # not a race. If the destination is not a directory the rename failed for its own
+                # reasons, and hiding those behind an adoption would be worse than raising them.
+                if not data_dir.is_dir():
+                    raise
+                log(f"[tau2-data] another provisioner published {data_dir} first; adopting it")
     verify(data_dir)
     _write_marker(sha_dir, data_dir)
     log(f"[tau2-data] provisioned {data_dir}")

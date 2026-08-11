@@ -7,13 +7,18 @@ points ``TAU2_DATA_DIR`` at. It is idempotent: a tree that already is the pinned
 and skipped.
 
     uv run python tools/provision_tau2_data.py            # fetch if missing, else verify
-    uv run python tools/provision_tau2_data.py --force    # re-fetch and replace what is there
+    uv run python tools/provision_tau2_data.py --force    # re-fetch, replacing what is there
     uv run python tools/provision_tau2_data.py --check     # verify only, never fetch
 
 Verification is against a committed manifest of the pinned commit's sizes and sha256s, so it
 answers "is this that commit's data", not merely "are some files here". A tree that fails it is
 named file by file, which is what makes ``--force`` the repair: it replaces the tree it fetched
 over.
+
+An explicit ``TAU2_DATA_DIR`` is honored, and a tree there is the operator's rather than this
+command's. So a failing one is reported and left alone, with everything else living in it, and
+only ``--force`` replaces it. The managed cache carries no such claim: an invalid one is replaced
+without asking, because this command is the only thing that put it there.
 
 The runner names this command when a tau2 cell is asked to run without the data present.
 """

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -240,6 +241,59 @@ def test_force_replaces_the_tree_it_paid_to_download(_cache, monkeypatch) -> Non
     monkeypatch.setattr(tau2_data, "_TARBALL_URL", tarball('["new"]\n'))
     assert tau2_data.provision(force=True, log=lambda *a: None) == data_dir
     assert (data_dir / canary).read_text() == '["new"]\n'
+
+
+def _override_checkout(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
+    """An operator's own tree at TAU2_DATA_DIR: not the pinned data, and lived in."""
+    data = _tree(tmp_path / "operator")
+    (data / "tau2/domains/telecom/main_policy.md").write_text("# POLICY\n")
+    work = data / "my-uncommitted-work.txt"
+    work.write_text("hours of it\n")
+    monkeypatch.setenv("TAU2_DATA_DIR", str(data))
+    return data, work
+
+
+def test_an_invalid_override_is_refused_rather_than_replaced(_cache, monkeypatch) -> None:
+    """A tree named by TAU2_DATA_DIR belongs to the operator, so failing verify is a reason to
+    stop, not a licence to delete it and everything living beside it. The refusal also comes
+    before the download: the unreachable url proves nothing was fetched to justify it."""
+    data, work = _override_checkout(_cache, monkeypatch)
+    monkeypatch.setattr(tau2_data, "_TARBALL_URL", "http://unreachable.invalid/x.tar.gz")
+
+    with pytest.raises(tau2_data.Tau2DataError, match="--force"):
+        tau2_data.provision(log=lambda *a: None)
+    assert work.read_text() == "hours of it\n"
+    assert (data / "tau2/domains/telecom/main_policy.md").read_text() == "# POLICY\n"
+
+
+def test_force_replaces_an_override_the_operator_asked_to_replace(_cache, monkeypatch) -> None:
+    """Forcing is the operator saying so, so the same tree is replaced without argument."""
+    data, work = _override_checkout(_cache, monkeypatch)
+    monkeypatch.setattr(tau2_data, "_TARBALL_URL", _make_tarball(_cache))
+
+    assert tau2_data.provision(force=True, log=lambda *a: None) == data
+    tau2_data.verify(data)
+    assert not work.exists()
+
+
+def test_a_lost_publish_race_adopts_the_tree_that_won(_cache, monkeypatch) -> None:
+    """Two provisioners of one pin want the same bytes, so losing the publish is not a failure to
+    report to the caller. The tree that landed is adopted, and adopted on the verify below the
+    publish block rather than on trust. Simulated without threads by publishing the winner while
+    this run is still unpacking, which is the window the race opens."""
+    monkeypatch.setattr(tau2_data, "_TARBALL_URL", _make_tarball(_cache))
+    data_dir = tau2_data.resolve_data_dir()
+    unpack = tau2_data._extract_data_subtree
+
+    def unpack_then_lose_the_race(archive: Path, staged_data: Path) -> None:
+        unpack(archive, staged_data)
+        shutil.copytree(_tree(_cache / "winner"), data_dir)
+        (data_dir / "published-by-the-winner").write_text("yes\n")
+
+    monkeypatch.setattr(tau2_data, "_extract_data_subtree", unpack_then_lose_the_race)
+    assert tau2_data.provision(log=lambda *a: None) == data_dir
+    # Adopted, not overwritten: the winner's tree is the one still in place.
+    assert (data_dir / "published-by-the-winner").exists()
 
 
 # ----- the real data, when it is provisioned here -----
