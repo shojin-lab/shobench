@@ -512,6 +512,9 @@ def _single_task_split(split: Split, phase: str, task_id: str) -> Split:
 
 
 SUSPENSION_FILE = "suspended.json"
+# The run's whole egress capture. One process writes it and any continuation appends to it, so
+# the published summary covers the cell rather than only its last stretch.
+EGRESS_LOG = "egress.tsv"
 # The exit status a suspended cell leaves. `run` cannot return it, because a suspension is the
 # one path that must not unwind, so the status is how a shell or a supervising script tells a
 # cell that is waiting for a window from one that failed. 75 is the conventional "temporary
@@ -536,17 +539,23 @@ class Suspension:
     pool_queued: int
     legs_before: int
     suspended_at: float
+    # The clock the interrupted rollout was actually given. It rides in the record instead of
+    # being re-read from the cell file, because a cell file is a working document and a running
+    # experiment is not: a budget edited while the run waited for its window would otherwise
+    # change the length of a rollout that is already half spent.
+    rollout_wall_clock_s: int
 
-    def remaining_rollout_s(self, budget_s: int) -> int:
-        """What is left of the one wall clock the rollout gets, never a fresh one.
+    @property
+    def remaining_rollout_s(self) -> int:
+        """What is left of the one wall clock the rollout was given, never a fresh one.
 
-        A continuation inherits the run's remaining time. Handing it the full budget again would
-        make the measured rollout as long as its interruptions were frequent, and a cell that
-        was suspended twice would quietly be a longer experiment than one that ran straight
-        through. Repeated suspensions accumulate into ``elapsed_rollout_s``, so this shrinks
-        monotonically to zero and the operator is told when there is nothing left.
+        A continuation inherits the run's remaining time. Handing it a budget again would make
+        the measured rollout as long as its interruptions were frequent, and a cell suspended
+        twice would quietly be a longer experiment than one that ran straight through. Repeated
+        suspensions accumulate into ``elapsed_rollout_s``, so this shrinks monotonically to zero
+        and the operator is told when there is nothing left.
         """
-        return int(max(0.0, budget_s - self.elapsed_rollout_s))
+        return int(max(0.0, self.rollout_wall_clock_s - self.elapsed_rollout_s))
 
     @classmethod
     def read(cls, run_dir: Path) -> Suspension:
@@ -559,7 +568,52 @@ class Suspension:
             pool_queued=int(record["pool_queued"]),
             legs_before=int(record["legs_before"]),
             suspended_at=float(record["suspended_at"]),
+            rollout_wall_clock_s=int(record["rollout_wall_clock_s"]),
         )
+
+
+def experiment_drift(
+    manifest: dict[str, Any], *, cell: Cell, split: Split, instruction: Instruction
+) -> list[str]:
+    """What the checkout now says that the recorded run does not, as human-readable lines.
+
+    A suspended cell can wait hours, and a repository is edited in hours. A continuation runs
+    against whatever the files say today, so anything that moved between the two is a different
+    experiment wearing the first one's run id: a re-tuned budget, a regenerated split whose
+    positions no longer mean what the record says they mean, a reworded instruction the second
+    half of the rollout would be run under. The digests to compare are already in the manifest,
+    written before anything spent, so this is a comparison rather than a new mechanism.
+
+    Returned rather than raised, so a caller can report every difference at once. An operator
+    told about the budget, only to be told about the split on the next attempt, learns to stop
+    reading.
+    """
+    recorded_cell = manifest.get("cell", {})
+    recorded_split = manifest.get("split", {})
+    recorded_instruction = manifest.get("instruction", {})
+    checks = (
+        (
+            "cell config",
+            recorded_cell.get("config_sha256"),
+            cell.to_manifest().get("config_sha256"),
+        ),
+        ("split ids", recorded_split.get("id_digest"), split.to_manifest().get("id_digest")),
+        (
+            "rollout instruction",
+            recorded_instruction.get("rollout_system_sha256"),
+            instruction.rollout_system_sha256,
+        ),
+        (
+            "eval instruction",
+            recorded_instruction.get("eval_system_sha256"),
+            instruction.eval_system_sha256,
+        ),
+    )
+    return [
+        f"{what} changed since the run started (recorded {was}, now {now})"
+        for what, was, now in checks
+        if was is not None and now is not None and was != now
+    ]
 
 
 def _fresh_session_id(ctx: RunContext) -> str | None:
@@ -580,6 +634,7 @@ def _suspend_and_exit(
     elapsed_rollout_s: float,
     tasks_dispensed: int,
     pool_queued: int,
+    rollout_wall_clock_s: int,
 ) -> None:
     """Write the suspension, stop the containers, and leave without unwinding. Never returns.
 
@@ -596,7 +651,6 @@ def _suspend_and_exit(
     place where the correct behavior and the tidy behavior are not the same.
     """
     run_dir = ctx.run_dir
-    budget_s = ctx.cell.budget.rollout_wall_clock_s
     suspension = {
         "schema": "shobench.suspension/1",
         "run_id": ctx.run_id,
@@ -608,27 +662,39 @@ def _suspend_and_exit(
         "tasks_dispensed": tasks_dispensed,
         "pool_queued": pool_queued,
         "elapsed_rollout_s": round(elapsed_rollout_s, 3),
-        "rollout_wall_clock_s": budget_s,
-        "remaining_rollout_s": round(max(0.0, budget_s - elapsed_rollout_s), 3),
+        # The clock this rollout was given, carried forward rather than re-read: a second
+        # suspension has to hand on the same budget the first one was measured against.
+        "rollout_wall_clock_s": rollout_wall_clock_s,
+        "remaining_rollout_s": round(max(0.0, rollout_wall_clock_s - elapsed_rollout_s), 3),
         "stop_evidence": record.verdict.to_json(),
         "suspended_at": time.time(),
-        "resume_with": f"shobench resume --run {run_dir} --go",
+        "resume_with": f"uv run shobench resume --run {run_dir} --go",
     }
+    # The record first, and outside the guard below. Everything after it is best-effort, but
+    # this is not: a suspension nobody can read is not a suspension, and if it cannot be written
+    # then failing through the normal path, which at least publishes, beats exiting into silence.
     write_json(run_dir / SUSPENSION_FILE, suspension)
-    write_json(run_dir / "legs.json", ctx.leg_records())
-    # The agent's container is already gone (its process is what ended), so this is the network
-    # namespace and the egress observer, plus whatever the caller registered.
-    if ctx.teardown is not None:
-        with contextlib.suppress(Exception):
+    try:
+        write_json(run_dir / "legs.json", ctx.leg_records())
+        # The agent's container is already gone, its process being what ended, so this stops the
+        # network namespace and the egress observer.
+        if ctx.teardown is not None:
             ctx.teardown()
-    print(
-        f"[shobench] {ctx.cell.name}: suspended on a usage limit after "
-        f"{tasks_dispensed} task(s); resume with: {suspension['resume_with']}",
-        file=sys.stderr,
-    )
-    sys.stderr.flush()
-    sys.stdout.flush()
-    os._exit(SUSPENDED_EXIT_CODE)
+        print(
+            f"[shobench] {ctx.cell.name}: suspended on a usage limit after "
+            f"{tasks_dispensed} task(s); resume with: {suspension['resume_with']}",
+            file=sys.stderr,
+        )
+        sys.stderr.flush()
+        sys.stdout.flush()
+    finally:
+        # Reporting and cleanup are courtesies; the exit is the correctness property, so it sits
+        # in a finally where nothing above it can prevent it. A closed output pipe or a docker
+        # daemon that will not answer must not propagate from here: the exception would unwind
+        # the stream this was called from, shogym would drain the task in flight into a scored
+        # row, and the position the suspension exists to preserve would be spent. Leaving on the
+        # way out of a failure is also what discards it, since os._exit runs no handlers.
+        os._exit(SUSPENDED_EXIT_CODE)
 
 
 async def run_rollout_phase(
@@ -678,11 +744,11 @@ async def run_rollout_phase(
     queued = suspended.pool_queued if resuming else stream.queue_info().remaining
     spent_before = suspended.elapsed_rollout_s if resuming else 0.0
     dispensed_before = suspended.tasks_dispensed if resuming else 0
-    remaining_s = (
-        suspended.remaining_rollout_s(budget.rollout_wall_clock_s)
-        if resuming
-        else budget.rollout_wall_clock_s
-    )
+    # A continuation's clock comes off the record, which carries the budget the interrupted
+    # rollout was given. Subtracting from today's cell file instead would let a budget edited
+    # while the run waited change the length of a rollout that is already half spent.
+    clock_s = suspended.rollout_wall_clock_s if resuming else budget.rollout_wall_clock_s
+    remaining_s = suspended.remaining_rollout_s if resuming else clock_s
     ctx.port = free_port()
     async with stream, _served(stream, ctx.port):
         consumed_before = stream.queue_info().consumed
@@ -719,6 +785,7 @@ async def run_rollout_phase(
                 elapsed_rollout_s=spent_before + (record.ended_at - record.started_at),
                 tasks_dispensed=dispensed_before + info.consumed,
                 pool_queued=queued,
+                rollout_wall_clock_s=clock_s,
             )
         elif info.remaining == 0:
             stopping["stop_reason"] = "pool_exhausted"
@@ -775,9 +842,15 @@ class _Egress:
             return self.summary
         capture, self._capture = self._capture, None
         egress.stop(capture)
-        self.summary = dict(
-            egress.write_summary(self._run_dir / "egress.tsv", self._run_dir / "egress.json")
-        )
+        record = self._run_dir / EGRESS_LOG
+        if capture.log_path != record:
+            # A continuation's observer writes its own segment, because the capture command
+            # truncates whatever file it is pointed at. Its traffic is appended to the run's
+            # record here, so the published summary covers the whole cell rather than only the
+            # last continuation: the eval that ran before the interruption is evidence too.
+            with record.open("a", encoding="utf-8") as whole:
+                whole.write(capture.log_path.read_text(encoding="utf-8", errors="ignore"))
+        self.summary = dict(egress.write_summary(record, self._run_dir / "egress.json"))
         return self.summary
 
 
@@ -789,6 +862,7 @@ async def _run_phases(
     results_dir: Path,
     observer: _Egress,
     suspended: Suspension | None = None,
+    recorded_phases: tuple[str, ...] = (),
 ) -> Path:
     """Run this cell's phases, then finalize the manifest and publish the results.
 
@@ -801,11 +875,22 @@ async def _run_phases(
     """
 
     def teardown() -> None:
-        observer.stop()
-        ctx.sandbox.down()
+        # Independent best-effort steps, with the sandbox in a finally. This runs on the way out
+        # of a suspension, where an observer that will not stop must not leave a namespace
+        # container and a network running for the hours a cell waits for its window.
+        try:
+            observer.stop()
+        finally:
+            ctx.sandbox.down()
 
     ctx.teardown = teardown
-    phase_rows: dict[str, list[TaskResult]] = {}
+    # A continuation starts from the phases the interrupted run already recorded, not from
+    # nothing. eval_before is the half of the paired measurement that ran before the
+    # interruption, and a results file without it reports no requested tasks, no deltas, and
+    # every after row unpaired: the benchmark's whole question, silently unanswered.
+    phase_rows: dict[str, list[TaskResult]] = {
+        phase: read_phase(ctx.run_dir / phase) for phase in recorded_phases
+    }
     stopping: dict[str, Any] = {}
     for phase in phases:
         if phase == "rollout":
@@ -814,9 +899,10 @@ async def _run_phases(
             phase_rows[phase] = await run_eval_phase(ctx, phase)
         write_json(ctx.run_dir / "legs.json", ctx.leg_records())
 
-    # Which model answered, read off the traces rather than assumed from the config.
+    # Which model answered, read off the traces rather than assumed from the config, and off
+    # every leg of the run rather than the ones this process happened to launch.
     manifest["observed_models"] = sorted(
-        {model for leg in ctx.legs for model in leg.observed_models}
+        {model for leg in ctx.leg_records() for model in leg.get("observed_models", [])}
     )
     manifest["home"]["digest_after"] = home_digest(ctx.sandbox.home, exclude=is_noise)
     manifest["home"]["inventory_after"] = home_inventory(ctx.sandbox.home, exclude=is_noise)
@@ -922,21 +1008,34 @@ async def resume_cell(
     it was holding when the window closed.
 
     What it must not do is start a second measurement of a different thing. The cell is the one
-    the manifest recorded, the clock is what remained of the original rollout budget, and the
-    ending is the shared one, so a continued cell publishes the same shape of result as a cell
-    that was never interrupted.
+    the manifest recorded, checked against it rather than trusted; the clock is what remained of
+    the budget that run was given, read from the record and not from today's cell file; the
+    phases already measured are carried into the published result; and the ending is the shared
+    one, so a continued cell publishes the same result shape as a cell that was never
+    interrupted.
     """
     suspension = Suspension.read(run_dir)
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     cell = load_cell_by_name(manifest["cell"]["name"])
     split = load_split_by_name(cell.split)
+    instruction = load_instruction(cell.instruction_arm)
+    drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)
+    if drift:
+        # Refused rather than reconciled. Continuing under an edited definition would publish
+        # one run id describing two experiments, and the operator is the only one who can say
+        # whether the edit was meant for this run or for the next one.
+        raise RuntimeError(
+            "the checkout no longer matches the run being continued: "
+            + "; ".join(drift)
+            + ". Restore the recorded definition, or start a fresh cell."
+        )
     sandbox = CellSandbox(
         run_id=suspension.run_id, home=run_dir / "home", workdir=run_dir / "work"
     )
     ctx = RunContext(
         cell=cell,
         split=split,
-        instruction=load_instruction(cell.instruction_arm),
+        instruction=instruction,
         harness=harness_for(cell.harness),
         run_id=suspension.run_id,
         run_dir=run_dir,
@@ -949,11 +1048,9 @@ async def resume_cell(
         # The legs the suspended run recorded. This process appends to that record rather than
         # replacing it, so a finished cell shows its whole rollout and not just the last stretch.
         ctx.prior_legs = json.loads(legs_path.read_text(encoding="utf-8"))
-    sandbox.up()
-    # The credential is placed again because the sandbox is new even though the home is not;
-    # credential files are excluded from every digest, so re-seeding changes no record.
-    seed_home(spec_for(cell.harness, cell.credential_mode), sandbox.home)
-    observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
+    # Written before anything can suspend again, because a manifest that lives only in memory
+    # loses every resumption to the next hard exit, and a cell continued three times would
+    # publish as though it had been continued once.
     manifest.setdefault("resumptions", []).append(
         {
             "suspended_at": suspension.suspended_at,
@@ -962,19 +1059,31 @@ async def resume_cell(
             "session_id": suspension.session_id,
         }
     )
+    write_json(run_dir / "manifest.json", manifest)
+    sandbox.up()
+    # The credential is placed again because the sandbox is new even though the home is not;
+    # credential files are excluded from every digest, so re-seeding changes no record.
+    seed_home(spec_for(cell.harness, cell.credential_mode), sandbox.home)
+    observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
     try:
-        # The suspension record is removed now rather than after the run: it describes a cell
-        # waiting to be continued, and this is the continuation. A second limit writes a fresh
-        # one with the accumulated clock.
-        (run_dir / SUSPENSION_FILE).unlink(missing_ok=True)
-        return await _run_phases(
+        results_path = await _run_phases(
             ctx,
             manifest=manifest,
             phases=("rollout", "eval_after"),
             results_dir=results_dir,
             observer=observer,
             suspended=suspension,
+            # The measurement that ran before the interruption, read back off the run's own
+            # provenance so the published result carries both halves of the pair.
+            recorded_phases=("eval_before",),
         )
+        # Only now is the record spent. It is this run's one retry handle, and everything
+        # between here and the top of this function can fail: a stream that will not open, a
+        # server that will not bind, a leg that dies. Removing it earlier turned any of those
+        # into a cell that could neither finish nor be tried again. A second usage limit never
+        # reaches this line, having already replaced the record with its own.
+        (run_dir / SUSPENSION_FILE).unlink(missing_ok=True)
+        return results_path
     finally:
         with contextlib.suppress(Exception):
             observer.stop()
@@ -982,10 +1091,22 @@ async def resume_cell(
 
 
 def _start_egress(sandbox: CellSandbox, run_dir: Path) -> egress.EgressCapture:
+    """Attach the observer, writing to its own segment when the run already has a capture.
+
+    The capture command truncates the file it writes, so pointing a continuation's observer at
+    the existing record would erase the traffic from before the interruption. Each process gets
+    a segment of its own instead, and the segments are folded into the record as they stop.
+    """
+    log_path = run_dir / EGRESS_LOG
+    if log_path.exists():
+        segment = 2
+        while (run_dir / f"egress.{segment}.tsv").exists():
+            segment += 1
+        log_path = run_dir / f"egress.{segment}.tsv"
     return egress.start(
         netns_container=sandbox.netns_container,
         name=f"{sandbox.netns_container}-egress"[:63],
-        log_path=run_dir / "egress.tsv",
+        log_path=log_path,
     )
 
 

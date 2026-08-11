@@ -80,15 +80,26 @@ asks about, and nothing prompts the agent onward.
 the agent's doing, so the run stops where it stands and an operator continues it once the
 window resets:
 
-    shobench resume --run runs/<run-id>          # the plan: which cell is waiting, and for how much
-    shobench resume --run runs/<run-id> --go     # continue it
+    uv run shobench resume --run runs/<run-id>        # the plan: which cell waits, and for how much
+    uv run shobench resume --run runs/<run-id> --go   # continue it
 
 A suspended cell writes `runs/<run-id>/suspended.json` (the session to reattach to, how far the
-pool got, how much of the rollout clock is spent), stops its containers, and keeps every
-directory. It publishes no results and runs no `eval_after`, because that measurement belongs
-after a real rollout terminus and never inside an exhausted window. The continuation reattaches
-to the same session, reopens the same provenance record at the position it was holding, and
-gets only what remained of the one rollout budget; a second limit suspends again with the time
-accumulated. A suspending run exits 75, so a script can tell "waiting for a window" from
-"failed". `docs/harness-autonomy.md` records how each harness announces a usage limit, and
-where each rule came from.
+pool got, how much of the rollout clock is spent, and the budget that clock came from), stops
+its containers, and keeps every directory. It publishes no results and runs no `eval_after`,
+because that measurement belongs after a real rollout terminus and never inside an exhausted
+window. A suspending run exits 75, so a script can tell "waiting for a window" from "failed".
+
+The continuation reattaches to the same session, reopens the same provenance record at the
+position it was holding, and gets only what remained of the recorded rollout budget; a second
+limit suspends again with the time accumulated. It publishes what an uninterrupted cell would:
+the eval that ran before the interruption is read back off the run directory and paired with
+the one that follows the rollout, and the models and legs of both processes are in the record.
+
+Three things stop a continuation before it spends, all of them for the same reason, which is
+that a cell can wait hours and a repository changes in hours. The rollout clock must have time
+left on it. The cell's serving-side needs (a dataset, a judge key) must be present in this
+shell as they were in the first. And the cell, split, and instruction must still match the
+digests the manifest recorded, or the run would publish one run id describing two experiments.
+Each of those refusals leaves the suspension record where it is, so the run stays resumable
+once the shell or the checkout is put right. `docs/harness-autonomy.md` records how each
+harness announces a usage limit, and where each rule came from.

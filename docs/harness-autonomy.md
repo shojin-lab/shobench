@@ -26,9 +26,9 @@ through the pool".
 
 The one interruption that is not the agent's own is a provider usage limit, and it gets the
 one exception. The cell **suspends**: a record says where the rollout stood, the containers
-stop, every directory stays, and `shobench resume --run <run-dir> --go` continues the same
-session against the same stream for what is left of the rollout clock. `eval_after` waits for a
-real terminus, so no measurement is ever taken inside an exhausted window.
+stop, every directory stays, and `uv run shobench resume --run <run-dir> --go` continues the
+same session against the same stream for what is left of the rollout clock. `eval_after` waits
+for a real terminus, so no measurement is ever taken inside an exhausted window.
 
 Suspending has to leave the process without unwinding, and that is the one place in the runner
 where the tidy thing is the wrong thing. shogym's orderly close drains the task in flight into
@@ -37,7 +37,20 @@ would spend the task the agent was working on and no continuation could serve it
 hard leaves the claim on disk and the position row-less, which is exactly the state `resume`
 exists to reclaim (observed, against the pinned shogym: a stream ended without unwinding leaves
 no row and replays the position, while the same stream closed in an orderly way leaves a
-`drained` row and the position is gone for good).
+`drained` row and the position is gone for good). The exit itself is in a `finally`, so a
+console that will not take the message and a daemon that will not stop a container cannot turn
+the suspension back into the orderly close it exists to avoid.
+
+What a continuation is allowed to be is the other half of the design, because the point of
+resuming is a comparable measurement rather than a finished job. Its clock is the budget the
+interrupted rollout was given, read from the record, so a cell file edited while the run waited
+cannot lengthen a rollout that is already half spent. Its cell, split, and instruction are
+checked against the digests the manifest recorded before anything spent, and a difference is
+refused by name rather than reconciled. The phases already measured are read back off the run
+directory and published with the new ones, so a continued cell reports the same paired
+before-and-after as one that ran straight through. And the suspension record is spent only once
+the results are written, so a continuation that fails on a missing dataset variable leaves the
+cell exactly as resumable as it found it.
 
 None of the three has a usage-limit exit code. All three need text or event classification,
 and the rules below are what the runner implements.
