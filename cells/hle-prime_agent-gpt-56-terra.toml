@@ -9,6 +9,10 @@ name = "hle-prime_agent-gpt-56-terra"
 env = "hle"
 harness = "prime_agent"
 model = "gpt-5.6-terra"
+# Effort is a cell axis: a different effort is a different cell file. v0 starts every base
+# cell at xhigh. prime_agent exposes no effort control today; the field records the cell's
+# intent and the harness ignores it until one exists.
+effort = "xhigh"
 split = "hle"
 instruction_arm = "get-better"
 # Subscription is the preferred mode for every v0 cell. The runner supports both modes and

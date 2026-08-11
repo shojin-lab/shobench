@@ -124,6 +124,16 @@ def test_the_v0_matrix_is_three_envs_by_four_harness_model_pairs() -> None:
     }
 
 
+def test_every_v0_cell_pins_xhigh_effort_and_the_manifest_records_it() -> None:
+    """Effort is a cell axis, so the v0 matrix pins one value rather than inheriting each
+    CLI's own default; a cell that drifted would make its numbers non-comparable silently."""
+    for cell in load_all_cells():
+        if cell.name.startswith("smoke"):
+            continue
+        assert cell.effort == "xhigh", cell.name
+        assert cell.to_manifest()["effort"] == "xhigh", cell.name
+
+
 def test_the_instruction_is_byte_identical_across_every_cell() -> None:
     digests = {load_instruction(c.instruction_arm).rollout_system_sha256 for c in load_all_cells()}
     assert len(digests) == 1
@@ -487,6 +497,30 @@ def test_codex_resume_puts_the_subcommand_before_the_flags(tmp_path: Path) -> No
         resume=True,
     )
     assert spec.argv[:4] == ["codex", "exec", "resume", "thread-1"]
+
+
+def test_effort_reaches_the_harness_only_when_the_cell_pins_it(tmp_path: Path) -> None:
+    """An empty effort must leave the CLI's own default untouched, so the flag appears only
+    when a cell pins one. codex takes it as a config override and its prompt stays the last
+    positional argument either way."""
+    kwargs = dict(
+        mcp_url="http://h:1/mcp",
+        system_prompt="s",
+        user_prompt="u",
+        model="m",
+        trace_path=tmp_path / "t",
+    )
+    claude = harness_for("claude_code").launch(effort="xhigh", **kwargs)
+    index = claude.argv.index("--effort")
+    assert claude.argv[index + 1] == "xhigh"
+    assert "--effort" not in harness_for("claude_code").launch(**kwargs).argv
+
+    codex = harness_for("codex").launch(effort="xhigh", **kwargs)
+    assert 'model_reasoning_effort="xhigh"' in codex.argv
+    assert codex.argv[-1] == "s\n\nu"
+    bare = harness_for("codex").launch(**kwargs)
+    assert not any("model_reasoning_effort" in arg for arg in bare.argv)
+    assert bare.argv[-1] == "s\n\nu"
 
 
 def test_prime_agent_raises_every_autonomous_budget(tmp_path: Path) -> None:

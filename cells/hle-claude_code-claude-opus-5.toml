@@ -9,6 +9,9 @@ name = "hle-claude_code-claude-opus-5"
 env = "hle"
 harness = "claude_code"
 model = "claude-opus-5"
+# Effort is a cell axis: a different effort is a different cell file. v0 starts every base
+# cell at xhigh, the effort the registered conversation-not-memories training ran at.
+effort = "xhigh"
 split = "hle"
 instruction_arm = "get-better"
 # Subscription is the preferred mode for every v0 cell. The runner supports both modes and

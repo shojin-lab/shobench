@@ -103,7 +103,10 @@ class PrimeAgent(Harness):
         session_id: str | None = None,
         resume: bool = False,
         leg_timeout_s: int = 3600,
+        effort: str = "",
     ) -> LaunchSpec:
+        # prime-agent exposes no reasoning-effort control today; the parameter is accepted for
+        # interface parity and ignored, and the cell's manifest still records the intent.
         prompt = f"{system_prompt}\n\n{user_prompt}"
         argv = [
             "prime-agent",

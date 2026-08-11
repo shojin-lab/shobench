@@ -9,6 +9,10 @@ name = "tau2_telecom-codex-gpt-56-terra"
 env = "tau2_telecom"
 harness = "codex"
 model = "gpt-5.6-terra"
+# Effort is a cell axis: a different effort is a different cell file. v0 starts every base
+# cell at xhigh so all harnesses sit at the same reasoning tier (codex's own config default
+# is only high).
+effort = "xhigh"
 split = "tau2_telecom"
 instruction_arm = "get-better"
 # Subscription is the preferred mode for every v0 cell. The runner supports both modes and

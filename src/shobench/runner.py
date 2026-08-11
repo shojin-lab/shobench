@@ -270,6 +270,7 @@ def run_leg(
         session_id=session_id,
         resume=resume,
         leg_timeout_s=timeout_s,
+        effort=ctx.cell.effort,
     )
     ctx.cfg_dir.mkdir(parents=True, exist_ok=True)
     for name, body in spec.config_files.items():

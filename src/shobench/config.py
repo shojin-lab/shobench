@@ -179,6 +179,12 @@ class Cell:
     required_env: tuple[str, ...] = ()
     # Free-text note carried into the manifest, for anything a reader of the results needs.
     note: str = ""
+    # Reasoning effort handed to the harness, when it exposes one (claude_code's ``--effort``,
+    # codex's ``model_reasoning_effort``). Effort is a cell axis: a different effort is a
+    # different cell file. Empty means the cell does not pin it and the CLI's own default
+    # stands; pinning it makes effort a controlled variable rather than an inherited one, which
+    # is what lets a cell match the effort a registered study ran at.
+    effort: str = ""
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -186,6 +192,7 @@ class Cell:
             "env": self.env,
             "harness": self.harness,
             "model": self.model,
+            "effort": self.effort,
             "split": self.split,
             "instruction_arm": self.instruction_arm,
             "credential_mode": self.credential_mode,
@@ -240,6 +247,7 @@ def load_cell(path: Path) -> Cell:
         env_kwargs=dict(raw.get("env_kwargs", {})),
         required_env=tuple(cell.get("required_env", ())),
         note=cell.get("note", ""),
+        effort=str(cell.get("effort", "")),
     )
 
 

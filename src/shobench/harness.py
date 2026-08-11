@@ -143,6 +143,7 @@ class Harness:
         session_id: str | None = None,
         resume: bool = False,
         leg_timeout_s: int = 3600,
+        effort: str = "",
     ) -> LaunchSpec:
         raise NotImplementedError
 

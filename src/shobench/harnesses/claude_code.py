@@ -86,6 +86,7 @@ class ClaudeCode(Harness):
         session_id: str | None = None,
         resume: bool = False,
         leg_timeout_s: int = 3600,
+        effort: str = "",
     ) -> LaunchSpec:
         argv = [
             "claude",
@@ -110,6 +111,9 @@ class ClaudeCode(Harness):
             "--verbose",
             "--include-partial-messages",
         ]
+        # Pin reasoning effort only when the cell asks for it; otherwise the CLI default stands.
+        if effort:
+            argv += ["--effort", effort]
         if resume and session_id:
             argv += ["--resume", session_id]
         elif resume:

@@ -75,6 +75,7 @@ class Codex(Harness):
         session_id: str | None = None,
         resume: bool = False,
         leg_timeout_s: int = 3600,
+        effort: str = "",
     ) -> LaunchSpec:
         # codex exec has no separate system-prompt channel, so the standing instruction is
         # prepended to the turn. The bytes are the same as every other harness's system prompt
@@ -110,8 +111,13 @@ class Codex(Harness):
             # A container has no OS keyring, so credentials have to resolve from the file.
             "-c",
             'cli_auth_credentials_store="file"',
-            prompt,
         ]
+        # Pin reasoning effort only when the cell asks for it; otherwise codex's config default
+        # (or its built-in default) stands.
+        if effort:
+            argv += ["-c", f'model_reasoning_effort="{effort}"']
+        # The prompt is exec's positional argument and has to come last.
+        argv.append(prompt)
         return LaunchSpec(argv=argv, env=self.base_env())
 
     def classify(
