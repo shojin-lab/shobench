@@ -139,8 +139,10 @@ class CellSandbox:
         task gets a fresh empty directory of its own, discarded with its task HOME, rather than a
         copy of anything. The rollout keeps the cell's one accumulating ``/work`` (the default).
         """
-        home_path = self.home if home is None else home
-        work_path = self.workdir if workdir is None else workdir
+        # Host paths must be absolute: docker reads a non-absolute ``-v`` source as a named
+        # volume, and the default runs/ layout arrives here relative to the invocation cwd.
+        home_path = (self.home if home is None else home).resolve()
+        work_path = (self.workdir if workdir is None else workdir).resolve()
         args = [
             "run",
             "--rm",
@@ -158,7 +160,7 @@ class CellSandbox:
             "/work",
         ]
         for host_path, container_path in mounts.items():
-            args += ["-v", f"{host_path}:{container_path}"]
+            args += ["-v", f"{host_path.resolve()}:{container_path}"]
         for key, value in env.items():
             args += ["-e", f"{key}={value}"]
         return args

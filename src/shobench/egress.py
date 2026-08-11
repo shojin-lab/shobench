@@ -98,7 +98,8 @@ def start(
             "--cap-add",
             "NET_RAW",
             "-v",
-            f"{log_path.parent}:/out:rw",
+            # Absolute, or docker reads the source as a named volume rather than a host dir.
+            f"{log_path.parent.resolve()}:/out:rw",
             image,
             "sh",
             "-c",
