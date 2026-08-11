@@ -137,6 +137,21 @@ def is_noise(rel_path: str) -> bool:
     return False
 
 
+def durable_filter(harness: Harness) -> Callable[[str], bool]:
+    """What a cell of this harness leaves out of its durable self: noise, plus what the runner owns.
+
+    Two different reasons to exclude, and both have to hold or the measurement is wrong in a way
+    that reads as a result. Noise is a session byproduct: it changes whether or not the agent
+    changed itself, so counting it answers "did a session happen". Runner-owned files are the
+    opposite, files only the runner ever writes, rewritten on every launch because the served
+    endpoint moves between phases and between concurrent eval tasks. Counting those made a
+    prime_agent cell that wrote nothing at all publish a changed durable self, which is a false
+    positive on the one question the cell exists to answer.
+    """
+    owned = frozenset(harness.runner_owned_home_files)
+    return lambda rel_path: rel_path in owned or is_noise(rel_path)
+
+
 @dataclass
 class LegRecord:
     """One harness invocation inside a phase.
@@ -241,6 +256,11 @@ class RunContext:
     def cfg_dir(self) -> Path:
         return self.run_dir / "cfg"
 
+    @property
+    def durable(self) -> Callable[[str], bool]:
+        """This cell's durable-self filter, which depends on which harness is running."""
+        return durable_filter(self.harness)
+
 
 # ----- the manifest ------------------------------------------------------------------------
 
@@ -272,9 +292,15 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
     """The record of what this cell was, written before anything spends.
 
     It carries the substrate pin, the split digest, the instruction digests, the resolved
-    harness version and model, and the agent home's digest at the start. Everything a reader
-    needs to know whether two cells were the same experiment.
+    harness version and model, and both persistent channels' digests at the start. Everything a
+    reader needs to know whether two cells were the same experiment.
+
+    The baseline is taken after the runner has placed everything it owns, which is the state the
+    rollout actually begins from. Taken before, the vendored skill package the runner seeds
+    would land on the far side of it and every prime_agent cell would publish those bytes as
+    something the rollout wrote.
     """
+    exclude = ctx.durable
     return {
         "schema": "shobench.manifest/1",
         "run_id": ctx.run_id,
@@ -303,10 +329,25 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
             "forms_watched": ctx.redactor.count,
             "applied_to": ["traces", "legs.json", "manifest.json", "results", "suspension"],
         },
+        # The two channels that persist across a leg and that the agent can write. HOME is the
+        # durable self the benchmark measures. /work is the writable cwd every harness runs in;
+        # it is not the durable self (an eval session gets a fresh empty one, so nothing written
+        # there reaches a later session) but it is persistent and agent-visible for the whole
+        # rollout, and a cell that left a CLAUDE.md or a pile of scripts there used to publish a
+        # manifest that mentioned none of it. Recorded, not scored.
         "home": {
-            "digest_before": home_digest(ctx.sandbox.home, exclude=is_noise),
+            "digest_before": home_digest(ctx.sandbox.home, exclude=exclude),
             "digest_after": None,
             "inventory_after": [],
+        },
+        "work": {
+            "digest_before": home_digest(ctx.sandbox.workdir, exclude=exclude),
+            "digest_after": None,
+            "inventory_after": [],
+            "note": (
+                "the rollout's writable cwd, persistent for the cell and visible to the agent; "
+                "an eval task gets its own empty one, so this reaches no later session"
+            ),
         },
     }
 
@@ -1284,6 +1325,12 @@ async def _run_phases(
             # Persist the stop classification the moment the rollout ends, so an eval_after
             # suspension that follows can republish it: only the runner saw how the leg ended.
             ctx.publish_json(ctx.run_dir / ROLLOUT_STOPPING_FILE, stopping)
+            # The durable measurement is taken here, at the rollout's terminus, and written into
+            # the manifest before eval_after runs. That is the whole boundary: what the rollout
+            # left, read at the moment the rollout ended, and never again afterwards. Taken at
+            # the end of the cell instead, anything an eval phase managed to write into the base
+            # home would be attributed to the rollout, and the reader would have no way to tell.
+            _snapshot_durable_state(ctx, manifest)
         else:
             phase_rows[phase] = await run_eval_phase(ctx, phase)
         ctx.publish_json(ctx.run_dir / "legs.json", ctx.leg_records())
@@ -1300,11 +1347,13 @@ async def _run_phases(
     manifest["observed_models"] = sorted(
         {model for leg in ctx.leg_records() for model in leg.get("observed_models", [])}
     )
-    manifest["home"]["digest_after"] = home_digest(ctx.sandbox.home, exclude=is_noise)
-    manifest["home"]["inventory_after"] = home_inventory(ctx.sandbox.home, exclude=is_noise)
-    manifest["home"]["changed"] = (
-        manifest["home"]["digest_after"] != manifest["home"]["digest_before"]
-    )
+    if manifest["home"]["digest_after"] is None:
+        # No rollout ran in this process and none was carried forward, which only happens when
+        # an operator asked for a subset of the phases. There is no rollout terminus to have
+        # measured, so the state is read now and said to have been.
+        _snapshot_durable_state(ctx, manifest, measured_at="publish")
+    else:
+        _check_evals_left_the_snapshot_alone(ctx, manifest)
     manifest["ended_at"] = time.time()
     ctx.publish_json(ctx.run_dir / "manifest.json", manifest)
 
@@ -1319,6 +1368,78 @@ async def _run_phases(
         redact=ctx.redactor.json,
     )
     return results_path
+
+
+def _snapshot_durable_state(
+    ctx: RunContext, manifest: dict[str, Any], *, measured_at: str = "rollout_end"
+) -> None:
+    """Record what the rollout left in each persistent channel, at the rollout's terminus.
+
+    The boundary this cell publishes, stated once:
+
+    - the **baseline** is the state after the runner has placed everything it owns and before
+      any phase runs, so the seeds a cell starts with are on the same side as the rollout that
+      may improve them;
+    - **eval_before** reads that baseline through a throwaway copy per task and writes only into
+      the copy, so it moves neither channel;
+    - the **rollout** is the only thing that runs against the cell's own HOME and ``/work``;
+    - **this snapshot** is taken the moment the rollout ends, which makes the recorded delta the
+      rollout's and nothing else's;
+    - **eval_after** reads that same post-rollout state through its own throwaway copies.
+
+    Both channels are recorded, but they answer different questions. The HOME digest is the
+    durable self, the thing a later fresh session inherits. ``/work`` is persistent and
+    agent-visible but reaches no later session, so it is inventoried as evidence rather than
+    scored: a rollout that spent its time writing scripts and notes into its cwd should be
+    legible in the record instead of showing up as an agent that did nothing.
+    """
+    exclude = ctx.durable
+    for key, root in (("home", ctx.sandbox.home), ("work", ctx.sandbox.workdir)):
+        channel = manifest.setdefault(key, {"digest_before": None})
+        channel["digest_after"] = home_digest(root, exclude=exclude)
+        channel["inventory_after"] = home_inventory(root, exclude=exclude)
+        channel["changed"] = channel["digest_after"] != channel["digest_before"]
+        channel["measured_at"] = measured_at
+
+
+def _check_evals_left_the_snapshot_alone(ctx: RunContext, manifest: dict[str, Any]) -> None:
+    """Confirm at publish time that no eval phase moved either channel after the rollout.
+
+    An eval task runs against its own copy of the HOME and its own empty ``/work``, so this is
+    an invariant rather than a measurement. Checking it is what turns a future change that
+    quietly shares one of them into a recorded fact instead of a rollout credited with writes it
+    did not make. It never rewrites the snapshot: the rollout's terminus is the measurement, and
+    a mismatch is reported beside it rather than folded into it.
+    """
+    exclude = ctx.durable
+    for key, root in (("home", ctx.sandbox.home), ("work", ctx.sandbox.workdir)):
+        channel = manifest.get(key)
+        if channel is None or channel.get("digest_after") is None:
+            continue
+        channel["unchanged_by_evals"] = (
+            home_digest(root, exclude=exclude) == channel["digest_after"]
+        )
+
+
+def _place_runner_files(ctx: RunContext) -> list[str]:
+    """Put the harness assets the cell starts with into its HOME, before the baseline is taken.
+
+    These are the agent's from here on: the rollout may improve them, and the eval that follows
+    has to read what the rollout left rather than what the checkout shipped. So they are written
+    only when absent, and they are inside the baseline rather than beside it. Seeded lazily on
+    the rollout's first leg instead, as they were, every one of these files landed after the
+    digest that was supposed to precede it, and a prime_agent cell that wrote nothing published
+    ten kilobytes of vendored skill as its own durable output.
+    """
+    placed = []
+    for name, body in ctx.harness.home_seed_files().items():
+        target = ctx.sandbox.home / name
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+        placed.append(name)
+    return sorted(placed)
 
 
 def _cell_redactor(ctx: RunContext, spec: CredentialSpec) -> Redactor:
@@ -1393,8 +1514,12 @@ async def run_cell(
                 env=ctx.credentials,
                 redactor=ctx.redactor,
             )
+        # Everything the runner owns goes in before the baseline digest is taken, so what the
+        # rollout starts from and what the manifest calls the starting point are the same thing.
+        seeds = _place_runner_files(ctx)
         manifest = build_manifest(ctx, probes=probes)
         manifest["credential_seed"] = seeded
+        manifest["home"]["seeded"] = seeds
         ctx.publish_json(run_dir / "manifest.json", manifest)
         return await _run_phases(
             ctx,
@@ -1579,6 +1704,7 @@ __all__ = [
     "EvalSuspension",
     "Suspension",
     "build_manifest",
+    "durable_filter",
     "cleanup",
     "read_eval_phase",
     "resume_cell",

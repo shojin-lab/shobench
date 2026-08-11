@@ -136,8 +136,17 @@ class PrimeAgent(Harness):
     # formality; its absence is a silent no-tools run.
     MCP_TOKEN_VAR = "SHOBENCH_MCP_TOKEN"
 
+    # The one HOME file the runner rewrites every leg, because the endpoint is per leg: the
+    # rollout and each concurrent eval task serve on their own port. Excluded from the durable
+    # digest for that reason, since a file the runner overwrites on every launch cannot carry
+    # anything the agent chose to keep.
+    runner_owned_home_files = (".prime/agent/settings.json",)
+
     def base_env(self) -> dict[str, str]:
         return {**super().base_env(), self.MCP_TOKEN_VAR: "local"}
+
+    def home_seed_files(self) -> dict[str, str]:
+        return shogym_stream_skill_files()
 
     def session_id_from_trace(self, trace_path: Path) -> str | None:
         # prime-agent's first line is its session header, which carries the id.
@@ -198,7 +207,7 @@ class PrimeAgent(Harness):
         # rollout and each concurrent eval task serve on their own port, and an eval task's HOME
         # is a copy of the rollout's, so its inherited url points at a server that is gone.
         home_files = {
-            ".prime/agent/settings.json": json.dumps(
+            self.runner_owned_home_files[0]: json.dumps(
                 {
                     "mcpServers": {
                         "shogym": {
@@ -221,7 +230,7 @@ class PrimeAgent(Harness):
             argv=argv,
             env=self.base_env(),
             home_files=home_files,
-            home_seed_files=shogym_stream_skill_files(),
+            home_seed_files=self.home_seed_files(),
         )
 
     def classify(

@@ -125,6 +125,24 @@ class Harness:
     name: str = ""
     usage_limit_rules: Sequence[UsageLimitRule] = ()
 
+    # HOME paths the RUNNER writes on every leg, declared here so the durable-self digest can
+    # exclude them. They are the same paths ``launch`` returns as ``home_files``, and a
+    # characterization test holds the two together. Declaring them separately is what lets the
+    # digest be taken before any leg has run: an endpoint the runner rewrites per leg cannot be
+    # an agent write however it changes, and counting it made a prime_agent cell that wrote
+    # nothing report a changed durable self.
+    runner_owned_home_files: tuple[str, ...] = ()
+
+    def home_seed_files(self) -> dict[str, str]:
+        """Assets the cell's HOME starts with, which the agent then owns.
+
+        Separate from ``launch`` because the runner places them once, before the baseline digest
+        is taken, and they depend on nothing a leg knows. Placing them lazily on the rollout's
+        first leg put them on the far side of the baseline, so the vendored bytes themselves
+        read as something the rollout had written.
+        """
+        return {}
+
     def base_env(self) -> dict[str, str]:
         """Environment every invocation of this harness needs, credentials excluded.
 
