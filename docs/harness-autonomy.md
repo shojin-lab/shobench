@@ -395,12 +395,50 @@ connection and refuses to open a session without one, even against a server that
 so the variable must be set to some non-empty value in the agent's environment. The runner
 sets it.
 
-**Remaining work, stated rather than papered over:** declaring the server is only half of what
-prime-agent needs. Each integration also requires a Python skill package under
-`.prime/agent/skills/<name>/` that is installed into the kernel venv at session start, and a
-new Python-backed skill needs a fresh session to be picked up. shogym's `examples/prime_agent`
-carries a working `shogym-stream` skill; wiring it into the cell HOME is the last piece before
-a prime_agent cell can run, and it is not done in this PR.
+**The skill, now wired.** Declaring the server is only half of what prime-agent needs. Each
+integration also requires a Python skill package under `.prime/agent/skills/<name>/` that is
+installed into the kernel venv at session start, and a new Python-backed skill needs a fresh
+session to be picked up. The `shogym-stream` skill is vendored under `prime_agent/skills/` and
+installed into each prime_agent cell's isolated HOME beside the settings entry
+(`harnesses/prime_agent.py`, `shogym_stream_skill_files`). It is vendored rather than copied
+verbatim from shogym's `examples/prime_agent` because it has to carry the runner's own token
+variable (`SHOBENCH_MCP_TOKEN`), which the settings entry names too; a test asserts the two
+agree and that the served stream exposes the tools the skill enumerates.
+
+The two files land on different HOME channels, and the difference is measurement rather than
+plumbing. The settings entry is per-leg: the endpoint moves between phases and between
+concurrent eval tasks, and an eval task's HOME is a copy of the rollout's, so its inherited url
+names a server that is gone. The skill package is seeded once and never rewritten, because a
+rollout is free to improve it like any other durable artifact and the eval that follows has to
+read what the rollout left. A leg that restored the vendored bytes would delete the improvement
+in the moment before the session meant to measure it.
+
+**What a tool call returns, since the natural guess is wrong.** `McpIntegration._parse_result`
+prefers a result's `structuredContent` over its text content (source), and shogym's stream
+declares an output schema for its own control tools and none for the tools an env publishes
+(source). So `get_task()` and `queue_info()` arrive as dicts and a task's tools arrive as JSON
+strings (observed, against a live stream over http with the runtime's own parser). The
+inherited quickstart wording, "every one of them returns a JSON string", would have made the
+first line of the documented loop raise `TypeError`; SKILL.md now documents the split and a
+test pins which side of it each tool falls on. A missing skill package is likewise a launch
+error rather than an empty mapping, because the alternative is a healthy prime-agent that can
+reach nothing and a record that reads as an agent which chose to do no work.
+
+That contract holds only under the MCP version the kernel resolves, which is why the skill pins
+one. The bundled runtime reads the 1.x result model's `structuredContent` and `isError`, and
+mcp 2.0 renamed both to `structured_content` and `is_error` (observed: the 2.0 model handed to
+the pinned runtime's parser returns the text of a structured result, and never raises on a
+result flagged as an error, so a failed call comes back looking like an answer). Nothing else in
+the kernel venv bounds it, since `prime-agent-runtime` declares no MCP dependency at all
+(source), so the skill's own requirement is all that stands between a fresh kernel and the
+newest release. It is pinned to the 1.x line, floored where `structuredContent` first appears
+(1.9 has no such field, 1.10 does). Bumping the harness pin to a runtime that speaks the 2.x
+model is what unpins it.
+
+What that leaves is only the credentialed end-to-end check: prime-agent bootstrapping the
+kernel, installing this package, importing it as `shogym_stream`, and pulling a task. That needs
+the interactive login this host does not yet have (see Credentials above), so it waits on the
+same login as the rest of the prime_agent leg, not on more wiring.
 
 ## Docker checklist
 

@@ -142,12 +142,18 @@ class Budget:
     rollout_wall_clock_s: int
     pool_ceiling: int | None = None
     eval_task_timeout_s: int = 3600
+    # How many held-out eval tasks may run at once. Each runs in its own fresh session against
+    # its own isolated copy of the phase's home, so raising this trades host resources for wall
+    # clock without touching the one-session-per-task guarantee. The rollout is unaffected: it
+    # is a single sustained run, never a fan-out.
+    eval_concurrency: int = 4
 
     def to_manifest(self) -> dict[str, Any]:
         return {
             "rollout_wall_clock_s": self.rollout_wall_clock_s,
             "pool_ceiling": self.pool_ceiling,
             "eval_task_timeout_s": self.eval_task_timeout_s,
+            "eval_concurrency": self.eval_concurrency,
         }
 
 
@@ -232,6 +238,7 @@ def load_cell(path: Path) -> Cell:
         rollout_wall_clock_s=int(_require(budget_table, "rollout_wall_clock_s", path)),
         pool_ceiling=budget_table.get("pool_ceiling"),
         eval_task_timeout_s=int(budget_table.get("eval_task_timeout_s", 3600)),
+        eval_concurrency=int(budget_table.get("eval_concurrency", 4)),
     )
     return Cell(
         name=_require(cell, "name", path),

@@ -10,6 +10,66 @@ from pathlib import Path
 from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict, UsageLimitRule, tail
 from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
 
+# The prime-agent skill that makes the served stream reachable. Declaring the HTTP server in
+# settings.json is only half of the wiring: prime-agent hands the model no MCP tools, it reaches
+# a server by importing a Python-backed skill in its kernel and calling it, so the cell HOME
+# must also carry the `shogym-stream` skill package. It is vendored under the repo's
+# `prime_agent/skills/` and seeded into the isolated HOME beside the settings file, which is
+# written per leg while this is written once and then belongs to the agent.
+SHOGYM_STREAM_SKILL = "shogym-stream"
+_SKILL_HOME_PREFIX = ".prime/agent/skills"
+# What prime-agent's discovery requires of a Python-backed skill: the frontmatter that makes it
+# loadable at all, the pyproject that makes it Python-backed rather than markdown, and the module
+# the kernel imports, whose name is the skill's with hyphens turned into underscores. A directory
+# missing any one of them is skipped or installed without the client, and either way the leg runs
+# with no reachable tools.
+_SKILL_IMPORT_NAME = SHOGYM_STREAM_SKILL.replace("-", "_")
+_SKILL_REQUIRED_FILES = (
+    "SKILL.md",
+    "pyproject.toml",
+    f"src/{_SKILL_IMPORT_NAME}/__init__.py",
+)
+
+
+def _vendored_skill_dir() -> Path:
+    from shobench.config import repo_root
+
+    return repo_root() / "prime_agent" / "skills" / SHOGYM_STREAM_SKILL
+
+
+def shogym_stream_skill_files() -> dict[str, str]:
+    """The vendored ``shogym-stream`` skill as ``{home-relative path: contents}``.
+
+    Every file under the vendored skill package, keyed by where it lands in the cell HOME, so a
+    prime-agent kernel installs it editable at session start and exposes it as ``shogym_stream``.
+    Vendored rather than fetched from the pinned shogym examples because the package must carry
+    the runner's own token variable (``bearerTokenEnvVar``), not the quickstart's, so a verbatim
+    copy would be wrong here rather than merely drift-prone; the file is a few dozen lines of
+    text either way.
+
+    Absent or incomplete, the skill is an error and not an empty mapping. A leg launched with
+    the settings entry alone is the failure this wiring exists to prevent: prime-agent starts,
+    the model has nothing to import, and the run looks like an agent that chose to do nothing
+    rather than a harness that was never connected. The asset is resolved from the checkout, so
+    the way it goes missing is an install that is not one, which must fail here rather than
+    twelve serving hours later.
+    """
+    root = _vendored_skill_dir()
+    files: dict[str, str] = {}
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        rel = path.relative_to(root).as_posix()
+        files[f"{_SKILL_HOME_PREFIX}/{SHOGYM_STREAM_SKILL}/{rel}"] = path.read_text(
+            encoding="utf-8"
+        )
+    prefix = f"{_SKILL_HOME_PREFIX}/{SHOGYM_STREAM_SKILL}"
+    missing = [name for name in _SKILL_REQUIRED_FILES if f"{prefix}/{name}" not in files]
+    if missing:
+        raise FileNotFoundError(
+            f"the vendored {SHOGYM_STREAM_SKILL} skill at {root} is missing "
+            f"{', '.join(missing)}; a prime_agent leg without it reaches no tools"
+        )
+    return files
+
 
 class PrimeAgent(Harness):
     """Prime Intellect's prime-agent, non-interactive.
@@ -132,27 +192,36 @@ class PrimeAgent(Harness):
         # In print mode a resume and its prompt are separated by --, so the id is never read
         # as part of the prompt.
         argv += ["--", prompt]
+        # Global settings live in the isolated HOME, so the endpoint is configured where every
+        # session in this cell sees it and nowhere else. Only http servers are honored; a stdio
+        # entry is dropped without an error. This is per-leg because the endpoint is: the
+        # rollout and each concurrent eval task serve on their own port, and an eval task's HOME
+        # is a copy of the rollout's, so its inherited url points at a server that is gone.
+        home_files = {
+            ".prime/agent/settings.json": json.dumps(
+                {
+                    "mcpServers": {
+                        "shogym": {
+                            "type": "http",
+                            "url": mcp_url,
+                            "bearerTokenEnvVar": self.MCP_TOKEN_VAR,
+                        }
+                    }
+                },
+                indent=2,
+            )
+            + "\n"
+        }
+        # The skill package rides in the same HOME, because the settings entry alone reaches
+        # nothing: prime-agent's client is a kernel-side import, not a host-managed tool bridge.
+        # It seeds rather than rewrites. The vendored bytes are only a starting point, the
+        # rollout may improve them like any other durable artifact, and the eval that follows
+        # has to read what the rollout left rather than what this file shipped.
         return LaunchSpec(
             argv=argv,
             env=self.base_env(),
-            # Global settings live in the isolated HOME, so the endpoint is configured where
-            # every session in this cell sees it and nowhere else. Only http servers are
-            # honored; a stdio entry is dropped without an error.
-            home_files={
-                ".prime/agent/settings.json": json.dumps(
-                    {
-                        "mcpServers": {
-                            "shogym": {
-                                "type": "http",
-                                "url": mcp_url,
-                                "bearerTokenEnvVar": self.MCP_TOKEN_VAR,
-                            }
-                        }
-                    },
-                    indent=2,
-                )
-                + "\n"
-            },
+            home_files=home_files,
+            home_seed_files=shogym_stream_skill_files(),
         )
 
     def classify(

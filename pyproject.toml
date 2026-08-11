@@ -39,6 +39,10 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.8",
     "numpy>=1.26",
+    # Reading a declared version range as a range rather than as a string: the skill's MCP bound
+    # is asserted against the version the tests actually run with. Transitive via pytest, used
+    # directly here, so it is declared.
+    "packaging>=24",
 ]
 
 [build-system]
@@ -49,7 +53,7 @@ build-backend = "hatchling.build"
 packages = ["src/shobench"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "cells", "splits", "docs", "README.md", "LICENSE"]
+include = ["src", "cells", "splits", "docs", "prime_agent", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

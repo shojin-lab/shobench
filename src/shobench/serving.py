@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,38 @@ def env_factory(env: str, kwargs: dict[str, Any]):
         return shogym.make(name, config=dict(kwargs) or None)
 
     return env_for
+
+
+# Envs whose upstream this process has already provisioned. shogym caches the fetch on disk and
+# guards it with a lock, so a second construction is cheap; this set makes the runner's own warm
+# call a no-op after the first, so a concurrent eval phase warms once rather than once per task.
+_WARMED_ENVS: set[str] = set()
+
+
+def warm_env(cell: Cell, *, make: Callable[..., Any] | None = None) -> None:
+    """Provision the cell's env once, before an eval phase fans its tasks out concurrently.
+
+    An env's upstream source is fetched into ``~/.cache/shogym`` on first construction and reused
+    after (see the env adapters' ``ensure_source``). Constructing one env here, before the fan-out,
+    means the fetch and the module import are paid once by the runner rather than raced by the
+    first wave of per-task streams. It is isolation-safe by construction: this is read-only
+    reference data on the serving side, identical for every task, mounted into no agent container,
+    and it consumes no task from any queue. ``make`` is injectable so the warm can be tested
+    without standing up a real env.
+    """
+    if cell.env in _WARMED_ENVS:
+        return
+    if make is None:
+        import shogym
+
+        make = shogym.make
+    env = make(cell.env, config=(dict(cell.env_kwargs) or None))
+    _WARMED_ENVS.add(cell.env)
+    close = getattr(env, "close", None)
+    if callable(close):
+        # Warming must never fail a phase: a warm env that cannot be torn down is still warm.
+        with contextlib.suppress(Exception):
+            close()
 
 
 def build_stream(
@@ -217,4 +250,5 @@ __all__ = [
     "serve",
     "side_for_phase",
     "task_indices",
+    "warm_env",
 ]

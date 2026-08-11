@@ -1,0 +1,36 @@
+# What makes `shogym-stream` a Python-backed skill rather than a markdown one: prime-agent
+# installs this package editable into its kernel venv (~/.prime/agent/kernel-venv) during
+# kernel setup, and exposes it in IPython under the import name -- the skill directory name
+# with hyphens turned into underscores, i.e. `shogym_stream`.
+#
+# `mcp` is the only dependency the kernel venv does not already have: its bootstrap installs
+# `prime-agent-runtime` (from the copy bundled with the CLI, not from PyPI, where it does not
+# exist) and `httpx` among its default packages. Declaring all three anyway is what the Prime
+# Agent docs' integration template does, and it costs nothing -- uv leaves an already-installed
+# requirement alone rather than going looking for it.
+#
+# The bound on `mcp` is the load-bearing part of that line, because nothing else in the kernel
+# venv constrains it: `prime-agent-runtime` declares ipykernel, nest-asyncio and tyro, and no
+# MCP at all, so an unconstrained requirement resolves to whatever is newest the day the kernel
+# is built. mcp 2.0 renamed the result model's fields, `structuredContent` to
+# `structured_content` and `isError` to `is_error`, and the runtime bundled with the pinned
+# prime-agent still reads the old names. Under 2.0 the kernel therefore hands the model the
+# text of a structured result where SKILL.md documents a dict, and misses a failed call's error
+# flag entirely, returning the error message as if it were an answer. The image pins the
+# harness, so this pins what the harness's kernel resolves; when the harness pin moves to a
+# runtime that speaks the 2.x model, this moves with it. The floor is where the 1.x line grew
+# `structuredContent` at all: 1.9 has no such field, 1.10 does, and the control tools depend
+# on it.
+
+[project]
+name = "prime-agent-skill-shogym-stream"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.10,<2", "httpx", "prime-agent-runtime"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shogym_stream"]
