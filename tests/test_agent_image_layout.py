@@ -45,6 +45,32 @@ def _mount_targets(args: list[str]) -> list[str]:
     ]
 
 
+def _mount_sources(args: list[str]) -> list[str]:
+    """The host-side paths of those same bind mounts."""
+    return [
+        args[index + 1].split(":")[0]
+        for index, token in enumerate(args)
+        if token == "-v" and index + 1 < len(args)
+    ]
+
+
+def test_relative_host_paths_still_reach_docker_absolute(tmp_path: Path, monkeypatch) -> None:
+    """Docker reads a non-absolute ``-v`` source as a named volume and refuses it.
+
+    The CLI's default layout hands the sandbox paths relative to the invocation cwd
+    (``runs/precheck-<cell>/home``), which is how the first real precheck died with
+    "invalid characters for a local volume name" before any spend.
+    """
+    monkeypatch.chdir(tmp_path)
+    sandbox = CellSandbox(run_id="r", home=Path("runs/pre/home"), workdir=Path("runs/pre/work"))
+
+    sources = _mount_sources(sandbox.docker_args(env={}, mounts={Path("runs/cfg"): "/cfg:ro"}))
+
+    assert sources, "no bind mounts in the leg argv at all"
+    for source in sources:
+        assert Path(source).is_absolute(), f"docker would read {source!r} as a named volume"
+
+
 def test_the_runtime_mounts_are_the_ones_the_leg_actually_runs_with(tmp_path: Path) -> None:
     """A guard on the guard: the mount list below is read off the real argv, not assumed."""
     sandbox = CellSandbox(run_id="r", home=tmp_path / "home", workdir=tmp_path / "work")
