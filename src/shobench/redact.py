@@ -2,10 +2,16 @@
 
 Every v0 harness gets a shell and full internet, and a rollout whose whole instruction is to
 improve itself has an obvious reason to read its own environment and its own auth file. What it
-reads is echoed verbatim into the leg's trace, and the runner then copies tails of that output
-into ``legs.json``, the manifest's stop evidence, and the results JSON. Nothing between the
-agent's ``env`` call and the published file used to look at the bytes, so a single curious
+reads is echoed verbatim into the leg's trace, which is durable run data an operator reads and
+shares, and values the runner holds directly reach published artifacts by other routes as well:
+the probe output in the manifest, and whatever the agent typed into a task result. Nothing
+between the agent's ``env`` call and those files used to look at the bytes, so a single curious
 command was enough to put a live token into an artifact meant to be shared.
+
+This is one of the two mechanisms and it is the weaker one. It can only replace values it can
+name, and a harness that mints a credential and overwrites it inside a single leg leaves one it
+cannot: see :func:`shobench.harness.stderr_evidence` for the boundary that does not depend on
+naming the value.
 
 The runner is the party that can fix this, because it is the party that provisioned the
 credential: it knows the exact strings it put into the container's environment and the exact

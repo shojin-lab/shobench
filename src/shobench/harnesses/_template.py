@@ -17,7 +17,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict, UsageLimitRule, tail
+from shobench.harness import (
+    Harness,
+    LaunchSpec,
+    StopKind,
+    StopVerdict,
+    UsageLimitRule,
+    stderr_evidence,
+)
 from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
 
 
@@ -120,7 +127,11 @@ class TemplateHarness(Harness):
         evidence = {
             "returncode": returncode,
             "terminal_event": None if terminal is None else terminal.get("type"),
-            "stderr_tail": tail(stderr_path)[-2000:],
+            # Never a tail of the harness's own output: a leg's stderr can hold a credential the
+            # harness minted and overwrote inside the same leg, which nothing downstream can
+            # name afterwards. Describe the file instead; the raw bytes stay in the run
+            # directory. Read `stderr_evidence` before you put anything else from stderr here.
+            "stderr": stderr_evidence(stderr_path),
         }
         # Return CHOSEN only for the agent's own clean stop; ERROR for a failure; and reserve
         # UNKNOWN for a terminal event you cannot read, never as a catch-all. Crib: Codex is the

@@ -14,6 +14,7 @@ from shobench.harness import (
     StopVerdict,
     UsageLimitRule,
     jsonl_events,
+    stderr_evidence,
     tail,
 )
 from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
@@ -290,11 +291,18 @@ class PrimeAgent(Harness):
                 return limit
 
         stderr_text = texts["stderr"].lower()
-        if any(marker in stderr_text for marker in self.LIMIT_MARKERS):
+        # The markers that fired, by name, out of the tuple above. They are literals in this
+        # file, so naming them says exactly what the classification read without quoting a byte
+        # of what the harness wrote around them.
+        hits = [marker for marker in self.LIMIT_MARKERS if marker in stderr_text]
+        if hits:
             return StopVerdict(
                 StopKind.LEG_TIMEOUT,
                 "an autonomous host limit ended the run, which is a cutoff and not a stop",
-                {"returncode": returncode, "stderr_tail": texts["stderr"][-2000:]},
+                {
+                    "returncode": returncode,
+                    "stderr": stderr_evidence(stderr_path, matched=hits),
+                },
             )
 
         ended = _last_event_of_type(stdout_path, ("agent_end",))
@@ -302,7 +310,7 @@ class PrimeAgent(Harness):
             "returncode": returncode,
             "stop_reason": stop_reason,
             "saw_agent_end": ended is not None,
-            "stderr_tail": texts["stderr"][-2000:],
+            "stderr": stderr_evidence(stderr_path),
         }
         # The exit code is not usable here: every model-level failure sets exit 1 only in text
         # mode, so a json-mode run that errored still exits 0. The event stream is the record.

@@ -12,11 +12,17 @@ in the results JSON, so a reader can check the call rather than trust it. Anythi
 not recognise becomes ``UNKNOWN``, which the runner treats as an error and never as a chosen
 stop; a metric that silently absorbs surprises is worse than one that reports them.
 
+Evidence a verdict carries is quoted only where the runner knows what it is quoting. The
+harness's raw stderr is the one artifact it never knows that about, so a verdict describes it
+instead: see :func:`stderr_evidence` for why, and for what a description has to include to keep
+the classification checkable.
+
 The per-harness settings and the citations behind them are in ``docs/harness-autonomy.md``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Sequence
@@ -263,6 +269,53 @@ def tail(path: Path, *, lines: int = 60, limit: int = 8000) -> str:
     return "\n".join(content.splitlines()[-lines:])[-limit:]
 
 
+def stderr_evidence(path: Path, *, matched: Sequence[str] = ()) -> dict[str, Any]:
+    """What a published verdict may say about a leg's stderr: everything except its bytes.
+
+    A 2KB tail of the harness's own output used to be lifted in here, and it was the one thing a
+    verdict carried that nothing could vouch for. The credential file a harness rewrites mid-leg
+    is the case that settles it. A leg is one invocation lasting up to eight hours, so a
+    file-backed OAuth client refreshes inside it more than once: a token minted an hour in, read
+    by an ordinary config inspection, and overwritten by the next refresh is in the stderr of
+    that leg and in no file anything can read afterwards. Redaction performed when the leg ends
+    can only name what the file holds then, so a tail lifted from those bytes is a tail nothing
+    downstream can promise is clean, and the verdict copies it into legs.json, the suspension
+    record, and the published results.
+
+    So the bytes are not lifted at all. The raw stderr stays in the run directory beside the
+    trace, which is the operator's own data on the operator's own machine and where a failure is
+    actually diagnosed; what crosses into a published artifact is a description of that file.
+    The name is the runner's own stem, the counts and the digest are computed from the bytes
+    rather than taken from them, and ``matched`` is whichever of the caller's own marker strings
+    the classification found. Every field is a number, a runner-chosen name, or a literal from
+    this repository's source, so no value here can be a secret whatever the harness wrote.
+
+    The digest is what keeps the record checkable, which is the property the tail used to serve:
+    a reader with the run directory can prove the local file is the one this verdict was
+    computed from, rather than being asked to trust it.
+    """
+    described: dict[str, Any] = {
+        "file": path.name,
+        "bytes": None,
+        "lines": None,
+        "sha256": None,
+        "matched": list(matched),
+    }
+    size, lines = 0, 0
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                size += len(chunk)
+                lines += chunk.count(b"\n")
+                digest.update(chunk)
+    except OSError:
+        # A leg that wrote no stderr file at all, or one this cannot read. Left as the absence it
+        # is rather than reported as an empty file, which is a different fact about the run.
+        return described
+    return {**described, "bytes": size, "lines": lines, "sha256": digest.hexdigest()}
+
+
 def jsonl_events(path: Path, *, limit: int = 400) -> list[dict[str, Any]]:
     """The last events of a stream-json trace, parsed and tolerant of a truncated final line."""
     if not path.exists():
@@ -289,5 +342,6 @@ __all__ = [
     "StopVerdict",
     "UsageLimitRule",
     "jsonl_events",
+    "stderr_evidence",
     "tail",
 ]

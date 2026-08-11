@@ -6,7 +6,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict, UsageLimitRule, tail
+from shobench.harness import (
+    Harness,
+    LaunchSpec,
+    StopKind,
+    StopVerdict,
+    UsageLimitRule,
+    stderr_evidence,
+)
 from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
 
 
@@ -147,7 +154,7 @@ class Codex(Harness):
             "returncode": returncode,
             "terminal_event": None if terminal is None else terminal.get("type"),
             "error_message": failure,
-            "stderr_tail": tail(stderr_path)[-2000:],
+            "stderr": stderr_evidence(stderr_path),
         }
         if terminal is not None and terminal.get("type") == "turn.completed" and returncode == 0:
             return StopVerdict(StopKind.CHOSEN, "codex exec completed its turn", evidence)

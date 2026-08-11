@@ -14,7 +14,7 @@ from shobench.harness import (
     StopVerdict,
     UsageLimitRule,
     jsonl_events,
-    tail,
+    stderr_evidence,
 )
 from shobench.harnesses._trace import _last_event_of_type
 
@@ -172,11 +172,11 @@ class ClaudeCode(Harness):
             return StopVerdict(
                 StopKind.ERROR,
                 "no result event in the stream trace",
-                {"returncode": returncode, "stderr_tail": tail(stderr_path)[-2000:]},
+                {"returncode": returncode, "stderr": stderr_evidence(stderr_path)},
             )
         evidence = {
             "returncode": returncode,
-            "stderr_tail": tail(stderr_path)[-2000:],
+            "stderr": stderr_evidence(stderr_path),
             "subtype": result.get("subtype"),
             "is_error": result.get("is_error"),
             "stop_reason": result.get("stop_reason"),

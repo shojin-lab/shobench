@@ -52,7 +52,7 @@ supply it.
 |---|---|---|
 | `name` | Keys the registry and labels the cell manifest. | yes |
 | `launch(...)` | Builds the argv, env, and files for one autonomous invocation, returned as a `LaunchSpec`. This is the harness's whole autonomy story. | yes |
-| `classify(...)` | Reads how a leg ended into a `StopVerdict`: a `CHOSEN` stop (the only kind the stopping metrics count), a `USAGE_LIMIT` (resumed, not counted), a `LEG_TIMEOUT`, an `ERROR`, or `UNKNOWN`. | yes |
+| `classify(...)` | Reads how a leg ended into a `StopVerdict`: a `CHOSEN` stop (the only kind the stopping metrics count), a `USAGE_LIMIT` (resumed, not counted), a `LEG_TIMEOUT`, an `ERROR`, or `UNKNOWN`. Its evidence must never quote the leg's raw stderr: a harness can mint a credential and overwrite it inside one leg, so those bytes are ones nothing downstream can name. Call `stderr_evidence(stderr_path)`, which describes the file instead. | yes |
 | `version_probe()` | Records the installed harness version in the manifest. | yes |
 | `usage_limit_rules` | The evidence-based rules `classify` matches against named artifacts via `_match_usage_limit`. Each names where it read and cites its source. | if the harness has a usage limit |
 | `pins_session_id` | Says whether the runner may choose the session id before launch. False means the harness mints its own. | default False |

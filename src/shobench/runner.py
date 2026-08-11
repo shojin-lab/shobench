@@ -125,6 +125,14 @@ NOISE_FILES = frozenset(
 # the agent wrote about itself.
 CREDENTIAL_FILES = frozenset({".claude.json", ".credentials.json", "auth.json"})
 
+# How often the runner re-reads a running leg's credential files. The HOME a leg runs against is
+# a host directory bind-mounted into the container, so the runner can watch what the harness
+# writes into it while the leg is still going. A leg is one invocation of up to eight hours and a
+# file-backed OAuth client refreshes inside it repeatedly, so reading only when the leg ends
+# learns the last generation and no other. A second is far below any refresh interval any of the
+# three harnesses uses and costs one read of a kilobyte file per leg per second.
+CREDENTIAL_POLL_S = 1.0
+
 
 def is_noise(rel_path: str) -> bool:
     """Is this file a session byproduct rather than part of the durable self?"""
@@ -448,6 +456,46 @@ def write_home_files(home: Path, spec: LaunchSpec) -> None:
         target.write_text(body, encoding="utf-8")
 
 
+@contextlib.contextmanager
+def _watching_credentials(ctx: RunContext, home: Path):
+    """Fold every generation of this HOME's credential files into the redactor as they appear.
+
+    A read taken when the harness has already exited can only learn the generation that survived
+    it. Anything the harness minted and then overwrote inside the same invocation was never in
+    the redactor and is no longer in the file, so nothing downstream can name it: that is a
+    credential the runner provisioned and cannot protect. Reading while the harness runs is what
+    turns "the last generation" into "every generation this saw", and the runner is in a position
+    to do it because the HOME is a host directory it bind-mounts into the container.
+
+    The first read is taken here on the calling thread rather than by the poller, so the state
+    the invocation starts from is covered before it has run at all; a copied eval HOME is the
+    case that needs it, since its file arrives from outside this leg entirely.
+
+    What this does not close is the gap between two reads: a generation written and overwritten
+    inside one interval is missed exactly as before. That is a race against a token lifetime
+    measured in hours with an interval measured in a second, and it is a narrowing rather than a
+    guarantee. The guarantee is elsewhere, in what a published artifact is allowed to carry at
+    all (see :func:`shobench.harness.stderr_evidence`); this keeps the operator's own local trace
+    clean as well.
+    """
+    ctx.watch_credentials(home)
+    done = threading.Event()
+
+    def poll() -> None:
+        while not done.wait(CREDENTIAL_POLL_S):
+            ctx.watch_credentials(home)
+
+    watcher = threading.Thread(target=poll, name="shobench-credentials", daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        done.set()
+        # Bounded, and a daemon thread besides: a poller that somehow wedged on a read must not
+        # be what keeps a finished leg from being recorded.
+        watcher.join(timeout=CREDENTIAL_POLL_S * 5)
+
+
 def run_leg(
     ctx: RunContext,
     *,
@@ -520,7 +568,14 @@ def run_leg(
 
     started = time.time()
     timed_out = False
-    with stdout_path.open("a", encoding="utf-8") as out, stderr_path.open("a") as err:
+    # Watched for the whole invocation rather than after it, because a leg is where a harness
+    # refreshes its credential and a refresh that is itself overwritten before the leg ends
+    # leaves nothing on disk to learn from afterwards.
+    with (
+        _watching_credentials(ctx, home),
+        stdout_path.open("a", encoding="utf-8") as out,
+        stderr_path.open("a") as err,
+    ):
         # Every harness in v0 either hangs on an open stdin or reads its prompt from it, so
         # stdin is always explicit and never inherited.
         stdin_data = spec.stdin
@@ -540,24 +595,23 @@ def run_leg(
             returncode = -1
             docker("rm", "-f", container, check=False)
 
-    # What this leg's credential file holds now, before a byte of its output is read. A harness
-    # that refreshes an expired OAuth token writes the new one back over the file in this HOME
-    # while the leg runs, so the value to be replaced below can be one that did not exist when
-    # the cell built its redactor. It is also the last moment an eval task's value can be learned
-    # at all: its HOME is a private copy discarded the moment this returns.
+    # The generation the harness left behind, taken before a byte of its output is read. The
+    # watcher above covered the ones it wrote and replaced; this is the last one, and it is also
+    # the last moment an eval task's values can be learned at all, since its HOME is a private
+    # copy discarded the moment this returns.
     ctx.watch_credentials(home)
 
     # The credential values out of the leg's own output, before anything reads it. Order is the
-    # whole point: `classify` lifts a 2KB tail of stderr into the verdict, the verdict goes into
-    # legs.json and into the results JSON, and `observed_models` and the session id are read off
-    # the trace as well. Redacting here means every one of those downstream copies is taken from
-    # bytes that no longer hold the secret, rather than each of them having to remember to.
+    # whole point: `observed_models`, the session id and the classification are all read off
+    # these files, so redacting here means every downstream copy is taken from bytes that no
+    # longer hold a value this cell can name, rather than each of them having to remember to.
     #
-    # The window this leaves is the leg itself: while the harness runs, its raw output is on
-    # disk in the run directory, on the same machine that holds the credential it came from.
-    # Closing that too would mean pumping an eight-hour stream through this process, and a
-    # redactor that can stall a rollout is a worse trade than a window inside the operator's own
-    # run directory. Nothing publishes from inside a leg.
+    # What this cannot promise is that it named every value the leg saw. A generation written and
+    # overwritten between two of the watcher's reads is in these files and in nothing the runner
+    # can still read, so these two calls are a best effort over the operator's own local trace.
+    # The guarantee is elsewhere: a published artifact quotes none of a leg's raw output. The
+    # verdict describes its stderr rather than quoting it (`shobench.harness.stderr_evidence`),
+    # and everything else it carries is a field the harness's own structured stream named.
     ctx.redactor.file(stdout_path)
     ctx.redactor.file(stderr_path)
 
@@ -1652,10 +1706,13 @@ async def run_cell(
         model_probe = ctx.harness.model_probe()
         if model_probe:
             # The first thing in the run that authenticates, so the first thing that can refresh
-            # a file-backed credential. What the file holds after it is folded in before its own
-            # output is redacted, or a token this probe minted would be published in the manifest
-            # the probe feeds.
-            output = _probe(model_probe, image=agent_image, sandbox=sandbox, env=ctx.credentials)
+            # a file-backed credential. Its raw output goes into the manifest, so it is watched
+            # while it runs and once more before that output is redacted: a probe that refreshed
+            # twice would otherwise put the first of the two into the manifest it feeds.
+            with _watching_credentials(ctx, sandbox.home):
+                output = _probe(
+                    model_probe, image=agent_image, sandbox=sandbox, env=ctx.credentials
+                )
             ctx.watch_credentials(sandbox.home)
             probes["model"] = ctx.redactor.text(output)
         # Everything the runner owns goes in before the baseline digest is taken, so what the
