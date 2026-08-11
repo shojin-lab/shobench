@@ -245,23 +245,51 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         instruction=load_instruction(cell.instruction_arm),
     )
     missing_required = [n for n in cell.required_env if not os.environ.get(n)]
+    # Where the limit fell decides what a continuation needs to know and what it must guard. A
+    # rollout suspension is one session on one clock, so its plan is a clock and a dispense count
+    # and its one added guard is the spent-clock refusal. An eval suspension is a fan-out of
+    # fresh per-task sessions, so it has no clock to be spent and no session to reattach to: its
+    # plan is which held-out ids are done and which remain, and it skips the clock guard entirely.
+    interrupted_phase = record.get("phase", "rollout")
     plan = {
         "run_dir": str(run_dir),
         "cell": record["cell"],
         "harness": record["harness"],
-        "session_id": record["session_id"],
-        "tasks_dispensed_so_far": record["tasks_dispensed"],
-        "pool_queued": record["pool_queued"],
-        "elapsed_rollout_s": record["elapsed_rollout_s"],
-        "remaining_rollout_s": record["remaining_rollout_s"],
+        "interrupted_phase": interrupted_phase,
         "suspended_at": record["suspended_at"],
         "stop_evidence": record["stop_evidence"],
-        "phases_left": ["rollout", "eval_after"],
         "credentials_present": credentials.inventory(dict(os.environ)),
         "required_env_present": {name: bool(os.environ.get(name)) for name in cell.required_env},
         "missing_required_env": missing_required,
         "experiment_drift": drift,
     }
+    if interrupted_phase == "rollout":
+        plan.update(
+            {
+                "session_id": record["session_id"],
+                "tasks_dispensed_so_far": record["tasks_dispensed"],
+                "pool_queued": record["pool_queued"],
+                "elapsed_rollout_s": record["elapsed_rollout_s"],
+                "remaining_rollout_s": record["remaining_rollout_s"],
+                "phases_left": ["rollout", "eval_after"],
+            }
+        )
+    else:
+        pending = record.get("pending_task_ids", [])
+        plan.update(
+            {
+                "completed_task_ids": record.get("completed_task_ids", []),
+                "pending_task_ids": pending,
+                "held_out_tasks_left": len(pending),
+                # An eval_before limit fell before the rollout, so all three phases remain; an
+                # eval_after limit is the last phase, so only it does.
+                "phases_left": (
+                    [interrupted_phase, "rollout", "eval_after"]
+                    if interrupted_phase == "eval_before"
+                    else [interrupted_phase]
+                ),
+            }
+        )
     if not args.go:
         print(json.dumps(plan, indent=2))
         print(
@@ -274,10 +302,12 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     # touched. A continuation is normally started in a new shell hours later, which is exactly
     # where a serving-side variable goes missing, and a failure past this point used to consume
     # the record that made another attempt possible.
-    if record["remaining_rollout_s"] <= 0:
+    if interrupted_phase == "rollout" and record["remaining_rollout_s"] <= 0:
         # The clock the rollout was given is gone. Continuing would hand it a second budget,
         # which is the one thing a continuation must not do, so this stops and says so rather
-        # than running a rollout nobody budgeted.
+        # than running a rollout nobody budgeted. Only a rollout suspension has this clock; an
+        # eval phase is bounded per task, not by the rollout wall clock, so it is never refused
+        # here.
         print(json.dumps(plan, indent=2), file=sys.stderr)
         print(
             "\nBLOCKED: the rollout wall clock is already spent, so there is nothing to "

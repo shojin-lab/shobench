@@ -26,9 +26,16 @@ from pathlib import Path
 from shobench import runner, serving
 from shobench.config import load_cell_by_name, load_instruction
 from shobench.containers import CellSandbox, home_digest
+from shobench.harness import StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.results import TaskResult
-from shobench.runner import RunContext, _copy_task_home, _eval_container_name, is_noise
+from shobench.runner import (
+    LegRecord,
+    RunContext,
+    _copy_task_home,
+    _eval_container_name,
+    is_noise,
+)
 from shobench.splits import Side, Split
 
 # ----- per-task home isolation ---------------------------------------------------------------
@@ -121,6 +128,40 @@ def test_concurrent_container_names_are_unique_and_keep_the_task_id() -> None:
     assert names[119].endswith("-eval-t00119")
 
 
+# ----- the per-task /work mount --------------------------------------------------------------
+
+
+def _work_mount(args: list[str]) -> str:
+    """The ``-v`` value the generated docker args map to ``/work:rw``."""
+    return next(
+        args[i + 1]
+        for i, a in enumerate(args)
+        if a == "-v" and args[i + 1].endswith(":/work:rw")
+    )
+
+
+def test_each_eval_task_mounts_its_own_work_directory(tmp_path: Path) -> None:
+    """Finding 1: every eval task's ``/work`` is a directory of its own, never the cell-wide one,
+    so two concurrent tasks cannot share the writable cwd. Inspected on the generated docker args,
+    the same construction the reviewer drove against the real image."""
+    sandbox = CellSandbox(run_id="r", home=tmp_path / "home", workdir=tmp_path / "cellwork")
+    work_a = tmp_path / "task-a"
+    work_b = tmp_path / "task-b"
+    args_a = sandbox.docker_args(env={}, mounts={}, home=tmp_path / "ha", workdir=work_a)
+    args_b = sandbox.docker_args(env={}, mounts={}, home=tmp_path / "hb", workdir=work_b)
+
+    # Distinct per-task mounts, each its own directory.
+    assert _work_mount(args_a) == f"{work_a}:/work:rw"
+    assert _work_mount(args_b) == f"{work_b}:/work:rw"
+    assert _work_mount(args_a) != _work_mount(args_b)
+    # The cwd is still /work, so the harness runs where it always has, just in isolation.
+    assert args_a[args_a.index("-w") + 1] == "/work"
+
+    # The rollout keeps the cell's one accumulating /work (the default), unchanged by the fix.
+    rollout_args = sandbox.docker_args(env={}, mounts={})
+    assert _work_mount(rollout_args) == f"{tmp_path / 'cellwork'}:/work:rw"
+
+
 # ----- concurrency correctness ---------------------------------------------------------------
 
 
@@ -181,18 +222,25 @@ def test_the_eval_phase_runs_in_parallel_keys_every_result_and_survives_a_failur
     max_in_flight = 0
     prompts: list[str] = []
     homes_seen: dict[int, Path] = {}
+    works_seen: dict[int, Path] = {}
 
-    def fake_run_leg(ctx_arg: RunContext, **kw: object) -> None:
+    def fake_run_leg(ctx_arg: RunContext, **kw: object) -> LegRecord:
         nonlocal in_flight, max_in_flight
         idx = int(kw["task_idx"])  # type: ignore[arg-type]
         home = Path(kw["home"])  # type: ignore[arg-type]
+        work = Path(kw["workdir"])  # type: ignore[arg-type]
         # Every task reads the accumulated durable self out of its own isolated home.
         note = home / ".claude/projects/-work/memory/note.md"
         assert note.read_text() == "accumulated lesson\n"
+        # And writes into a /work of its own that starts empty: a fresh scratch cwd, never a
+        # shared one, so a file this task drops there cannot be read by a sibling.
+        assert work.is_dir() and list(work.iterdir()) == []
+        (work / "from-task.txt").write_text(str(idx), encoding="utf-8")
         with lock:
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
             homes_seen[idx] = home
+            works_seen[idx] = work
             prompts.append(str(kw["system_prompt"]))
         # Hold the slot long enough that the bounded set of siblings genuinely overlap.
         time.sleep(0.05)
@@ -200,6 +248,19 @@ def test_the_eval_phase_runs_in_parallel_keys_every_result_and_survives_a_failur
             in_flight -= 1
         if idx == failing:
             raise RuntimeError("this task could not be run")
+        return LegRecord(
+            leg=idx,
+            phase=str(kw["phase"]),
+            task_idx=idx,
+            started_at=0.0,
+            ended_at=1.0,
+            returncode=0,
+            verdict=StopVerdict(StopKind.CHOSEN, "it stopped on its own"),
+            tasks_consumed_before=0,
+            tasks_consumed_after=0,
+            trace_path="t",
+            run_dir=ctx_arg.run_dir,
+        )
 
     def fake_read_phase(prov_dir: Path) -> list[TaskResult]:
         idx = int(prov_dir.name.split("-")[1])
@@ -230,6 +291,11 @@ def test_the_eval_phase_runs_in_parallel_keys_every_result_and_survives_a_failur
     assert len(set(homes_seen.values())) == len(homes_seen)
     for home in homes_seen.values():
         assert not home.exists()
+    # And a distinct /work of its own, discarded with the home: no eval-writable directory is
+    # shared, which is what keeps one task's file from reaching another (finding 1).
+    assert len(set(works_seen.values())) == len(works_seen)
+    for work in works_seen.values():
+        assert not work.exists()
     # The failing task left a provenance breadcrumb rather than vanishing.
     assert (ctx.run_dir / "eval_before" / f"task-{failing:05d}" / "runner-error.txt").exists()
 

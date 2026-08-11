@@ -115,6 +115,7 @@ class CellSandbox:
         mounts: dict[Path, str],
         name: str | None = None,
         home: Path | None = None,
+        workdir: Path | None = None,
     ) -> list[str]:
         """The ``docker run`` prefix an agent leg uses.
 
@@ -129,8 +130,17 @@ class CellSandbox:
         ``home`` overrides which HOME is mounted at ``/root``. The rollout mounts the cell's one
         accumulating home (the default); an eval task mounts its own throwaway copy of it, so
         two tasks can run at once without one task's writes reaching the other or the base.
+
+        ``workdir`` overrides which host directory is mounted at ``/work``, the cwd every
+        harness runs in. It is the same isolation story as ``home`` and it matters for the same
+        reason: ``/work`` is writable, so concurrent eval tasks sharing one would let task A's
+        file reach task B, and one phase's ``/work`` would leak into the next. Unlike ``home``,
+        ``/work`` is not part of the measured durable self (only the HOME digest is), so an eval
+        task gets a fresh empty directory of its own, discarded with its task HOME, rather than a
+        copy of anything. The rollout keeps the cell's one accumulating ``/work`` (the default).
         """
         home_path = self.home if home is None else home
+        work_path = self.workdir if workdir is None else workdir
         args = [
             "run",
             "--rm",
@@ -143,7 +153,7 @@ class CellSandbox:
             "-v",
             f"{home_path}:/root:rw",
             "-v",
-            f"{self.workdir}:/work:rw",
+            f"{work_path}:/work:rw",
             "-w",
             "/work",
         ]
