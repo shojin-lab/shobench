@@ -1,0 +1,1 @@
+Continue. Any task you had in progress was interrupted and cannot be resumed. Call `get_task` to pull the next one, then keep going until the stream is exhausted.

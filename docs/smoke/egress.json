@@ -1,0 +1,12 @@
+{
+  "available": true,
+  "path": "egress.tsv",
+  "observations": 65,
+  "distinct_hosts": 2,
+  "hosts": {
+    "api.anthropic.com": 50,
+    "http-intake.logs.us5.datadoghq.com": 15
+  },
+  "mechanism": "passive tshark capture in the cell network namespace (DNS + TLS SNI)",
+  "limit": "hostnames only; TLS payloads are not decrypted"
+}

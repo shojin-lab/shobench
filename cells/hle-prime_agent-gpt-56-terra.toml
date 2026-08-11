@@ -1,0 +1,34 @@
+# hle x prime_agent @ gpt-5.6-terra
+#
+# One cell of the v0 matrix. Everything that distinguishes it from another cell is here, so
+# the matrix is reviewable as data and a new experiment arm is a new file. The
+# generation-effect study rides this same runner by varying instruction_arm alone.
+
+[cell]
+name = "hle-prime_agent-gpt-56-terra"
+env = "hle"
+harness = "prime_agent"
+model = "gpt-5.6-terra"
+# Effort is a cell axis: a different effort is a different cell file. v0 starts every base
+# cell at xhigh. prime_agent exposes no effort control today; the field records the cell's
+# intent and the harness ignores it until one exists.
+effort = "xhigh"
+# How many tasks may be live at once (shogym max_in_flight). Above 1 the agent holds
+# several tasks, every env tool is lease-wrapped, and a pull at the limit displaces the
+# oldest. v0 serves 8 so one-at-a-time is a choice the agent makes, not the only option.
+max_in_flight = 8
+split = "hle"
+instruction_arm = "get-better"
+# Subscription is the preferred mode for every v0 cell. The runner supports both modes and
+# records which one the cell actually ran under.
+credential_mode = "subscription"
+required_env = ["HF_TOKEN", "OPENAI_API_KEY"]
+note = "Answers are public. v0 observes leakage rather than gating it, so this is the cell most worth reading the egress log for."
+
+[budget]
+# Wall-clock parity, decided in the scope: identical across harnesses within an env, no token
+# ceiling, because the cells run on subscription billing.
+rollout_wall_clock_s = 28800
+# The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
+pool_ceiling = 300
+eval_task_timeout_s = 900

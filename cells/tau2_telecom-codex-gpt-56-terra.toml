@@ -1,0 +1,37 @@
+# tau2_telecom x codex @ gpt-5.6-terra
+#
+# One cell of the v0 matrix. Everything that distinguishes it from another cell is here, so
+# the matrix is reviewable as data and a new experiment arm is a new file. The
+# generation-effect study rides this same runner by varying instruction_arm alone.
+
+[cell]
+name = "tau2_telecom-codex-gpt-56-terra"
+env = "tau2_telecom"
+harness = "codex"
+model = "gpt-5.6-terra"
+# Effort is a cell axis: a different effort is a different cell file. v0 starts every base
+# cell at xhigh so all harnesses sit at the same reasoning tier (codex's own config default
+# is only high).
+effort = "xhigh"
+# How many tasks may be live at once (shogym max_in_flight). Above 1 the agent holds
+# several tasks, every env tool is lease-wrapped, and a pull at the limit displaces the
+# oldest. v0 serves 8 so one-at-a-time is a choice the agent makes, not the only option.
+max_in_flight = 8
+split = "tau2_telecom"
+instruction_arm = "get-better"
+# Subscription is the preferred mode for every v0 cell. The runner supports both modes and
+# records which one the cell actually ran under.
+credential_mode = "subscription"
+# OPENAI_API_KEY is the user simulator's, server-side. TAU2_DATA_DIR is not listed here: the
+# runner provisions the ~730 MB tau2 data into shogym's cache and points TAU2_DATA_DIR at it,
+# rather than requiring the operator to export it. `uv run python tools/provision_tau2_data.py`.
+required_env = ["OPENAI_API_KEY"]
+note = "Upstream's declared 74/40 split at the pinned sha. 40 held-out is below the N >= 60 power aim, and honoring the benchmark's canonical split wins over inventing a larger leaky one."
+
+[budget]
+# Wall-clock parity, decided in the scope: identical across harnesses within an env, no token
+# ceiling, because the cells run on subscription billing.
+rollout_wall_clock_s = 28800
+# The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
+pool_ceiling = 74
+eval_task_timeout_s = 1800

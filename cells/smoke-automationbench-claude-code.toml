@@ -1,0 +1,27 @@
+# smoke: automationbench x claude_code, minutes not hours
+#
+# One cell of the v0 matrix. Everything that distinguishes it from another cell is here, so
+# the matrix is reviewable as data and a new experiment arm is a new file. The
+# generation-effect study rides this same runner by varying instruction_arm alone.
+
+# This cell exists to prove the machinery, not to measure anything. Its budget is minutes and
+# its splits are a handful of tasks, so a full pass through all three phases finishes while a
+# human watches. It uses the smoke split, never a real one.
+
+[cell]
+name = "smoke-automationbench-claude-code"
+env = "automationbench"
+harness = "claude_code"
+model = "claude-sonnet-4-5"
+split = "smoke-automationbench"
+# Above 1 every env tool is advertised lease-wrapped, so this smoke proves a real harness
+# carries the per-task lease on every call, which the capacity-8 v0 cells depend on.
+max_in_flight = 2
+instruction_arm = "get-better"
+credential_mode = "subscription"
+note = "Machinery proof. Not a measurement, and never reported as one."
+
+[budget]
+rollout_wall_clock_s = 900
+pool_ceiling = 2
+eval_task_timeout_s = 600

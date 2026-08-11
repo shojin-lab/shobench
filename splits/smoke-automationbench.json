@@ -1,0 +1,30 @@
+{
+  "schema": "shobench.split/1",
+  "env": "automationbench",
+  "total_tasks": 600,
+  "provenance": {
+    "kind": "adopted",
+    "source": "splits/automationbench.json improvement pool",
+    "procedure": "Two tasks from the front of the real improvement pool stand in for the held-out set and three more for the pool. Both sides come from the pool side of the real split, so a machinery test never touches a real held-out task.",
+    "purpose": "machinery proof only; never reported as a measurement"
+  },
+  "heldout": {
+    "n": 2,
+    "env_kwargs": {},
+    "task_ids": [
+      "558",
+      "399"
+    ],
+    "labels": []
+  },
+  "pool": {
+    "n": 3,
+    "env_kwargs": {},
+    "task_ids": [
+      "539",
+      "505",
+      "532"
+    ],
+    "labels": []
+  }
+}

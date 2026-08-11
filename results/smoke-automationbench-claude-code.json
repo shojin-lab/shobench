@@ -1,0 +1,357 @@
+{
+  "schema": "shobench.results/1",
+  "manifest": {
+    "schema": "shobench.manifest/1",
+    "run_id": "smoke-automationbench-claude-code-20260810T193908Z",
+    "started_at": 1786390748.611389,
+    "cell": {
+      "name": "smoke-automationbench-claude-code",
+      "env": "automationbench",
+      "harness": "claude_code",
+      "model": "claude-sonnet-4-5",
+      "split": "smoke-automationbench",
+      "instruction_arm": "get-better",
+      "credential_mode": "subscription",
+      "env_kwargs": {},
+      "required_env": [],
+      "budget": {
+        "rollout_wall_clock_s": 900,
+        "pool_ceiling": 2,
+        "eval_task_timeout_s": 600
+      },
+      "config_path": "cells/smoke-automationbench-claude-code.toml",
+      "config_sha256": "550e0142c22d4747c3be5592a574f47172408bc7ba85a77c9b0567fce6d15378",
+      "note": "Machinery proof. Not a measurement, and never reported as one."
+    },
+    "split": {
+      "env": "automationbench",
+      "path": "splits/smoke-automationbench.json",
+      "n_heldout": 2,
+      "n_pool": 3,
+      "heldout_env_kwargs": {},
+      "pool_env_kwargs": {},
+      "total_tasks": 600,
+      "id_digest": "9ce481e2263d9d9a8c08265413b66c7230c6ea87b152ffeb952dfb1e9a9d077f",
+      "provenance": {
+        "kind": "adopted",
+        "source": "splits/automationbench.json improvement pool",
+        "procedure": "Two tasks from the front of the real improvement pool stand in for the held-out set and three more for the pool. Both sides come from the pool side of the real split, so a machinery test never touches a real held-out task.",
+        "purpose": "machinery proof only; never reported as a measurement"
+      }
+    },
+    "instruction": {
+      "arm": "get-better",
+      "rollout_system": "Get Better.\n\nAn MCP server provides a stream of tasks.\nNothing external loops for you - drive yourself:\n\n1. Calling `get_task` pulls the next task.\n   If it returns {done: true}, the stream is exhausted, stop.\n2. The task can be completed using the tools listed.\n   One of them ends the task; call it before pulling the next.\n3. Continue until the stream is exhausted.\n",
+      "rollout_system_sha256": "4ddbdfc6ca191ba9761f9921a021ecdf5321af4dd1e028b1ff79f80fbcab845d",
+      "eval_system": "An MCP server provides a stream of tasks.\nNothing external loops for you - drive yourself:\n\n1. Calling `get_task` pulls the next task.\n   If it returns {done: true}, the stream is exhausted, stop.\n2. The task can be completed using the tools listed.\n   One of them ends the task; call it before pulling the next.\n3. Continue until the stream is exhausted.\n\nThis is a measurement. Do the task as well as you can with what you already have,\nand do not spend effort changing your own setup.\n",
+      "eval_system_sha256": "db9ca73c19a6fbb017ee4e32eb7fde9a66611e068e37b6fd27b2e13427e8b5a4",
+      "kickoff": "Begin.\n",
+      "continuation": "Continue.\n",
+      "continuation_sha256": "e972ecc19111beeb4832d42144b1f9d624b97a96707ddce97adcf0002633c207"
+    },
+    "substrate": {
+      "shogym_repo": "https://github.com/shojin-lab/shogym.git",
+      "shogym_rev": "695e21f8ce87b0097cea922bdb70a4c355766a0b",
+      "mcp_server_name": "shogym"
+    },
+    "harness_probes": {
+      "version": "2.1.226 (Claude Code)"
+    },
+    "container": {
+      "agent_image": "shobench-agent:v0",
+      "network": "shobench-smoke-automationbench-claude-code-2026081-net",
+      "netns_container": "shobench-smoke-automationbench-claude-code-2026081-ns",
+      "home": "home"
+    },
+    "home": {
+      "digest_before": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "digest_after": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "inventory_after": [],
+      "changed": false
+    },
+    "credential_seed": "no file-based credential for this mode",
+    "observed_models": [
+      "claude-sonnet-4-5"
+    ],
+    "ended_at": 1786391949.862156
+  },
+  "eval_before": {
+    "summary": {
+      "n_requested": 2,
+      "n_scored": 2,
+      "mean_reward": 0.5,
+      "full_solve_rate": 0.5,
+      "closures": {
+        "sealed": 2
+      }
+    },
+    "tasks": [
+      {
+        "seq": 1,
+        "position": 0,
+        "task_idx": 558,
+        "closure": "sealed",
+        "reward": 0.0,
+        "success": false,
+        "diagnostic": null,
+        "observed": [
+          {
+            "name": "reward",
+            "value": 0.0,
+            "level": "episode"
+          },
+          {
+            "name": "partial_credit",
+            "value": 0.0,
+            "level": "episode"
+          },
+          {
+            "name": "success",
+            "value": false,
+            "level": "episode"
+          }
+        ]
+      },
+      {
+        "seq": 1,
+        "position": 0,
+        "task_idx": 399,
+        "closure": "sealed",
+        "reward": 1.0,
+        "success": true,
+        "diagnostic": null,
+        "observed": [
+          {
+            "name": "reward",
+            "value": 1.0,
+            "level": "episode"
+          },
+          {
+            "name": "partial_credit",
+            "value": 1.0,
+            "level": "episode"
+          },
+          {
+            "name": "success",
+            "value": true,
+            "level": "episode"
+          }
+        ]
+      }
+    ]
+  },
+  "eval_after": {
+    "summary": {
+      "n_requested": 2,
+      "n_scored": 2,
+      "mean_reward": 0.08695652173913043,
+      "full_solve_rate": 0.0,
+      "closures": {
+        "sealed": 2
+      }
+    },
+    "tasks": [
+      {
+        "seq": 1,
+        "position": 0,
+        "task_idx": 558,
+        "closure": "sealed",
+        "reward": 0.0,
+        "success": false,
+        "diagnostic": null,
+        "observed": [
+          {
+            "name": "reward",
+            "value": 0.0,
+            "level": "episode"
+          },
+          {
+            "name": "partial_credit",
+            "value": 0.0,
+            "level": "episode"
+          },
+          {
+            "name": "success",
+            "value": false,
+            "level": "episode"
+          }
+        ]
+      },
+      {
+        "seq": 1,
+        "position": 0,
+        "task_idx": 399,
+        "closure": "sealed",
+        "reward": 0.17391304347826086,
+        "success": false,
+        "diagnostic": null,
+        "observed": [
+          {
+            "name": "reward",
+            "value": 0.17391304347826086,
+            "level": "episode"
+          },
+          {
+            "name": "partial_credit",
+            "value": 0.17391304347826086,
+            "level": "episode"
+          },
+          {
+            "name": "success",
+            "value": false,
+            "level": "episode"
+          }
+        ]
+      }
+    ]
+  },
+  "rollout": {
+    "summary": {
+      "tasks_attempted": 2,
+      "tasks_scored": 2,
+      "mean_reward": 0.0,
+      "full_solve_rate": 0.0,
+      "closures": {
+        "sealed": 2
+      }
+    },
+    "stopping": {
+      "stop_reason": "agent_chose_to_stop",
+      "usage_limit_resumes": 0,
+      "legs": [
+        {
+          "leg": 0,
+          "observed_models": [
+            "claude-sonnet-4-5"
+          ],
+          "phase": "rollout",
+          "task_idx": null,
+          "started_at": 1786391112.777694,
+          "ended_at": 1786391527.420979,
+          "wall_clock_s": 414.643,
+          "returncode": 0,
+          "verdict": {
+            "kind": "chosen_stop",
+            "reason": "the session ended its turn cleanly",
+            "evidence": {
+              "returncode": 0,
+              "subtype": "success",
+              "is_error": false,
+              "stop_reason": "end_turn",
+              "terminal_reason": "completed",
+              "api_error_status": null,
+              "num_turns": 111
+            }
+          },
+          "tasks_consumed_before": 0,
+          "tasks_consumed_after": 2,
+          "trace_path": "rollout/traces/leg-0000.stream.jsonl"
+        }
+      ],
+      "wall_clock_budget_s": 900,
+      "session_id": "f672349d-1f88-499e-9f9e-267be4909ef4",
+      "stop_evidence": {
+        "kind": "chosen_stop",
+        "reason": "the session ended its turn cleanly",
+        "evidence": {
+          "returncode": 0,
+          "subtype": "success",
+          "is_error": false,
+          "stop_reason": "end_turn",
+          "terminal_reason": "completed",
+          "api_error_status": null,
+          "num_turns": 111
+        }
+      },
+      "tasks_dispensed": 2,
+      "tasks_remaining_in_pool": 0,
+      "pool_queued": 2,
+      "stopped_with_tasks_available": false
+    },
+    "tasks": [
+      {
+        "seq": 1,
+        "position": 0,
+        "task_idx": 539,
+        "closure": "sealed",
+        "reward": 0.0,
+        "success": false,
+        "diagnostic": null,
+        "observed": [
+          {
+            "name": "reward",
+            "value": 0.0,
+            "level": "episode"
+          },
+          {
+            "name": "partial_credit",
+            "value": 0.0,
+            "level": "episode"
+          },
+          {
+            "name": "success",
+            "value": false,
+            "level": "episode"
+          }
+        ]
+      },
+      {
+        "seq": 2,
+        "position": 1,
+        "task_idx": 505,
+        "closure": "sealed",
+        "reward": 0.0,
+        "success": false,
+        "diagnostic": null,
+        "observed": [
+          {
+            "name": "reward",
+            "value": 0.0,
+            "level": "episode"
+          },
+          {
+            "name": "partial_credit",
+            "value": 0.0,
+            "level": "episode"
+          },
+          {
+            "name": "success",
+            "value": false,
+            "level": "episode"
+          }
+        ]
+      }
+    ]
+  },
+  "paired": [
+    {
+      "task_idx": 399,
+      "reward_before": 1.0,
+      "reward_after": 0.17391304347826086,
+      "reward_delta": -0.8260869565217391,
+      "success_before": true,
+      "success_after": false
+    },
+    {
+      "task_idx": 558,
+      "reward_before": 0.0,
+      "reward_after": 0.0,
+      "reward_delta": 0.0,
+      "success_before": false,
+      "success_after": false
+    }
+  ],
+  "unpaired": [],
+  "egress": {
+    "available": true,
+    "path": "egress.tsv",
+    "observations": 65,
+    "distinct_hosts": 2,
+    "hosts": {
+      "api.anthropic.com": 50,
+      "http-intake.logs.us5.datadoghq.com": 15
+    },
+    "mechanism": "passive tshark capture in the cell network namespace (DNS + TLS SNI)",
+    "limit": "hostnames only; TLS payloads are not decrypted"
+  }
+}
