@@ -401,10 +401,18 @@ installed into the kernel venv at session start, and a new Python-backed skill n
 session to be picked up. The `shogym-stream` skill is vendored under `prime_agent/skills/` and
 installed into each prime_agent cell's isolated HOME beside the settings entry, by the same
 `home_files` mechanism (`harnesses/prime_agent.py`, `shogym_stream_skill_files`). It is vendored
-rather than
-copied verbatim from shogym's `examples/prime_agent` because it has to carry the runner's own
-token variable (`SHOBENCH_MCP_TOKEN`), which the settings entry names too; a test asserts the
-two agree and that the served stream exposes the tools the skill enumerates.
+rather than copied verbatim from shogym's `examples/prime_agent` because it has to carry the
+runner's own token variable (`SHOBENCH_MCP_TOKEN`), which the settings entry names too; a test
+asserts the two agree and that the served stream exposes the tools the skill enumerates.
+
+**What a tool call returns, since the natural guess is wrong.** `McpIntegration._parse_result`
+prefers a result's `structuredContent` over its text content (source), and shogym's stream
+declares an output schema for its own control tools and none for the tools an env publishes
+(source). So `get_task()` and `queue_info()` arrive as dicts and a task's tools arrive as JSON
+strings (observed, against a live stream over http with the runtime's own parser). The
+inherited quickstart wording, "every one of them returns a JSON string", would have made the
+first line of the documented loop raise `TypeError`; SKILL.md now documents the split and a
+test pins which side of it each tool falls on.
 
 What that leaves is only the credentialed end-to-end check: prime-agent bootstrapping the
 kernel, installing this package, importing it as `shogym_stream`, and pulling a task. That needs

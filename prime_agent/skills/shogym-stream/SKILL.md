@@ -6,21 +6,31 @@ description: Play a stream of shogym evaluation tasks served over MCP. Pull a ta
 # shogym-stream
 
 A queue of evaluation tasks behind one MCP endpoint. Every tool is an `async` method on the
-`shogym_stream` module, and every one of them returns a **JSON string**: the server sends text
-content, so parse before you index:
+`shogym_stream` module, and two shapes come back, because the kernel's MCP client returns a
+tool's structured content when the server declares an output schema for it and the text content
+when it does not:
+
+- the stream's own control tools, `get_task` and `queue_info`, arrive **already parsed**, as
+  dicts. Index them directly; `json.loads` on one raises `TypeError`.
+- the tools a task publishes arrive as **JSON strings**. Parse those before you index.
 
 ```python
 import json
 
-task = json.loads(await shogym_stream.get_task())
+task = await shogym_stream.get_task()  # a dict already
+result = json.loads(await shogym_stream.some_task_tool(arg="value"))  # a JSON string
 ```
+
+That is the rule as the server stands today, and one line survives either shape if you would
+rather not depend on it: `value if isinstance(value, dict) else json.loads(value)`.
 
 ## The loop
 
 1. `get_task()` takes the next task off the queue. It answers either
    `{env, instructions, budget, tools}` or `{done: true, ...}`, and `done` means stop.
 2. `tools` lists the tools that task published, by name and schema. They are methods on this
-   same module: `await shogym_stream.<name>(**kwargs)`. Nothing else is available for the task.
+   same module: `await shogym_stream.<name>(**kwargs)`. Nothing else is available for the task,
+   and their results are the JSON strings above.
 3. One of them ends the episode. Call it when you are finished; then go back to step 1.
 4. Stop when `get_task()` reports `done`.
 

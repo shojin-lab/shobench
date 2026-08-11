@@ -6,7 +6,14 @@ the whole client. ``McpIntegration`` connects over streamable HTTP, discovers th
 tools and binds each one as an async method::
 
     import shogym_stream
-    task = json.loads(await shogym_stream.get_task())
+    task = await shogym_stream.get_task()
+
+What a bound method hands back is decided by ``McpIntegration._parse_result``, which prefers a
+result's ``structuredContent`` over its text content. The stream server declares an output
+schema for its own control tools and none for the tools an env publishes, so ``get_task`` and
+``queue_info`` arrive as dicts while a task's tools arrive as JSON strings. SKILL.md documents
+that split because the model writes the calls, and a test pins it because only the server can
+change it.
 
 Two class attributes are load-bearing:
 

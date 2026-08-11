@@ -6,7 +6,8 @@ skill in its kernel and calling it. So declaring the HTTP server in ``settings.j
 the wiring and the skill package is the other half. These prove the vendored skill is a
 well-formed Python-backed skill, that a prime_agent leg installs it into the isolated HOME with
 the same token variable the settings entry names, and that a locally-served stream exposes the
-tools the skill would drive.
+tools the skill would drive and hands them back in the shapes SKILL.md tells the model to
+expect.
 
 The skill's own ``__init__.py`` is the one Python file in this repo written for prime-agent's
 kernel interpreter: it imports ``rlm``, which is not a shobench dependency and is not on PyPI at
@@ -22,6 +23,9 @@ import ast
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from shobench.config import repo_root
 from shobench.harnesses import SHOGYM_STREAM_SKILL, PrimeAgent, shogym_stream_skill_files
@@ -29,6 +33,32 @@ from shobench.serving import SERVER_NAME
 
 _SKILL = repo_root() / "prime_agent" / "skills" / SHOGYM_STREAM_SKILL
 _INIT = _SKILL / "src" / "shogym_stream" / "__init__.py"
+
+
+def _as_the_kernel_sees_it(result: Any) -> Any:
+    """One tool result, normalized the way the kernel's MCP client normalizes it.
+
+    ``McpIntegration._parse_result`` returns a result's structured content when the server sent
+    any and its joined text content otherwise, so what a bound method hands the model is decided
+    by whether the server declared an output schema for that tool, not by anything the skill
+    does. That rule is transcribed here rather than called, because the runtime package is not a
+    dependency and is not on PyPI (the same reason the skill module is read with ``ast``); the
+    field is the wire's ``structuredContent``, which is the field the runtime prefers.
+    """
+    if result.structured_content is not None:
+        return result.structured_content
+    return "\n".join(block.text for block in result.content if hasattr(block, "text"))
+
+
+def _launch_spec(tmp_path: Path):
+    """A prime_agent leg's launch spec, with inputs that do not matter to these assertions."""
+    return PrimeAgent().launch(
+        mcp_url="http://host.docker.internal:12345/mcp",
+        system_prompt="s",
+        user_prompt="u",
+        model="m",
+        trace_path=tmp_path / "t",
+    )
 
 
 def _skill_class_attrs() -> dict[str, str]:
@@ -76,15 +106,9 @@ def test_the_skill_names_the_runners_server_and_token_variable() -> None:
 
 
 def test_launch_installs_the_skill_beside_the_settings_entry(tmp_path: Path) -> None:
-    """The wiring this PR adds: a prime_agent leg's HOME carries the skill package, and the
-    settings entry and the skill agree on the token variable, resolved from one constant."""
-    spec = PrimeAgent().launch(
-        mcp_url="http://host.docker.internal:12345/mcp",
-        system_prompt="s",
-        user_prompt="u",
-        model="m",
-        trace_path=tmp_path / "t",
-    )
+    """The wiring: a prime_agent leg's HOME carries the skill package, and the settings entry
+    and the skill agree on the token variable, resolved from one constant."""
+    spec = _launch_spec(tmp_path)
     home = spec.home_files
     prefix = f".prime/agent/skills/{SHOGYM_STREAM_SKILL}"
     for rel in ("SKILL.md", "pyproject.toml", "src/shogym_stream/__init__.py"):
@@ -107,8 +131,9 @@ def test_the_served_stream_exposes_the_tools_the_skill_enumerates(tmp_path: Path
     the well-formed ``{env, instructions, budget, tools}`` the SKILL.md documents. ``wordle_v1``
     needs no extra, no key and no download, so this stays offline. prime-agent's own client is
     not installed here (it imports ``rlm``), so the manifest is enumerated with the MCP client
-    shogym ships; what prime-agent adds on top, the kernel install and import, is read from docs
-    rather than run."""
+    shogym ships and the pulled task is read through the kernel's normalization rule rather than
+    off a text block, which is how the model will read it; what prime-agent adds on top, the
+    kernel install and import, is read from docs rather than run."""
     import shogym
     from fastmcp import Client
     from shogym.serve import Immediate, TaskRef, TaskStream, build_stream_server
@@ -124,7 +149,7 @@ def test_the_served_stream_exposes_the_tools_the_skill_enumerates(tmp_path: Path
             server = build_stream_server(stream, name=SERVER_NAME)
             async with Client(server) as client:
                 names = {tool.name for tool in await client.list_tools()}
-                pulled = json.loads((await client.call_tool("get_task", {})).content[0].text)
+                pulled = _as_the_kernel_sees_it(await client.call_tool("get_task", {}))
                 await client.call_tool("terminate", {})
                 return names, pulled
 
@@ -133,3 +158,40 @@ def test_the_served_stream_exposes_the_tools_the_skill_enumerates(tmp_path: Path
     assert set(task) == {"env", "instructions", "budget", "tools"}
     assert task["env"] == "wordle_v1"
     assert task["tools"], "the task must publish the tools the skill will call"
+
+
+def test_the_control_tools_arrive_parsed_and_a_task_tool_as_a_json_string(tmp_path: Path) -> None:
+    """The return contract SKILL.md teaches, checked where the server decides it.
+
+    The kernel's client prefers a result's structured content, so the shape the model gets is
+    whatever the server declared an output schema for. This stream declares one for its control
+    tools and none for the tools an env publishes, which makes ``get_task`` a dict the model
+    indexes directly and a task tool a JSON string the model parses. A doc that says otherwise
+    costs a prime_agent cell its first call, so the split is pinned here: if shogym ever changes
+    which side a tool falls on, this fails and SKILL.md gets corrected with it."""
+    import shogym
+    from fastmcp import Client
+    from shogym.serve import Immediate, TaskRef, TaskStream, build_stream_server
+
+    async def _shapes() -> tuple[Any, Any]:
+        stream = TaskStream(
+            shogym.make,
+            [TaskRef("wordle_v1", 0)],
+            prov_dir=tmp_path / "prov",
+            feedback=Immediate(),
+        )
+        async with stream:
+            server = build_stream_server(stream, name=SERVER_NAME)
+            async with Client(server) as client:
+                pulled = _as_the_kernel_sees_it(await client.call_tool("get_task", {}))
+                # `terminate` is a tool of the task, published in its manifest like any other,
+                # so it stands in for the env's own tools without assuming an env's tool names.
+                ended = _as_the_kernel_sees_it(await client.call_tool("terminate", {}))
+                return pulled, ended
+
+    task, ended = asyncio.run(_shapes())
+    assert isinstance(task, dict), "get_task is already parsed; the SKILL.md example indexes it"
+    with pytest.raises(TypeError):
+        json.loads(task)  # what the old "every tool returns a JSON string" wording produced
+    assert isinstance(ended, str), "a task's tools are text, so the model parses them"
+    assert isinstance(json.loads(ended), dict)
