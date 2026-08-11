@@ -109,7 +109,12 @@ class CellSandbox:
         docker("network", "rm", self.network, check=False)
 
     def docker_args(
-        self, *, env: dict[str, str], mounts: dict[Path, str], name: str | None = None
+        self,
+        *,
+        env: dict[str, str],
+        mounts: dict[Path, str],
+        name: str | None = None,
+        home: Path | None = None,
     ) -> list[str]:
         """The ``docker run`` prefix an agent leg uses.
 
@@ -120,7 +125,12 @@ class CellSandbox:
         stop the container it started, so a leg the runner ends at its budget would otherwise
         keep running, keep spending, and keep talking to the stream after the runner had
         moved on. A named container can be removed.
+
+        ``home`` overrides which HOME is mounted at ``/root``. The rollout mounts the cell's one
+        accumulating home (the default); an eval task mounts its own throwaway copy of it, so
+        two tasks can run at once without one task's writes reaching the other or the base.
         """
+        home_path = self.home if home is None else home
         args = [
             "run",
             "--rm",
@@ -131,7 +141,7 @@ class CellSandbox:
             "--network",
             f"container:{self.netns_container}",
             "-v",
-            f"{self.home}:/root:rw",
+            f"{home_path}:/root:rw",
             "-v",
             f"{self.workdir}:/work:rw",
             "-w",
