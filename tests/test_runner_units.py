@@ -645,6 +645,24 @@ def test_each_harness_reads_its_own_session_id_off_its_trace(tmp_path: Path) -> 
         assert harness_for(name).session_id_from_trace(path) == expected
 
 
+def test_the_session_id_is_found_however_long_the_trace_grew(tmp_path: Path) -> None:
+    """A long run is exactly the run whose session id matters most.
+
+    Two of the three harnesses mint their own id and announce it in the first event, and the
+    runner reads it back to continue a rollout a usage limit suspended. Searching a window of
+    the tail would find it in every test trace and lose it in every real one, and a suspension
+    with no id is a rollout that cannot be continued at all.
+    """
+    for name, header, expected in (
+        ("codex", {"type": "thread.started", "thread_id": "cx-1"}, "cx-1"),
+        ("prime_agent", {"type": "session", "version": 3, "id": "pa-1"}, "pa-1"),
+    ):
+        path = tmp_path / f"long-{name}.jsonl"
+        chatter = (json.dumps({"type": "item.completed", "n": i}) for i in range(5000))
+        path.write_text("\n".join([json.dumps(header), *chatter]) + "\n")
+        assert harness_for(name).session_id_from_trace(path) == expected
+
+
 def test_a_trace_with_no_session_line_yields_no_id(tmp_path: Path) -> None:
     path = tmp_path / "empty.jsonl"
     path.write_text("")
