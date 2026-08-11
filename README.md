@@ -57,7 +57,8 @@ a file list: every file a tau2_telecom run reads has to match the size and sha25
 commit has, so a stale checkout handed in through `TAU2_DATA_DIR`, or an edited policy or DB, is
 refused by name instead of quietly moving the numbers. A refused tree that the operator named
 through `TAU2_DATA_DIR` is then left exactly as it was, along with everything else living in it:
-only `--force` replaces that one. The runner sets `TAU2_DATA_DIR` itself and refuses a tau2 cell
+only `--force` replaces that one, and a tree that passes is only read, not even annotated, so a
+read-only checkout works. The runner sets `TAU2_DATA_DIR` itself and refuses a tau2 cell
 whose data is not that tree, naming the command. `HF_TOKEN` is not blocking today: the
 `cais/hle` dataset is already cached on the run host, so the gate passes without a fresh token;
 it is only needed on a cold cache.

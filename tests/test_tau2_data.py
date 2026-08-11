@@ -276,6 +276,25 @@ def test_force_replaces_an_override_the_operator_asked_to_replace(_cache, monkey
     assert not work.exists()
 
 
+def test_a_valid_override_is_verified_and_not_written_to(_cache, monkeypatch) -> None:
+    """The operator owns a tree they named down to its provenance, so verify-and-skip records
+    nothing beside it. Otherwise the marker lands in their checkout root, outside the dir they
+    pointed at, and a checkout mounted read-only fails the one command advertised as safe. The
+    read-only parent is the assertion: nothing is written, so nothing can fail to be."""
+    checkout = _cache / "operator"
+    data = _tree(checkout)
+    (checkout / "README.md").write_text("the operator's own checkout\n")
+    monkeypatch.setenv("TAU2_DATA_DIR", str(data))
+    monkeypatch.setattr(tau2_data, "_TARBALL_URL", "http://unreachable.invalid/x.tar.gz")
+
+    checkout.chmod(0o555)
+    try:
+        assert tau2_data.provision(log=lambda *a: None) == data
+    finally:
+        checkout.chmod(0o755)
+    assert sorted(p.name for p in checkout.iterdir()) == ["README.md", "data"]
+
+
 def test_a_lost_publish_race_adopts_the_tree_that_won(_cache, monkeypatch) -> None:
     """Two provisioners of one pin want the same bytes, so losing the publish is not a failure to
     report to the caller. The tree that landed is adopted, and adopted on the verify below the

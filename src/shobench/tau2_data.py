@@ -62,8 +62,10 @@ _MANIFEST: dict[str, dict[str, Any]] = json.loads(
     _MANIFEST_PATH.read_text(encoding="utf-8")
 )["files"]
 
-# The record written next to a validated tree. Its presence is not what the tree is judged on
-# (an externally provisioned tree without it is still recognized), but it carries provenance.
+# The record written beside the managed cache, and only there: a tree the operator named through
+# TAU2_DATA_DIR owns its own provenance, and a marker beside it would be this module writing into
+# their checkout. Its presence is not what any tree is judged on (an externally provisioned tree
+# without it is still recognized), which is what makes leaving it out free.
 _MARKER = ".shobench-tau2-data.json"
 
 # What the runner and the docs tell an operator to run when the data is missing.
@@ -212,15 +214,17 @@ def _extract_data_subtree(archive: Path, staged_data: Path) -> None:
 def provision(*, force: bool = False, log=print) -> Path:
     """Fetch tau2's ``data/`` at the pinned sha into the cache; return the data dir.
 
-    Idempotent: a tree that already is the pinned data is verified, has its marker refreshed, and
-    touches no network, unless ``force``. Otherwise the tarball is downloaded, the ``data/``
-    subtree is extracted to a staging dir, verified, and only then renamed into place, so an
-    interrupted run leaves no tree that :func:`verify` would accept.
+    Idempotent: a tree that already is the pinned data is verified and touches no network, unless
+    ``force``. Otherwise the tarball is downloaded, the ``data/`` subtree is extracted to a
+    staging dir, verified, and only then renamed into place, so an interrupted run leaves no tree
+    that :func:`verify` would accept.
 
     ``force`` is the repair path, so it replaces the managed cache. Paying for a download and then
     keeping the tree the operator asked to be rid of would make the flag do nothing at full price.
     It is also the only thing that replaces a tree under an explicit ``TAU2_DATA_DIR``: that one
-    belongs to the operator, so an unforced run refuses it rather than overwrites it.
+    belongs to the operator, so an unforced run refuses it rather than overwrites it. Nothing at
+    all is written beside such a tree, not even the provenance marker, so pointing this command at
+    a read-only checkout verifies it and stops there.
     """
     data_dir = resolve_data_dir()
     override = _override_data_dir()
@@ -242,9 +246,14 @@ def provision(*, force: bool = False, log=print) -> Path:
                     f"instead, or re-run with --force to replace {data_dir}"
                 ) from exc
         else:
-            sha_dir = data_dir.parent
-            if sha_dir.is_dir() and not (sha_dir / _MARKER).is_file():
-                _write_marker(sha_dir, data_dir)
+            # Verified, and for an override that is the whole of it: reading a tree the operator
+            # named must not write to it, and the marker would land in their checkout root rather
+            # than in the data dir they pointed at, which a read-only checkout would refuse
+            # outright. So the advertised verify-and-skip does exactly that, and nothing else.
+            if override is None:
+                sha_dir = data_dir.parent
+                if sha_dir.is_dir() and not (sha_dir / _MARKER).is_file():
+                    _write_marker(sha_dir, data_dir)
             log(f"[tau2-data] already provisioned at {data_dir}")
             return data_dir
 
@@ -288,7 +297,10 @@ def provision(*, force: bool = False, log=print) -> Path:
                     raise
                 log(f"[tau2-data] another provisioner published {data_dir} first; adopting it")
     verify(data_dir)
-    _write_marker(sha_dir, data_dir)
+    # Same rule after a fetch, forced or not: provenance is recorded for the cache this module
+    # owns, and a tree the operator named keeps its own.
+    if override is None:
+        _write_marker(sha_dir, data_dir)
     log(f"[tau2-data] provisioned {data_dir}")
     return data_dir
 
