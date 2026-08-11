@@ -12,12 +12,12 @@ single-task ``EvalStream``, so a session that ignores its instruction and pulls 
 is told the stream is done rather than quietly consuming the next task's measurement. The
 serving process is this one, so the dataset loads once per phase rather than once per task.
 
-**The rollout is a sequence of legs against one live stream.** The stream and its HTTP server
-outlive each harness invocation, so the queue advances monotonically across legs and one
-provenance directory covers the phase. A leg that ends at a provider usage limit is resumed
-and does not count as a stop; a leg that ends on the agent's own terms while the queue still
-had tasks is the stop the charter asks about, and the runner stops serving there rather than
-prompting the agent onward.
+**The rollout is one honest run of the harness against one live stream.** A single harness
+invocation is driven against the pool for the cell's wall clock, and the runner does not
+relaunch it: whether a harness sustains autonomous operation is one of the things being
+measured. A run that ends on the agent's own terms while the queue still had tasks is the stop
+the charter asks about, and the runner does not prompt the agent onward. A run stopped by a
+provider usage limit is recorded resumable, for a human to relaunch when the window resets.
 """
 
 from __future__ import annotations
@@ -526,7 +526,7 @@ async def run_rollout_phase(ctx: RunContext) -> tuple[list[TaskResult], dict[str
             user_prompt=ctx.instruction.kickoff,
             session_id=session_id,
             resume=False,
-            timeout_s=budget.rollout_leg_timeout_s,
+            timeout_s=budget.rollout_wall_clock_s,
             task_idx=None,
             consumed_before=consumed_before,
         )

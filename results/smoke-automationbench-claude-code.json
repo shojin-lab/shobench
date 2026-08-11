@@ -17,12 +17,10 @@
       "budget": {
         "rollout_wall_clock_s": 900,
         "pool_ceiling": 2,
-        "eval_task_timeout_s": 600,
-        "rollout_leg_timeout_s": 600,
-        "max_stalled_legs": 2
+        "eval_task_timeout_s": 600
       },
       "config_path": "cells/smoke-automationbench-claude-code.toml",
-      "config_sha256": "55002bbaf31875df5a159935220ee9abebed131fe050becc29cb8896526fdf27",
+      "config_sha256": "550e0142c22d4747c3be5592a574f47172408bc7ba85a77c9b0567fce6d15378",
       "note": "Machinery proof. Not a measurement, and never reported as one."
     },
     "split": {

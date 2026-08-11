@@ -133,29 +133,21 @@ class Budget:
     """The rollout budget, and the eval-phase guard rails.
 
     ``rollout_wall_clock_s`` is the parity axis the scope settled on: identical wall clock
-    across harnesses within an env, no token ceiling. ``pool_ceiling`` is the maximum number of
-    improvement tasks the runner will serve; the agent stopping short of it is an outcome, not
-    a failure, so nothing re-serves to reach it.
+    across harnesses within an env, no token ceiling. The rollout is one harness invocation, so
+    this is also the single run's time cap; there are no per-leg bounds to set. ``pool_ceiling``
+    is the maximum number of improvement tasks the runner will serve; the agent stopping short
+    of it is an outcome, not a failure, so nothing re-serves to reach it.
     """
 
     rollout_wall_clock_s: int
     pool_ceiling: int | None = None
     eval_task_timeout_s: int = 3600
-    # A rollout leg is one harness invocation inside the wall clock. Bounding it keeps a
-    # harness that wedges from consuming the whole budget in one unrecoverable process, and it
-    # is what makes codex's episodic supervision the same mechanism as everyone else's.
-    rollout_leg_timeout_s: int = 3600
-    # How many consecutive legs may end without the stream advancing before the runner calls
-    # the rollout over. This is what separates "chose to stop" from "wedged".
-    max_stalled_legs: int = 3
 
     def to_manifest(self) -> dict[str, Any]:
         return {
             "rollout_wall_clock_s": self.rollout_wall_clock_s,
             "pool_ceiling": self.pool_ceiling,
             "eval_task_timeout_s": self.eval_task_timeout_s,
-            "rollout_leg_timeout_s": self.rollout_leg_timeout_s,
-            "max_stalled_legs": self.max_stalled_legs,
         }
 
 
@@ -240,8 +232,6 @@ def load_cell(path: Path) -> Cell:
         rollout_wall_clock_s=int(_require(budget_table, "rollout_wall_clock_s", path)),
         pool_ceiling=budget_table.get("pool_ceiling"),
         eval_task_timeout_s=int(budget_table.get("eval_task_timeout_s", 3600)),
-        rollout_leg_timeout_s=int(budget_table.get("rollout_leg_timeout_s", 3600)),
-        max_stalled_legs=int(budget_table.get("max_stalled_legs", 3)),
     )
     return Cell(
         name=_require(cell, "name", path),

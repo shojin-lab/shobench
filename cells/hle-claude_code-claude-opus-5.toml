@@ -31,7 +31,3 @@ rollout_wall_clock_s = 28800
 # The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
 pool_ceiling = 300
 eval_task_timeout_s = 900
-# One leg of the rollout. Bounding it is what keeps a wedged harness from consuming the whole
-# budget in one unrecoverable process; the wall clock is unaffected.
-rollout_leg_timeout_s = 3600
-max_stalled_legs = 3
