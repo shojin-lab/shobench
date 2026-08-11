@@ -33,8 +33,10 @@ RUN npm install -g --no-fund --no-audit \
 # prime-agent installs from its vendor script, never from npm: the npm name in its source tree
 # installs Pi instead. The script downloads a checksum-verified release tarball and hands it to
 # `npm install -g`, so the command still lands in /usr/local. PRIME_AGENT_INSTALLER_PLAIN keeps
-# the output greppable in a build log.
-ARG PRIME_AGENT_VERSION=
+# the output greppable in a build log. The version is set rather than left empty: the installer
+# reads PRIME_AGENT_VERSION when it has one and resolves the stable channel when it does not, so
+# an empty value pins nothing and two images built a week apart could carry different agents.
+ARG PRIME_AGENT_VERSION=0.7.1
 RUN PRIME_AGENT_INSTALLER_PLAIN=1 \
     PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 \
     ${PRIME_AGENT_VERSION:+PRIME_AGENT_VERSION=$PRIME_AGENT_VERSION} \
