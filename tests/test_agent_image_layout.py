@@ -114,3 +114,80 @@ def test_the_build_verifies_its_own_bake(tmp_path: Path) -> None:
     assert "test ! -e /root/.prime/agent/kernel-venv" in body
     assert "test -x /usr/local/bin/uv" in body
     assert "import ipykernel" in body
+
+
+def test_two_runs_of_one_cell_never_share_container_names(tmp_path: Path) -> None:
+    """Truncation must not erase what makes a run unique.
+
+    The prime-opus cell name is long enough that a bare [:50] cut off the whole timestamp, two
+    concurrent runs of the cell shared one namespace-holder name, and the second run's up()
+    (a docker rm -f before the create) tore down the first run's live network mid-eval.
+    """
+    cell = "automationbench-prime_agent-claude-opus-5"
+    a = CellSandbox(run_id=f"{cell}-20260812T001456Z", home=tmp_path / "a", workdir=tmp_path / "aw")
+    b = CellSandbox(run_id=f"{cell}-20260812T110239Z", home=tmp_path / "b", workdir=tmp_path / "bw")
+    again = CellSandbox(
+        run_id=f"{cell}-20260812T001456Z", home=tmp_path / "c", workdir=tmp_path / "cw"
+    )
+
+    assert a.netns_container != b.netns_container
+    assert a.network != b.network
+    # The same run keeps the same names: resume and rerun reclaim their own holder by name.
+    assert again.netns_container == a.netns_container
+    # DNS-label budget: the longest derived name (the egress observer suffix) must still fit.
+    assert len(f"{a.netns_container}-egress") <= 63
+
+
+def test_crash_cleanup_and_the_sandbox_agree_on_every_name(tmp_path: Path, monkeypatch) -> None:
+    """cleanup() must remove the names up() creates, not a hand-reconstructed formula.
+
+    The first digest fix left cleanup rebuilding the OLD stem by hand, so it silently removed
+    nothing: every docker call in it is check=False.
+    """
+    from shobench import runner
+
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(runner, "docker", lambda *a, **k: calls.append(a))
+
+    run_id = "automationbench-prime_agent-claude-opus-5-20260812T001456Z"
+    sandbox = CellSandbox(run_id=run_id, home=tmp_path / "h", workdir=tmp_path / "w")
+    runner.cleanup(run_id)
+
+    removed = {args[2] for args in calls if args[:2] == ("rm", "-f")}
+    assert sandbox.netns_container in removed
+    networks = {args[2] for args in calls if args[:2] == ("network", "rm")}
+    assert sandbox.network in networks
+
+
+def test_migrating_a_pre_digest_run_rewrites_names_and_deletes_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two legacy manifests can claim the SAME recorded names, so deleting by record could
+    tear down a live neighbor: migration rewrites the record and touches no docker resource."""
+    from shobench import runner
+
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(runner, "docker", lambda *a, **k: calls.append(a))
+
+    legacy = 'shobench-automationbench-prime_agent-claude-opus-5'[:50]
+    shared_record = {"netns_container": f"{legacy}-ns", "network": f"{legacy}-net"}
+    run_a = CellSandbox(
+        run_id="automationbench-prime_agent-claude-opus-5-20260812T001456Z",
+        home=tmp_path / "a",
+        workdir=tmp_path / "aw",
+    )
+    manifest_a = {"container": dict(shared_record)}
+    manifest_b = {"container": dict(shared_record)}
+
+    runner._migrate_recorded_containers(manifest_a, run_a)
+
+    assert calls == []
+    assert manifest_a["container"]["netns_container"] == run_a.netns_container
+    assert manifest_a["container"]["network"] == run_a.network
+    # The neighbor's identical record is untouched by A's migration.
+    assert manifest_b["container"] == shared_record
+
+    # A post-fix run's recorded names already match: the block is left exactly as recorded.
+    same = {"container": {"netns_container": run_a.netns_container, "network": run_a.network}}
+    runner._migrate_recorded_containers(same, run_a)
+    assert calls == []

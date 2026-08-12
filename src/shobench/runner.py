@@ -53,6 +53,7 @@ from shobench.containers import (
     home_digest,
     home_inventory,
     run_relative,
+    run_stem,
     write_json,
 )
 from shobench.credentials import CredentialSpec, seed_home, spec_for
@@ -1915,6 +1916,7 @@ async def _resume_cell_owned(
         )
     run_id = record["run_id"]
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
+    _migrate_recorded_containers(manifest, sandbox)
     ctx = RunContext(
         cell=cell,
         split=split,
@@ -2077,6 +2079,7 @@ async def _rerun_eval_owned(
         )
     run_id = str(manifest["run_id"])
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
+    _migrate_recorded_containers(manifest, sandbox)
     ctx = RunContext(
         cell=cell,
         split=split,
@@ -2121,6 +2124,31 @@ async def _rerun_eval_owned(
         sandbox.down()
 
 
+def _migrate_recorded_containers(manifest: dict[str, Any], sandbox: CellSandbox) -> None:
+    """One-time migration for a run recorded under the pre-digest container names.
+
+    A continuation builds its names from the run id, so a run created before the digest fix
+    computes DIFFERENT names than its manifest recorded. The manifest's container block is
+    rewritten to the names the continuation actually uses, so the record keeps describing the
+    run's real resources, and nothing recorded is deleted: the legacy formula is
+    collision-prone by definition, so two runs' manifests can legitimately claim the SAME
+    strings, and removing them here could tear down a live neighbor still running on a pre-fix
+    process, which is the production failure this change exists to end. A legacy holder a
+    crashed teardown left behind is inert (nothing joins it by name again) and is for explicit
+    operator cleanup.
+    """
+    recorded = manifest.get("container") or {}
+    if recorded and (
+        recorded.get("netns_container") != sandbox.netns_container
+        or recorded.get("network") != sandbox.network
+    ):
+        manifest["container"] = {
+            **recorded,
+            "network": sandbox.network,
+            "netns_container": sandbox.netns_container,
+        }
+
+
 def _start_egress(sandbox: CellSandbox, run_dir: Path) -> egress.EgressCapture:
     """Attach the observer, writing to its own segment when the run already has a capture.
 
@@ -2143,7 +2171,7 @@ def _start_egress(sandbox: CellSandbox, run_dir: Path) -> egress.EgressCapture:
 
 def cleanup(run_id: str) -> None:
     """Remove a crashed run's containers and network, which are named after its run id."""
-    stem = f"shobench-{run_id}"[:50]
+    stem = run_stem(run_id)
     for name in (f"{stem}-ns-egress", f"{stem}-ns"):
         docker("rm", "-f", name, check=False)
     docker("network", "rm", f"{stem}-net", check=False)

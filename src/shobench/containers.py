@@ -23,6 +23,7 @@ open.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -64,6 +65,24 @@ def build_image(dockerfile: Path, context: Path, tag: str) -> str:
     return tag
 
 
+def run_stem(run_id: str) -> str:
+    """The one name stem every docker resource of a run derives from.
+
+    Container names become DNS labels, capped at 63 characters, so the stem is truncated.
+    Truncation alone once erased the run timestamp for a long cell name, and two concurrent
+    runs of one cell then fought over a single namespace holder: ``up()`` is a docker rm -f
+    before the create, so the second run tore down the first run's live network mid-eval. The
+    64-bit digest of the FULL run id keeps distinct runs' names distinct whatever the cell
+    name's length (a pairwise collision is 1 in 2**64; the 32-bit version this replaced was
+    reviewably weak), while the same run keeps the same names across resume and rerun, which
+    reclaim their own holder by name. Derivation lives in one function because a cleanup path
+    that reconstructed the stem by hand kept the OLD formula after the fix and silently
+    removed nothing.
+    """
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:16]
+    return f"shobench-{run_id}"[:33] + f"-{digest}"
+
+
 @dataclass
 class CellSandbox:
     """The per-cell network, namespace holder, and isolated HOME.
@@ -79,8 +98,7 @@ class CellSandbox:
     netns_container: str = field(init=False)
 
     def __post_init__(self) -> None:
-        # Container names become DNS labels, which are capped at 63 characters.
-        stem = f"shobench-{self.run_id}"[:50]
+        stem = run_stem(self.run_id)
         self.network = f"{stem}-net"
         self.netns_container = f"{stem}-ns"
 
@@ -167,8 +185,6 @@ class CellSandbox:
 
 
 def _digest_file(path: Path) -> str:
-    import hashlib
-
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
