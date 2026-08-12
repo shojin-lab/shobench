@@ -737,3 +737,64 @@ def test_rerun_eval_is_refused_while_the_run_has_a_live_owner(tmp_path) -> None:
             asyncio.run(runner.rerun_eval(run_dir, results_dir=tmp_path / "results"))
     finally:
         runner._release_run_lock(fd)
+
+
+def test_a_baseline_only_run_can_repair_its_eval_before(tmp_path, monkeypatch) -> None:
+    """The token cliff holes a deferred-baseline run, and the repair re-runs only the holes."""
+    from shobench import runner
+
+    captured = {}
+
+    async def fake_run_phases(ctx, *, manifest, phases, results_dir, observer, **kwargs):
+        captured.update(phases=phases, recorded=kwargs.get("recorded_phases"))
+        return results_dir / "cell.json"
+
+    monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
+    monkeypatch.setattr(runner, "CellSandbox", _FakeSandbox)
+    monkeypatch.setattr(runner, "_watch_cell_credential", lambda ctx, spec: None)
+
+    run_dir = _reopenable_run(tmp_path, with_terminus=False, with_before=True)
+    asyncio.run(
+        runner.rerun_eval(
+            run_dir, results_dir=tmp_path / "results", phase="eval_before", capture_egress=False
+        )
+    )
+
+    assert captured["phases"] == ("eval_before",)
+    assert captured["recorded"] == ()
+    rewritten = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert rewritten["eval_reruns"][0]["phase"] == "eval_before"
+
+
+def test_an_eval_before_repair_is_refused_once_a_rollout_has_run(tmp_path) -> None:
+    """A before taken after the rollout would measure the accumulated home: contamination."""
+    from shobench import runner
+
+    run_dir = _reopenable_run(tmp_path, with_terminus=True, with_before=True)
+
+    with pytest.raises(RuntimeError, match="cannot be re-measured"):
+        asyncio.run(
+            runner.rerun_eval(
+                run_dir,
+                results_dir=tmp_path / "results",
+                phase="eval_before",
+                capture_egress=False,
+            )
+        )
+
+
+def test_an_eval_before_repair_needs_the_phase_to_have_run(tmp_path) -> None:
+    """Repair fills holes; a phase that never ran is launched, not repaired."""
+    from shobench import runner
+
+    run_dir = _reopenable_run(tmp_path, with_terminus=False, with_before=False)
+
+    with pytest.raises(RuntimeError, match="never ran an eval_before"):
+        asyncio.run(
+            runner.rerun_eval(
+                run_dir,
+                results_dir=tmp_path / "results",
+                phase="eval_before",
+                capture_egress=False,
+            )
+        )

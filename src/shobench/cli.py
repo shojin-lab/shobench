@@ -306,17 +306,18 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
         instruction=load_instruction(cell.instruction_arm),
     )
     heldout_ids = [str(task_id) for task_id in split.heldout.task_ids]
-    pending = runner._eval_pending_ids(run_dir / "eval_after", heldout_ids)
+    pending = runner._eval_pending_ids(run_dir / args.phase, heldout_ids)
     missing_required = [name for name in cell.required_env if not os.environ.get(name)]
     plan = {
         "run_dir": str(run_dir),
         "cell": cell.name,
-        "phase": "eval_after",
+        "phase": args.phase,
         "heldout_ids": len(heldout_ids),
         "already_complete": len(heldout_ids) - len(pending),
         "pending": len(pending),
         "suspension_present": (run_dir / runner.SUSPENSION_FILE).is_file(),
         "rollout_terminus_present": (run_dir / "rollout_stopping.json").is_file(),
+        "rollout_ever_ran": (run_dir / "rollout").is_dir(),
         "required_env_present": {name: bool(os.environ.get(name)) for name in cell.required_env},
         "missing_required_env": missing_required,
         "experiment_drift": drift,
@@ -344,6 +345,7 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
         runner.rerun_eval(
             run_dir,
             results_dir=Path(args.results),
+            phase=args.phase,
             agent_image=args.image,
             credentials=credentials.agent_env(cell.harness, cell.credential_mode, dict(os.environ)),
             capture_egress=not args.no_egress,
@@ -555,6 +557,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "rerun-eval", help="finish an eval_after that lost tasks with no suspension to resume"
     )
     rerun.add_argument("--run", required=True, help="the finished run directory to reopen")
+    rerun.add_argument(
+        "--phase",
+        choices=["eval_after", "eval_before"],
+        default="eval_after",
+        help="which eval phase to repair (eval_before only for a run that never rolled out)",
+    )
     rerun.add_argument("--go", action="store_true", help="actually re-run the holes (real spend)")
     rerun.add_argument("--results", default="results")
     rerun.add_argument("--image", default=AGENT_IMAGE)
