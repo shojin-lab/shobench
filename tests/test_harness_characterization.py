@@ -336,5 +336,10 @@ def test_prime_agent_names_the_provider_for_both_model_families() -> None:
 
     import pytest as _pytest
 
+    # gpt-4.1 exists in prime's catalog under other providers but NOT under openai-codex; an
+    # explicit provider disables the catalog check, so a prefix rule would have misrouted it
+    # into the codex backend's custom-model fallback. Exact mapping refuses it instead.
+    with _pytest.raises(ValueError, match="no provider mapping"):
+        PrimeAgent.provider_for("gpt-4.1")
     with _pytest.raises(ValueError, match="no provider mapping"):
         PrimeAgent.provider_for("o5-preview")

@@ -140,23 +140,28 @@ class PrimeAgent(Harness):
     MAX_TURNS = 100000
     MAX_TOKENS = 1000000000
 
-    # Which provider serves each model family, passed as an explicit ``--provider`` on every
-    # launch and probe. Left to resolve a bare model id on its own, prime-agent 0.7.1 routed
+    # Which provider serves each model, passed as an explicit ``--provider`` on every launch
+    # and probe. Left to resolve a bare model id on its own, prime-agent 0.7.1 routed
     # ``gpt-5.6-terra`` to azure-openai-responses, a provider nothing here is logged into, and
-    # the run died with "No API key found" while the openai-codex login sat unused. The mapping
-    # is by prefix because the axis it encodes (Anthropic models vs OpenAI models) is the same
-    # split the credential seeding already makes; a model neither prefix covers is a config
-    # error worth stopping on rather than a resolution to gamble on.
-    PROVIDER_BY_PREFIX = (("claude", "anthropic"), ("gpt", "openai-codex"))
+    # the run died with "No API key found" while the openai-codex login sat unused. The map is
+    # exact rather than by prefix: an explicit provider disables 0.7.1's catalog check (an
+    # absent id falls back to a custom-model launch), so a prefix rule would silently misroute
+    # any GPT id the codex backend does not serve. Every model a cell may name is listed here
+    # against the provider whose catalog carries it, and anything else stops the launch.
+    PROVIDER_BY_MODEL = {
+        "claude-opus-5": "anthropic",
+        "gpt-5.6-terra": "openai-codex",
+    }
 
     @classmethod
     def provider_for(cls, model: str) -> str:
-        for prefix, provider in cls.PROVIDER_BY_PREFIX:
-            if model.startswith(prefix):
-                return provider
-        raise ValueError(
-            f"no provider mapping for model {model!r}; add it to PrimeAgent.PROVIDER_BY_PREFIX"
-        )
+        provider = cls.PROVIDER_BY_MODEL.get(model)
+        if provider is None:
+            raise ValueError(
+                f"no provider mapping for model {model!r}; add it to "
+                "PrimeAgent.PROVIDER_BY_MODEL against the provider whose catalog serves it"
+            )
+        return provider
 
     # prime-agent's MCP client resolves a bearer token before every connection and refuses to
     # open a session without one, even against a server that ignores it. The value is a
