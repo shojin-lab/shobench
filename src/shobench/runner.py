@@ -2001,20 +2001,24 @@ async def rerun_eval(
     run_dir: Path,
     *,
     results_dir: Path,
+    phase: str = "eval_after",
     agent_image: str = AGENT_IMAGE,
     credentials: dict[str, str] | None = None,
     capture_egress: bool = True,
 ) -> Path:
-    """Finish an eval_after that lost tasks without a suspension, and republish.
+    """Finish an eval phase that lost tasks without a suspension, and republish.
 
     Ownership first, refusals second: acquiring the lock of a genuinely finished run is free
     and leaves no trace, while a live owner refuses here before anything is read or written.
     """
+    if phase not in ("eval_before", "eval_after"):
+        raise ValueError(f"rerun_eval repairs eval phases, not {phase!r}")
     lock_fd = _acquire_run_lock(run_dir)
     try:
         return await _rerun_eval_owned(
             run_dir,
             results_dir=results_dir,
+            phase=phase,
             agent_image=agent_image,
             credentials=credentials,
             capture_egress=capture_egress,
@@ -2027,6 +2031,7 @@ async def _rerun_eval_owned(
     run_dir: Path,
     *,
     results_dir: Path,
+    phase: str = "eval_after",
     agent_image: str = AGENT_IMAGE,
     credentials: dict[str, str] | None = None,
     capture_egress: bool = True,
@@ -2052,10 +2057,27 @@ async def _rerun_eval_owned(
             "the interruption was waiting for. This entry is for a run that ended with no "
             "record and left held-out ids row-less."
         )
-    if not (run_dir / "rollout_stopping.json").is_file():
+    if phase == "eval_after" and not (run_dir / "rollout_stopping.json").is_file():
         raise RuntimeError(
             f"{run_dir} has no rollout terminus, so eval_after must not run: the measurement "
             "belongs on the far side of a real rollout ending."
+        )
+    if phase == "eval_before" and (
+        (run_dir / "rollout_stopping.json").is_file() or (run_dir / "rollout").is_dir()
+    ):
+        # The one repair that must never happen: eval tasks copy the cell home at task time,
+        # and a home a rollout has already touched is not the before state. A baseline that
+        # holed out in a run that later rolled out is measured by a FRESH baseline-only run,
+        # never by reopening this one.
+        raise RuntimeError(
+            f"{run_dir} has run its rollout, so its eval_before cannot be re-measured here: "
+            "a before taken after the rollout would measure the accumulated home. Run a fresh "
+            "--phases eval_before cell instead."
+        )
+    if phase == "eval_before" and not (run_dir / "eval_before").is_dir():
+        raise RuntimeError(
+            f"{run_dir} never ran an eval_before, so there is nothing to repair: launch the "
+            "phase with `shobench run --phases eval_before` instead."
         )
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     cell = load_cell_by_name(manifest["cell"]["name"])
@@ -2100,12 +2122,16 @@ async def _rerun_eval_owned(
     legs_path = run_dir / "legs.json"
     if legs_path.is_file():
         ctx.prior_legs = json.loads(legs_path.read_text(encoding="utf-8"))
-    # eval_before is carried only when this run measured one: a run whose baseline was deferred
-    # to a standalone run publishes without it here exactly as it did at its own ending.
-    recorded_phases: tuple[str, ...] = ("rollout",)
-    if (run_dir / "eval_before").is_dir():
-        recorded_phases = ("eval_before", "rollout")
-    manifest.setdefault("eval_reruns", []).append({"at": time.time(), "phase": "eval_after"})
+    # Everything this run measured other than the phase under repair is carried forward, so
+    # the republication has the same shape the run's own ending produced: a baseline-only run
+    # carries nothing, an eval_after repair carries the rollout and any recorded eval_before.
+    recorded: list[str] = []
+    if phase != "eval_before" and (run_dir / "eval_before").is_dir():
+        recorded.append("eval_before")
+    if (run_dir / "rollout_stopping.json").is_file():
+        recorded.append("rollout")
+    recorded_phases = tuple(recorded)
+    manifest.setdefault("eval_reruns", []).append({"at": time.time(), "phase": phase})
     ctx.publish_json(run_dir / "manifest.json", manifest)
     sandbox.up()
     observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
@@ -2113,7 +2139,7 @@ async def _rerun_eval_owned(
         return await _run_phases(
             ctx,
             manifest=manifest,
-            phases=("eval_after",),
+            phases=(phase,),
             results_dir=results_dir,
             observer=observer,
             recorded_phases=recorded_phases,
