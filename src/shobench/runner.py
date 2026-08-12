@@ -1891,6 +1891,106 @@ async def resume_cell(
         sandbox.down()
 
 
+async def rerun_eval(
+    run_dir: Path,
+    *,
+    results_dir: Path,
+    agent_image: str = AGENT_IMAGE,
+    credentials: dict[str, str] | None = None,
+    capture_egress: bool = True,
+) -> Path:
+    """Finish an eval_after that lost tasks without a suspension, and republish.
+
+    A suspension is the runner's own record and ``resume`` spends it; this entry exists for the
+    ending no record names. Legs that die on infrastructure (a network that falls over mid
+    fan-out) leave row-less held-out ids, the run publishes under the incomplete name, and the
+    process exits cleanly, so there is nothing for ``resume`` to hold on to. The eval phase
+    runner is already idempotent (only ids lacking a valid completed row are run), so reopening
+    the same run directory re-runs exactly the holes, against the home the rollout left, and
+    publishes the same shape the uninterrupted run would have.
+
+    Refused while a suspension record exists, because that ending belongs to ``resume`` and
+    running here would spend the window the suspension is waiting out. Refused when the rollout
+    never reached a terminus, because eval_after belongs on the far side of one and nowhere
+    else, which is the same rule ``_run_phases`` states for a fresh cell.
+    """
+    if (run_dir / SUSPENSION_FILE).is_file():
+        raise RuntimeError(
+            f"{run_dir} holds a suspension record; use `shobench resume`, which knows what "
+            "the interruption was waiting for. This entry is for a run that ended with no "
+            "record and left held-out ids row-less."
+        )
+    if not (run_dir / "rollout_stopping.json").is_file():
+        raise RuntimeError(
+            f"{run_dir} has no rollout terminus, so eval_after must not run: the measurement "
+            "belongs on the far side of a real rollout ending."
+        )
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    cell = load_cell_by_name(manifest["cell"]["name"])
+    recorded_regime = recorded_rollout_feedback(manifest)
+    if cell.rollout_feedback != recorded_regime:
+        # Same recovery as a resume: the run's recorded arm wins over the checkout's default,
+        # even though an eval re-run never constructs a rollout stream, so the manifest this
+        # process republishes keeps describing the experiment that actually ran.
+        from dataclasses import replace
+
+        cell = replace(cell, rollout_feedback=recorded_regime)
+    manifest["cell"]["rollout_feedback"] = recorded_regime
+    split = load_split_by_name(cell.split)
+    instruction = load_instruction(cell.instruction_arm)
+    drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)
+    if drift:
+        raise RuntimeError(
+            "the checkout no longer matches the run being reopened: "
+            + "; ".join(drift)
+            + ". Restore the recorded definition, or start a fresh cell."
+        )
+    run_id = str(manifest["run_id"])
+    sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
+    ctx = RunContext(
+        cell=cell,
+        split=split,
+        instruction=instruction,
+        harness=harness_for(cell.harness),
+        run_id=run_id,
+        run_dir=run_dir,
+        sandbox=sandbox,
+        agent_image=agent_image,
+        credentials=dict(credentials or {}),
+    )
+    # Re-seeded for the same reason a resume re-seeds: the sandbox is new even though the home
+    # is not, credential files are excluded from every digest, and the redactor is built from
+    # what was placed.
+    spec = spec_for(cell.harness, cell.credential_mode)
+    seed_home(spec, sandbox.home)
+    _watch_cell_credential(ctx, spec)
+    legs_path = run_dir / "legs.json"
+    if legs_path.is_file():
+        ctx.prior_legs = json.loads(legs_path.read_text(encoding="utf-8"))
+    # eval_before is carried only when this run measured one: a run whose baseline was deferred
+    # to a standalone run publishes without it here exactly as it did at its own ending.
+    recorded_phases: tuple[str, ...] = ("rollout",)
+    if (run_dir / "eval_before").is_dir():
+        recorded_phases = ("eval_before", "rollout")
+    manifest.setdefault("eval_reruns", []).append({"at": time.time(), "phase": "eval_after"})
+    ctx.publish_json(run_dir / "manifest.json", manifest)
+    sandbox.up()
+    observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
+    try:
+        return await _run_phases(
+            ctx,
+            manifest=manifest,
+            phases=("eval_after",),
+            results_dir=results_dir,
+            observer=observer,
+            recorded_phases=recorded_phases,
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            observer.stop()
+        sandbox.down()
+
+
 def _start_egress(sandbox: CellSandbox, run_dir: Path) -> egress.EgressCapture:
     """Attach the observer, writing to its own segment when the run already has a capture.
 
