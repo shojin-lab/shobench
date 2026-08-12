@@ -289,7 +289,7 @@ outcome arrived at by default rather than by declaration, so the image declares 
 
 ### Invocation
 
-    prime-agent -p --mode json --model <model>
+    prime-agent -p --mode json --provider <provider> --model <model>
       --autonomous
       --autonomous-max-continuations <large>
       --autonomous-max-turns <large>
@@ -297,6 +297,14 @@ outcome arrived at by default rather than by declaration, so the image declares 
       --autonomous-timeout-ms <past the run's own wall clock>
       [--resume <id>] -- <prompt>
       </dev/null
+
+The provider is always explicit, from an exact model-to-provider map in the harness
+(`claude-opus-5` -> `anthropic`, `gpt-5.6-terra` -> `openai-codex`); a model outside the map
+stops the launch. Observed on 0.7.1: a bare `gpt-5.6-terra` resolved to `azure-openai-responses`
+and died with "No API key found" while the openai-codex login sat unused, and the map is exact
+rather than by prefix because an explicit provider disables the catalog check, so an absent id
+launches through the custom-model fallback instead of refusing. The credential probe passes the
+same explicit provider, so it exercises the leg's exact resolution path.
 
 ### There is nothing to bypass, and that is the finding
 

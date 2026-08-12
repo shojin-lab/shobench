@@ -559,7 +559,7 @@ def test_codex_opens_the_sandbox_because_exec_defaults_to_read_only(tmp_path: Pa
         mcp_url="http://h:1/mcp",
         system_prompt="s",
         user_prompt="u",
-        model="m",
+        model="claude-opus-5",
         trace_path=tmp_path / "t",
     )
     assert "--dangerously-bypass-approvals-and-sandbox" in spec.argv
@@ -573,7 +573,7 @@ def test_codex_resume_puts_the_subcommand_before_the_flags(tmp_path: Path) -> No
         mcp_url="http://h:1/mcp",
         system_prompt="s",
         user_prompt="u",
-        model="m",
+        model="claude-opus-5",
         trace_path=tmp_path / "t",
         session_id="thread-1",
         resume=True,
@@ -589,7 +589,7 @@ def test_effort_reaches_the_harness_only_when_the_cell_pins_it(tmp_path: Path) -
         mcp_url="http://h:1/mcp",
         system_prompt="s",
         user_prompt="u",
-        model="m",
+        model="claude-opus-5",
         trace_path=tmp_path / "t",
     )
     claude = harness_for("claude_code").launch(effort="xhigh", **kwargs)
@@ -612,7 +612,7 @@ def test_prime_agent_raises_every_autonomous_budget(tmp_path: Path) -> None:
         mcp_url="http://h:1/mcp",
         system_prompt="s",
         user_prompt="u",
-        model="m",
+        model="claude-opus-5",
         trace_path=tmp_path / "t",
         leg_timeout_s=3600,
     )
@@ -635,7 +635,7 @@ def test_prime_agent_declares_an_http_server_with_a_bearer_token(tmp_path: Path)
         mcp_url="http://h:1/mcp",
         system_prompt="s",
         user_prompt="u",
-        model="m",
+        model="claude-opus-5",
         trace_path=tmp_path / "t",
     )
     settings = json.loads(spec.home_files[".prime/agent/settings.json"])
