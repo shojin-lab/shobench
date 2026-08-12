@@ -114,3 +114,25 @@ def test_the_build_verifies_its_own_bake(tmp_path: Path) -> None:
     assert "test ! -e /root/.prime/agent/kernel-venv" in body
     assert "test -x /usr/local/bin/uv" in body
     assert "import ipykernel" in body
+
+
+def test_two_runs_of_one_cell_never_share_container_names(tmp_path: Path) -> None:
+    """Truncation must not erase what makes a run unique.
+
+    The prime-opus cell name is long enough that a bare [:50] cut off the whole timestamp, two
+    concurrent runs of the cell shared one namespace-holder name, and the second run's up()
+    (a docker rm -f before the create) tore down the first run's live network mid-eval.
+    """
+    cell = "automationbench-prime_agent-claude-opus-5"
+    a = CellSandbox(run_id=f"{cell}-20260812T001456Z", home=tmp_path / "a", workdir=tmp_path / "aw")
+    b = CellSandbox(run_id=f"{cell}-20260812T110239Z", home=tmp_path / "b", workdir=tmp_path / "bw")
+    again = CellSandbox(
+        run_id=f"{cell}-20260812T001456Z", home=tmp_path / "c", workdir=tmp_path / "cw"
+    )
+
+    assert a.netns_container != b.netns_container
+    assert a.network != b.network
+    # The same run keeps the same names: resume and rerun reclaim their own holder by name.
+    assert again.netns_container == a.netns_container
+    # DNS-label budget: the longest derived name (the egress observer suffix) must still fit.
+    assert len(f"{a.netns_container}-egress") <= 63

@@ -23,6 +23,7 @@ open.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -79,8 +80,15 @@ class CellSandbox:
     netns_container: str = field(init=False)
 
     def __post_init__(self) -> None:
-        # Container names become DNS labels, which are capped at 63 characters.
-        stem = f"shobench-{self.run_id}"[:50]
+        # Container names become DNS labels, which are capped at 63 characters, so the stem is
+        # truncated. Truncation alone once erased the run timestamp for a long cell name, and
+        # two concurrent runs of one cell then fought over a single namespace holder: up() is a
+        # docker rm -f before the create, so the second run tore down the first run's live
+        # network mid-eval. The digest of the FULL run id keeps every distinct run's names
+        # distinct whatever the cell name's length, while the same run keeps the same names
+        # across resume and rerun, which those paths rely on to reclaim their own holder.
+        digest = hashlib.sha256(self.run_id.encode("utf-8")).hexdigest()[:8]
+        stem = f"shobench-{self.run_id}"[:41] + f"-{digest}"
         self.network = f"{stem}-net"
         self.netns_container = f"{stem}-ns"
 
@@ -167,8 +175,6 @@ class CellSandbox:
 
 
 def _digest_file(path: Path) -> str:
-    import hashlib
-
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
