@@ -56,6 +56,10 @@ class TaskResult:
     success: bool | None
     diagnostic: str | None = None
     observed: list[dict[str, Any]] = field(default_factory=list)
+    # The regime the stream served this row under, verbatim from shogym's record: row-level
+    # evidence of which feedback arm produced the number, independent of the manifest's claim,
+    # so a manifest/row disagreement stays auditable. None only for filled rows no stream served.
+    feedback_regime: str | None = None
 
     @property
     def scored(self) -> bool:
@@ -87,6 +91,9 @@ def read_phase(prov_dir: Path) -> list[TaskResult]:
                 success=None if score is None else score.success,
                 diagnostic=row.diagnostic,
                 observed=[dict(item) for item in (row.observed or ())],
+                feedback_regime=(
+                    None if row.feedback_regime is None else str(row.feedback_regime)
+                ),
             )
         )
     return out
@@ -333,6 +340,11 @@ def write_results(
     harness said, and the manifest's probe output. Redacting once at the end covers all of them
     and cannot be forgotten for a field added later.
     """
+    cell_manifest = manifest.get("cell")
+    if isinstance(cell_manifest, dict) and "rollout_feedback" not in cell_manifest:
+        # A manifest written before the axis existed could only have served the never posture,
+        # so its absence is backfilled explicitly rather than left for every reader to infer.
+        manifest = {**manifest, "cell": {**cell_manifest, "rollout_feedback": "never"}}
     ids = [int(task_id) for task_id in heldout_ids]
     # Filled here as well as by the reader that produced the rows, so a caller that assembles a
     # phase some other way still cannot publish a hole. Filling twice is free: the second pass
