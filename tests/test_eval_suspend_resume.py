@@ -600,3 +600,140 @@ def test_resume_plan_for_an_eval_suspension_skips_the_rollout_clock_guard(
     assert plan["phases_left"] == ["eval_after"]
     # The rollout-only fields are absent: an eval suspension is not bounded by that clock.
     assert "remaining_rollout_s" not in plan
+
+
+# ----- reopening a finished run whose eval_after lost tasks to infrastructure -----------------
+
+
+class _FakeSandbox:
+    def __init__(self, run_id: str, home, workdir):
+        self.run_id, self.home, self.workdir = run_id, home, workdir
+
+    def up(self) -> None:
+        pass
+
+    def down(self) -> None:
+        pass
+
+
+def _reopenable_run(tmp_path, *, with_suspension=False, with_terminus=True, with_before=False):
+    from shobench.config import load_cell_by_name
+    from shobench.runner import SUSPENSION_FILE
+
+    run_dir = tmp_path / "run"
+    (run_dir / "home").mkdir(parents=True)
+    (run_dir / "work").mkdir()
+    cell = load_cell_by_name("smoke-automationbench-claude-code")
+    from shobench.config import load_instruction
+    from shobench.splits import load_split_by_name
+
+    split = load_split_by_name(cell.split)
+    instruction = load_instruction(cell.instruction_arm)
+    # Modeled on a wave-1 artifact: written before the rollout_feedback axis existed, so the
+    # key is absent and absence must read as never.
+    cell_manifest = {k: v for k, v in cell.to_manifest().items() if k != "rollout_feedback"}
+    manifest = {
+        "run_id": "r-1",
+        "cell": cell_manifest,
+        "split": split.to_manifest(),
+        "instruction": {
+            "rollout_system_sha256": instruction.rollout_system_sha256,
+            "eval_system_sha256": instruction.eval_system_sha256,
+        },
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    if with_terminus:
+        (run_dir / "rollout_stopping.json").write_text("{}", encoding="utf-8")
+    if with_suspension:
+        (run_dir / SUSPENSION_FILE).write_text("{}", encoding="utf-8")
+    if with_before:
+        (run_dir / "eval_before").mkdir()
+    return run_dir
+
+
+def test_a_suspended_run_is_refused_by_rerun_eval(tmp_path) -> None:
+    """That ending belongs to resume, which knows what the interruption was waiting for."""
+    from shobench import runner
+
+    run_dir = _reopenable_run(tmp_path, with_suspension=True)
+
+    with pytest.raises(RuntimeError, match="suspension record"):
+        asyncio.run(runner.rerun_eval(run_dir, results_dir=tmp_path / "results"))
+
+
+def test_a_run_without_a_rollout_terminus_is_refused(tmp_path) -> None:
+    """eval_after belongs on the far side of a real rollout ending, reopened or not."""
+    from shobench import runner
+
+    run_dir = _reopenable_run(tmp_path, with_terminus=False)
+
+    with pytest.raises(RuntimeError, match="terminus"):
+        asyncio.run(runner.rerun_eval(run_dir, results_dir=tmp_path / "results"))
+
+
+def test_rerun_eval_reopens_only_eval_after_and_records_itself(tmp_path, monkeypatch) -> None:
+    """The reopened run carries its recorded phases, runs only eval_after, and the manifest
+    says a re-run happened, with the arm recovered the way a resume recovers it."""
+    from shobench import runner
+
+    captured = {}
+
+    async def fake_run_phases(ctx, *, manifest, phases, results_dir, observer, **kwargs):
+        captured.update(phases=phases, recorded=kwargs.get("recorded_phases"), manifest=manifest)
+        return results_dir / "cell.json"
+
+    monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
+    monkeypatch.setattr(runner, "CellSandbox", _FakeSandbox)
+    monkeypatch.setattr(runner, "_watch_cell_credential", lambda ctx, spec: None)
+
+    run_dir = _reopenable_run(tmp_path, with_before=False)
+    asyncio.run(
+        runner.rerun_eval(run_dir, results_dir=tmp_path / "results", capture_egress=False)
+    )
+
+    assert captured["phases"] == ("eval_after",)
+    assert captured["recorded"] == ("rollout",)
+    rewritten = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert rewritten["cell"]["rollout_feedback"] == "never"
+    assert rewritten["eval_reruns"] and rewritten["eval_reruns"][0]["phase"] == "eval_after"
+
+    run_dir = _reopenable_run(tmp_path / "second", with_before=True)
+    asyncio.run(
+        runner.rerun_eval(run_dir, results_dir=tmp_path / "results", capture_egress=False)
+    )
+    assert captured["recorded"] == ("eval_before", "rollout")
+
+
+def test_a_live_owners_lock_refuses_a_second_owner_and_a_dead_one_is_free(tmp_path) -> None:
+    """The lock is kernel-held: alive means flocked, and any hard ending releases it."""
+    import os
+
+    from shobench import runner
+
+    run_dir = tmp_path / "run"
+    fd = runner._acquire_run_lock(run_dir)
+    with pytest.raises(RuntimeError, match="owned by a live process"):
+        runner._acquire_run_lock(run_dir)
+    runner._release_run_lock(fd)
+
+    # A dead owner's lock file remains, unlocked, holding whatever it held: the state every
+    # suspension leaves behind. Acquisition succeeds without any steal protocol.
+    (run_dir / runner.RUN_LOCK_FILE).write_text(
+        json.dumps({"pid": 2**22 + 12345, "at": 0}), encoding="utf-8"
+    )
+    fd = runner._acquire_run_lock(run_dir)
+    assert json.loads((run_dir / runner.RUN_LOCK_FILE).read_text())["pid"] == os.getpid()
+    runner._release_run_lock(fd)
+
+
+def test_rerun_eval_is_refused_while_the_run_has_a_live_owner(tmp_path) -> None:
+    """The exact race the review demonstrated: reopening a cell mid-eval tears its network."""
+    from shobench import runner
+
+    run_dir = _reopenable_run(tmp_path)
+    fd = runner._acquire_run_lock(run_dir)
+    try:
+        with pytest.raises(RuntimeError, match="owned by a live process"):
+            asyncio.run(runner.rerun_eval(run_dir, results_dir=tmp_path / "results"))
+    finally:
+        runner._release_run_lock(fd)

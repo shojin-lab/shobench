@@ -1666,6 +1666,49 @@ def _watch_cell_credential(ctx: RunContext, spec: CredentialSpec) -> None:
     ctx.redactor = redactor_for(environment=ctx.credentials, credential_files=seeded)
 
 
+# The exclusive-ownership marker of a live run directory. Three entry points mutate one (a
+# fresh run, a resume, an eval re-run), and two shells can point two of them at the same
+# directory: the second would rebuild the namespace holder out from under the first
+# (CellSandbox.up is a docker rm -f before the create) and re-run ids the first is mid-way
+# through. The lock is kernel-held (flock on a kept-open fd), which makes every hard ending
+# safe by construction: a suspension's os._exit, a crash, and a kill all release it in the
+# kernel, so there is no stale-lock steal protocol to race and no pid to misidentify. The
+# file's contents are diagnostics for a human reading a refusal, never part of the protocol,
+# and the file is never unlinked, because unlinking a path a contender has already opened
+# would put two processes behind two different inodes of one name.
+RUN_LOCK_FILE = "run.lock"
+
+
+def _acquire_run_lock(run_dir: Path) -> int:
+    """Take exclusive kernel ownership of ``run_dir``; returns the fd that holds it."""
+    import fcntl
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(run_dir / RUN_LOCK_FILE, os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = ""
+        with contextlib.suppress(OSError, ValueError):
+            holder = os.read(fd, 256).decode("utf-8", "replace").strip()
+        os.close(fd)
+        raise RuntimeError(
+            f"{run_dir} is owned by a live process"
+            + (f" ({holder})" if holder else "")
+            + "; a second owner would tear down its network and re-run ids it is mid-way "
+            "through. Wait for it to finish, or stop it first."
+        ) from None
+    os.ftruncate(fd, 0)
+    os.write(fd, json.dumps({"pid": os.getpid(), "at": time.time()}).encode("utf-8"))
+    return fd
+
+
+def _release_run_lock(lock_fd: int) -> None:
+    """Closing the fd releases the kernel lock; every hard ending already did this implicitly."""
+    with contextlib.suppress(OSError):
+        os.close(lock_fd)
+
+
 async def run_cell(
     cell: Cell,
     split: Split,
@@ -1678,10 +1721,45 @@ async def run_cell(
     phases: tuple[str, ...] = ("eval_before", "rollout", "eval_after"),
     capture_egress: bool = True,
 ) -> Path:
-    """Run one cell end to end and return the path of its results JSON."""
-    instruction = load_instruction(cell.instruction_arm)
+    """Run one cell end to end and return the path of its results JSON.
+
+    Ownership is taken before anything else and released after everything, including a
+    teardown that raises: the lock has to outlive every fallible setup step it protects.
+    """
     run_id = _run_id(cell)
     run_dir = runs_dir / run_id
+    lock_fd = _acquire_run_lock(run_dir)
+    try:
+        return await _run_cell_owned(
+            cell,
+            split,
+            run_id=run_id,
+            run_dir=run_dir,
+            results_dir=results_dir,
+            port=port,
+            agent_image=agent_image,
+            credentials=credentials,
+            phases=phases,
+            capture_egress=capture_egress,
+        )
+    finally:
+        _release_run_lock(lock_fd)
+
+
+async def _run_cell_owned(
+    cell: Cell,
+    split: Split,
+    *,
+    run_id: str,
+    run_dir: Path,
+    results_dir: Path,
+    port: int,
+    agent_image: str,
+    credentials: dict[str, str] | None,
+    phases: tuple[str, ...],
+    capture_egress: bool,
+) -> Path:
+    instruction = load_instruction(cell.instruction_arm)
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
     ctx = RunContext(
         cell=cell,
@@ -1761,6 +1839,32 @@ async def resume_cell(
     capture_egress: bool = True,
 ) -> Path:
     """Continue a cell a provider limit suspended, and finish it. Returns the results path.
+
+    Ownership first: the suspension's own lock was released by its hard exit in the kernel,
+    so this acquisition succeeds against a genuinely waiting run and refuses a live one.
+    """
+    lock_fd = _acquire_run_lock(run_dir)
+    try:
+        return await _resume_cell_owned(
+            run_dir,
+            results_dir=results_dir,
+            agent_image=agent_image,
+            credentials=credentials,
+            capture_egress=capture_egress,
+        )
+    finally:
+        _release_run_lock(lock_fd)
+
+
+async def _resume_cell_owned(
+    run_dir: Path,
+    *,
+    results_dir: Path,
+    agent_image: str = AGENT_IMAGE,
+    credentials: dict[str, str] | None = None,
+    capture_egress: bool = True,
+) -> Path:
+    """The suspended cell's continuation, run under an already-held run-directory lock.
 
     Everything this needs is on disk, because the process that wrote it is gone: the suspension
     record names which phase was interrupted, and the manifest beside it names the cell. The run
@@ -1885,6 +1989,132 @@ async def resume_cell(
         # reaches this line, having already replaced the record with its own.
         (run_dir / SUSPENSION_FILE).unlink(missing_ok=True)
         return results_path
+    finally:
+        with contextlib.suppress(Exception):
+            observer.stop()
+        sandbox.down()
+
+
+async def rerun_eval(
+    run_dir: Path,
+    *,
+    results_dir: Path,
+    agent_image: str = AGENT_IMAGE,
+    credentials: dict[str, str] | None = None,
+    capture_egress: bool = True,
+) -> Path:
+    """Finish an eval_after that lost tasks without a suspension, and republish.
+
+    Ownership first, refusals second: acquiring the lock of a genuinely finished run is free
+    and leaves no trace, while a live owner refuses here before anything is read or written.
+    """
+    lock_fd = _acquire_run_lock(run_dir)
+    try:
+        return await _rerun_eval_owned(
+            run_dir,
+            results_dir=results_dir,
+            agent_image=agent_image,
+            credentials=credentials,
+            capture_egress=capture_egress,
+        )
+    finally:
+        _release_run_lock(lock_fd)
+
+
+async def _rerun_eval_owned(
+    run_dir: Path,
+    *,
+    results_dir: Path,
+    agent_image: str = AGENT_IMAGE,
+    credentials: dict[str, str] | None = None,
+    capture_egress: bool = True,
+) -> Path:
+    """The reopened run's eval_after, run under an already-held run-directory lock.
+
+    A suspension is the runner's own record and ``resume`` spends it; this entry exists for the
+    ending no record names. Legs that die on infrastructure (a network that falls over mid
+    fan-out) leave row-less held-out ids, the run publishes under the incomplete name, and the
+    process exits cleanly, so there is nothing for ``resume`` to hold on to. The eval phase
+    runner is already idempotent (only ids lacking a valid completed row are run), so reopening
+    the same run directory re-runs exactly the holes, against the home the rollout left, and
+    publishes the same shape the uninterrupted run would have.
+
+    Refused while a suspension record exists, because that ending belongs to ``resume`` and
+    running here would spend the window the suspension is waiting out. Refused when the rollout
+    never reached a terminus, because eval_after belongs on the far side of one and nowhere
+    else, which is the same rule ``_run_phases`` states for a fresh cell.
+    """
+    if (run_dir / SUSPENSION_FILE).is_file():
+        raise RuntimeError(
+            f"{run_dir} holds a suspension record; use `shobench resume`, which knows what "
+            "the interruption was waiting for. This entry is for a run that ended with no "
+            "record and left held-out ids row-less."
+        )
+    if not (run_dir / "rollout_stopping.json").is_file():
+        raise RuntimeError(
+            f"{run_dir} has no rollout terminus, so eval_after must not run: the measurement "
+            "belongs on the far side of a real rollout ending."
+        )
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    cell = load_cell_by_name(manifest["cell"]["name"])
+    recorded_regime = recorded_rollout_feedback(manifest)
+    if cell.rollout_feedback != recorded_regime:
+        # Same recovery as a resume: the run's recorded arm wins over the checkout's default,
+        # even though an eval re-run never constructs a rollout stream, so the manifest this
+        # process republishes keeps describing the experiment that actually ran.
+        from dataclasses import replace
+
+        cell = replace(cell, rollout_feedback=recorded_regime)
+    manifest["cell"]["rollout_feedback"] = recorded_regime
+    split = load_split_by_name(cell.split)
+    instruction = load_instruction(cell.instruction_arm)
+    drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)
+    if drift:
+        raise RuntimeError(
+            "the checkout no longer matches the run being reopened: "
+            + "; ".join(drift)
+            + ". Restore the recorded definition, or start a fresh cell."
+        )
+    run_id = str(manifest["run_id"])
+    sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
+    ctx = RunContext(
+        cell=cell,
+        split=split,
+        instruction=instruction,
+        harness=harness_for(cell.harness),
+        run_id=run_id,
+        run_dir=run_dir,
+        sandbox=sandbox,
+        agent_image=agent_image,
+        credentials=dict(credentials or {}),
+    )
+    # Re-seeded for the same reason a resume re-seeds: the sandbox is new even though the home
+    # is not, credential files are excluded from every digest, and the redactor is built from
+    # what was placed.
+    spec = spec_for(cell.harness, cell.credential_mode)
+    seed_home(spec, sandbox.home)
+    _watch_cell_credential(ctx, spec)
+    legs_path = run_dir / "legs.json"
+    if legs_path.is_file():
+        ctx.prior_legs = json.loads(legs_path.read_text(encoding="utf-8"))
+    # eval_before is carried only when this run measured one: a run whose baseline was deferred
+    # to a standalone run publishes without it here exactly as it did at its own ending.
+    recorded_phases: tuple[str, ...] = ("rollout",)
+    if (run_dir / "eval_before").is_dir():
+        recorded_phases = ("eval_before", "rollout")
+    manifest.setdefault("eval_reruns", []).append({"at": time.time(), "phase": "eval_after"})
+    ctx.publish_json(run_dir / "manifest.json", manifest)
+    sandbox.up()
+    observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
+    try:
+        return await _run_phases(
+            ctx,
+            manifest=manifest,
+            phases=("eval_after",),
+            results_dir=results_dir,
+            observer=observer,
+            recorded_phases=recorded_phases,
+        )
     finally:
         with contextlib.suppress(Exception):
             observer.stop()

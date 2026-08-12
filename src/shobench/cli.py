@@ -6,6 +6,7 @@
     shobench build                          # build the three images
     shobench run --cell <name> --go         # run one cell (real spend without --go: a plan)
     shobench resume --run <run-dir> --go    # continue a cell a usage limit suspended
+    shobench rerun-eval --run <run-dir> --go # finish an eval_after that lost tasks
     shobench report [results/]              # the summary table
 
 ``--go`` is the whole safety story: every command that spends prints its plan and exits unless
@@ -283,6 +284,75 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rerun_eval(args: argparse.Namespace) -> int:
+    """Finish an eval_after that lost tasks to infrastructure, with no suspension to resume.
+
+    The plan without ``--go`` names the run, the ids still row-less, and the drift check, and
+    spends nothing. The eval phase runner re-runs only the pending ids, so the plan's count is
+    exactly what a ``--go`` will pay for.
+    """
+    run_dir = Path(args.run)
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.is_file():
+        print(f"no manifest at {manifest_path}; this is not a run directory.", file=sys.stderr)
+        return 1
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cell = load_cell_by_name(manifest["cell"]["name"])
+    split = load_split_by_name(cell.split)
+    drift = runner.experiment_drift(
+        manifest,
+        cell=cell,
+        split=split,
+        instruction=load_instruction(cell.instruction_arm),
+    )
+    heldout_ids = [str(task_id) for task_id in split.heldout.task_ids]
+    pending = runner._eval_pending_ids(run_dir / "eval_after", heldout_ids)
+    missing_required = [name for name in cell.required_env if not os.environ.get(name)]
+    plan = {
+        "run_dir": str(run_dir),
+        "cell": cell.name,
+        "phase": "eval_after",
+        "heldout_ids": len(heldout_ids),
+        "already_complete": len(heldout_ids) - len(pending),
+        "pending": len(pending),
+        "suspension_present": (run_dir / runner.SUSPENSION_FILE).is_file(),
+        "rollout_terminus_present": (run_dir / "rollout_stopping.json").is_file(),
+        "required_env_present": {name: bool(os.environ.get(name)) for name in cell.required_env},
+        "missing_required_env": missing_required,
+        "experiment_drift": drift,
+    }
+    if not args.go:
+        print(json.dumps(plan, indent=2))
+        print("\nDry plan. Re-run with --go to spend.", file=sys.stderr)
+        return 0
+    if missing_required:
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(
+            f"\nBLOCKED: the cell needs {missing_required} in the environment and they are "
+            "not set. Nothing was spent.",
+            file=sys.stderr,
+        )
+        return 1
+    # A zero-pending invocation still runs the tail: the fan-out may have finished while the
+    # prior process died before republishing, and the phase runner is a no-op over complete
+    # ids, so the only work left is the accounting and the artifact.
+    blocked = _set_tau2_data_dir(cell)
+    if blocked:
+        print(f"BLOCKED: {blocked}\nNothing was spent.", file=sys.stderr)
+        return 1
+    results_path = asyncio.run(
+        runner.rerun_eval(
+            run_dir,
+            results_dir=Path(args.results),
+            agent_image=args.image,
+            credentials=credentials.agent_env(cell.harness, cell.credential_mode, dict(os.environ)),
+            capture_egress=not args.no_egress,
+        )
+    )
+    print(f"results: {results_path}")
+    return 0
+
+
 def _cmd_resume(args: argparse.Namespace) -> int:
     """Continue a cell a provider usage limit suspended, and let it finish.
 
@@ -480,6 +550,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     res.add_argument("--image", default=AGENT_IMAGE)
     res.add_argument("--no-egress", action="store_true")
     res.set_defaults(func=_cmd_resume)
+
+    rerun = sub.add_parser(
+        "rerun-eval", help="finish an eval_after that lost tasks with no suspension to resume"
+    )
+    rerun.add_argument("--run", required=True, help="the finished run directory to reopen")
+    rerun.add_argument("--go", action="store_true", help="actually re-run the holes (real spend)")
+    rerun.add_argument("--results", default="results")
+    rerun.add_argument("--image", default=AGENT_IMAGE)
+    rerun.add_argument("--no-egress", action="store_true")
+    rerun.set_defaults(func=_cmd_rerun_eval)
 
     rep = sub.add_parser("report", help="the summary table")
     rep.add_argument("results", nargs="?", default="results")
