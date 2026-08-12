@@ -302,3 +302,68 @@ def _manifest(tmp_path: Path, harness: str, *, effort: str) -> dict:
         sandbox=sandbox,
     )
     return build_manifest(ctx, probes={})
+
+
+# ----- rollout feedback regime --------------------------------------------------------------
+
+
+def test_rollout_feedback_defaults_to_immediate_and_reaches_the_manifest() -> None:
+    """The premise is the default: a cell that says nothing gets feedback on done."""
+    cell = load_cell_by_name("automationbench-claude_code-claude-opus-5")
+
+    assert cell.rollout_feedback == "immediate"
+    assert cell.to_manifest()["rollout_feedback"] == "immediate"
+
+
+def test_a_never_cell_loads_and_an_unknown_regime_is_refused(tmp_path: Path) -> None:
+    """The ablation arm is explicit, and a typo is a config error rather than a silent arm."""
+    from shobench.config import load_cell
+
+    base = "\n".join(
+        [
+            "[cell]",
+            'name = "t"',
+            'env = "automationbench"',
+            'harness = "claude_code"',
+            'model = "m"',
+            'split = "automationbench"',
+            "{regime}",
+            "[budget]",
+            "rollout_wall_clock_s = 60",
+        ]
+    )
+    never = tmp_path / "never.toml"
+    never.write_text(base.format(regime='rollout_feedback = "never"'), encoding="utf-8")
+    assert load_cell(never).rollout_feedback == "never"
+
+    typo = tmp_path / "typo.toml"
+    typo.write_text(base.format(regime='rollout_feedback = "always"'), encoding="utf-8")
+    with pytest.raises(ValueError, match="rollout_feedback"):
+        load_cell(typo)
+
+
+def test_the_rollout_stream_regime_follows_the_cell_axis(monkeypatch, tmp_path: Path) -> None:
+    """What the stream is actually constructed with, not what the config claims."""
+    import dataclasses
+
+    import shogym.serve as shogym_serve
+
+    from shobench import serving
+
+    captured: dict = {}
+
+    class _FakeStream:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(shogym_serve, "TaskStream", _FakeStream)
+    cell = load_cell_by_name("automationbench-claude_code-claude-opus-5")
+    split = load_split_by_name(cell.split)
+
+    serving.build_stream(cell, split, "rollout", tmp_path)
+    assert type(captured["feedback"]).__name__ == "Immediate"
+
+    serving.build_stream(
+        dataclasses.replace(cell, rollout_feedback="never"), split, "rollout", tmp_path
+    )
+    assert type(captured["feedback"]).__name__ == "Never"
