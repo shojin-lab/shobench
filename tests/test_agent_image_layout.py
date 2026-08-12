@@ -136,3 +136,55 @@ def test_two_runs_of_one_cell_never_share_container_names(tmp_path: Path) -> Non
     assert again.netns_container == a.netns_container
     # DNS-label budget: the longest derived name (the egress observer suffix) must still fit.
     assert len(f"{a.netns_container}-egress") <= 63
+
+
+def test_crash_cleanup_and_the_sandbox_agree_on_every_name(tmp_path: Path, monkeypatch) -> None:
+    """cleanup() must remove the names up() creates, not a hand-reconstructed formula.
+
+    The first digest fix left cleanup rebuilding the OLD stem by hand, so it silently removed
+    nothing: every docker call in it is check=False.
+    """
+    from shobench import runner
+
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(runner, "docker", lambda *a, **k: calls.append(a))
+
+    run_id = "automationbench-prime_agent-claude-opus-5-20260812T001456Z"
+    sandbox = CellSandbox(run_id=run_id, home=tmp_path / "h", workdir=tmp_path / "w")
+    runner.cleanup(run_id)
+
+    removed = {args[2] for args in calls if args[:2] == ("rm", "-f")}
+    assert sandbox.netns_container in removed
+    networks = {args[2] for args in calls if args[:2] == ("network", "rm")}
+    assert sandbox.network in networks
+
+
+def test_a_pre_digest_run_reclaims_its_recorded_names_and_rewrites_them(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Migration removes exactly what THIS run's manifest recorded, never a recomputed formula,
+    and the republished manifest names the resources the continuation actually uses."""
+    from shobench import runner
+
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(runner, "containers_docker", lambda *a, **k: calls.append(a))
+
+    run_id = "automationbench-prime_agent-claude-opus-5-20260812T001456Z"
+    sandbox = CellSandbox(run_id=run_id, home=tmp_path / "h", workdir=tmp_path / "w")
+    legacy = f"shobench-{run_id}"[:50]
+    manifest = {"container": {"netns_container": f"{legacy}-ns", "network": f"{legacy}-net"}}
+
+    runner._reclaim_recorded_containers(manifest, sandbox)
+
+    removed = {args[2] for args in calls if args[:2] == ("rm", "-f")}
+    assert {f"{legacy}-ns-egress", f"{legacy}-ns"} <= removed
+    assert manifest["container"]["netns_container"] == sandbox.netns_container
+    assert manifest["container"]["network"] == sandbox.network
+
+    # A post-fix run's recorded names already match: nothing is removed, nothing rewritten away.
+    calls.clear()
+    same = {
+        "container": {"netns_container": sandbox.netns_container, "network": sandbox.network}
+    }
+    runner._reclaim_recorded_containers(same, sandbox)
+    assert calls == []
