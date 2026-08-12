@@ -1670,53 +1670,43 @@ def _watch_cell_credential(ctx: RunContext, spec: CredentialSpec) -> None:
 # fresh run, a resume, an eval re-run), and two shells can point two of them at the same
 # directory: the second would rebuild the namespace holder out from under the first
 # (CellSandbox.up is a docker rm -f before the create) and re-run ids the first is mid-way
-# through. The lock carries the owner's pid. A dead owner's lock is stale by definition and is
-# replaced, which is not an edge case but the normal life cycle: a suspension leaves the
-# process with os._exit on purpose, so every resumed run starts by replacing the lock its own
-# suspension left behind.
+# through. The lock is kernel-held (flock on a kept-open fd), which makes every hard ending
+# safe by construction: a suspension's os._exit, a crash, and a kill all release it in the
+# kernel, so there is no stale-lock steal protocol to race and no pid to misidentify. The
+# file's contents are diagnostics for a human reading a refusal, never part of the protocol,
+# and the file is never unlinked, because unlinking a path a contender has already opened
+# would put two processes behind two different inodes of one name.
 RUN_LOCK_FILE = "run.lock"
 
 
-def _acquire_run_lock(run_dir: Path) -> None:
+def _acquire_run_lock(run_dir: Path) -> int:
+    """Take exclusive kernel ownership of ``run_dir``; returns the fd that holds it."""
+    import fcntl
+
     run_dir.mkdir(parents=True, exist_ok=True)
-    lock = run_dir / RUN_LOCK_FILE
-    for _ in range(3):
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            try:
-                pid = int(json.loads(lock.read_text(encoding="utf-8")).get("pid", -1))
-            except (ValueError, OSError):
-                pid = -1
-            alive = False
-            if pid > 0:
-                try:
-                    os.kill(pid, 0)
-                    alive = True
-                except ProcessLookupError:
-                    alive = False
-                except PermissionError:
-                    alive = True
-            if alive:
-                raise RuntimeError(
-                    f"{run_dir} is owned by a live process (pid {pid}); a second owner would "
-                    "tear down its network and re-run ids it is mid-way through. Wait for it "
-                    "to finish, or stop it first."
-                ) from None
-            lock.unlink(missing_ok=True)
-            continue
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"pid": os.getpid(), "at": time.time()}, handle)
-        return
-    raise RuntimeError(f"could not acquire {lock}: a fresh lock kept appearing while stealing")
+    fd = os.open(run_dir / RUN_LOCK_FILE, os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = ""
+        with contextlib.suppress(OSError, ValueError):
+            holder = os.read(fd, 256).decode("utf-8", "replace").strip()
+        os.close(fd)
+        raise RuntimeError(
+            f"{run_dir} is owned by a live process"
+            + (f" ({holder})" if holder else "")
+            + "; a second owner would tear down its network and re-run ids it is mid-way "
+            "through. Wait for it to finish, or stop it first."
+        ) from None
+    os.ftruncate(fd, 0)
+    os.write(fd, json.dumps({"pid": os.getpid(), "at": time.time()}).encode("utf-8"))
+    return fd
 
 
-def _release_run_lock(run_dir: Path) -> None:
-    """Best effort, and only this process's own: a suspension has already hard-exited by here."""
-    lock = run_dir / RUN_LOCK_FILE
-    with contextlib.suppress(OSError, ValueError):
-        if int(json.loads(lock.read_text(encoding="utf-8")).get("pid", -1)) == os.getpid():
-            lock.unlink()
+def _release_run_lock(lock_fd: int) -> None:
+    """Closing the fd releases the kernel lock; every hard ending already did this implicitly."""
+    with contextlib.suppress(OSError):
+        os.close(lock_fd)
 
 
 async def run_cell(
@@ -1731,10 +1721,45 @@ async def run_cell(
     phases: tuple[str, ...] = ("eval_before", "rollout", "eval_after"),
     capture_egress: bool = True,
 ) -> Path:
-    """Run one cell end to end and return the path of its results JSON."""
-    instruction = load_instruction(cell.instruction_arm)
+    """Run one cell end to end and return the path of its results JSON.
+
+    Ownership is taken before anything else and released after everything, including a
+    teardown that raises: the lock has to outlive every fallible setup step it protects.
+    """
     run_id = _run_id(cell)
     run_dir = runs_dir / run_id
+    lock_fd = _acquire_run_lock(run_dir)
+    try:
+        return await _run_cell_owned(
+            cell,
+            split,
+            run_id=run_id,
+            run_dir=run_dir,
+            results_dir=results_dir,
+            port=port,
+            agent_image=agent_image,
+            credentials=credentials,
+            phases=phases,
+            capture_egress=capture_egress,
+        )
+    finally:
+        _release_run_lock(lock_fd)
+
+
+async def _run_cell_owned(
+    cell: Cell,
+    split: Split,
+    *,
+    run_id: str,
+    run_dir: Path,
+    results_dir: Path,
+    port: int,
+    agent_image: str,
+    credentials: dict[str, str] | None,
+    phases: tuple[str, ...],
+    capture_egress: bool,
+) -> Path:
+    instruction = load_instruction(cell.instruction_arm)
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
     ctx = RunContext(
         cell=cell,
@@ -1749,7 +1774,6 @@ async def run_cell(
         credentials=dict(credentials or {}),
     )
 
-    _acquire_run_lock(run_dir)
     sandbox.up()
     # A harness whose credential lives in a file gets it placed in this cell's own HOME. The
     # negative control validated the same placement in its own sandbox; without this the cell
@@ -1804,7 +1828,6 @@ async def run_cell(
         with contextlib.suppress(Exception):
             observer.stop()
         sandbox.down()
-        _release_run_lock(run_dir)
 
 
 async def resume_cell(
@@ -1816,6 +1839,32 @@ async def resume_cell(
     capture_egress: bool = True,
 ) -> Path:
     """Continue a cell a provider limit suspended, and finish it. Returns the results path.
+
+    Ownership first: the suspension's own lock was released by its hard exit in the kernel,
+    so this acquisition succeeds against a genuinely waiting run and refuses a live one.
+    """
+    lock_fd = _acquire_run_lock(run_dir)
+    try:
+        return await _resume_cell_owned(
+            run_dir,
+            results_dir=results_dir,
+            agent_image=agent_image,
+            credentials=credentials,
+            capture_egress=capture_egress,
+        )
+    finally:
+        _release_run_lock(lock_fd)
+
+
+async def _resume_cell_owned(
+    run_dir: Path,
+    *,
+    results_dir: Path,
+    agent_image: str = AGENT_IMAGE,
+    credentials: dict[str, str] | None = None,
+    capture_egress: bool = True,
+) -> Path:
+    """The suspended cell's continuation, run under an already-held run-directory lock.
 
     Everything this needs is on disk, because the process that wrote it is gone: the suspension
     record names which phase was interrupted, and the manifest beside it names the cell. The run
@@ -1838,7 +1887,6 @@ async def resume_cell(
     are carried into the published result rather than re-run.
     """
     record = json.loads((run_dir / SUSPENSION_FILE).read_text(encoding="utf-8"))
-    _acquire_run_lock(run_dir)
     interrupted_phase = record.get("phase", "rollout")
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     cell = load_cell_by_name(manifest["cell"]["name"])
@@ -1945,7 +1993,6 @@ async def resume_cell(
         with contextlib.suppress(Exception):
             observer.stop()
         sandbox.down()
-        _release_run_lock(run_dir)
 
 
 async def rerun_eval(
@@ -1957,6 +2004,32 @@ async def rerun_eval(
     capture_egress: bool = True,
 ) -> Path:
     """Finish an eval_after that lost tasks without a suspension, and republish.
+
+    Ownership first, refusals second: acquiring the lock of a genuinely finished run is free
+    and leaves no trace, while a live owner refuses here before anything is read or written.
+    """
+    lock_fd = _acquire_run_lock(run_dir)
+    try:
+        return await _rerun_eval_owned(
+            run_dir,
+            results_dir=results_dir,
+            agent_image=agent_image,
+            credentials=credentials,
+            capture_egress=capture_egress,
+        )
+    finally:
+        _release_run_lock(lock_fd)
+
+
+async def _rerun_eval_owned(
+    run_dir: Path,
+    *,
+    results_dir: Path,
+    agent_image: str = AGENT_IMAGE,
+    credentials: dict[str, str] | None = None,
+    capture_egress: bool = True,
+) -> Path:
+    """The reopened run's eval_after, run under an already-held run-directory lock.
 
     A suspension is the runner's own record and ``resume`` spends it; this entry exists for the
     ending no record names. Legs that die on infrastructure (a network that falls over mid
@@ -1982,7 +2055,6 @@ async def rerun_eval(
             f"{run_dir} has no rollout terminus, so eval_after must not run: the measurement "
             "belongs on the far side of a real rollout ending."
         )
-    _acquire_run_lock(run_dir)
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     cell = load_cell_by_name(manifest["cell"]["name"])
     recorded_regime = recorded_rollout_feedback(manifest)
@@ -2047,7 +2119,6 @@ async def rerun_eval(
         with contextlib.suppress(Exception):
             observer.stop()
         sandbox.down()
-        _release_run_lock(run_dir)
 
 
 def _start_egress(sandbox: CellSandbox, run_dir: Path) -> egress.EgressCapture:
