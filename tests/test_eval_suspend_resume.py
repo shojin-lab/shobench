@@ -702,3 +702,37 @@ def test_rerun_eval_reopens_only_eval_after_and_records_itself(tmp_path, monkeyp
         runner.rerun_eval(run_dir, results_dir=tmp_path / "results", capture_egress=False)
     )
     assert captured["recorded"] == ("eval_before", "rollout")
+
+
+def test_a_live_owners_lock_refuses_a_second_owner_and_a_dead_one_is_stolen(tmp_path) -> None:
+    """The lock is the no-double-owner guarantee, and a suspension's leftover must not be."""
+    import os
+
+    from shobench import runner
+
+    run_dir = tmp_path / "run"
+    runner._acquire_run_lock(run_dir)
+    with pytest.raises(RuntimeError, match="owned by a live process"):
+        runner._acquire_run_lock(run_dir)
+
+    # A dead owner's lock is the normal post-suspension state and is replaced silently.
+    (run_dir / runner.RUN_LOCK_FILE).write_text(
+        json.dumps({"pid": 2**22 + 12345, "at": 0}), encoding="utf-8"
+    )
+    runner._acquire_run_lock(run_dir)
+    assert json.loads((run_dir / runner.RUN_LOCK_FILE).read_text())["pid"] == os.getpid()
+    runner._release_run_lock(run_dir)
+    assert not (run_dir / runner.RUN_LOCK_FILE).exists()
+
+
+def test_rerun_eval_is_refused_while_the_run_has_a_live_owner(tmp_path) -> None:
+    """The exact race the review demonstrated: reopening a cell mid-eval tears its network."""
+    from shobench import runner
+
+    run_dir = _reopenable_run(tmp_path)
+    runner._acquire_run_lock(run_dir)
+    try:
+        with pytest.raises(RuntimeError, match="owned by a live process"):
+            asyncio.run(runner.rerun_eval(run_dir, results_dir=tmp_path / "results"))
+    finally:
+        runner._release_run_lock(run_dir)

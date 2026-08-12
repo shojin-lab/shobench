@@ -1666,6 +1666,59 @@ def _watch_cell_credential(ctx: RunContext, spec: CredentialSpec) -> None:
     ctx.redactor = redactor_for(environment=ctx.credentials, credential_files=seeded)
 
 
+# The exclusive-ownership marker of a live run directory. Three entry points mutate one (a
+# fresh run, a resume, an eval re-run), and two shells can point two of them at the same
+# directory: the second would rebuild the namespace holder out from under the first
+# (CellSandbox.up is a docker rm -f before the create) and re-run ids the first is mid-way
+# through. The lock carries the owner's pid. A dead owner's lock is stale by definition and is
+# replaced, which is not an edge case but the normal life cycle: a suspension leaves the
+# process with os._exit on purpose, so every resumed run starts by replacing the lock its own
+# suspension left behind.
+RUN_LOCK_FILE = "run.lock"
+
+
+def _acquire_run_lock(run_dir: Path) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    lock = run_dir / RUN_LOCK_FILE
+    for _ in range(3):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                pid = int(json.loads(lock.read_text(encoding="utf-8")).get("pid", -1))
+            except (ValueError, OSError):
+                pid = -1
+            alive = False
+            if pid > 0:
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                except ProcessLookupError:
+                    alive = False
+                except PermissionError:
+                    alive = True
+            if alive:
+                raise RuntimeError(
+                    f"{run_dir} is owned by a live process (pid {pid}); a second owner would "
+                    "tear down its network and re-run ids it is mid-way through. Wait for it "
+                    "to finish, or stop it first."
+                ) from None
+            lock.unlink(missing_ok=True)
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"pid": os.getpid(), "at": time.time()}, handle)
+        return
+    raise RuntimeError(f"could not acquire {lock}: a fresh lock kept appearing while stealing")
+
+
+def _release_run_lock(run_dir: Path) -> None:
+    """Best effort, and only this process's own: a suspension has already hard-exited by here."""
+    lock = run_dir / RUN_LOCK_FILE
+    with contextlib.suppress(OSError, ValueError):
+        if int(json.loads(lock.read_text(encoding="utf-8")).get("pid", -1)) == os.getpid():
+            lock.unlink()
+
+
 async def run_cell(
     cell: Cell,
     split: Split,
@@ -1696,6 +1749,7 @@ async def run_cell(
         credentials=dict(credentials or {}),
     )
 
+    _acquire_run_lock(run_dir)
     sandbox.up()
     # A harness whose credential lives in a file gets it placed in this cell's own HOME. The
     # negative control validated the same placement in its own sandbox; without this the cell
@@ -1750,6 +1804,7 @@ async def run_cell(
         with contextlib.suppress(Exception):
             observer.stop()
         sandbox.down()
+        _release_run_lock(run_dir)
 
 
 async def resume_cell(
@@ -1783,6 +1838,7 @@ async def resume_cell(
     are carried into the published result rather than re-run.
     """
     record = json.loads((run_dir / SUSPENSION_FILE).read_text(encoding="utf-8"))
+    _acquire_run_lock(run_dir)
     interrupted_phase = record.get("phase", "rollout")
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     cell = load_cell_by_name(manifest["cell"]["name"])
@@ -1889,6 +1945,7 @@ async def resume_cell(
         with contextlib.suppress(Exception):
             observer.stop()
         sandbox.down()
+        _release_run_lock(run_dir)
 
 
 async def rerun_eval(
@@ -1925,6 +1982,7 @@ async def rerun_eval(
             f"{run_dir} has no rollout terminus, so eval_after must not run: the measurement "
             "belongs on the far side of a real rollout ending."
         )
+    _acquire_run_lock(run_dir)
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     cell = load_cell_by_name(manifest["cell"]["name"])
     recorded_regime = recorded_rollout_feedback(manifest)
@@ -1989,6 +2047,7 @@ async def rerun_eval(
         with contextlib.suppress(Exception):
             observer.stop()
         sandbox.down()
+        _release_run_lock(run_dir)
 
 
 def _start_egress(sandbox: CellSandbox, run_dir: Path) -> egress.EgressCapture:

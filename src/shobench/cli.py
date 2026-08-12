@@ -307,6 +307,7 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
     )
     heldout_ids = [str(task_id) for task_id in split.heldout.task_ids]
     pending = runner._eval_pending_ids(run_dir / "eval_after", heldout_ids)
+    missing_required = [name for name in cell.required_env if not os.environ.get(name)]
     plan = {
         "run_dir": str(run_dir),
         "cell": cell.name,
@@ -316,15 +317,25 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
         "pending": len(pending),
         "suspension_present": (run_dir / runner.SUSPENSION_FILE).is_file(),
         "rollout_terminus_present": (run_dir / "rollout_stopping.json").is_file(),
+        "required_env_present": {name: bool(os.environ.get(name)) for name in cell.required_env},
+        "missing_required_env": missing_required,
         "experiment_drift": drift,
     }
     if not args.go:
         print(json.dumps(plan, indent=2))
         print("\nDry plan. Re-run with --go to spend.", file=sys.stderr)
         return 0
-    if not pending:
-        print("every held-out id already has a valid completed row; nothing to re-run.")
-        return 0
+    if missing_required:
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(
+            f"\nBLOCKED: the cell needs {missing_required} in the environment and they are "
+            "not set. Nothing was spent.",
+            file=sys.stderr,
+        )
+        return 1
+    # A zero-pending invocation still runs the tail: the fan-out may have finished while the
+    # prior process died before republishing, and the phase runner is a no-op over complete
+    # ids, so the only work left is the accounting and the artifact.
     blocked = _set_tau2_data_dir(cell)
     if blocked:
         print(f"BLOCKED: {blocked}\nNothing was spent.", file=sys.stderr)
