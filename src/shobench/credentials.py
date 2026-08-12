@@ -483,7 +483,21 @@ def _probe_argv(harness: str, model: str) -> list[str]:
             PROBE_PROMPT,
         ]
     if harness == "prime_agent":
-        return ["prime-agent", "-p", "--mode", "json", PROBE_PROMPT, "--model", model]
+        from shobench.harnesses.prime_agent import PrimeAgent
+
+        # The same explicit provider the real launch passes, so the probe exercises the exact
+        # resolution path a leg will use rather than a luckier or unluckier one.
+        return [
+            "prime-agent",
+            "-p",
+            "--mode",
+            "json",
+            "--provider",
+            PrimeAgent.provider_for(model),
+            PROBE_PROMPT,
+            "--model",
+            model,
+        ]
     raise ValueError(f"no probe for harness {harness!r}")
 
 

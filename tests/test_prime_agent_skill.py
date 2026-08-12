@@ -95,7 +95,7 @@ def _launch_spec(tmp_path: Path, mcp_url: str = "http://host.docker.internal:123
         mcp_url=mcp_url,
         system_prompt="s",
         user_prompt="u",
-        model="m",
+        model="claude-opus-5",
         trace_path=tmp_path / "t",
     )
 

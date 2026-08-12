@@ -69,7 +69,7 @@ def test_a_prime_cell_that_wrote_nothing_reports_an_unchanged_durable_self(tmp_p
         mcp_url="http://host.docker.internal:8973/mcp",
         system_prompt="S",
         user_prompt="U",
-        model="m",
+        model="claude-opus-5",
         trace_path=tmp_path / "t.jsonl",
         leg_timeout_s=60,
     )
@@ -101,7 +101,7 @@ def test_the_old_lazy_seeding_would_have_reported_a_change(tmp_path) -> None:
         mcp_url="http://host.docker.internal:8973/mcp",
         system_prompt="S",
         user_prompt="U",
-        model="m",
+        model="claude-opus-5",
         trace_path=tmp_path / "t.jsonl",
         leg_timeout_s=60,
     )
@@ -143,7 +143,7 @@ def test_every_harness_declares_the_home_files_its_launch_actually_writes(harnes
         mcp_url="http://host.docker.internal:8973/mcp",
         system_prompt="S",
         user_prompt="U",
-        model="m",
+        model="claude-opus-5",
         trace_path=Path("/t"),
         leg_timeout_s=60,
     )

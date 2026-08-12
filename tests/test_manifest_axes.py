@@ -184,7 +184,7 @@ def test_the_declared_effort_flag_matches_what_the_launch_actually_passes(name: 
     and the argv would put the wrong claim in the record for every cell of that harness.
     """
     harness = harness_for(name)
-    argv = " ".join(harness.launch(**_LAUNCH, effort="xhigh").argv)
+    argv = " ".join(harness.launch(**{**_LAUNCH, "model": "claude-opus-5"}, effort="xhigh").argv)
 
     if harness.effort_flag:
         assert harness.effort_flag in argv

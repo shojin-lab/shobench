@@ -191,14 +191,16 @@ def test_prime_agent_probes_and_env_are_pinned() -> None:
 
 
 def test_prime_agent_fresh_launch_is_pinned() -> None:
-    spec = harness_for("prime_agent").launch(**_LAUNCH)
+    spec = harness_for("prime_agent").launch(**{**_LAUNCH, "model": "claude-opus-5"})
     assert spec.argv == [
         "prime-agent",
         "-p",
         "--mode",
         "json",
+        "--provider",
+        "anthropic",
         "--model",
-        "the-model",
+        "claude-opus-5",
         "--autonomous",
         "--autonomous-max-continuations",
         "100000",
@@ -228,13 +230,14 @@ def test_prime_agent_fresh_launch_is_pinned() -> None:
 
 def test_prime_agent_resume_variants_sit_before_the_prompt_separator() -> None:
     h = harness_for("prime_agent")
-    resumed = h.launch(**_LAUNCH, session_id="SID-1", resume=True)
+    launch = {**_LAUNCH, "model": "claude-opus-5"}
+    resumed = h.launch(**launch, session_id="SID-1", resume=True)
     sep = resumed.argv.index("--")
     assert resumed.argv[sep - 2 : sep] == ["--resume", "SID-1"]
-    continued = h.launch(**_LAUNCH, resume=True)
+    continued = h.launch(**launch, resume=True)
     sep = continued.argv.index("--")
     assert continued.argv[sep - 1] == "--continue"
-    pinned = h.launch(**_LAUNCH, session_id="SID-1")
+    pinned = h.launch(**launch, session_id="SID-1")
     assert "--resume" not in pinned.argv
     assert "--continue" not in pinned.argv
 
@@ -310,3 +313,28 @@ def test_a_clean_finish_carries_each_harness_its_own_reason(tmp_path: Path) -> N
     )
     assert prime.kind is StopKind.CHOSEN
     assert prime.reason == "the last message ended the turn"
+
+
+# ----- provider is explicit, never resolved by luck -------------------------------------------
+
+
+def test_prime_agent_names_the_provider_for_both_model_families() -> None:
+    """prime-agent 0.7.1 routes a bare gpt id to azure-openai-responses, which nothing is
+    logged into, so every launch and probe names the provider instead of letting the catalog
+    resolve it."""
+    from shobench.credentials import _probe_argv
+    from shobench.harnesses.prime_agent import PrimeAgent
+
+    h = harness_for("prime_agent")
+    opus = h.launch(**{**_LAUNCH, "model": "claude-opus-5"}).argv
+    gpt = h.launch(**{**_LAUNCH, "model": "gpt-5.6-terra"}).argv
+    assert opus[opus.index("--provider") + 1] == "anthropic"
+    assert gpt[gpt.index("--provider") + 1] == "openai-codex"
+
+    probe = _probe_argv("prime_agent", "gpt-5.6-terra")
+    assert probe[probe.index("--provider") + 1] == "openai-codex"
+
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="no provider mapping"):
+        PrimeAgent.provider_for("o5-preview")
