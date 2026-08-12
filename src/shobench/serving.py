@@ -120,11 +120,14 @@ def build_stream(
     """Build the phase's stream.
 
     Both eval phases use ``EvalStream``, which pins the feedback regime to ``never`` and
-    refuses to resume a directory recorded under any other regime. The rollout uses
-    ``TaskStream`` with the same ``Never`` regime, so the agent learns from the environment
-    rather than from a score the server hands back, and the two phases stay comparable.
+    refuses to resume a directory recorded under any other regime: held-out measurement is
+    always blind. The rollout's regime is the cell's ``rollout_feedback`` axis. "immediate"
+    is the study's premise (improvement grounded in feedback: the sealed task's own outcome
+    comes back on the ``done`` that ended it); "never" withholds it and makes the rollout a
+    feedback-ablation arm. The regime is recorded per row by the stream itself, so the two
+    arms cannot be conflated after the fact.
     """
-    from shogym.serve import EvalStream, Never, TaskRef, TaskStream
+    from shogym.serve import EvalStream, Immediate, Never, TaskRef, TaskStream
 
     side = side_for_phase(split, phase)
     kwargs = dict(side.env_kwargs)
@@ -142,7 +145,7 @@ def build_stream(
             prov_dir=prov_dir,
             resume=resume,
             deadline=deadline,
-            feedback=Never(),
+            feedback=Immediate() if cell.rollout_feedback == "immediate" else Never(),
             max_in_flight=cell.max_in_flight,
         )
     return EvalStream(

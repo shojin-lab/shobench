@@ -188,6 +188,12 @@ class Cell:
     # advertised lease-wrapped, and a pull at the limit displaces the oldest. Only the rollout
     # stream reads it; the eval phase stays one-session-per-task.
     max_in_flight: int = 1
+    # What the rollout's ``done`` returns. "immediate" hands back the sealed task's own
+    # feedback on the call that ended it: the training posture, and the premise the whole
+    # study rests on (improvement grounded in feedback). "never" withholds it, which makes
+    # the rollout a feedback-ablation arm. Both eval phases stay pinned to never regardless,
+    # so held-out measurement is always blind.
+    rollout_feedback: str = "immediate"
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -197,6 +203,7 @@ class Cell:
             "model": self.model,
             "effort": self.effort,
             "max_in_flight": self.max_in_flight,
+            "rollout_feedback": self.rollout_feedback,
             "split": self.split,
             "instruction_arm": self.instruction_arm,
             "credential_mode": self.credential_mode,
@@ -233,6 +240,11 @@ def load_cell(path: Path) -> Cell:
     max_in_flight = int(cell.get("max_in_flight", 1))
     if max_in_flight < 1:
         raise ValueError(f"{path}: max_in_flight must be at least 1, got {max_in_flight}")
+    rollout_feedback = str(cell.get("rollout_feedback", "immediate"))
+    if rollout_feedback not in ("immediate", "never"):
+        raise ValueError(
+            f"{path}: rollout_feedback {rollout_feedback!r} is not one of ('immediate', 'never')"
+        )
 
     budget = Budget(
         rollout_wall_clock_s=int(_require(budget_table, "rollout_wall_clock_s", path)),
@@ -255,6 +267,7 @@ def load_cell(path: Path) -> Cell:
         note=cell.get("note", ""),
         effort=str(cell.get("effort", "")),
         max_in_flight=max_in_flight,
+        rollout_feedback=rollout_feedback,
     )
 
 

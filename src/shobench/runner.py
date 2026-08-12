@@ -1062,6 +1062,16 @@ class EvalSuspension:
         )
 
 
+def recorded_rollout_feedback(manifest: dict[str, Any]) -> str:
+    """The feedback arm the recorded run actually served.
+
+    A manifest written before the axis existed carries no key, and that absence is
+    unambiguous: never was the only rollout posture before the axis, so absence reads as
+    never rather than as whatever the checkout's default is today.
+    """
+    return str(manifest.get("cell", {}).get("rollout_feedback") or "never")
+
+
 def experiment_drift(
     manifest: dict[str, Any], *, cell: Cell, split: Split, instruction: Instruction
 ) -> list[str]:
@@ -1776,6 +1786,17 @@ async def resume_cell(
     interrupted_phase = record.get("phase", "rollout")
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     cell = load_cell_by_name(manifest["cell"]["name"])
+    recorded_regime = recorded_rollout_feedback(manifest)
+    if cell.rollout_feedback != recorded_regime:
+        # The continuation finishes the experiment the record started, so the run's recorded
+        # feedback arm wins over the checkout's default. shogym would refuse to reopen the
+        # provenance directory under the other regime anyway; this makes the recovery explicit
+        # instead of a refusal the operator has to decode. Backfilled into the manifest below,
+        # so later resumptions read an explicit value.
+        from dataclasses import replace
+
+        cell = replace(cell, rollout_feedback=recorded_regime)
+    manifest["cell"]["rollout_feedback"] = recorded_regime
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
     drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)

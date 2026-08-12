@@ -910,3 +910,62 @@ def test_a_cell_leaves_one_results_file_whichever_way_its_run_ended(tmp_path: Pa
     # And back again, so neither direction is the special case.
     assert publish([_row(2, 0.5)]).name == "cell.incomplete.json"
     assert sorted(p.name for p in results.glob("*.json")) == ["cell.incomplete.json"]
+
+
+# ----- the feedback arm survives into the published record ------------------------------------
+
+
+def test_the_row_stamp_and_the_legacy_manifest_both_name_the_arm(tmp_path: Path) -> None:
+    """A pre-axis manifest publishes as the never arm, and served rows keep their own stamp.
+
+    The manifest claim and the row stamp are deliberately independent: the manifest says what
+    was asked for, the row says what the stream actually served, and a disagreement between
+    them must stay visible in the artifact rather than be normalized away.
+    """
+    served = TaskResult(
+        seq=1,
+        position=1,
+        task_idx=1,
+        closure="sealed",
+        reward=1.0,
+        success=True,
+        feedback_regime="never",
+    )
+
+    path = write_results(
+        tmp_path / "cell.json",
+        manifest={"cell": {"name": "c"}},
+        phases={"eval_before": [served], "eval_after": [served], "rollout": [served]},
+        stopping={},
+        heldout_ids=[1],
+    )
+
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["manifest"]["cell"]["rollout_feedback"] == "never"
+    assert doc["rollout"]["tasks"][0]["feedback_regime"] == "never"
+    assert doc["eval_before"]["tasks"][0]["feedback_regime"] == "never"
+
+
+def test_a_manifest_that_names_its_arm_is_not_rewritten(tmp_path: Path) -> None:
+    """Backfill is for absence only: an explicit immediate manifest keeps saying immediate."""
+    path = write_results(
+        tmp_path / "cell.json",
+        manifest={"cell": {"name": "c", "rollout_feedback": "immediate"}},
+        phases={"eval_before": [], "eval_after": [], "rollout": []},
+        stopping={},
+        heldout_ids=(),
+    )
+
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["manifest"]["cell"]["rollout_feedback"] == "immediate"
+
+
+def test_a_resumed_run_keeps_the_arm_its_record_started_under() -> None:
+    """Absence in a pre-axis manifest reads as never, never as today's default."""
+    from shobench.runner import recorded_rollout_feedback
+
+    assert recorded_rollout_feedback({"cell": {"name": "c"}}) == "never"
+    assert recorded_rollout_feedback({}) == "never"
+    assert (
+        recorded_rollout_feedback({"cell": {"rollout_feedback": "immediate"}}) == "immediate"
+    )
