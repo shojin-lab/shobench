@@ -56,7 +56,6 @@ from shobench.containers import (
     run_stem,
     write_json,
 )
-from shobench.containers import docker as containers_docker
 from shobench.credentials import CredentialSpec, seed_home, spec_for
 from shobench.credentials import effective_mode as credential_effective_mode
 from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
@@ -1917,7 +1916,7 @@ async def _resume_cell_owned(
         )
     run_id = record["run_id"]
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
-    _reclaim_recorded_containers(manifest, sandbox)
+    _migrate_recorded_containers(manifest, sandbox)
     ctx = RunContext(
         cell=cell,
         split=split,
@@ -2080,7 +2079,7 @@ async def _rerun_eval_owned(
         )
     run_id = str(manifest["run_id"])
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
-    _reclaim_recorded_containers(manifest, sandbox)
+    _migrate_recorded_containers(manifest, sandbox)
     ctx = RunContext(
         cell=cell,
         split=split,
@@ -2125,26 +2124,24 @@ async def _rerun_eval_owned(
         sandbox.down()
 
 
-def _reclaim_recorded_containers(manifest: dict[str, Any], sandbox: CellSandbox) -> None:
+def _migrate_recorded_containers(manifest: dict[str, Any], sandbox: CellSandbox) -> None:
     """One-time migration for a run recorded under the pre-digest container names.
 
     A continuation builds its names from the run id, so a run created before the digest fix
-    computes DIFFERENT names than its manifest recorded, and anything a crashed teardown left
-    under the recorded names would never be reclaimed. The recorded names are removed here,
-    exactly the ones THIS run's manifest claims and never a recomputed legacy formula, because
-    legacy names could be shared across two runs of one cell and a formula would tear down a
-    neighbor. The manifest's container block is then rewritten to the names the continuation
-    actually uses, so the record keeps describing the run's real resources.
+    computes DIFFERENT names than its manifest recorded. The manifest's container block is
+    rewritten to the names the continuation actually uses, so the record keeps describing the
+    run's real resources, and nothing recorded is deleted: the legacy formula is
+    collision-prone by definition, so two runs' manifests can legitimately claim the SAME
+    strings, and removing them here could tear down a live neighbor still running on a pre-fix
+    process, which is the production failure this change exists to end. A legacy holder a
+    crashed teardown left behind is inert (nothing joins it by name again) and is for explicit
+    operator cleanup.
     """
     recorded = manifest.get("container") or {}
-    old_holder = str(recorded.get("netns_container") or "")
-    old_network = str(recorded.get("network") or "")
-    if old_holder and old_holder != sandbox.netns_container:
-        for name in (f"{old_holder}-egress", old_holder):
-            containers_docker("rm", "-f", name, check=False)
-    if old_network and old_network != sandbox.network:
-        containers_docker("network", "rm", old_network, check=False)
-    if recorded:
+    if recorded and (
+        recorded.get("netns_container") != sandbox.netns_container
+        or recorded.get("network") != sandbox.network
+    ):
         manifest["container"] = {
             **recorded,
             "network": sandbox.network,
