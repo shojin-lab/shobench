@@ -85,6 +85,27 @@ class Codex(Harness):
         started = _first_event_of_type(trace_path, ("thread.started",))
         return None if started is None else str(started.get("thread_id") or "") or None
 
+    def session_transcript(self, home: Path, session_id: str) -> Path | None:
+        """The rollout file whose name ends in this thread id, and its meta must agree.
+
+        The CLI resolves the thread by that filename suffix and then refuses a file it cannot
+        read a ``session_meta`` from ("rollout ... is empty", observed on an empty file), so
+        the meta line is the floor a resumable rollout carries. Requiring its payload id to
+        equal the thread id also rejects a rollout recorded for some other thread, and the
+        exact suffix keeps a longer id that merely contains this one from standing in.
+        """
+        root = home / ".codex" / "sessions"
+        if not root.is_dir():
+            return None
+        suffix = f"-{session_id}.jsonl"
+        for path in sorted(root.rglob("*.jsonl")):
+            if not path.is_file() or not path.name.endswith(suffix):
+                continue
+            meta = _first_event_of_type(path, ("session_meta",))
+            if meta is not None and (meta.get("payload") or {}).get("id") == session_id:
+                return path
+        return None
+
     def version_probe(self) -> list[str]:
         return ["codex", "--version"]
 

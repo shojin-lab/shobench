@@ -840,10 +840,11 @@ def _rollout_terminal_session(ctx: RunContext) -> str:
     if ctx.harness.session_transcript(ctx.sandbox.home, session_id) is None:
         raise RuntimeError(
             f"{ctx.cell.name}: eval_context is 'resumed' but the rollout session "
-            f"{session_id} has no transcript under the cell home's "
-            f"{', '.join(ctx.harness.session_state_dirs) or 'session state'} for "
-            f"{ctx.harness.name} to reopen. Nothing has been spent; restore the home or run "
-            "a cell with eval_context = 'cold' if cold is the intent."
+            f"{session_id} has no resumable transcript under the cell home's "
+            f"{', '.join(ctx.harness.session_state_dirs) or 'session state'}: nothing there "
+            f"both names that session and carries what {ctx.harness.name} itself requires to "
+            "reopen it. Nothing has been spent; restore the home or run a cell with "
+            "eval_context = 'cold' if cold is the intent."
         )
     return session_id
 

@@ -453,12 +453,25 @@ same login as the rest of the prime_agent leg, not on more wiring.
 `eval_after` measures the agent with its lived rollout state, so under the default
 `eval_context = "resumed"` each held-out task resumes the rollout's terminal session rather
 than starting cold. The forks are independent by home isolation, not by session machinery:
-every task's throwaway HOME copy carries the harness's recorded conversations (the
+every task's throwaway HOME copy carries the harness's recorded session state (the
 `session_state_dirs` each harness declares) beside the durable self, and each launch resumes
 the rollout's session id inside its own copy. The runner refuses the whole phase up front when
 the recorded session id or its transcript is missing, because a phase that quietly ran cold
 would publish a mislabeled measurement; `eval_context = "cold"` on the cell is the recorded
 ablation, and eval_before is always cold since no conversation exists yet.
+
+The preflight validates rather than globs, because existence is not resumability. Each
+harness's `session_transcript` resolves the file the way that CLI's own resume lookup does
+(exact naming, never a substring) and then requires the minimum the pinned CLI requires
+before it will reopen the file, identity included: the file's own recorded metadata must name
+the session. The degenerate files this rejects are exactly the ones the CLIs refuse
+(observed, network off, zero tokens): an empty filename-matching transcript gets Claude's
+`No conversation found with session ID`, an empty rollout file gets codex's
+`failed to read session metadata ... rollout ... is empty`, and a prime session file whose
+header names another id gets `No session found matching` for the filename's id, because
+prime's resolver indexes by the header id and never the filename (source: `setSessionFile`).
+Without the validation each of those refusals would arrive per task, after the fan-out's
+copies, streams, and containers were already paid for.
 
 Every claim below was produced against the pinned image (Claude Code 2.1.226, codex-cli
 0.147.0, prime-agent 0.7.1) with the network disabled and no credential present, so each probe
@@ -507,6 +520,20 @@ is resolved, re-emits the session header with the **same** id (the line
 `session_id_from_trace` reads), appends the resumed turn to that file, and stops at
 `No API key found for anthropic` with nothing spent. `--fork <path|id>` also exists at 0.7.1;
 the runner does not use it, since the per-task copy is the fork.
+
+The transcript is not the whole persisted session. Its artifact tree at
+`<agent-dir>/session-artifacts/<id>/` is part of it (source, in the installed bundle): the
+kernel snapshot `kernel-state.dill`/`kernel-state.json` is revived into the fresh kernel
+right after start ("Only persistent sessions (which have an artifact dir) get a revivable
+snapshot", and `restoreState` runs before the runtime bootstrap), the `sub-*` child session
+dirs are where the RLM runtime persists children and reads completed ones back ("completed
+children from their persisted session dirs, so the tree survives child disposal"), and the
+local harness-state dir and the session's scheduled jobs live beside them. A fork that
+carried the transcript alone would reopen the conversation while silently dropping the
+learned kernel state and every child conversation, so `session_state_dirs` carries both
+subtrees. The operational neighbors stay behind: leases are
+`<agent-dir>/session-leases/<hash>.lock` and daemon state is `<agent-dir>/daemon-workers`,
+both sibling subtrees the copy's noise rules already exclude (source: `leaseDirectory`).
 
 ## Docker checklist
 

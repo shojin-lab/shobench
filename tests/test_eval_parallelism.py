@@ -134,6 +134,59 @@ def test_the_copy_carries_the_rollout_conversation_only_when_asked(tmp_path: Pat
     assert not (forked / ".cache/big/blob").exists()
 
 
+def test_a_prime_fork_copy_carries_the_kernel_and_child_state_independently(
+    tmp_path: Path,
+) -> None:
+    """Prime's persisted session is the transcript PLUS its artifact tree.
+
+    At the pinned 0.7.1 the kernel snapshot is revived from session-artifacts/<id>/ right
+    after kernel start and completed RLM children are read back from its sub-* dirs, so a fork
+    that copied the transcript alone would reopen the conversation with the learned kernel
+    state and every child conversation silently gone. Both must cross, each fork must get its
+    own copy, and the operational subtrees beside them (leases, daemon workers) must not.
+    """
+    sid = "eeeeeeee-6666-6666-6666-eeeeeeeeeeee"
+    base = tmp_path / "base"
+    (base / ".prime/agent/sessions").mkdir(parents=True)
+    (base / ".prime/agent/sessions" / f"{sid}.jsonl").write_text(
+        json.dumps({"type": "session", "version": 3, "id": sid, "cwd": "/work"}) + "\n",
+        encoding="utf-8",
+    )
+    artifacts = base / ".prime/agent/session-artifacts" / sid
+    (artifacts / "sub-child1").mkdir(parents=True)
+    (artifacts / "kernel-state.dill").write_bytes(b"pickled namespace")
+    (artifacts / "kernel-state.json").write_text("{}", encoding="utf-8")
+    (artifacts / "sub-child1" / "child.jsonl").write_text('{"type":"session"}\n')
+    # The operational neighbors that must stay behind: a lease and a daemon worker.
+    lease = base / ".prime/agent/session-leases/deadbeef.lock"
+    lease.mkdir(parents=True)
+    (lease / "owner.json").write_text("{}", encoding="utf-8")
+    (base / ".prime/agent/daemon-workers").mkdir(parents=True)
+    (base / ".prime/agent/daemon-workers" / "worker.json").write_text("{}", encoding="utf-8")
+
+    keep = harness_for("prime_agent").session_state_dirs
+    fork_a = tmp_path / "fork-a"
+    fork_b = tmp_path / "fork-b"
+    _copy_task_home(base, fork_a, keep=keep)
+    _copy_task_home(base, fork_b, keep=keep)
+
+    for fork in (fork_a, fork_b):
+        assert (fork / ".prime/agent/sessions" / f"{sid}.jsonl").is_file()
+        forked = fork / ".prime/agent/session-artifacts" / sid
+        assert (forked / "kernel-state.dill").read_bytes() == b"pickled namespace"
+        assert (forked / "kernel-state.json").is_file()
+        assert (forked / "sub-child1/child.jsonl").is_file()
+        assert not (fork / ".prime/agent/session-leases").exists()
+        assert not (fork / ".prime/agent/daemon-workers").exists()
+
+    # Independent copies: one fork's kernel mutating reaches neither the base nor its sibling.
+    (fork_a / ".prime/agent/session-artifacts" / sid / "kernel-state.dill").write_bytes(b"MUT")
+    assert (artifacts / "kernel-state.dill").read_bytes() == b"pickled namespace"
+    assert (
+        fork_b / ".prime/agent/session-artifacts" / sid / "kernel-state.dill"
+    ).read_bytes() == b"pickled namespace"
+
+
 # ----- container naming under the length cap -------------------------------------------------
 
 
@@ -376,14 +429,17 @@ _ROLLOUT_SID = "cccccccc-4444-4444-4444-cccccccccccc"
 
 def _rollout_terminus(ctx: RunContext, session_id: str = _ROLLOUT_SID) -> None:
     """The record a finished rollout leaves behind: the stopping file naming its terminal
-    session, and that session's transcript in the cell's base home."""
+    session, and that session's transcript in the cell's base home. The transcript names its
+    session the way a real one does, because the preflight validates rather than globs."""
     (ctx.run_dir / "rollout_stopping.json").write_text(
         json.dumps({"stop_reason": "pool_exhausted", "session_id": session_id}),
         encoding="utf-8",
     )
     transcript = ctx.sandbox.home / ".claude" / "projects" / "-work" / f"{session_id}.jsonl"
     transcript.parent.mkdir(parents=True, exist_ok=True)
-    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+    transcript.write_text(
+        json.dumps({"type": "user", "sessionId": session_id}) + "\n", encoding="utf-8"
+    )
 
 
 def _capture_launches(monkeypatch, launches: dict[int, dict]) -> None:
@@ -530,7 +586,9 @@ def test_the_terminal_session_falls_back_to_the_last_rollout_leg(tmp_path: Path)
     )
     transcript = ctx.sandbox.home / ".claude" / "projects" / "-work" / f"{_ROLLOUT_SID}.jsonl"
     transcript.parent.mkdir(parents=True, exist_ok=True)
-    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+    transcript.write_text(
+        json.dumps({"type": "user", "sessionId": _ROLLOUT_SID}) + "\n", encoding="utf-8"
+    )
 
     assert runner._rollout_terminal_session(ctx) == _ROLLOUT_SID
 

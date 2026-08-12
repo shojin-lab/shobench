@@ -227,24 +227,20 @@ class Harness:
         return None
 
     def session_transcript(self, home: Path, session_id: str) -> Path | None:
-        """The recorded conversation for ``session_id`` under ``home``, when one exists.
+        """The recorded conversation for ``session_id`` under ``home``, proven resumable.
 
-        Every harness names its session file after the id it records (claude_code as
-        ``<id>.jsonl`` under a per-project directory, codex with the thread id embedded in the
-        rollout filename, prime-agent as ``<id>.jsonl`` in its sessions directory), so one
-        containment search over the declared subtrees covers all three. What this exists for is
-        refusal: a resumed eval_after has to prove the conversation is in the home it is about
-        to fork BEFORE the fan-out, because each per-task launch discovers a missing transcript
-        only after its copy, its stream, and its container are already paid for, and a phase
-        that quietly ran cold instead would publish a mislabeled measurement.
+        Each harness resolves this the way its own resume lookup resolves it, and then
+        requires the minimum its pinned CLI requires before reopening the file, because
+        existence is not resumability: an empty or crashed file whose name carries the id
+        passes any filename test, and all three CLIs refuse exactly that file (observed, see
+        ``docs/harness-autonomy.md``). Without the validation the refusal arrives per task,
+        after every fork's copy, stream, and container are already paid for; with it, the one
+        pre-fan-out check refuses the phase instead. Identity is part of the minimum: the
+        file must name this session in its own recorded metadata, so a file that merely wears
+        the id in its filename cannot stand in for the conversation.
+
+        The base harness records no sessions, so there is nothing to resolve.
         """
-        for prefix in self.session_state_dirs:
-            root = home / prefix
-            if not root.is_dir():
-                continue
-            for path in sorted(root.rglob("*")):
-                if path.is_file() and session_id in path.name:
-                    return path
         return None
 
     def observed_models(self, trace_path: Path) -> list[str]:

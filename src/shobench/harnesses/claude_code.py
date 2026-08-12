@@ -145,6 +145,24 @@ class ClaudeCode(Harness):
                 return str(event["session_id"])
         return None
 
+    def session_transcript(self, home: Path, session_id: str) -> Path | None:
+        """The exactly-named project transcript, and it must record this session.
+
+        The CLI resolves ``--resume <id>`` to ``projects/<slug>/<id>.jsonl`` and refuses an
+        empty file with the same "No conversation found" a missing one gets (observed), so a
+        filename alone is not a resumable session. Every conversation line the CLI writes
+        carries ``sessionId``, so requiring one line that names this id is the CLI's own
+        floor, and it also rejects a file recording some other session under this file name.
+        """
+        root = home / ".claude" / "projects"
+        if not root.is_dir():
+            return None
+        for project in sorted(p for p in root.iterdir() if p.is_dir()):
+            path = project / f"{session_id}.jsonl"
+            if path.is_file() and _transcript_names_session(path, session_id):
+                return path
+        return None
+
     def observed_models(self, trace_path: Path) -> list[str]:
         # The result event's modelUsage is keyed by the models that were actually billed,
         # which includes the small model the harness uses for its own bookkeeping. Reporting
@@ -208,3 +226,27 @@ class ClaudeCode(Harness):
 def _last_result_event(path: Path) -> dict | None:
     """The final ``type: result`` event of a stream-json trace."""
     return _last_event_of_type(path, ("result",))
+
+
+def _transcript_names_session(path: Path, session_id: str) -> bool:
+    """Does any line of this transcript name ``session_id`` as its own?
+
+    Streamed and stopped at the first match, tolerant of a malformed line, because the file
+    was written by another process and a crash can cut it anywhere; a transcript that was cut
+    after its first conversation line is still one the CLI resumes.
+    """
+    try:
+        with path.open(encoding="utf-8", errors="ignore") as lines:
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict) and event.get("sessionId") == session_id:
+                    return True
+    except OSError:
+        return False
+    return False

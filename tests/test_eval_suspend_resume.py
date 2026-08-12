@@ -148,17 +148,22 @@ def _http_leg(*, usage_limit_ids: tuple[int, ...] = (), dispatched: list[int]):
 
 
 def _wordle_ctx(
-    tmp_path: Path, *, heldout: tuple[str, ...], pool: tuple[str, ...] = ("3", "4")
+    tmp_path: Path,
+    *,
+    heldout: tuple[str, ...],
+    pool: tuple[str, ...] = ("3", "4"),
+    eval_context: str = "cold",
 ) -> RunContext:
     cell = load_cell_by_name(_SMOKE_CELL)
     cell = replace(
         cell,
         env="wordle_v1",
         budget=replace(cell.budget, eval_concurrency=1, eval_task_timeout_s=120),
-        # Pinned cold: these tests are about suspension and republication mechanics, and a
-        # resumed eval_after would demand a rollout session these fixtures never record. The
-        # fork axis has its own coverage in test_eval_parallelism.
-        eval_context="cold",
+        # Cold by default: most of these tests are about suspension and republication
+        # mechanics, and a resumed eval_after would demand a rollout session their fixtures
+        # never record. The resumed suspension test asks for the fork explicitly and records
+        # the terminus it forks.
+        eval_context=eval_context,
     )
     run_dir = tmp_path / "run"
     sandbox = CellSandbox(run_id="test", home=run_dir / "home", workdir=run_dir / "work")
@@ -329,6 +334,87 @@ def test_eval_after_resume_republishes_the_rollout_and_eval_before_intact(
     assert not published["unpaired"]
 
 
+def test_usage_limit_mid_resumed_eval_after_suspends_then_the_continuation_forks_again(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The resumed axis through the real suspension plumbing, end to end and provider-free.
+
+    A usage limit closes the window in the middle of a RESUMED eval_after. The suspension must
+    trigger exactly as it does cold, and the continuation must fork again from the same
+    recorded terminus: the stopping record re-resolves, only the ids still pending re-run, and
+    every relaunch (before and after the interruption) carries the rollout's terminal session
+    with its transcript in that task's own copy.
+    """
+    sid = "dddddddd-5555-5555-5555-dddddddddddd"
+    ctx = _wordle_ctx(tmp_path, heldout=("0", "1", "2"), eval_context="resumed")
+    runner.write_json(
+        ctx.run_dir / ROLLOUT_STOPPING_FILE,
+        {"stop_reason": "pool_exhausted", "session_id": sid},
+    )
+    transcript = ctx.sandbox.home / ".claude" / "projects" / "-work" / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps({"type": "user", "sessionId": sid}) + "\n")
+    monkeypatch.setattr(runner, "warm_env", lambda cell: None)
+
+    launches: list[tuple[int, str, bool, bool]] = []
+
+    def capturing(inner):
+        def leg(ctx_arg, **kw):
+            launches.append(
+                (
+                    int(kw["task_idx"]),
+                    str(kw["session_id"]),
+                    bool(kw["resume"]),
+                    (Path(kw["home"]) / ".claude/projects/-work" / f"{sid}.jsonl").is_file(),
+                )
+            )
+            return inner(ctx_arg, **kw)
+
+        return leg
+
+    captured: dict[str, object] = {}
+
+    class _Suspended(Exception):
+        pass
+
+    def fake_suspend(ctx_arg, *, phase, verdict):
+        captured["phase"] = phase
+        raise _Suspended()
+
+    monkeypatch.setattr(runner, "_suspend_eval_and_exit", fake_suspend)
+    dispatched: list[int] = []
+    monkeypatch.setattr(
+        runner, "run_leg", capturing(_http_leg(usage_limit_ids=(1,), dispatched=dispatched))
+    )
+
+    with pytest.raises(_Suspended):
+        asyncio.run(runner.run_eval_phase(ctx, "eval_after"))
+
+    assert captured["phase"] == "eval_after"
+    assert dispatched == [0, 1]
+
+    # What the continuation reads back: the run's own record says resumed explicitly, which is
+    # the value _resume_cell_owned recovers the cell from before re-running the phase.
+    assert runner.recorded_eval_context({"cell": ctx.cell.to_manifest()}) == "resumed"
+
+    # The window reopens. The continuation re-resolves the same stopping record and re-runs
+    # only the pending ids, forking each one from the terminus again; the finished id gets no
+    # relaunch and no transcript recopy.
+    dispatched.clear()
+    monkeypatch.setattr(runner, "run_leg", capturing(_http_leg(dispatched=dispatched)))
+    rows = asyncio.run(runner.run_eval_phase(ctx, "eval_after"))
+
+    assert sorted(dispatched) == [1, 2]
+    assert 0 not in dispatched
+    assert [r.task_idx for r in rows] == [0, 1, 2]
+    assert all(r.scored and r.closure != "drained" for r in rows)
+    assert launches, "the fan-out launched nothing"
+    for _idx, session, resumed, transcript_in_copy in launches:
+        assert session == sid
+        assert resumed is True
+        assert transcript_in_copy is True
+
+
 # ----- a held-out id that produced no row at all ----------------------------------------------
 #
 # The failure this section exists for is not a task that scored badly. It is a task that left the
@@ -480,6 +566,7 @@ def test_resume_cell_routes_an_eval_suspension_to_the_phases_that_remain(
         captured["recorded_phases"] = recorded_phases
         captured["suspended"] = suspended
         captured["resumptions"] = list(manifest.get("resumptions", []))
+        captured["cell"] = ctx.cell
         return results_dir / "x.json"
 
     monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
@@ -501,6 +588,10 @@ def test_resume_cell_routes_an_eval_suspension_to_the_phases_that_remain(
     assert captured["recorded_phases"] == want_recorded
     assert captured["suspended"] is None
     assert captured["resumptions"][-1]["phase"] == phase  # type: ignore[index]
+    # The manifest this suspension recorded says resumed explicitly (the checkout default at
+    # write time), and the continuation's cell must still say it: a resume that fell back to
+    # the checkout's value would re-run the pending ids under whatever the default had become.
+    assert captured["cell"].eval_context == "resumed"  # type: ignore[union-attr]
 
 
 # ----- the guaranteed hard exit, and publishing nothing --------------------------------------

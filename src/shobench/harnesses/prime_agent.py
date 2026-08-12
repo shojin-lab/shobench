@@ -107,11 +107,19 @@ class PrimeAgent(Harness):
 
     name = "prime_agent"
 
-    # Where its saved sessions live: --resume <id> resolves against <sessions>/<id>.jsonl in
-    # the HOME it runs with (cwd-matching sessions first, then all of them; every leg runs at
-    # /work so the rollout's session is in the local set), errors with "No session found
-    # matching" when none does, and appends the resumed turn to the file it found.
-    session_state_dirs = (".prime/agent/sessions",)
+    # Where its persisted sessions live: --resume <id> resolves against <sessions>/<id>.jsonl
+    # in the HOME it runs with (cwd-matching sessions first, then all of them; every leg runs
+    # at /work so the rollout's session is in the local set), errors with "No session found
+    # matching" when none does, and appends the resumed turn to the file it found. The
+    # artifact tree rides beside the transcript because at 0.7.1 it IS part of the persisted
+    # session: session-artifacts/<id>/ holds the kernel snapshot (kernel-state.dill/json,
+    # revived into the fresh kernel right after start), the sub-* child session dirs the RLM
+    # runtime reads completed children back from, the local harness-state dir, and the
+    # session's scheduled jobs. A fork that carried the transcript alone would reopen the
+    # conversation while silently dropping the learned kernel state and every child
+    # conversation. Leases and daemon state live in sibling subtrees (session-leases/,
+    # daemon-workers/) and stay behind with the rest of the noise.
+    session_state_dirs = (".prime/agent/sessions", ".prime/agent/session-artifacts")
 
     # The structured signal, which is the cleanest of the three harnesses: a stream failure is
     # classified into a kind, and rate_limit is one of them.
@@ -194,6 +202,23 @@ class PrimeAgent(Harness):
         # prime-agent's first line is its session header, which carries the id.
         header = _first_event_of_type(trace_path, ("session",))
         return None if header is None else str(header.get("id") or "") or None
+
+    def session_transcript(self, home: Path, session_id: str) -> Path | None:
+        """The exactly-named session file, and its header must name this id.
+
+        The header check is not extra strictness; it is the CLI's own lookup. The resolver
+        indexes saved sessions by the HEADER id and never the filename (source:
+        ``setSessionFile`` reads ``id`` off the ``type: "session"`` entry), and it is
+        observed: a file named for one id whose header names another is "No session found
+        matching" for the filename's id. An empty file has no header and is not found either.
+        """
+        path = home / ".prime" / "agent" / "sessions" / f"{session_id}.jsonl"
+        if not path.is_file():
+            return None
+        header = _first_event_of_type(path, ("session",))
+        if header is not None and str(header.get("id") or "") == session_id:
+            return path
+        return None
 
     def observed_models(self, trace_path: Path) -> list[str]:
         """Which model actually answered, off prime-agent's own assistant messages.

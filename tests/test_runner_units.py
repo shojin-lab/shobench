@@ -759,26 +759,88 @@ def test_a_resumed_eval_launch_names_the_rollout_session_per_harness(tmp_path: P
     assert prime[at + 2 :] == ["--", "EVALSYS\n\ngo"]
 
 
-def test_each_harness_finds_the_rollout_transcript_in_a_home_copy(tmp_path: Path) -> None:
-    """The transcript lookup a resumed eval_after refuses on, against each harness's real
-    session layout: claude_code names the file after the id, codex embeds the thread id in the
-    rollout filename, prime-agent names the file after the id."""
-    cases = {
-        "claude_code": ".claude/projects/-work/sid-123.jsonl",
-        "codex": ".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-sid-123.jsonl",
-        "prime_agent": ".prime/agent/sessions/sid-123.jsonl",
-    }
-    for name, rel in cases.items():
-        home = tmp_path / name
-        target = home / rel
-        target.parent.mkdir(parents=True)
-        target.write_text("{}\n", encoding="utf-8")
-        harness = harness_for(name)
-        assert harness.session_transcript(home, "sid-123") == target, name
-        assert harness.session_transcript(home, "absent-999") is None, name
-        # The transcript sits inside a declared session-state subtree, which is exactly what a
-        # resumed fork's home copy carries.
-        assert any(rel.startswith(prefix + "/") for prefix in harness.session_state_dirs), name
+# What each harness's preflight requires of a transcript, per case. ``valid`` is the minimum
+# the pinned CLI itself accepts; every degenerate body below was refused by that CLI in a
+# network-off probe (empty: claude "No conversation found", codex "rollout ... is empty";
+# mismatched identity: prime "No session found matching"), so a preflight that passed one
+# would only move the refusal to after the fan-out was paid for.
+_SID = "sid-123"
+_TRANSCRIPT_CASES = {
+    "claude_code": {
+        "rel": f".claude/projects/-work/{_SID}.jsonl",
+        "valid": json.dumps({"type": "user", "sessionId": _SID}) + "\n",
+        "mismatch": json.dumps({"type": "user", "sessionId": "other-session"}) + "\n",
+        "substring_rel": f".claude/projects/-work/{_SID}4.jsonl",
+    },
+    "codex": {
+        "rel": f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl",
+        "valid": json.dumps({"type": "session_meta", "payload": {"id": _SID, "cwd": "/work"}})
+        + "\n",
+        "mismatch": json.dumps({"type": "session_meta", "payload": {"id": "other-thread"}})
+        + "\n",
+        "substring_rel": f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}4.jsonl",
+    },
+    "prime_agent": {
+        "rel": f".prime/agent/sessions/{_SID}.jsonl",
+        "valid": json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/work"})
+        + "\n",
+        "mismatch": json.dumps({"type": "session", "version": 3, "id": "other-session"}) + "\n",
+        "substring_rel": f".prime/agent/sessions/{_SID}4.jsonl",
+    },
+}
+
+
+def _home_with(tmp_path: Path, rel: str, body: str) -> Path:
+    home = tmp_path
+    target = home / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+    return home
+
+
+@pytest.mark.parametrize("name", sorted(_TRANSCRIPT_CASES))
+def test_a_valid_transcript_resolves_and_lives_in_the_forked_subtrees(
+    tmp_path: Path, name: str
+) -> None:
+    """The positive case per harness: the real layout with the CLI's minimum content resolves,
+    and it sits inside a declared session-state subtree, which is what a fork's copy carries."""
+    case = _TRANSCRIPT_CASES[name]
+    home = _home_with(tmp_path, case["rel"], case["valid"])
+    harness = harness_for(name)
+
+    assert harness.session_transcript(home, _SID) == home / case["rel"]
+    assert harness.session_transcript(home, "absent-999") is None
+    assert any(case["rel"].startswith(prefix + "/") for prefix in harness.session_state_dirs)
+
+
+@pytest.mark.parametrize("name", sorted(_TRANSCRIPT_CASES))
+def test_a_transcript_that_only_wears_the_id_does_not_pass_the_preflight(
+    tmp_path: Path, name: str
+) -> None:
+    """The degenerate files the CLIs refuse must not pass the preflight either.
+
+    Four ways a file can wear the id without being the session: empty (a crashed leg's
+    leftover), malformed (a cut file with no parseable record), an identity mismatch (the
+    file's own metadata names another session), and a filename that merely contains the id
+    (a longer id's file). Each was worth its own home so one passing case cannot mask another.
+    """
+    case = _TRANSCRIPT_CASES[name]
+    harness = harness_for(name)
+
+    empty = _home_with(tmp_path / "empty", case["rel"], "")
+    assert harness.session_transcript(empty, _SID) is None
+
+    malformed = _home_with(tmp_path / "malformed", case["rel"], "not json\n{cut mid-")
+    assert harness.session_transcript(malformed, _SID) is None
+
+    mismatch = _home_with(tmp_path / "mismatch", case["rel"], case["mismatch"])
+    assert harness.session_transcript(mismatch, _SID) is None
+
+    # A valid transcript for a LONGER id whose name contains this one: the substring trap.
+    longer = _home_with(
+        tmp_path / "substring", case["substring_rel"], case["valid"].replace(_SID, f"{_SID}4")
+    )
+    assert harness.session_transcript(longer, _SID) is None
 
 
 # ----- what counts as the agent's durable self ------------------------------------------------
