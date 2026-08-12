@@ -39,6 +39,12 @@ class Codex(Harness):
     name = "codex"
     # No base_env override: codex adds nothing to the base's clean NODE_OPTIONS.
 
+    # Where its recorded threads live: `codex exec resume <thread-id>` resolves the id against
+    # the rollout files under sessions/YYYY/MM/DD/ in the HOME it runs with (the thread id is
+    # embedded in the filename), errors with "no rollout found for thread id" when none
+    # matches, and appends the resumed turn to the file it found.
+    session_state_dirs = (".codex/sessions",)
+
     # codex exec's JSONL does not name a model anywhere, and this is declared rather than left
     # to be inferred from an empty list, because the two read as opposite things. Checked
     # against the pinned CLI rather than assumed: `thread.started` carries a thread id alone,

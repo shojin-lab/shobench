@@ -107,6 +107,12 @@ class PrimeAgent(Harness):
 
     name = "prime_agent"
 
+    # Where its saved sessions live: --resume <id> resolves against <sessions>/<id>.jsonl in
+    # the HOME it runs with (cwd-matching sessions first, then all of them; every leg runs at
+    # /work so the rollout's session is in the local set), errors with "No session found
+    # matching" when none does, and appends the resumed turn to the file it found.
+    session_state_dirs = (".prime/agent/sessions",)
+
     # The structured signal, which is the cleanest of the three harnesses: a stream failure is
     # classified into a kind, and rate_limit is one of them.
     usage_limit_rules = (

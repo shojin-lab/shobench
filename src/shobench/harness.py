@@ -197,6 +197,13 @@ class Harness:
     # the id back rather than assuming it.
     pins_session_id: bool = False
 
+    # HOME subtrees that hold this harness's recorded conversations, relative to the HOME.
+    # Everywhere else they are session byproducts (the durable digest rightly ignores them, and
+    # a cold eval copy leaves them behind), but a resumed eval_after fork cannot exist without
+    # them: each task's home copy carries these subtrees so the harness can reopen the rollout's
+    # terminal session inside the copy, where its own resume lookup goes searching for it.
+    session_state_dirs: tuple[str, ...] = ()
+
     # Does this harness's trace say which model answered? Declared rather than inferred from an
     # empty list, because the two mean opposite things: a harness that reports models and
     # returned none had none answer, while a harness that reports none has told us nothing. The
@@ -217,6 +224,27 @@ class Harness:
         that mints its own, and resuming the wrong id starts a fresh session that has lost
         everything the rollout had built up in context.
         """
+        return None
+
+    def session_transcript(self, home: Path, session_id: str) -> Path | None:
+        """The recorded conversation for ``session_id`` under ``home``, when one exists.
+
+        Every harness names its session file after the id it records (claude_code as
+        ``<id>.jsonl`` under a per-project directory, codex with the thread id embedded in the
+        rollout filename, prime-agent as ``<id>.jsonl`` in its sessions directory), so one
+        containment search over the declared subtrees covers all three. What this exists for is
+        refusal: a resumed eval_after has to prove the conversation is in the home it is about
+        to fork BEFORE the fan-out, because each per-task launch discovers a missing transcript
+        only after its copy, its stream, and its container are already paid for, and a phase
+        that quietly ran cold instead would publish a mislabeled measurement.
+        """
+        for prefix in self.session_state_dirs:
+            root = home / prefix
+            if not root.is_dir():
+                continue
+            for path in sorted(root.rglob("*")):
+                if path.is_file() and session_id in path.name:
+                    return path
         return None
 
     def observed_models(self, trace_path: Path) -> list[str]:

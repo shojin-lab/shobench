@@ -448,6 +448,66 @@ kernel, installing this package, importing it as `shogym_stream`, and pulling a 
 the interactive login this host does not yet have (see Credentials above), so it waits on the
 same login as the rest of the prime_agent leg, not on more wiring.
 
+## Forking the rollout into eval_after
+
+`eval_after` measures the agent with its lived rollout state, so under the default
+`eval_context = "resumed"` each held-out task resumes the rollout's terminal session rather
+than starting cold. The forks are independent by home isolation, not by session machinery:
+every task's throwaway HOME copy carries the harness's recorded conversations (the
+`session_state_dirs` each harness declares) beside the durable self, and each launch resumes
+the rollout's session id inside its own copy. The runner refuses the whole phase up front when
+the recorded session id or its transcript is missing, because a phase that quietly ran cold
+would publish a mislabeled measurement; `eval_context = "cold"` on the cell is the recorded
+ablation, and eval_before is always cold since no conversation exists yet.
+
+Every claim below was produced against the pinned image (Claude Code 2.1.226, codex-cli
+0.147.0, prime-agent 0.7.1) with the network disabled and no credential present, so each probe
+stopped at authentication or transport and spent nothing. What that class of probe cannot show
+is a model actually continuing the conversation; see the unverified list.
+
+### claude_code (observed)
+
+`--resume <uuid>` resolves the id against the transcripts under
+`~/.claude/projects/<cwd-slug>/<uuid>.jsonl` in the HOME the process runs with. Observed, in a
+container with a fabricated transcript in a mounted HOME copy: a bogus id fails loudly
+(`No conversation found with session ID: ...`, `is_error: true`, exit 1), and a present
+transcript proceeds, emitting the normal `system/init` event with the **same** session id and
+appending the resumed turn to that same transcript file inside the copy. A resume does not
+fork the id, so the fork is the copy, which is exactly what the per-task HOME provides. The
+resumed argv carried `--append-system-prompt` with the eval instruction and
+`--permission-mode bypassPermissions`, both accepted and reflected in the init event; that
+matters because resume restores no flags (docs) and the runner rebuilds the whole argv every
+launch. The credential-less run then stopped at `authentication_failed` with zero tokens.
+
+### codex (observed for the resume mechanics, source elsewhere)
+
+`codex exec resume` exists at the pinned 0.147.0 as a non-interactive subcommand:
+`codex exec resume [SESSION_ID] [PROMPT]`, accepting `--json`, `-m`, `-c` overrides,
+`--dangerously-bypass-approvals-and-sandbox`, and `--skip-git-repo-check` (observed:
+`codex exec resume --help` in the image). Observed against a fabricated session file: a bogus
+id exits 1 with `no rollout found for thread id ... (code -32600)`, and a file at
+`~/.codex/sessions/YYYY/MM/DD/rollout-<stamp>-<thread-id>.jsonl` in the mounted HOME is found
+by the thread id embedded in its filename. The resumed run re-emits `thread.started` with the
+**same** thread id, appends the resumed turn to that file, starts the turn, and only then goes
+to the provider (blocked here by the disabled network, zero spend). The prompt-after-flags
+argv order the harness builds is the order the probe ran. One edge worth naming: `--last` and
+thread-name selection are cwd-filtered and `--all` disables the filter (help text); an
+explicit UUID, with rollout and eval both running at `/work`, does not touch that path.
+
+### prime_agent (observed for the resume mechanics, source for the layout)
+
+`-r/--resume <path|id>` is a run option of the pinned 0.7.1 (help). Sessions are stored as
+`<sessions-dir>/<id>.jsonl` where the sessions dir is `<agent-dir>/sessions`, so
+`~/.prime/agent/sessions` in a cell HOME (source: `getSessionsDir` and `getSessionFilePath` in
+the installed bundle). The resolver matches the id against cwd-matching sessions first and all
+sessions second (source: `resolveSessionPath`), so the `/work` cwd shared by the rollout and
+every eval task finds the rollout's session in the local set. Observed against a fabricated
+session file: a bogus id exits 1 with `No session found matching '<id>'`, and a present file
+is resolved, re-emits the session header with the **same** id (the line
+`session_id_from_trace` reads), appends the resumed turn to that file, and stops at
+`No API key found for anthropic` with nothing spent. `--fork <path|id>` also exists at 0.7.1;
+the runner does not use it, since the per-task copy is the fork.
+
 ## Docker checklist
 
 Applies to every harness:
@@ -477,3 +537,8 @@ stdin for all three.
 4. Whether prime-agent's own OAuth `/login` yields a subscription credential or an api key for
    each provider. That is answerable only after the interactive login, which only the owner can
    perform.
+5. No resumed eval_after leg has run against a live provider. The fork mechanics (session
+   lookup in a copied HOME, same-id resumption, append-to-copy, loud failure on a missing
+   transcript) are observed to the authentication or transport boundary for all three
+   harnesses; a model actually continuing the resumed conversation, and the quality of a
+   fabricated-versus-real transcript, are verifiable only by a credentialed run.

@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from shobench import runner, serving
 from shobench.config import load_cell_by_name, load_instruction
@@ -110,6 +113,25 @@ def test_copying_an_empty_base_home_yields_an_empty_isolated_home(tmp_path: Path
     _copy_task_home(base, task_home)
     assert task_home.is_dir()
     assert list(task_home.rglob("*")) == []
+
+
+def test_the_copy_carries_the_rollout_conversation_only_when_asked(tmp_path: Path) -> None:
+    """A resumed fork needs the transcript in its copy; a cold copy still leaves it behind.
+
+    ``keep`` names the harness's session-state subtrees and nothing else, so the rest of the
+    noise stays out of the copy either way.
+    """
+    base = tmp_path / "base"
+    _seed_base_home(base)
+
+    cold = tmp_path / "cold"
+    _copy_task_home(base, cold)
+    assert not (cold / ".claude/projects/-work/abc-123.jsonl").exists()
+
+    forked = tmp_path / "forked"
+    _copy_task_home(base, forked, keep=(".claude/projects",))
+    assert (forked / ".claude/projects/-work/abc-123.jsonl").read_text() == "transcript\n"
+    assert not (forked / ".cache/big/blob").exists()
 
 
 # ----- container naming under the length cap -------------------------------------------------
@@ -344,6 +366,173 @@ def test_warm_env_survives_an_env_that_cannot_be_torn_down(monkeypatch) -> None:
         assert cell.env in serving._WARMED_ENVS
     finally:
         serving._WARMED_ENVS.discard(cell.env)
+
+
+# ----- eval_after forks the rollout's terminal session ---------------------------------------
+
+
+_ROLLOUT_SID = "cccccccc-4444-4444-4444-cccccccccccc"
+
+
+def _rollout_terminus(ctx: RunContext, session_id: str = _ROLLOUT_SID) -> None:
+    """The record a finished rollout leaves behind: the stopping file naming its terminal
+    session, and that session's transcript in the cell's base home."""
+    (ctx.run_dir / "rollout_stopping.json").write_text(
+        json.dumps({"stop_reason": "pool_exhausted", "session_id": session_id}),
+        encoding="utf-8",
+    )
+    transcript = ctx.sandbox.home / ".claude" / "projects" / "-work" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+
+
+def _capture_launches(monkeypatch, launches: dict[int, dict]) -> None:
+    """Route the eval fan-out through fakes that record what each task's leg was launched with."""
+
+    def fake_run_leg(ctx_arg: RunContext, **kw: object) -> LegRecord:
+        idx = int(kw["task_idx"])  # type: ignore[arg-type]
+        home = Path(kw["home"])  # type: ignore[arg-type]
+        launches[idx] = {
+            "session_id": kw["session_id"],
+            "resume": kw["resume"],
+            "transcript_in_copy": (
+                home / ".claude/projects/-work" / f"{_ROLLOUT_SID}.jsonl"
+            ).exists(),
+        }
+        return LegRecord(
+            leg=idx,
+            phase=str(kw["phase"]),
+            task_idx=idx,
+            started_at=0.0,
+            ended_at=1.0,
+            returncode=0,
+            verdict=StopVerdict(StopKind.CHOSEN, "it stopped on its own"),
+            tasks_consumed_before=0,
+            tasks_consumed_after=0,
+            trace_path="t",
+            run_dir=ctx_arg.run_dir,
+        )
+
+    def fake_read_phase(prov_dir: Path) -> list[TaskResult]:
+        idx = int(prov_dir.name.split("-")[1])
+        if idx not in launches:
+            return []
+        return [
+            TaskResult(
+                seq=idx, position=0, task_idx=idx, closure="sealed", reward=1.0, success=True
+            )
+        ]
+
+    monkeypatch.setattr(runner, "warm_env", lambda cell: None)
+    monkeypatch.setattr(runner, "build_stream", lambda *a, **k: _FakeStream())
+    monkeypatch.setattr(runner, "_served", _fake_served)
+    monkeypatch.setattr(runner, "run_leg", fake_run_leg)
+    monkeypatch.setattr(runner, "read_phase", fake_read_phase)
+
+
+def test_a_resumed_eval_after_forks_the_rollout_session_into_every_task(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every task resumes the rollout's terminal session, independently: same id in every
+    launch, and each fork's own home copy carries the transcript the resume reopens."""
+    ctx = _ctx(tmp_path, ("1", "2", "3"))
+    assert ctx.cell.eval_context == "resumed"
+    _rollout_terminus(ctx)
+    launches: dict[int, dict] = {}
+    _capture_launches(monkeypatch, launches)
+
+    rows = asyncio.run(runner.run_eval_phase(ctx, "eval_after"))
+
+    assert [r.task_idx for r in rows] == [1, 2, 3]
+    assert set(launches) == {1, 2, 3}
+    for record in launches.values():
+        assert record["session_id"] == _ROLLOUT_SID
+        assert record["resume"] is True
+        assert record["transcript_in_copy"] is True
+
+
+def test_eval_before_never_resumes_whatever_the_axis_says(tmp_path: Path, monkeypatch) -> None:
+    """The before-bookend has no conversation to carry, so even a resumed cell with a rollout
+    terminus already on disk (a resume re-running an interrupted eval_before) starts cold."""
+    ctx = _ctx(tmp_path, ("1", "2"))
+    _rollout_terminus(ctx)
+    launches: dict[int, dict] = {}
+    _capture_launches(monkeypatch, launches)
+
+    asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
+
+    assert set(launches) == {1, 2}
+    for record in launches.values():
+        assert record["resume"] is False
+        assert record["session_id"] != _ROLLOUT_SID  # a fresh pinned id, never the rollout's
+        assert record["transcript_in_copy"] is False
+
+
+def test_a_cold_cell_runs_eval_after_cold(tmp_path: Path, monkeypatch) -> None:
+    """The recorded ablation: eval_context = "cold" starts fresh even when a resumable rollout
+    session is sitting right there, and the transcript stays out of the copies."""
+    ctx = _ctx(tmp_path, ("1", "2"))
+    ctx = replace(ctx, cell=replace(ctx.cell, eval_context="cold"))
+    _rollout_terminus(ctx)
+    launches: dict[int, dict] = {}
+    _capture_launches(monkeypatch, launches)
+
+    asyncio.run(runner.run_eval_phase(ctx, "eval_after"))
+
+    assert set(launches) == {1, 2}
+    for record in launches.values():
+        assert record["resume"] is False
+        assert record["session_id"] != _ROLLOUT_SID
+        assert record["transcript_in_copy"] is False
+
+
+def test_a_resumed_eval_after_with_no_rollout_session_fails_before_spending(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No session to fork is a refusal, never a silent fall-back to cold: a phase that ran cold
+    under the resumed label would publish a mislabeled measurement. Nothing launches, nothing
+    is copied, no stream is built."""
+    ctx = _ctx(tmp_path, ("1", "2"))
+    launches: dict[int, dict] = {}
+    _capture_launches(monkeypatch, launches)
+
+    # No rollout_stopping.json at all: the record names no session.
+    with pytest.raises(RuntimeError, match="eval_context"):
+        asyncio.run(runner.run_eval_phase(ctx, "eval_after"))
+    assert launches == {}
+    assert not (ctx.run_dir / "eval_after" / "homes").exists()
+
+    # A session id whose transcript is not in the base home is the same refusal: the id alone
+    # resumes nothing, and each fork would discover that only after it had spent.
+    (ctx.run_dir / "rollout_stopping.json").write_text(
+        json.dumps({"stop_reason": "pool_exhausted", "session_id": _ROLLOUT_SID}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="transcript"):
+        asyncio.run(runner.run_eval_phase(ctx, "eval_after"))
+    assert launches == {}
+
+
+def test_the_terminal_session_falls_back_to_the_last_rollout_leg(tmp_path: Path) -> None:
+    """A stopping record without a top-level id still names its legs, and the LAST leg's
+    session is the terminal one: an earlier leg's session was ended by whatever forced the
+    next leg, so forking it would resume a conversation the rollout itself abandoned."""
+    ctx = _ctx(tmp_path, ("1",))
+    (ctx.run_dir / "rollout_stopping.json").write_text(
+        json.dumps(
+            {
+                "stop_reason": "pool_exhausted",
+                "session_id": None,
+                "legs": [{"session_id": "early-sid"}, {"session_id": _ROLLOUT_SID}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    transcript = ctx.sandbox.home / ".claude" / "projects" / "-work" / f"{_ROLLOUT_SID}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+
+    assert runner._rollout_terminal_session(ctx) == _ROLLOUT_SID
 
 
 def test_the_eval_launch_prefix_is_identical_across_tasks(tmp_path: Path) -> None:

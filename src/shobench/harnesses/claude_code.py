@@ -40,6 +40,11 @@ class ClaudeCode(Harness):
     # Claude Code accepts --session-id, so the runner pins it before launch and an interrupted
     # leg is resumable even if it died before writing anything.
     pins_session_id = True
+    # Where its recorded conversations live: --resume resolves the id against the transcripts
+    # under projects/<cwd-slug>/<id>.jsonl in the HOME it runs with, fails loudly when none
+    # matches, and appends the resumed turn to that same file. Every leg runs at cwd /work, so
+    # a transcript recorded by the rollout is under the slug an eval fork resolves.
+    session_state_dirs = (".claude/projects",)
     # The result event's modelUsage names every model that was billed.
     reports_observed_models = True
     effort_flag = "--effort"

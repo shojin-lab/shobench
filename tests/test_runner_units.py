@@ -726,6 +726,61 @@ def test_a_trace_with_no_session_line_yields_no_id(tmp_path: Path) -> None:
         assert harness_for(name).session_id_from_trace(path) is None
 
 
+def test_a_resumed_eval_launch_names_the_rollout_session_per_harness(tmp_path: Path) -> None:
+    """The argv shape a resumed eval_after fork launches with, per harness.
+
+    Claude Code restores nothing on resume, so the rebuilt argv must still carry the eval
+    instruction and never a --session-id beside the --resume. codex takes the subcommand form
+    with the prompt as the trailing positional. prime-agent separates the id from the prompt
+    with --, so the id can never be read as a message.
+    """
+    kwargs = dict(
+        mcp_url="http://h:1/mcp",
+        system_prompt="EVALSYS",
+        user_prompt="go",
+        model="claude-opus-5",
+        trace_path=tmp_path / "t",
+        session_id="rollout-sid",
+        resume=True,
+    )
+
+    claude = harness_for("claude_code").launch(**kwargs).argv
+    assert claude[claude.index("--resume") + 1] == "rollout-sid"
+    assert "--session-id" not in claude
+    assert claude[claude.index("--append-system-prompt") + 1] == "EVALSYS"
+
+    codex = harness_for("codex").launch(**kwargs).argv
+    assert codex[:4] == ["codex", "exec", "resume", "rollout-sid"]
+    assert codex[-1] == "EVALSYS\n\ngo"
+
+    prime = harness_for("prime_agent").launch(**kwargs).argv
+    at = prime.index("--resume")
+    assert prime[at + 1] == "rollout-sid"
+    assert prime[at + 2 :] == ["--", "EVALSYS\n\ngo"]
+
+
+def test_each_harness_finds_the_rollout_transcript_in_a_home_copy(tmp_path: Path) -> None:
+    """The transcript lookup a resumed eval_after refuses on, against each harness's real
+    session layout: claude_code names the file after the id, codex embeds the thread id in the
+    rollout filename, prime-agent names the file after the id."""
+    cases = {
+        "claude_code": ".claude/projects/-work/sid-123.jsonl",
+        "codex": ".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-sid-123.jsonl",
+        "prime_agent": ".prime/agent/sessions/sid-123.jsonl",
+    }
+    for name, rel in cases.items():
+        home = tmp_path / name
+        target = home / rel
+        target.parent.mkdir(parents=True)
+        target.write_text("{}\n", encoding="utf-8")
+        harness = harness_for(name)
+        assert harness.session_transcript(home, "sid-123") == target, name
+        assert harness.session_transcript(home, "absent-999") is None, name
+        # The transcript sits inside a declared session-state subtree, which is exactly what a
+        # resumed fork's home copy carries.
+        assert any(rel.startswith(prefix + "/") for prefix in harness.session_state_dirs), name
+
+
 # ----- what counts as the agent's durable self ------------------------------------------------
 
 
@@ -969,3 +1024,40 @@ def test_a_resumed_run_keeps_the_arm_its_record_started_under() -> None:
     assert (
         recorded_rollout_feedback({"cell": {"rollout_feedback": "immediate"}}) == "immediate"
     )
+
+
+# ----- the eval context survives into the published record ------------------------------------
+
+
+def test_a_continued_run_keeps_the_eval_context_its_record_started_under() -> None:
+    """Absence in a pre-axis manifest reads as cold, never as today's resumed default: every
+    pre-axis eval task ran fresh, and a continuation that forked a conversation into that run
+    would append to a measurement whose before-bookend never had one."""
+    from shobench.runner import recorded_eval_context
+
+    assert recorded_eval_context({"cell": {"name": "c"}}) == "cold"
+    assert recorded_eval_context({}) == "cold"
+    assert recorded_eval_context({"cell": {"eval_context": "resumed"}}) == "resumed"
+
+
+def test_a_pre_axis_manifest_publishes_as_the_cold_context(tmp_path: Path) -> None:
+    """The published record backfills absence explicitly, and an explicit value is kept."""
+    path = write_results(
+        tmp_path / "cell.json",
+        manifest={"cell": {"name": "c"}},
+        phases={"eval_before": [], "eval_after": [], "rollout": []},
+        stopping={},
+        heldout_ids=(),
+    )
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["manifest"]["cell"]["eval_context"] == "cold"
+
+    explicit = write_results(
+        tmp_path / "explicit" / "cell.json",
+        manifest={"cell": {"name": "c", "eval_context": "resumed"}},
+        phases={"eval_before": [], "eval_after": [], "rollout": []},
+        stopping={},
+        heldout_ids=(),
+    )
+    doc = json.loads(explicit.read_text(encoding="utf-8"))
+    assert doc["manifest"]["cell"]["eval_context"] == "resumed"

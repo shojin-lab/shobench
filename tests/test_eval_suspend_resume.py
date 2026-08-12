@@ -155,6 +155,10 @@ def _wordle_ctx(
         cell,
         env="wordle_v1",
         budget=replace(cell.budget, eval_concurrency=1, eval_task_timeout_s=120),
+        # Pinned cold: these tests are about suspension and republication mechanics, and a
+        # resumed eval_after would demand a rollout session these fixtures never record. The
+        # fork axis has its own coverage in test_eval_parallelism.
+        eval_context="cold",
     )
     run_dir = tmp_path / "run"
     sandbox = CellSandbox(run_id="test", home=run_dir / "home", workdir=run_dir / "work")
@@ -629,9 +633,13 @@ def _reopenable_run(tmp_path, *, with_suspension=False, with_terminus=True, with
 
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
-    # Modeled on a wave-1 artifact: written before the rollout_feedback axis existed, so the
-    # key is absent and absence must read as never.
-    cell_manifest = {k: v for k, v in cell.to_manifest().items() if k != "rollout_feedback"}
+    # Modeled on a wave-1 artifact: written before the rollout_feedback and eval_context axes
+    # existed, so both keys are absent; absence must read as never and as cold.
+    cell_manifest = {
+        k: v
+        for k, v in cell.to_manifest().items()
+        if k not in ("rollout_feedback", "eval_context")
+    }
     manifest = {
         "run_id": "r-1",
         "cell": cell_manifest,
@@ -679,7 +687,12 @@ def test_rerun_eval_reopens_only_eval_after_and_records_itself(tmp_path, monkeyp
     captured = {}
 
     async def fake_run_phases(ctx, *, manifest, phases, results_dir, observer, **kwargs):
-        captured.update(phases=phases, recorded=kwargs.get("recorded_phases"), manifest=manifest)
+        captured.update(
+            phases=phases,
+            recorded=kwargs.get("recorded_phases"),
+            manifest=manifest,
+            cell=ctx.cell,
+        )
         return results_dir / "cell.json"
 
     monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
@@ -695,6 +708,11 @@ def test_rerun_eval_reopens_only_eval_after_and_records_itself(tmp_path, monkeyp
     assert captured["recorded"] == ("rollout",)
     rewritten = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert rewritten["cell"]["rollout_feedback"] == "never"
+    # The eval context recovers the same way: the pre-axis run measured cold, so its holes
+    # re-run cold whatever the checkout's default is today, on the cell the phases actually
+    # read and not only in the republished record.
+    assert rewritten["cell"]["eval_context"] == "cold"
+    assert captured["cell"].eval_context == "cold"
     assert rewritten["eval_reruns"] and rewritten["eval_reruns"][0]["phase"] == "eval_after"
 
     run_dir = _reopenable_run(tmp_path / "second", with_before=True)
