@@ -185,7 +185,11 @@ def test_prime_agent_probes_and_env_are_pinned() -> None:
     h = harness_for("prime_agent")
     assert h.name == "prime_agent"
     assert h.pins_session_id is False
-    assert h.base_env() == {"NODE_OPTIONS": "", "SHOBENCH_MCP_TOKEN": "local"}
+    assert h.base_env() == {
+        "NODE_OPTIONS": "",
+        "SHOBENCH_MCP_TOKEN": "local",
+        "PI_CACHE_RETENTION": "long",
+    }
     assert h.version_probe() == ["prime-agent", "--version"]
     assert h.model_probe() == ["prime-agent", "model", "list"]
 
@@ -213,7 +217,11 @@ def test_prime_agent_fresh_launch_is_pinned() -> None:
         "--",
         "SYS\n\nUSR",
     ]
-    assert spec.env == {"NODE_OPTIONS": "", "SHOBENCH_MCP_TOKEN": "local"}
+    assert spec.env == {
+        "NODE_OPTIONS": "",
+        "SHOBENCH_MCP_TOKEN": "local",
+        "PI_CACHE_RETENTION": "long",
+    }
     assert spec.config_files == {}
     # The HOME carries the settings entry and the vendored shogym-stream skill package beside
     # it; the skill is what actually reaches the server, since prime-agent's client is a

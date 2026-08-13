@@ -192,8 +192,25 @@ class PrimeAgent(Harness):
     # anything the agent chose to keep.
     runner_owned_home_files = (".prime/agent/settings.json",)
 
+    # The long prompt cache, which prime-agent asks for only when told to. Verified in the pinned
+    # 0.7.1 bundle inside the agent image: `resolveCacheRetention` takes an explicit option, then
+    # `PI_CACHE_RETENTION === "long"`, and otherwise returns "short"; "long" is what makes
+    # `getCacheControl` attach a 1h ttl on the anthropic path (24h on the openai-responses one)
+    # where the model supports it, and nothing in the CLI ever passes the option itself.
+    #
+    # What it buys is cross-harness parity in cost, not behavior. Claude Code already runs with 1h
+    # retention, so a prime cell measured against it was paying to rewrite a cache every five
+    # minutes for the same conversation: an asymmetry between two cells of the same matrix with no
+    # scientific content, since a cache hit and a cache miss return the same tokens. It changes
+    # nothing the agent sees, decides, or can act on.
+    CACHE_RETENTION_VAR = "PI_CACHE_RETENTION"
+
     def base_env(self) -> dict[str, str]:
-        return {**super().base_env(), self.MCP_TOKEN_VAR: "local"}
+        return {
+            **super().base_env(),
+            self.MCP_TOKEN_VAR: "local",
+            self.CACHE_RETENTION_VAR: "long",
+        }
 
     def home_seed_files(self) -> dict[str, str]:
         return shogym_stream_skill_files()
