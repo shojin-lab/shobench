@@ -15,13 +15,22 @@ quietly paid for one would tie this file's verdict to a third-party host being r
 would make the same test pass on a machine with a network and skip on one without, which is a
 skip reason nobody can read. So the fetch is refused here and the absence is what gets
 reported. The tests themselves are unchanged: where the data is provisioned, they run in full.
+
+Two mechanisms hold that line, because the two downloads leave through different doors. The
+tarball fetch is shogym's own function, refused by the fixture below. The Hub fetch belongs to
+``datasets``, and it is stopped at the process level by ``conftest.py``, which pins the Hub
+client offline before anything imports it. What is left here is naming the absence: each test
+checks for the artifacts its env actually needs and skips on the ones it does not find.
 """
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
 import pytest
+from shogym.envs.hle import data as hle_data
 
 from shobench import tau2_data
 from shobench.serving import env_factory
@@ -46,6 +55,28 @@ def _no_upstream_fetch(monkeypatch):
         )
 
     monkeypatch.setattr(_upstream, "_download_package", refuse)
+
+
+def _prepared_hle_build(cache: Path) -> Path | None:
+    """The prepared ``cais/hle`` build under ``cache``, or None when nothing there is one.
+
+    ``datasets`` finishes a build at ``<cache>/<namespace>___<name>/<config>/<version>/<hash>/``,
+    where a ``dataset_info.json`` sits beside the arrow shards it describes. The rest of what that
+    root can hold is not a dataset: the lock a failed fetch leaves behind, a staging dir from a
+    partial one, an unrelated dataset cached under the same root by something else. Counting
+    entries cannot tell those apart from the real thing, so this asks for the pair, and a cache
+    miss becomes a skip that names what is missing.
+    """
+    namespace = hle_data.HF_DATASET.replace("/", "___")
+    for info_path in sorted(cache.glob(f"{namespace}/*/*/*/dataset_info.json")):
+        try:
+            info = json.loads(info_path.read_text())
+        except (OSError, ValueError):
+            continue
+        splits = info.get("splits") or {}
+        if hle_data.HF_SPLIT in splits and any(info_path.parent.glob("*.arrow")):
+            return info_path.parent
+    return None
 
 
 def _env(name: str, kwargs: dict):
@@ -80,14 +111,13 @@ def test_automationbench_manifest_covers_the_env_exactly() -> None:
 
 def test_hle_manifest_ids_resolve_to_the_question_ids_it_records() -> None:
     # hle's tasks come off the Hub through ``datasets``, which the fixture above cannot cover:
-    # huggingface_hub reads HF_HUB_OFFLINE once, at import, so setting it from a test is read
-    # too late to stop anything. The cache the loader is pointed at is checked instead, before
-    # the loader is called at all. A dir that is present but stale still reaches the Hub, which
-    # is the developer machine this runs on and not a runner.
-    from shogym.envs.hle import data as hle_data
-
+    # the download is not shogym's function. conftest.py pins the Hub client offline for the
+    # whole process, so the loader below reads the local cache or raises, and the check here is
+    # the cache the loader will be pointed at. Both are needed. Without the pin, a build this
+    # check rejected could still be completed over the network, and the same machine would pass
+    # online and skip offline.
     cache = hle_data.cache_dir()
-    if not (cache.is_dir() and any(cache.iterdir())):
+    if _prepared_hle_build(cache) is None:
         pytest.skip(f"the gated hle dataset is not cached at {cache}, and a test will not fetch it")
     split = load_split_by_name("hle")
     env = _env("hle", split.heldout.env_kwargs)
