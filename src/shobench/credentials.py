@@ -254,6 +254,139 @@ def describe_seed(spec: CredentialSpec, body: Any) -> str:
     return "unknown schema"
 
 
+# How much life a seeded OAuth credential must have left before an eval phase fans out.
+#
+# The fan-out is what makes this different from an ordinary expiry check. Every held-out task
+# copies the one seeded file into a HOME of its own and starts within seconds of its siblings, so
+# a credential that is about to expire is not one leg's problem: each copy reaches for a refresh
+# of its own, and a provider that rotates the refresh token on use invalidates every copy that
+# was a moment behind the first. One prime eval phase lost 119 of 120 legs to "No API key for
+# provider" in bursts of near-identical ~19s failures, with the file's own expiry hours away, so
+# the margin is a floor rather than the whole story: it rules out the credential that was already
+# dead before the phase began, and the launch stagger is what addresses the rest.
+PREFLIGHT_MIN_LIFETIME_S = 900
+
+
+def _expiring_oauth_providers(body: Any, *, now: float | None = None) -> list[str]:
+    """Provider names whose oauth entry has less than the preflight margin of life left.
+
+    ``expires`` is epoch milliseconds, which is what prime-agent writes. An entry that declares
+    no expiry at all is left alone: nothing here can prove such a credential is stale, and
+    refusing on an absence would refuse a perfectly good api_key entry as well. Names only; no
+    secret in the file is read.
+    """
+    deadline_ms = ((time.time() if now is None else now) + PREFLIGHT_MIN_LIFETIME_S) * 1000
+    if not isinstance(body, dict):
+        return []
+    return sorted(
+        name
+        for name, entry in body.items()
+        if isinstance(entry, dict)
+        and entry.get("type") == "oauth"
+        and isinstance(entry.get("expires"), int | float)
+        and float(entry["expires"]) < deadline_ms
+    )
+
+
+def preflight_seeded_credential(
+    spec: CredentialSpec, home: Path, *, now: float | None = None
+) -> tuple[bool, str]:
+    """Is the credential already seeded into this cell's HOME still usable, judged for free.
+
+    Structure and expiry, never a provider call. A probe that authenticated for real would spend
+    on every phase of every cell, and it would not settle the question anyway: the failure this
+    exists in front of is a whole phase of legs refused at once, which one successful call a
+    minute earlier cannot rule out.
+
+    Generic by schema rather than by harness, which is the honest shape of it. A mode that
+    carries its credential in the environment seeds no file, so there is nothing here to read
+    without reading a secret, and it passes. A mode that seeds a FILE is both the one this can
+    check and the one where the fan-out hands N homes copies of a single refreshable token.
+
+    Returns ``(ok, why_not)``. The reason names the file and what is wrong with it, never a value.
+    """
+    if not spec.seed_to:
+        return True, ""
+    path = home / spec.seed_to
+    if not path.is_file():
+        return False, f"the cell home has no {spec.seed_to} for its eval tasks to copy"
+    body = _read_json(path)
+    if body is None:
+        return False, f"the cell home's {spec.seed_to} is not readable JSON"
+    if spec.seed_schema == "prime_auth":
+        if not _prime_providers(body):
+            return False, (
+                f"the cell home's {spec.seed_to} declares no provider, so it authenticates nothing"
+            )
+        expiring = _expiring_oauth_providers(body, now=now)
+        if expiring:
+            return False, (
+                f"the cell home's {spec.seed_to} has under {PREFLIGHT_MIN_LIFETIME_S}s of life "
+                f"left on its oauth credential for {', '.join(expiring)}"
+            )
+        return True, ""
+    if spec.seed_schema == "codex_auth":
+        if body.get("auth_mode") != "chatgpt":
+            return False, f"the cell home's {spec.seed_to} is not a chatgpt subscription login"
+        tokens = body.get("tokens")
+        if not isinstance(tokens, dict) or not tokens.get("access_token"):
+            return False, f"the cell home's {spec.seed_to} carries no access token"
+        return True, ""
+    return True, ""
+
+
+def refresh_seeded_credential(spec: CredentialSpec, home: Path) -> str:
+    """Re-seed the cell HOME from the host file when the host's credential is the fresher one.
+
+    prime-agent specific, and it has to be: prime's auth.json is the only seeded schema that
+    states its own expiry in a field this can read, so it is the only one where "fresher" is a
+    computable fact rather than a guess. codex's auth.json carries no readable expiry (the
+    lifetime lives inside the token), so nothing here touches it.
+
+    The direction of the copy is the point. The cell HOME's file is whatever the last leg's
+    harness refreshed it to, and it is usually the newer of the two; the host's is newer only
+    when something else on the host logged in or refreshed while this cell was running. Taking
+    the later expiry of the two is the only refresh available without a browser flow or a
+    provider call, and a credential file is excluded from the durable digest either way, so
+    replacing one cannot touch what the cell measures.
+
+    Returns a short description for the operator's log, never a value.
+    """
+    if spec.seed_schema != "prime_auth" or not spec.seed_from or not spec.seed_to:
+        return ""
+    source = Path(spec.seed_from).expanduser()
+    target = home / spec.seed_to
+    host, seeded = _read_json(source), _read_json(target)
+    if not isinstance(host, dict):
+        return ""
+    host_life, seeded_life = _earliest_expiry(host), _earliest_expiry(seeded)
+    if host_life is None or (seeded_life is not None and host_life <= seeded_life):
+        return ""
+    seed_home(spec, home)
+    return (
+        f"re-seeded {spec.seed_to} from {spec.seed_from}, which carried the later expiry of "
+        "the two"
+    )
+
+
+def _earliest_expiry(body: Any) -> float | None:
+    """The soonest expiry any oauth entry in this file declares, in epoch milliseconds.
+
+    The soonest rather than the latest, because a file is only as good as its weakest provider:
+    the leg that needs the one expiring in a minute fails whatever the other one says.
+    """
+    if not isinstance(body, dict):
+        return None
+    expiries = [
+        float(entry["expires"])
+        for entry in body.values()
+        if isinstance(entry, dict)
+        and entry.get("type") == "oauth"
+        and isinstance(entry.get("expires"), int | float)
+    ]
+    return min(expiries) if expiries else None
+
+
 def credential_available(spec: CredentialSpec) -> tuple[bool, str]:
     """Is this mode's credential on the host right now, and if not, what is missing.
 
@@ -708,6 +841,7 @@ def write_verdict(path: Path, verdict: IsolationVerdict) -> Path:
 
 __all__ = [
     "BOGUS",
+    "PREFLIGHT_MIN_LIFETIME_S",
     "seed_home",
     "OPEN_QUESTIONS",
     "SPECS",
@@ -719,6 +853,8 @@ __all__ = [
     "describe_seed",
     "effective_mode",
     "inventory",
+    "preflight_seeded_credential",
+    "refresh_seeded_credential",
     "run_probe",
     "spec_for",
     "validate_isolation",

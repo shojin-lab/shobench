@@ -58,7 +58,13 @@ from shobench.containers import (
     run_stem,
     write_json,
 )
-from shobench.credentials import CredentialSpec, seed_home, spec_for
+from shobench.credentials import (
+    CredentialSpec,
+    preflight_seeded_credential,
+    refresh_seeded_credential,
+    seed_home,
+    spec_for,
+)
 from shobench.credentials import effective_mode as credential_effective_mode
 from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
@@ -513,6 +519,99 @@ def _watching_credentials(ctx: RunContext, home: Path):
         watcher.join(timeout=CREDENTIAL_POLL_S * 5)
 
 
+@dataclass(frozen=True)
+class DrainWatchdog:
+    """An eval leg's handle for being ended once its held-out task is finished.
+
+    ``fired`` is set from the phase's event loop by :func:`_watch_for_drain` and read by the
+    thread supervising the container, so the two halves of the decision (watching the stream,
+    ending the process) stay where each belongs. ``grace_s`` rides along because the verdict has
+    to say how long the leg was given after there was nothing left for it to do; a reader of the
+    record should not have to go looking up a constant to know what the ending means.
+    """
+
+    fired: threading.Event
+    grace_s: float
+
+
+# How often the leg supervisor looks up from waiting on the container. It only matters for a leg
+# that carries a watchdog, so a rollout leg waits once for its whole budget and wakes for nothing.
+LEG_POLL_S = 1.0
+
+
+def _feed_stdin(proc: subprocess.Popen, data: str) -> None:
+    """Write a harness's prompt into its stdin from a thread, then close it.
+
+    Threaded because the supervisor cannot block here: a prompt larger than the pipe buffer would
+    otherwise wait for a reader that is not reading yet, with nothing left to notice a watchdog or
+    a budget. A harness that exits before it drains the pipe closes it under this write, which is
+    that harness's own ending and not an error here.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        assert proc.stdin is not None
+        proc.stdin.write(data)
+        proc.stdin.close()
+
+
+def _supervise(
+    argv: list[str],
+    *,
+    out: Any,
+    err: Any,
+    stdin_data: str | None,
+    timeout_s: int,
+    container: str,
+    watchdog: DrainWatchdog | None,
+) -> tuple[int, bool, bool]:
+    """Run one container to its end and say how that end came about.
+
+    Returns ``(returncode, timed_out, drained)``, at most one of the two flags set. A leg that
+    ended by itself sets neither, and its return code is the harness's own.
+
+    Both endings the runner imposes are the same two steps, and the order is what makes them
+    work: the docker client is killed first, then the container is removed by name. Killing the
+    client alone leaves the container running, and a container that outlives its leg keeps
+    spending and keeps holding the task it was handed.
+    """
+    proc = subprocess.Popen(  # noqa: S603 (argv is built here, never a shell string)
+        argv,
+        stdout=out,
+        stderr=err,
+        stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+        text=stdin_data is not None,
+    )
+    if stdin_data is not None:
+        threading.Thread(
+            target=_feed_stdin, args=(proc, stdin_data), name="shobench-stdin", daemon=True
+        ).start()
+
+    def end_it() -> int:
+        proc.kill()
+        proc.wait()
+        docker("rm", "-f", container, check=False)
+        # The runner ended this, so the client's own exit status describes the kill rather than
+        # the run. -1 is what the timeout path has always recorded, and both endings keep it.
+        return -1
+
+    deadline = time.monotonic() + timeout_s
+    # No watchdog means nothing can end this leg early, so it waits once rather than spinning.
+    if watchdog is None:
+        try:
+            return proc.wait(timeout=timeout_s), False, False
+        except subprocess.TimeoutExpired:
+            return end_it(), True, False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return end_it(), True, False
+        try:
+            return proc.wait(timeout=min(LEG_POLL_S, remaining)), False, False
+        except subprocess.TimeoutExpired:
+            pass
+        if watchdog.fired.is_set():
+            return end_it(), False, True
+
+
 def run_leg(
     ctx: RunContext,
     *,
@@ -530,6 +629,7 @@ def run_leg(
     home: Path | None = None,
     workdir: Path | None = None,
     container_name: str | None = None,
+    watchdog: DrainWatchdog | None = None,
 ) -> LegRecord:
     """Run one harness invocation to completion and classify how it ended.
 
@@ -538,6 +638,11 @@ def run_leg(
     overrides all five so it reaches its own stream on its own port, writes its own config,
     mounts its own throwaway home and its own throwaway ``/work``, and names its own container,
     which is what lets many tasks run at once without sharing any of that mutable state.
+
+    ``watchdog`` is an eval task's handle for ending a leg whose work is already done (see
+    :class:`DrainWatchdog`). The rollout passes none, and must not: a rollout leg with an empty
+    queue in front of it is the charter's own question, and a runner that ended it would answer
+    that question for the agent.
     """
     if resume and not session_id:
         raise RuntimeError("cannot resume without a session id; the previous leg wrote none")
@@ -584,7 +689,6 @@ def run_leg(
     argv = ["docker", *args, ctx.agent_image, *spec.argv]
 
     started = time.time()
-    timed_out = False
     # Watched for the whole invocation rather than after it, because a leg is where a harness
     # refreshes its credential and a refresh that is itself overwritten before the leg ends
     # leaves nothing on disk to learn from afterwards.
@@ -595,22 +699,15 @@ def run_leg(
     ):
         # Every harness in v0 either hangs on an open stdin or reads its prompt from it, so
         # stdin is always explicit and never inherited.
-        stdin_data = spec.stdin
-        try:
-            completed = subprocess.run(
-                argv,
-                stdout=out,
-                stderr=err,
-                input=stdin_data,
-                text=stdin_data is not None,
-                stdin=None if stdin_data is not None else subprocess.DEVNULL,
-                timeout=timeout_s,
-            )
-            returncode = completed.returncode
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            returncode = -1
-            docker("rm", "-f", container, check=False)
+        returncode, timed_out, drained = _supervise(
+            argv,
+            out=out,
+            err=err,
+            stdin_data=spec.stdin,
+            timeout_s=timeout_s,
+            container=container,
+            watchdog=watchdog,
+        )
 
     # The generation the harness left behind, taken before a byte of its output is read. The
     # watcher above covered the ones it wrote and replaced; this is the last one, and it is also
@@ -632,12 +729,20 @@ def run_leg(
     ctx.redactor.file(stdout_path)
     ctx.redactor.file(stderr_path)
 
-    verdict = ctx.harness.classify(
-        returncode=returncode,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-        timed_out=timed_out,
-    )
+    # A leg the drain watchdog ended is classified by the runner rather than by the harness's own
+    # rules, exactly as a timeout is: what ended it was a decision here, and reading the trace for
+    # it would find whatever the harness happened to be saying when the container was removed. A
+    # usage limit in that trace is not read either, and must not be: the held-out row is already
+    # sealed and scored, so there is nothing for a suspension to re-run.
+    if watchdog is not None and drained:
+        verdict = ctx.harness.drained_verdict(grace_s=watchdog.grace_s)
+    else:
+        verdict = ctx.harness.classify(
+            returncode=returncode,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            timed_out=timed_out,
+        )
     record = LegRecord(
         leg=leg,
         phase=phase,
@@ -816,6 +921,74 @@ def _eval_pending_ids(phase_dir: Path, task_ids: Sequence[str]) -> list[str]:
     ]
 
 
+# How long an eval leg may keep running after its held-out task is sealed and its stream has
+# nothing left to give.
+#
+# Every harness needs a little of this. A leg does not end the instant the row seals: it writes
+# its last message, closes its session, and exits. Claude Code and codex do that in 8 to 25
+# seconds, so at two minutes this never fires for them and their legs still end on their own
+# terms, which is what keeps the stopping record comparable across harnesses.
+#
+# prime_agent is why it exists. Launched autonomous with no quality gate, its continuation check
+# has nothing to evaluate and returns "keep going" unconditionally, so the leg has no terminal
+# condition of its own and runs until the task timeout kills it: a median time-to-terminal of
+# about two minutes stretched into 25 to 30 minutes of wall clock, roughly 90% of it after the
+# measurement was already complete. The score is unaffected either way (the row seals at the
+# task's completion call and the per-task home is discarded), so what this recovers is time and
+# spend, and the ending is recorded as its own kind so the finding stays visible.
+EVAL_DRAIN_GRACE_S = 120.0
+# How often the condition is re-read. The condition is monotone in practice, so this only decides
+# how promptly the grace timer starts; it costs one queue read and one small file read.
+EVAL_DRAIN_POLL_S = 5.0
+
+
+def _eval_task_is_finished(stream: Any, prov_dir: Path, idx: int) -> bool:
+    """Has this eval task's leg got anything left to do?
+
+    Two independent readings have to agree, because either alone is wrong. The stream's own
+    queue says nothing was dispensed that is still live and nothing is left to dispense; the
+    provenance directory says a valid completed row for this id is on disk. The queue alone would
+    read the same before the first ``get_task`` if the harness never asked for one (an empty
+    queue would be a leg to leave running, since it has not started); the row alone would not
+    notice a task still in flight behind it.
+    """
+    info = stream.queue_info()
+    if info.consumed < 1 or info.remaining or info.in_flight:
+        return False
+    return _eval_task_valid_row(prov_dir, idx) is not None
+
+
+async def _watch_for_drain(
+    stream: Any,
+    prov_dir: Path,
+    idx: int,
+    watchdog: DrainWatchdog,
+    *,
+    poll_s: float = EVAL_DRAIN_POLL_S,
+) -> bool:
+    """Set the watchdog once this task has been finished for the whole grace period.
+
+    Runs on the phase's event loop, which is where the stream mutates, so reading the queue here
+    cannot catch it mid-change. The leg itself is on a worker thread and is told through the
+    event rather than by this coroutine, which touches no container.
+
+    The grace timer restarts if the condition stops holding. That cannot happen to a single-task
+    eval stream, and the reset is here anyway: it makes this a statement about the condition
+    rather than about the first time the condition was seen.
+    """
+    finished_since: float | None = None
+    while True:
+        await asyncio.sleep(poll_s)
+        if not _eval_task_is_finished(stream, prov_dir, idx):
+            finished_since = None
+            continue
+        if finished_since is None:
+            finished_since = time.monotonic()
+        elif time.monotonic() - finished_since >= watchdog.grace_s:
+            watchdog.fired.set()
+            return True
+
+
 def terminal_session_in(run_dir: Path) -> str | None:
     """The rollout's terminal session id as the run's own record names it, or ``None``.
 
@@ -872,6 +1045,50 @@ def _rollout_terminal_session(ctx: RunContext) -> str:
     return session_id
 
 
+# How long the runner waits between the launches of an eval phase's FIRST wave.
+#
+# After the first wave the launches space themselves out, because a slot opens only when a task
+# finishes. The first wave is the one moment N containers start at the same instant, each with
+# its own copy of one file-backed OAuth credential, each presenting the same token and each free
+# to refresh it. That is the shape of the failure this addresses: one prime eval phase lost 119
+# of 120 legs to "No API key for provider: anthropic", in bursts, at ~19s a leg, with the file's
+# own expiry hours in the future, which rules out plain expiry and leaves the simultaneity.
+#
+# Generic rather than prime-specific: codex seeds a refreshable auth.json the same way. It is
+# skipped for a mode that seeds no file, because a token handed to the container as an
+# environment variable is not refreshed by the harness and so has nothing to race.
+EVAL_LAUNCH_STAGGER_S = 2.0
+
+
+def _preflight_eval_credential(ctx: RunContext) -> None:
+    """Refuse the phase, before anything is spent, when the credential every task copies is dead.
+
+    Two steps, both free. The refresh takes the later of the cell HOME's credential and the
+    host's, which is the only refresh available here (see
+    :func:`shobench.credentials.refresh_seeded_credential`, and note that it is prime-specific
+    because prime's is the one seeded schema that states a readable expiry). The check is then
+    generic by credential schema, and a mode that seeds no file has nothing to check and passes.
+
+    Raising is the point rather than a fallback. Fanning out anyway costs a container, a home
+    copy, a stream and a port per held-out id before the first leg says the credential is no
+    good, and the phase's rows come back unscored, which reads as an agent that failed the
+    held-out set rather than as a phase that never authenticated.
+    """
+    spec = spec_for(ctx.harness.name, ctx.cell.credential_mode)
+    note = refresh_seeded_credential(spec, ctx.sandbox.home)
+    if note:
+        print(f"[shobench] {ctx.cell.name}: {note}", file=sys.stderr)
+    ok, why_not = preflight_seeded_credential(spec, ctx.sandbox.home)
+    if ok:
+        return
+    raise RuntimeError(
+        f"{ctx.cell.name}: the held-out phase will not start because {why_not}. Every task "
+        "copies that one file into a home of its own and launches within seconds of its "
+        "siblings, so an unusable credential costs the whole phase rather than one leg. "
+        "Nothing has been spent; renew the login on the host and rerun."
+    )
+
+
 async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     """Serve the held-out split, one session per task, up to N tasks at once.
 
@@ -889,6 +1106,12 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     context, compaction summaries included. Under "cold" (and always for eval_before, which has
     no conversation to resume) the session is fresh and only the durable channels cross.
 
+    Two things happen before the first container starts, and both exist because a fan-out
+    multiplies a single fault by the size of the held-out set. The credential every task will
+    copy is refreshed where that is free and the phase is refused where it is already unusable
+    (:func:`_preflight_eval_credential`), and the first wave's launches are spaced by
+    ``EVAL_LAUNCH_STAGGER_S`` so N homes do not present one token at the same instant.
+
     Only the ids that lack a valid completed row are run, which is what makes this both a fresh
     phase and a resume: a fresh phase has none done and runs all of them, a resumed one runs only
     the interrupted and unstarted ids and leaves the finished rows untouched. If a leg ends on a
@@ -899,6 +1122,9 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     """
     side = side_for_phase(ctx.split, phase)
     phase_dir = ctx.run_dir / phase
+    # Before anything is copied, served or launched: the one credential every task in this phase
+    # will carry, refreshed where that is possible and refused where it is already unusable.
+    _preflight_eval_credential(ctx)
     # The home every task copies from: pristine-plus-credential for eval_before, the rollout's
     # accumulated home for eval_after. It is read only from here on, since tasks write to copies.
     base_home = ctx.sandbox.home
@@ -919,12 +1145,23 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     # one, so admitting more only spends doomed legs and drains more positions to re-run.
     usage_limit: dict[str, Any] = {}
 
-    async def one_task(task_id: str) -> None:
+    # Whether this phase's launches need spacing at all, decided by the credential rather than by
+    # the harness: the race is between N homes holding copies of one refreshable file.
+    seeds_a_credential_file = bool(spec_for(ctx.harness.name, ctx.cell.credential_mode).seed_to)
+    stagger_s = EVAL_LAUNCH_STAGGER_S if seeds_a_credential_file else 0.0
+
+    async def one_task(task_id: str, position: int) -> None:
         idx = int(task_id)
         prov_dir = phase_dir / f"task-{idx:05d}"
         task_home = phase_dir / "homes" / f"task-{idx:05d}"
         task_work = phase_dir / "work" / f"task-{idx:05d}"
         task_cfg = phase_dir / "cfg" / f"task-{idx:05d}"
+        # Only the first wave is spaced, and it is spaced before the gate rather than inside it,
+        # so a waiting slot is never held idle. Nothing about the phase's ordering or its
+        # accounting rides on this: the ids are gathered, the rows are read back by task id, and
+        # a task delayed here still runs the same leg against the same one-task stream.
+        if position < limit and stagger_s:
+            await asyncio.sleep(position * stagger_s)
         async with gate:
             if usage_limit:
                 return  # a usage limit closed the window; this task waits for the resume
@@ -960,41 +1197,55 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                     prov_dir,
                     deadline=float(ctx.cell.budget.eval_task_timeout_s),
                 )
+                # The watchdog and the leg run side by side: the leg holds a worker thread, and
+                # the loop is free to keep reading this task's stream while it does. Cancelled in
+                # the `finally` so a leg that ended on its own leaves nothing watching a stream
+                # that is about to close.
+                watchdog = DrainWatchdog(threading.Event(), EVAL_DRAIN_GRACE_S)
                 async with stream, _served(stream, port):
-                    record = await asyncio.to_thread(
-                        run_leg,
-                        ctx,
-                        phase=phase,
-                        leg=idx,
-                        # A resumed fork carries the ROLLOUT's standing instruction, not the
-                        # eval one. The rule that the eval instruction never carries the
-                        # improvement objective was designed for cold measurement; a resumed
-                        # conversation already carries the objective in its history and its
-                        # compaction summaries, and swapping the standing instruction
-                        # mid-conversation would measure an agent that never existed. The
-                        # resumed after measures the agent as it lived, objective included;
-                        # every cold session (eval_before always) keeps the blind eval
-                        # instruction.
-                        system_prompt=(
-                            ctx.instruction.rollout_system
-                            if resume_session
-                            else ctx.instruction.eval_system
-                        ),
-                        user_prompt=ctx.instruction.kickoff,
-                        # A resumed fork names the rollout's terminal session; every task names
-                        # the same one, and the per-task home copies are what keep the forks
-                        # independent. A cold task pins a fresh id instead.
-                        session_id=resume_session or str(uuid.uuid4()),
-                        resume=resume_session is not None,
-                        timeout_s=ctx.cell.budget.eval_task_timeout_s,
-                        task_idx=idx,
-                        consumed_before=0,
-                        mcp_url=mcp_url,
-                        cfg_dir=task_cfg,
-                        home=task_home,
-                        workdir=task_work,
-                        container_name=container,
+                    watching = asyncio.create_task(
+                        _watch_for_drain(stream, prov_dir, idx, watchdog)
                     )
+                    try:
+                        record = await asyncio.to_thread(
+                            run_leg,
+                            ctx,
+                            phase=phase,
+                            leg=idx,
+                            # A resumed fork carries the ROLLOUT's standing instruction, not
+                            # the eval one. The rule that the eval instruction never carries
+                            # the improvement objective was designed for cold measurement; a
+                            # resumed conversation already carries the objective in its history
+                            # and its compaction summaries, and swapping the standing
+                            # instruction mid-conversation would measure an agent that never
+                            # existed. The resumed after measures the agent as it lived,
+                            # objective included; every cold session (eval_before always) keeps
+                            # the blind eval instruction.
+                            system_prompt=(
+                                ctx.instruction.rollout_system
+                                if resume_session
+                                else ctx.instruction.eval_system
+                            ),
+                            user_prompt=ctx.instruction.kickoff,
+                            # A resumed fork names the rollout's terminal session; every task
+                            # names the same one, and the per-task home copies are what keep the
+                            # forks independent. A cold task pins a fresh id instead.
+                            session_id=resume_session or str(uuid.uuid4()),
+                            resume=resume_session is not None,
+                            timeout_s=ctx.cell.budget.eval_task_timeout_s,
+                            task_idx=idx,
+                            consumed_before=0,
+                            mcp_url=mcp_url,
+                            cfg_dir=task_cfg,
+                            home=task_home,
+                            workdir=task_work,
+                            container_name=container,
+                            watchdog=watchdog,
+                        )
+                    finally:
+                        watching.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await watching
                 if record.verdict.kind is StopKind.USAGE_LIMIT and not usage_limit:
                     # First usage limit wins: it is the evidence the suspension records, and it
                     # closes admission for every task still waiting on the gate.
@@ -1012,7 +1263,7 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                 shutil.rmtree(task_work, ignore_errors=True)
 
     pending = _eval_pending_ids(phase_dir, side.task_ids)
-    await asyncio.gather(*(one_task(task_id) for task_id in pending))
+    await asyncio.gather(*(one_task(task_id, n) for n, task_id in enumerate(pending)))
     if usage_limit:
         # A provider stopped a leg, not the agent. The cell suspends where it stands: the finished
         # ids keep their rows, the interrupted one is left row-less-equivalent for the resume, and
