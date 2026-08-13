@@ -438,7 +438,16 @@ def _rollout_terminus(ctx: RunContext, session_id: str = _ROLLOUT_SID) -> None:
     transcript = ctx.sandbox.home / ".claude" / "projects" / "-work" / f"{session_id}.jsonl"
     transcript.parent.mkdir(parents=True, exist_ok=True)
     transcript.write_text(
-        json.dumps({"type": "user", "sessionId": session_id}) + "\n", encoding="utf-8"
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "kickoff"},
+                "timestamp": "2026-08-12T00:00:00.000Z",
+                "sessionId": session_id,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
     )
 
 
@@ -587,7 +596,16 @@ def test_the_terminal_session_falls_back_to_the_last_rollout_leg(tmp_path: Path)
     transcript = ctx.sandbox.home / ".claude" / "projects" / "-work" / f"{_ROLLOUT_SID}.jsonl"
     transcript.parent.mkdir(parents=True, exist_ok=True)
     transcript.write_text(
-        json.dumps({"type": "user", "sessionId": _ROLLOUT_SID}) + "\n", encoding="utf-8"
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "kickoff"},
+                "timestamp": "2026-08-12T00:00:00.000Z",
+                "sessionId": _ROLLOUT_SID,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
     )
 
     assert runner._rollout_terminal_session(ctx) == _ROLLOUT_SID

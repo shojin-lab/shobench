@@ -146,20 +146,26 @@ class ClaudeCode(Harness):
         return None
 
     def session_transcript(self, home: Path, session_id: str) -> Path | None:
-        """The exactly-named project transcript, and it must record this session.
+        """The exactly-named project transcript, and it must hold a conversation the CLI can
+        replay, not merely a line that names the session.
 
-        The CLI resolves ``--resume <id>`` to ``projects/<slug>/<id>.jsonl`` and refuses an
-        empty file with the same "No conversation found" a missing one gets (observed), so a
-        filename alone is not a resumable session. Every conversation line the CLI writes
-        carries ``sessionId``, so requiring one line that names this id is the CLI's own
-        floor, and it also rejects a file recording some other session under this file name.
+        The CLI resolves ``--resume <id>`` to ``projects/<slug>/<id>.jsonl`` and then demands
+        an actual conversation record. The floor was established by minimizing a transcript
+        the pinned CLI itself wrote and re-resuming after each cut (network off, zero
+        tokens): a ``user`` line with a ``message`` carrying a role and non-empty content,
+        a ``timestamp``, and the ``sessionId``. Every cut below that flips the CLI to a
+        refusal: no ``message`` or no ``timestamp`` is "No conversation found with session
+        ID" exactly as if the file were absent, and a ``message`` without content crashes
+        the resume outright ("Failed to resume session"). An id in a line is not a
+        conversation; requiring the whole floor also rejects a file recording some other
+        session under this file name.
         """
         root = home / ".claude" / "projects"
         if not root.is_dir():
             return None
         for project in sorted(p for p in root.iterdir() if p.is_dir()):
             path = project / f"{session_id}.jsonl"
-            if path.is_file() and _transcript_names_session(path, session_id):
+            if path.is_file() and _carries_resumable_conversation(path, session_id):
                 return path
         return None
 
@@ -228,12 +234,15 @@ def _last_result_event(path: Path) -> dict | None:
     return _last_event_of_type(path, ("result",))
 
 
-def _transcript_names_session(path: Path, session_id: str) -> bool:
-    """Does any line of this transcript name ``session_id`` as its own?
+def _carries_resumable_conversation(path: Path, session_id: str) -> bool:
+    """Does any line of this transcript hold the conversation floor the pinned CLI requires?
 
-    Streamed and stopped at the first match, tolerant of a malformed line, because the file
-    was written by another process and a crash can cut it anywhere; a transcript that was cut
-    after its first conversation line is still one the CLI resumes.
+    The qualifying line is the shape a real transcript's kickoff turn always has and the
+    minimum the CLI was observed to accept: a ``user`` entry naming this ``sessionId``, with a
+    ``message`` object carrying a role and non-empty content, and a ``timestamp``. Streamed
+    and stopped at the first match, tolerant of a malformed line, because the file was written
+    by another process and a crash can cut it anywhere; a transcript cut after its kickoff
+    line is still one the CLI resumes.
     """
     try:
         with path.open(encoding="utf-8", errors="ignore") as lines:
@@ -245,7 +254,16 @@ def _transcript_names_session(path: Path, session_id: str) -> bool:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(event, dict) and event.get("sessionId") == session_id:
+                if not isinstance(event, dict) or event.get("sessionId") != session_id:
+                    continue
+                if event.get("type") != "user" or not event.get("timestamp"):
+                    continue
+                message = event.get("message")
+                if (
+                    isinstance(message, dict)
+                    and message.get("role")
+                    and message.get("content")
+                ):
                     return True
     except OSError:
         return False

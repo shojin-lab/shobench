@@ -334,26 +334,52 @@ def test_eval_after_resume_republishes_the_rollout_and_eval_before_intact(
     assert not published["unpaired"]
 
 
-def test_usage_limit_mid_resumed_eval_after_suspends_then_the_continuation_forks_again(
+def test_usage_limit_mid_resumed_eval_after_suspends_and_resume_cell_finishes_the_fork(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The resumed axis through the real suspension plumbing, end to end and provider-free.
+    """The resumed axis through the whole suspension chain, provider-free.
 
-    A usage limit closes the window in the middle of a RESUMED eval_after. The suspension must
-    trigger exactly as it does cold, and the continuation must fork again from the same
-    recorded terminus: the stopping record re-resolves, only the ids still pending re-run, and
-    every relaunch (before and after the interruption) carries the rollout's terminal session
-    with its transcript in that task's own copy.
+    A usage limit closes the window in the middle of a RESUMED eval_after, and the real
+    suspension writes the real record (only the hard exit itself is stubbed, into an
+    exception). The continuation then goes through ``resume_cell``: `_resume_cell_owned`
+    reconstructs the cell from the persisted manifest, the real ``_run_phases`` carries the
+    recorded eval_before and rollout forward, ``rollout_stopping.json`` is re-resolved, only
+    the pending ids are recopied and relaunched, every relaunch names the rollout's terminal
+    session with its transcript in that task's own private copy, and the published result has
+    the whole cell in it. Docker, egress, and the checkout config loaders are the only stubs:
+    the cell under test is synthetic (wordle over the smoke cell), so the loaders return the
+    recorded definitions the drift check expects, exactly as the checkout would for a real
+    cell.
     """
     sid = "dddddddd-5555-5555-5555-dddddddddddd"
     ctx = _wordle_ctx(tmp_path, heldout=("0", "1", "2"), eval_context="resumed")
+    run_dir = ctx.run_dir
+
+    # The state a real cell has when its eval_after starts: eval_before measured, the rollout
+    # run with its stop classification persisted, and the terminal session's transcript in the
+    # cell home.
+    for idx in (0, 1, 2):
+        _play_eval_task(run_dir / "eval_before" / f"task-{idx:05d}", idx, terminate=True)
+    _play_rollout(run_dir / "rollout", ("3", "4"))
     runner.write_json(
-        ctx.run_dir / ROLLOUT_STOPPING_FILE,
+        run_dir / ROLLOUT_STOPPING_FILE,
         {"stop_reason": "pool_exhausted", "session_id": sid},
     )
     transcript = ctx.sandbox.home / ".claude" / "projects" / "-work" / f"{sid}.jsonl"
     transcript.parent.mkdir(parents=True)
-    transcript.write_text(json.dumps({"type": "user", "sessionId": sid}) + "\n")
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "kickoff"},
+                "timestamp": "2026-08-12T00:00:00.000Z",
+                "sessionId": sid,
+            }
+        )
+        + "\n"
+    )
+    manifest = build_manifest(ctx, probes={"version": "test"})
+    runner.write_json(run_dir / "manifest.json", manifest)
     monkeypatch.setattr(runner, "warm_env", lambda cell: None)
 
     launches: list[tuple[int, str, bool, bool]] = []
@@ -372,47 +398,68 @@ def test_usage_limit_mid_resumed_eval_after_suspends_then_the_continuation_forks
 
         return leg
 
-    captured: dict[str, object] = {}
-
-    class _Suspended(Exception):
+    # Act 1: the window closes on task 1. The suspension itself is real, record and all; only
+    # the process exit is turned into an exception this test can catch.
+    class _HardExit(Exception):
         pass
 
-    def fake_suspend(ctx_arg, *, phase, verdict):
-        captured["phase"] = phase
-        raise _Suspended()
-
-    monkeypatch.setattr(runner, "_suspend_eval_and_exit", fake_suspend)
+    monkeypatch.setattr(runner.os, "_exit", lambda code: (_ for _ in ()).throw(_HardExit(code)))
     dispatched: list[int] = []
     monkeypatch.setattr(
         runner, "run_leg", capturing(_http_leg(usage_limit_ids=(1,), dispatched=dispatched))
     )
 
-    with pytest.raises(_Suspended):
+    with pytest.raises(_HardExit):
         asyncio.run(runner.run_eval_phase(ctx, "eval_after"))
 
-    assert captured["phase"] == "eval_after"
     assert dispatched == [0, 1]
+    record = json.loads((run_dir / SUSPENSION_FILE).read_text())
+    assert record["phase"] == "eval_after"
+    assert record["completed_task_ids"] == [0]
+    assert record["pending_task_ids"] == [1, 2]
 
-    # What the continuation reads back: the run's own record says resumed explicitly, which is
-    # the value _resume_cell_owned recovers the cell from before re-running the phase.
-    assert runner.recorded_eval_context({"cell": ctx.cell.to_manifest()}) == "resumed"
-
-    # The window reopens. The continuation re-resolves the same stopping record and re-runs
-    # only the pending ids, forking each one from the terminus again; the finished id gets no
-    # relaunch and no transcript recopy.
+    # Act 2: the window reopens and the operator runs `shobench resume`. The loaders hand back
+    # the recorded synthetic definitions; everything else is the real continuation.
+    monkeypatch.setattr(
+        CellSandbox, "up", lambda self, **kw: self.home.mkdir(parents=True, exist_ok=True)
+    )
+    monkeypatch.setattr(CellSandbox, "down", lambda self: None)
+    monkeypatch.setattr(runner, "seed_home", lambda spec, home: {})
+    monkeypatch.setattr(runner, "load_cell_by_name", lambda name, **kw: ctx.cell)
+    monkeypatch.setattr(runner, "load_split_by_name", lambda name, **kw: ctx.split)
     dispatched.clear()
     monkeypatch.setattr(runner, "run_leg", capturing(_http_leg(dispatched=dispatched)))
-    rows = asyncio.run(runner.run_eval_phase(ctx, "eval_after"))
 
+    results_path = asyncio.run(
+        runner.resume_cell(run_dir, results_dir=tmp_path / "results", capture_egress=False)
+    )
+
+    # Only the pending ids re-ran, each fork resuming the rollout's terminal session with the
+    # transcript recopied into its own home; the finished id was neither recopied nor
+    # relaunched, before or after the interruption.
     assert sorted(dispatched) == [1, 2]
     assert 0 not in dispatched
-    assert [r.task_idx for r in rows] == [0, 1, 2]
-    assert all(r.scored and r.closure != "drained" for r in rows)
-    assert launches, "the fan-out launched nothing"
+    assert launches and [entry[0] for entry in launches] == [0, 1, 1, 2]
     for _idx, session, resumed, transcript_in_copy in launches:
         assert session == sid
         assert resumed is True
         assert transcript_in_copy is True
+
+    # The published result is the whole cell: the carried-forward phases, the re-resolved
+    # rollout terminus, the recovered resumed axis, and the resumption on the record. The
+    # spent suspension is gone, so a second resume cannot replay it.
+    published = json.loads(results_path.read_text())
+    assert results_path.name == f"{ctx.cell.name}.json"
+    after = published["eval_after"]["tasks"]
+    assert [r["task_idx"] for r in after] == [0, 1, 2]
+    assert all(r["closure"] != "drained" for r in after)
+    assert published["eval_after"]["summary"]["n_scored"] == 3
+    assert published["eval_before"]["summary"]["n_scored"] == 3
+    assert published["rollout"]["stopping"]["stop_reason"] == "pool_exhausted"
+    assert published["rollout"]["stopping"]["session_id"] == sid
+    assert published["manifest"]["cell"]["eval_context"] == "resumed"
+    assert published["manifest"]["resumptions"][-1]["phase"] == "eval_after"
+    assert not (run_dir / SUSPENSION_FILE).exists()
 
 
 # ----- a held-out id that produced no row at all ----------------------------------------------

@@ -17,7 +17,11 @@ from shobench.harness import (
     stderr_evidence,
     tail,
 )
-from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
+from shobench.harnesses._trace import (
+    _first_event_of_type,
+    _first_parseable_event,
+    _last_event_of_type,
+)
 
 # The prime-agent skill that makes the served stream reachable. Declaring the HTTP server in
 # settings.json is only half of the wiring: prime-agent hands the model no MCP tools, it reaches
@@ -204,19 +208,27 @@ class PrimeAgent(Harness):
         return None if header is None else str(header.get("id") or "") or None
 
     def session_transcript(self, home: Path, session_id: str) -> Path | None:
-        """The exactly-named session file, and its header must name this id.
+        """The exactly-named session file, whose FIRST parseable line is a header naming this
+        id.
 
-        The header check is not extra strictness; it is the CLI's own lookup. The resolver
-        indexes saved sessions by the HEADER id and never the filename (source:
-        ``setSessionFile`` reads ``id`` off the ``type: "session"`` entry), and it is
-        observed: a file named for one id whose header names another is "No session found
-        matching" for the filename's id. An empty file has no header and is not found either.
+        Neither half of that is extra strictness; both are the CLI's own scanner. It indexes
+        saved sessions by the header id and never the filename (source: ``scanSessionInfo``,
+        and observed: a mismatched header is "No session found matching" for the filename's
+        id), and it gives up on a file whose first parseable entry is not the header (source:
+        the scanner returns nothing for it, and observed: a message line above a valid header
+        is the same "No session found matching"). A header alone is enough: a header-only
+        file, timestamp absent and all, resumed to the auth boundary against the pinned CLI
+        (observed, network off). An empty file has no header and is not found either.
         """
         path = home / ".prime" / "agent" / "sessions" / f"{session_id}.jsonl"
         if not path.is_file():
             return None
-        header = _first_event_of_type(path, ("session",))
-        if header is not None and str(header.get("id") or "") == session_id:
+        header = _first_parseable_event(path)
+        if (
+            header is not None
+            and header.get("type") == "session"
+            and str(header.get("id") or "") == session_id
+        ):
             return path
         return None
 

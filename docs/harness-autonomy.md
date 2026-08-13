@@ -462,16 +462,17 @@ ablation, and eval_before is always cold since no conversation exists yet.
 
 The preflight validates rather than globs, because existence is not resumability. Each
 harness's `session_transcript` resolves the file the way that CLI's own resume lookup does
-(exact naming, never a substring) and then requires the minimum the pinned CLI requires
-before it will reopen the file, identity included: the file's own recorded metadata must name
-the session. The degenerate files this rejects are exactly the ones the CLIs refuse
-(observed, network off, zero tokens): an empty filename-matching transcript gets Claude's
-`No conversation found with session ID`, an empty rollout file gets codex's
-`failed to read session metadata ... rollout ... is empty`, and a prime session file whose
-header names another id gets `No session found matching` for the filename's id, because
-prime's resolver indexes by the header id and never the filename (source: `setSessionFile`).
-Without the validation each of those refusals would arrive per task, after the fan-out's
-copies, streams, and containers were already paid for.
+(exact naming, never a substring) and then requires the floor that CLI was observed to
+require, identity included. The floors were established empirically rather than guessed: for
+each harness a real session file was produced by driving the pinned CLI itself in the image
+(a credential-less run persists its session before failing auth), then minimized cut by cut
+with a re-resume after every cut, so each requirement in the predicate is one whose removal
+was seen to flip the CLI to a refusal, and each predicate's exact minimum body was seen to
+resume to the auth or transport boundary. The refusals this preempts would otherwise arrive
+per task, after the fan-out's copies, streams, and containers were already paid for. What no
+line-level predicate can promise is a file that carries the floor plus additional records
+the CLI cannot replay (a poisoned line elsewhere in a crashed file); that residue stays a
+per-task failure, and only a credentialed dry run could squeeze it further.
 
 Every claim below was produced against the pinned image (Claude Code 2.1.226, codex-cli
 0.147.0, prime-agent 0.7.1) with the network disabled and no credential present, so each probe
@@ -492,6 +493,15 @@ resumed argv carried `--append-system-prompt` with the eval instruction and
 matters because resume restores no flags (docs) and the runner rebuilds the whole argv every
 launch. The credential-less run then stopped at `authentication_failed` with zero tokens.
 
+The floor a transcript must carry, minimized from a transcript the CLI itself wrote and
+re-resumed after every cut (all observed): one `user` line holding a `message` with a role
+and non-empty content, a `timestamp`, and the `sessionId`. Exactly that line resumes to the
+auth boundary; without the `message` or without the `timestamp` the CLI reports
+`No conversation found with session ID` exactly as if the file were absent, and a `message`
+without content crashes the resume (`Failed to resume session: undefined is not an
+object`). The `uuid` field, present in every real line, is not required. A line that merely
+names the id is not a conversation, and the preflight requires the whole floor.
+
 ### codex (observed for the resume mechanics, source elsewhere)
 
 `codex exec resume` exists at the pinned 0.147.0 as a non-interactive subcommand:
@@ -507,6 +517,15 @@ argv order the harness builds is the order the probe ran. One edge worth naming:
 thread-name selection are cwd-filtered and `--all` disables the filter (help text); an
 explicit UUID, with rollout and eval both running at `/work`, does not touch that path.
 
+The floor a rollout must carry, minimized from a rollout the CLI itself wrote and re-resumed
+after every cut (all observed): the file must START with the session metadata, and the meta
+must decode whole. A `session_meta` first line whose payload holds `id`, `timestamp`, `cwd`,
+`originator`, and `cli_version`, with no items after it, resumes to the transport boundary.
+Dropping payload fields is refused as `failed to read session metadata`; an empty file as
+`rollout ... is empty`; and a parseable non-meta first line is refused as `does not start
+with session metadata` even when a fully valid meta sits on line two, so the preflight
+anchors on the first parseable line the way the CLI does.
+
 ### prime_agent (observed for the resume mechanics, source for the layout)
 
 `-r/--resume <path|id>` is a run option of the pinned 0.7.1 (help). Sessions are stored as
@@ -520,6 +539,15 @@ is resolved, re-emits the session header with the **same** id (the line
 `session_id_from_trace` reads), appends the resumed turn to that file, and stops at
 `No API key found for anthropic` with nothing spent. `--fork <path|id>` also exists at 0.7.1;
 the runner does not use it, since the per-task copy is the fork.
+
+The floor a session file must carry (all observed): the header alone, and it must be the
+FIRST parseable line. A one-line `{"type": "session", "version": 3, "id": ..., "cwd": ...}`
+file, timestamp absent and all, resumed to the auth boundary in a pristine home, so the
+header really is the whole floor. What the CLI refuses is anchoring: its scanner gives up on
+a file whose first parseable entry is not the header (source: `scanSessionInfo`), and a
+message line above a fully valid header is `No session found matching` for that id, the same
+answer a mismatched header id gets, because the scanner indexes by the header id and never
+the filename.
 
 The transcript is not the whole persisted session. Its artifact tree at
 `<agent-dir>/session-artifacts/<id>/` is part of it (source, in the installed bundle): the
@@ -566,6 +594,7 @@ stdin for all three.
    perform.
 5. No resumed eval_after leg has run against a live provider. The fork mechanics (session
    lookup in a copied HOME, same-id resumption, append-to-copy, loud failure on a missing
-   transcript) are observed to the authentication or transport boundary for all three
-   harnesses; a model actually continuing the resumed conversation, and the quality of a
-   fabricated-versus-real transcript, are verifiable only by a credentialed run.
+   transcript) and every preflight floor above are observed to the authentication or
+   transport boundary for all three harnesses. What remains: a model actually continuing the
+   resumed conversation, and a transcript that carries the floor plus additional records the
+   CLI cannot replay, both verifiable only by a credentialed run.

@@ -21,6 +21,31 @@ from pathlib import Path
 from shobench.harness import jsonl_events
 
 
+def _first_parseable_event(path: Path) -> dict | None:
+    """The first line of a JSONL file that parses as an object, whatever its type.
+
+    This is the anchor two of the harnesses' own session readers use: codex refuses a rollout
+    that "does not start with session metadata", and prime-agent's session scanner returns
+    nothing when the first parseable entry is not the session header (both observed against
+    the pinned binaries). A search that skipped past a foreign first line to find the record
+    later in the file would accept exactly the files those readers refuse, so the transcript
+    preflight anchors the same way they do.
+    """
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8", errors="ignore") as lines:
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            return event if isinstance(event, dict) else None
+    return None
+
+
 def _first_event_of_type(path: Path, types: tuple[str, ...]) -> dict | None:
     """The first event of a JSONL trace whose ``type`` is one of ``types``.
 

@@ -14,7 +14,11 @@ from shobench.harness import (
     UsageLimitRule,
     stderr_evidence,
 )
-from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
+from shobench.harnesses._trace import (
+    _first_event_of_type,
+    _first_parseable_event,
+    _last_event_of_type,
+)
 
 
 class Codex(Harness):
@@ -86,13 +90,19 @@ class Codex(Harness):
         return None if started is None else str(started.get("thread_id") or "") or None
 
     def session_transcript(self, home: Path, session_id: str) -> Path | None:
-        """The rollout file whose name ends in this thread id, and its meta must agree.
+        """The rollout file whose name ends in this thread id, opening with a meta the CLI's
+        own parser decodes.
 
-        The CLI resolves the thread by that filename suffix and then refuses a file it cannot
-        read a ``session_meta`` from ("rollout ... is empty", observed on an empty file), so
-        the meta line is the floor a resumable rollout carries. Requiring its payload id to
-        equal the thread id also rejects a rollout recorded for some other thread, and the
-        exact suffix keeps a longer id that merely contains this one from standing in.
+        The floor was established against the pinned CLI (network off, zero tokens). The
+        rollout must START with the session metadata: a parseable non-meta first line is
+        refused as "does not start with session metadata" even when a valid meta follows it.
+        And the meta must decode whole: its payload needs ``id``, ``timestamp``, ``cwd``,
+        ``originator``, and ``cli_version``, because dropping any of them is refused as
+        "failed to read session metadata" and an empty file as "rollout ... is empty". No
+        items after the meta are required; a meta-only rollout resumed to the transport
+        boundary. Requiring the payload id to equal the thread id also rejects a rollout
+        recorded for some other thread, and the exact filename suffix keeps a longer id that
+        merely contains this one from standing in.
         """
         root = home / ".codex" / "sessions"
         if not root.is_dir():
@@ -101,8 +111,16 @@ class Codex(Harness):
         for path in sorted(root.rglob("*.jsonl")):
             if not path.is_file() or not path.name.endswith(suffix):
                 continue
-            meta = _first_event_of_type(path, ("session_meta",))
-            if meta is not None and (meta.get("payload") or {}).get("id") == session_id:
+            meta = _first_parseable_event(path)
+            if meta is None or meta.get("type") != "session_meta":
+                continue
+            payload = meta.get("payload") or {}
+            if payload.get("id") != session_id:
+                continue
+            if all(
+                isinstance(payload.get(key), str) and payload.get(key)
+                for key in ("timestamp", "cwd", "originator", "cli_version")
+            ):
                 return path
         return None
 

@@ -759,35 +759,85 @@ def test_a_resumed_eval_launch_names_the_rollout_session_per_harness(tmp_path: P
     assert prime[at + 2 :] == ["--", "EVALSYS\n\ngo"]
 
 
-# What each harness's preflight requires of a transcript, per case. ``valid`` is the minimum
-# the pinned CLI itself accepts; every degenerate body below was refused by that CLI in a
-# network-off probe (empty: claude "No conversation found", codex "rollout ... is empty";
-# mismatched identity: prime "No session found matching"), so a preflight that passed one
+# What each harness's preflight requires of a transcript, per case. Every ``valid`` body was
+# resumed by its pinned CLI to the auth or transport boundary in a network-off probe, and each
+# was found by minimizing a record the CLI itself wrote, so the positive control is a proven
+# one rather than a guess. Every degenerate body was refused by that same CLI: empty and
+# ``undecodable`` files get the CLIs' own parse refusals ("No conversation found", "failed to
+# read session metadata", first-parseable-line anchoring), so a preflight that passed one
 # would only move the refusal to after the fan-out was paid for.
 _SID = "sid-123"
+_TS = "2026-08-12T00:00:00.000Z"
 _TRANSCRIPT_CASES = {
     "claude_code": {
         "rel": f".claude/projects/-work/{_SID}.jsonl",
-        "valid": json.dumps({"type": "user", "sessionId": _SID}) + "\n",
-        "mismatch": json.dumps({"type": "user", "sessionId": "other-session"}) + "\n",
+        # The verified floor: a user line with a message (role + content), a timestamp, and
+        # the sessionId. Dropping the timestamp or the message is "No conversation found";
+        # dropping the content crashes the resume.
+        "valid": json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "hello"},
+                "timestamp": _TS,
+                "sessionId": _SID,
+            }
+        )
+        + "\n",
+        # Identity-bearing but undecodable: the id without a conversation. This exact body
+        # was this file's previous positive control, and the CLI refuses it.
+        "undecodable": json.dumps({"type": "user", "sessionId": _SID}) + "\n",
+        "mismatch": None,  # filled below: the valid body recorded under another session's id
         "substring_rel": f".claude/projects/-work/{_SID}4.jsonl",
     },
     "codex": {
         "rel": f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl",
-        "valid": json.dumps({"type": "session_meta", "payload": {"id": _SID, "cwd": "/work"}})
+        # The verified floor: a first-line session_meta whose payload decodes whole (id,
+        # timestamp, cwd, originator, cli_version). No items are required after it.
+        "valid": json.dumps(
+            {
+                "timestamp": _TS,
+                "type": "session_meta",
+                "payload": {
+                    "id": _SID,
+                    "timestamp": _TS,
+                    "cwd": "/work",
+                    "originator": "codex_exec",
+                    "cli_version": "0.147.0",
+                },
+            }
+        )
         + "\n",
-        "mismatch": json.dumps({"type": "session_meta", "payload": {"id": "other-thread"}})
+        # Identity-bearing but undecodable: the previous positive control; the CLI refuses it
+        # as unreadable session metadata.
+        "undecodable": json.dumps(
+            {"type": "session_meta", "payload": {"id": _SID, "cwd": "/work"}}
+        )
         + "\n",
+        "mismatch": None,
         "substring_rel": f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}4.jsonl",
     },
     "prime_agent": {
+        # The verified floor is the header alone, and the CLI accepted exactly this body
+        # (timestamp absent and all), so unlike the other two it stays. What the CLI does
+        # refuse is a header that is not the FIRST parseable line, which is the undecodable
+        # case here.
         "rel": f".prime/agent/sessions/{_SID}.jsonl",
         "valid": json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/work"})
         + "\n",
-        "mismatch": json.dumps({"type": "session", "version": 3, "id": "other-session"}) + "\n",
+        "undecodable": json.dumps(
+            {"type": "message", "id": "m1", "message": {"role": "user", "content": "x"}}
+        )
+        + "\n"
+        + json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/work"})
+        + "\n",
+        "mismatch": None,
         "substring_rel": f".prime/agent/sessions/{_SID}4.jsonl",
     },
 }
+# The mismatch case is the valid body verbatim with the identity swapped, so what it tests is
+# identity alone and never a second structural difference.
+for _case in _TRANSCRIPT_CASES.values():
+    _case["mismatch"] = _case["valid"].replace(_SID, "other-session")
 
 
 def _home_with(tmp_path: Path, rel: str, body: str) -> Path:
@@ -819,10 +869,13 @@ def test_a_transcript_that_only_wears_the_id_does_not_pass_the_preflight(
 ) -> None:
     """The degenerate files the CLIs refuse must not pass the preflight either.
 
-    Four ways a file can wear the id without being the session: empty (a crashed leg's
-    leftover), malformed (a cut file with no parseable record), an identity mismatch (the
-    file's own metadata names another session), and a filename that merely contains the id
-    (a longer id's file). Each was worth its own home so one passing case cannot mask another.
+    Five ways a file can wear the id without being the session: empty (a crashed leg's
+    leftover), malformed (a cut file with no parseable record), identity-bearing but
+    undecodable (the id is in the right place and the record around it does not decode as a
+    session; each harness's case is a body its pinned CLI was observed to refuse), an
+    identity mismatch (the file's own metadata names another session), and a filename that
+    merely contains the id (a longer id's file). Each gets its own home so one passing case
+    cannot mask another.
     """
     case = _TRANSCRIPT_CASES[name]
     harness = harness_for(name)
@@ -832,6 +885,9 @@ def test_a_transcript_that_only_wears_the_id_does_not_pass_the_preflight(
 
     malformed = _home_with(tmp_path / "malformed", case["rel"], "not json\n{cut mid-")
     assert harness.session_transcript(malformed, _SID) is None
+
+    undecodable = _home_with(tmp_path / "undecodable", case["rel"], case["undecodable"])
+    assert harness.session_transcript(undecodable, _SID) is None
 
     mismatch = _home_with(tmp_path / "mismatch", case["rel"], case["mismatch"])
     assert harness.session_transcript(mismatch, _SID) is None
