@@ -479,11 +479,24 @@ stopping record and validated by the same preflight inside the copied home. The 
 is read and never written: it is an archived artifact, and the new run names it in a
 `rebookend` provenance block and publishes under the incomplete name, since a run with no
 eval_before cannot account for the before side; pairing with the source happens post-hoc.
-The source's existing lock file, when it has one, is held SHARED for exactly the duration of
-the snapshot: shared refuses a live mutator and blocks a would-be one (every mutating owner
-takes the lock exclusive) without writing a byte, and it is released before any spend, with
-the source manifest re-read under the hold so a mutation that ran whole between the plan
-read and the hold refuses rather than snapshotting new bytes under the old definition.
+The published artifact is named by the BOOKEND's run id, never the cell name. The cell-name
+artifact is the source's own measurement, the one the bookend exists to pair with, and the
+one-artifact-per-cell rule (`write_results` replaces the stem's other shape) would have
+destroyed it; the run-id stem keeps the source result and every bookend of every source
+coexisting, self-paired through the provenance block, and it makes the leaf unpredictable
+before the run mints its id, so nothing can pre-occupy it, with the minted names still
+bounded against the source before the lock. The source's lock file is held SHARED for
+exactly the duration of the snapshot: shared refuses a live mutator and blocks a would-be
+one (every mutating owner takes the lock exclusive) without writing a byte, and it is
+released before any spend. A source WITHOUT a lock file is refused as unholdable rather than
+copied unheld, because every mutator creates the lock on its way in and would write mid-copy
+under an empty hold; creating the lock from the rebookend would itself write into the
+archive, so the refusal names the operator's own one-file workaround, and every run since
+the lock landed carries one, so only pre-lock-era directories are affected. Under the hold,
+everything the plan relied on is re-proven before the copy: a suspension written without a
+manifest change refuses, a terminus that stopped naming a terminal session refuses, and a
+rewritten manifest refuses, so a mutation that ran whole between the plan read and the hold
+cannot be snapshotted under the old definition.
 The snapshot is MATERIALIZED, transcripts included: every symlink becomes the bytes it
 names, resolved from the link's own parent (a valid relative link, the shape of every link in
 the real prime homes, materializes wherever the process happens to run; the stdlib copy read

@@ -29,7 +29,6 @@ from shobench.config import load_all_cells, load_cell_by_name, load_instruction,
 from shobench.containers import AGENT_IMAGE, NETNS_IMAGE, CellSandbox, build_image, daemon_available
 from shobench.egress import EGRESS_IMAGE
 from shobench.pins import SHOGYM_REV
-from shobench.results import INCOMPLETE_SUFFIX
 from shobench.runner import SUSPENSION_FILE, resume_cell, run_cell
 from shobench.serving import DEFAULT_PORT
 from shobench.splits import load_split_by_name
@@ -395,28 +394,23 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         for out in (Path(args.runs), Path(args.results))
         if out.resolve() == source_resolved or out.resolve().is_relative_to(source_resolved)
     ]
-    # The concrete leaves too, exactly as the runner refuses them: a link planted at either
-    # deterministic result name aims publication at the archive, and a plan that said ready
-    # while --go would refuse is a plan that lied.
-    result_leaves_inside_source = [
-        str(leaf)
-        for leaf in (
-            Path(args.results) / f"{cell.name}.json",
-            Path(args.results) / f"{cell.name}{INCOMPLETE_SUFFIX}",
-        )
-        if leaf.resolve() == source_resolved
-        or leaf.resolve().is_relative_to(source_resolved)
-    ]
-    try:
-        runner._refuse_live_source(source_resolved)
-        source_live = False
-    except RuntimeError:
-        source_live = True
+    # The bookend publishes under its OWN run id, never the cell name: the cell-name artifact
+    # is the source's measurement, the one the bookend pairs with, so the two coexist and no
+    # deterministic leaf exists for anyone to pre-occupy; the runner still bounds the minted
+    # concrete names before its lock. What the plan can state is the scheme and the lock
+    # states.
+    source_lock_present = (source_dir / runner.RUN_LOCK_FILE).is_file()
+    source_live = False
+    if source_lock_present:
+        try:
+            runner._refuse_live_source(source_resolved)
+        except RuntimeError:
+            source_live = True
     refusals = {
         "suspension_present": (source_dir / SUSPENSION_FILE).is_file(),
+        "source_lock_present": source_lock_present,
         "source_live": source_live,
         "outputs_inside_source": outputs_inside_source,
-        "result_leaves_inside_source": result_leaves_inside_source,
         "rollout_terminus_present": source_stopping_path.is_file(),
         "terminal_session_resolvable": terminal_session is not None,
         "experiment_drift": drift,
@@ -437,6 +431,8 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         # Every held-out task, because a rebookend is a fresh bookend rather than a repair:
         # nothing is already complete in a run directory that does not exist yet.
         "heldout_tasks_to_run": len(split.heldout),
+        "result_artifact": f"<bookend-run-id>.json under {args.results} (the source's "
+        f"{cell.name}.json artifact is never touched)",
         "source_home": {
             "files": len(home_files),
             "bytes": sum(p.stat().st_size for p in home_files),
@@ -458,16 +454,15 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     blockers = []
     if refusals["suspension_present"]:
         blockers.append("the source holds a suspension record; finish it with `shobench resume`")
+    if not refusals["source_lock_present"]:
+        blockers.append(
+            "the source has no run.lock, so it cannot be held still for the snapshot"
+        )
     if refusals["source_live"]:
         blockers.append("the source is owned by a live process; wait for it to finish")
     if outputs_inside_source:
         blockers.append(
             f"outputs {outputs_inside_source} are inside the source run directory"
-        )
-    if result_leaves_inside_source:
-        blockers.append(
-            f"result leaves {result_leaves_inside_source} resolve into the source run "
-            "directory"
         )
     if not refusals["rollout_terminus_present"]:
         blockers.append("the source has no rollout terminus, so there is nothing to resume from")

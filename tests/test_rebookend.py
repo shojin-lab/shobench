@@ -126,6 +126,9 @@ def _source_run(
             source_dir / ROLLOUT_STOPPING_FILE,
             {"stop_reason": "agent_stopped_early", "session_id": session_id},
         )
+    # Every real run writes its lock on the way in, and a lock-less source is refused as
+    # unholdable, so the fixture is a lockable archive like the runs this entry exists for.
+    (source_dir / runner.RUN_LOCK_FILE).write_text("{}", encoding="utf-8")
     return source_dir
 
 
@@ -255,9 +258,10 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
         "source_stop_reason": "agent_stopped_early",
     }
 
-    # Published honestly: a run with no eval_before cannot account for the before side, so it
-    # carries the incomplete name; its after side is whole and pairs with the source post-hoc.
-    assert results_path.name.endswith(".incomplete.json")
+    # Published honestly and under its OWN name: a run with no eval_before cannot account for
+    # the before side, so it carries the incomplete name, and the stem is the bookend's run
+    # id, never the cell name, which is the source's artifact.
+    assert results_path.name == f"{new_run.name}.incomplete.json"
     published = json.loads(results_path.read_text(encoding="utf-8"))
     assert published["eval_after"]["summary"]["n_scored"] == 3
     assert all(r["closure"] == "missing" for r in published["eval_before"]["tasks"])
@@ -506,20 +510,27 @@ def test_the_materializer_fails_loudly_on_a_link_cycle(tmp_path: Path) -> None:
         runner._materialize_home(home, tmp_path / "copy")
 
 
-def test_rebookend_refuses_a_result_leaf_linked_into_the_source(
+def test_rebookend_refuses_its_minted_names_resolving_into_the_source(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The round-2 escape, closed pre-spend: the deterministic result leaf can pre-exist as a
-    link into the archive, and publication would land there after the whole eval was paid for.
-    The leaf resolves and refuses before anything launches; publication itself also replaces
-    atomically, so a link aimed anywhere else is replaced, never followed."""
+    """The bookend's own names are unpredictable before minting, so nothing can pre-occupy
+    them in the wild; the check still bounds the minted concrete names before the lock, and
+    with the mint pinned deterministic here, a link planted at the exact leaf refuses before
+    anything launches."""
+
+    class _FixedUuid:
+        hex = "deadbeefcafe0123"
+
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split)
     archived = source_dir / "archive-byte"
     archived.write_text("ARCHIVED BYTES", encoding="utf-8")
+    monkeypatch.setattr(runner, "_run_id", lambda c: f"{c.name}-20260101T000000Z")
+    monkeypatch.setattr(runner.uuid, "uuid4", lambda: _FixedUuid())
+    minted = f"{cell.name}-20260101T000000Z-rbdeadbeef"
     results = tmp_path / "results"
     results.mkdir()
-    (results / f"{cell.name}.incomplete.json").symlink_to(archived)
+    (results / f"{minted}.incomplete.json").symlink_to(archived)
     before = _fingerprint(source_dir)
     launches: dict[int, dict] = {}
     _wire_fakes(monkeypatch, cell, split, launches)
@@ -609,6 +620,10 @@ def test_two_rebookends_of_one_source_in_one_second_get_distinct_runs(
     assert len(run_dirs) == 2
     assert len({p.name for p in run_dirs}) == 2
     assert set(first) == set(second) == {0, 1, 2}
+    # And two coexisting artifacts, one per bookend, neither under the cell name.
+    artifacts = sorted(p.name for p in (tmp_path / "results").iterdir())
+    assert len(artifacts) == 2
+    assert artifacts == sorted(f"{p.name}.incomplete.json" for p in run_dirs)
 
 
 def test_a_suspended_bookend_resumes_with_nothing_recorded(tmp_path: Path, monkeypatch) -> None:
@@ -852,6 +867,7 @@ def _real_cell_source(tmp_path: Path) -> Path:
         source_dir / ROLLOUT_STOPPING_FILE,
         {"stop_reason": "pool_exhausted", "session_id": _SID},
     )
+    (source_dir / runner.RUN_LOCK_FILE).write_text("{}", encoding="utf-8")
     return source_dir
 
 
@@ -880,8 +896,11 @@ def test_cli_rebookend_plans_without_spending(tmp_path: Path, capsys) -> None:
     assert plan["source_home"]["files"] >= 1
     assert plan["source_home"]["bytes"] > 0
     assert plan["refusals"]["suspension_present"] is False
+    assert plan["refusals"]["source_lock_present"] is True
     assert plan["refusals"]["source_live"] is False
     assert plan["refusals"]["outputs_inside_source"] == []
+    assert "result_leaves_inside_source" not in plan["refusals"]
+    assert plan["result_artifact"].startswith("<bookend-run-id>.json")
     assert plan["refusals"]["rollout_terminus_present"] is True
     assert plan["refusals"]["terminal_session_resolvable"] is True
     assert plan["refusals"]["experiment_drift"] == []
@@ -906,35 +925,102 @@ def test_cli_rebookend_reports_and_blocks_on_a_refusal_state(tmp_path: Path, cap
     assert not (tmp_path / "runs").exists()
 
 
-def test_cli_rebookend_plan_surfaces_a_planted_result_leaf(tmp_path: Path, capsys) -> None:
-    """The plan never says ready when --go would refuse: a leaf link into the source is a
-    refusal state the plan lists, and the same state blocks a --go before the runner entry."""
-    from shobench.cli import main as cli_main
-    from shobench.config import load_cell_by_name as load_cell
-
-    source_dir = _real_cell_source(tmp_path)
-    cell = load_cell("smoke-automationbench-claude-code")
-    archived = source_dir / "archive-byte"
-    archived.write_text("ARCHIVED BYTES", encoding="utf-8")
+def test_the_bookend_and_the_source_results_coexist(tmp_path: Path, monkeypatch) -> None:
+    """The whole point of the namespace: the cell-name artifact is the SOURCE's measurement,
+    the one the bookend pairs with, and sharing that stem destroyed it (write_results keeps
+    one artifact per stem by design; reproduced). The bookend publishes under its own run id,
+    so the source result, in either of its shapes, and every bookend all coexist."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
     results = tmp_path / "results"
     results.mkdir()
-    (results / f"{cell.name}.incomplete.json").symlink_to(archived)
+    # The source's published artifact, in the report set's real shape (incomplete), plus the
+    # finished-name shape for good measure: a same-stem publish would have removed one and
+    # replaced the other.
+    (results / f"{cell.name}.incomplete.json").write_text('{"marker": "SOURCE"}')
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
 
-    assert (
-        cli_main(["rebookend", "--run", str(source_dir), "--results", str(results)]) == 0
-    )
-    plan = json.loads(capsys.readouterr().out)
-    assert plan["refusals"]["result_leaves_inside_source"] == [
-        str(results / f"{cell.name}.incomplete.json")
-    ]
-
-    assert (
-        cli_main(
-            ["rebookend", "--run", str(source_dir), "--results", str(results), "--go"]
+    results_path = asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=results,
+            capture_egress=False,
         )
-        == 1
     )
+
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    assert results_path.name == f"{new_run.name}.incomplete.json"
+    assert (results / f"{cell.name}.incomplete.json").read_text() == '{"marker": "SOURCE"}'
+    assert json.loads(results_path.read_text())["manifest"]["rebookend"][
+        "rebookend_of"
+    ] == "source-run-20260101T000000Z"
+
+
+def test_rebookend_refuses_an_unlockable_source(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A source without a lock file cannot be held still: a mutator would CREATE the lock and
+    write mid-copy (reproduced), and creating it from here would write into the archive. The
+    refusal names the operator's own workaround, and the plan surfaces the state; the real
+    report-set sources all carry their locks, so this costs them nothing."""
+    from shobench.cli import main as cli_main
+
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    (source_dir / runner.RUN_LOCK_FILE).unlink()
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="cannot be held still"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+
+    cli_source = _real_cell_source(tmp_path / "cli")
+    (cli_source / runner.RUN_LOCK_FILE).unlink()
+    assert cli_main(["rebookend", "--run", str(cli_source)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["refusals"]["source_lock_present"] is False
+    assert cli_main(["rebookend", "--run", str(cli_source), "--go"]) == 1
     err = capsys.readouterr().err
-    assert "BLOCKED" in err and "result leaves" in err
-    assert archived.read_text() == "ARCHIVED BYTES"
-    assert not (tmp_path / "runs").exists()
+    assert "BLOCKED" in err and "run.lock" in err
+
+
+def test_a_suspension_written_between_probe_and_hold_refuses(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A usage-limit ending writes suspended.json without touching the manifest, so the
+    manifest recheck alone missed it (reproduced interleaving: an owner took the lock, wrote
+    the suspension, released, and the copy proceeded). Suspension eligibility is re-proven
+    under the hold, before anything is copied."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    real_acquire = runner._acquire_run_lock
+
+    def suspending_acquire(run_dir: Path) -> int:
+        # The mutator that ran whole between the early probe and the hold: it suspended the
+        # source and released the lock, leaving the manifest untouched.
+        runner.write_json(source_dir / SUSPENSION_FILE, {"phase": "eval_after"})
+        return real_acquire(run_dir)
+
+    monkeypatch.setattr(runner, "_acquire_run_lock", suspending_acquire)
+
+    with pytest.raises(RuntimeError, match="suspended between the plan and the snapshot"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}

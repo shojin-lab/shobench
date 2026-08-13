@@ -1566,6 +1566,7 @@ async def _run_phases(
     observer: _Egress,
     suspended: Suspension | None = None,
     recorded_phases: tuple[str, ...] = (),
+    artifact: str | None = None,
 ) -> Path:
     """Run this cell's phases, then finalize the manifest and publish the results.
 
@@ -1580,6 +1581,12 @@ async def _run_phases(
     forward: eval_before for a rollout suspension, and both eval_before and the rollout for an
     eval_after suspension, since an eval_after limit falls after the rollout is already paid for
     and must not lose it.
+
+    ``artifact`` overrides the published result's stem. The default, the cell name, is right
+    for every run that IS the cell's measurement, because a rerun replacing the cell's last
+    artifact is the intended one-artifact-per-cell rule. A rebookend is not that run: it
+    pairs WITH the cell's artifact, and publishing under the same stem destroyed the very
+    result it must pair with, so it publishes under its own run id instead.
     """
 
     def teardown() -> None:
@@ -1666,7 +1673,7 @@ async def _run_phases(
 
     egress_summary = observer.stop()
     results_path = write_results(
-        results_dir / f"{ctx.cell.name}.json",
+        results_dir / f"{artifact or ctx.cell.name}.json",
         manifest=manifest,
         phases=phase_rows,
         stopping=stopping,
@@ -2436,16 +2443,26 @@ def _holding_source_still(source_run_dir: Path):
     probe left the copy racing any mutator that acquired in between (a concurrent rerun's
     mid-copy write landed in the published snapshot, in review).
 
-    A missing lock file yields without holding: no owner ever wrote one, which is true only
-    of pre-lock-era archives and fixtures, and creating it here would itself write into the
-    source.
+    A missing lock file is a refusal, not an empty hold. Every mutator would CREATE the lock
+    on its way in (``_acquire_run_lock`` opens with O_CREAT), so a source without one is not
+    quiet, it is unholdable: a resume or rerun starting mid-copy would mint the lock and
+    mutate under the advertised hold (reproduced). Creating the lock from here would itself
+    write into the archive, so the honest options are refusing or copy-and-revalidate, and
+    refusal is chosen because it is simple and the archives this entry exists for all carry
+    their locks (every run since the lock landed writes one; only pre-lock-era directories
+    lack it). The message names the workaround, which is the operator's deliberate one-file
+    write, never this runner's.
     """
     import fcntl
 
     lock_path = source_run_dir / RUN_LOCK_FILE
     if not lock_path.is_file():
-        yield
-        return
+        raise RuntimeError(
+            f"{source_run_dir} has no {RUN_LOCK_FILE}, so it cannot be held still while the "
+            "snapshot is taken: a mutator would create the lock and write mid-copy. If the "
+            "archive is genuinely settled and you accept adding one file to it, create the "
+            f"lock yourself (touch {source_run_dir / RUN_LOCK_FILE}) and re-run."
+        )
     fd = os.open(lock_path, os.O_RDONLY)
     try:
         try:
@@ -2504,23 +2521,6 @@ async def rebookend_run(
     # source publishes honestly as never + resumed.
     recorded_regime = recorded_rollout_feedback(source_manifest)
     cell = replace(cell, rollout_feedback=recorded_regime, eval_context="resumed")
-    # The concrete artifacts too, not only their directories: the result leaf names are
-    # deterministic, and a link left at one of them would aim publication itself at the
-    # archive. Publication also replaces atomically (see ``write_results``), so a link
-    # resolving anywhere ELSE is replaced rather than followed; one resolving into the source
-    # refuses here, before anything spends, because even a replaced entry should never have
-    # been aimed at the archive.
-    for leaf in (
-        Path(results_dir) / f"{cell.name}.json",
-        Path(results_dir) / f"{cell.name}{INCOMPLETE_SUFFIX}",
-    ):
-        resolved_leaf = leaf.resolve()
-        if resolved_leaf == source_run_dir or resolved_leaf.is_relative_to(source_run_dir):
-            raise RuntimeError(
-                f"the result artifact {leaf} resolves into the source run directory, and a "
-                "rebookend never writes into the archive it bookends. Remove the link, or "
-                "point --results elsewhere."
-            )
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
     drift = experiment_drift(source_manifest, cell=cell, split=split, instruction=instruction)
@@ -2550,14 +2550,24 @@ async def rebookend_run(
     # genuinely fresh rather than fresh-if-nobody-else-was-quick.
     run_id = f"{_run_id(cell)}-rb{uuid.uuid4().hex[:8]}"
     run_dir = Path(runs_dir) / run_id
-    # The concrete run path, same rule as the leaves: the directory check above bounds the
-    # parent, and this bounds the entry the lock is about to create through.
-    resolved_run_dir = run_dir.resolve()
-    if resolved_run_dir == source_run_dir or resolved_run_dir.is_relative_to(source_run_dir):
-        raise RuntimeError(
-            f"the new run directory {run_dir} resolves into the source run directory, and a "
-            "rebookend never writes into the archive it bookends."
-        )
+    # The concrete artifacts too, not only their directories. The bookend publishes under its
+    # OWN run id, never the cell name: the cell-name artifact is the SOURCE's measurement, the
+    # one this bookend exists to pair with, and sharing the stem destroyed it (write_results
+    # keeps one artifact per stem by design). The run-id stem keeps every bookend of every
+    # source coexisting beside the source result, and it makes the leaf unpredictable before
+    # this moment, so nothing can pre-occupy it; these checks still bound the minted names
+    # and the run path before the lock creates anything through them.
+    for target in (
+        run_dir,
+        Path(results_dir) / f"{run_id}.json",
+        Path(results_dir) / f"{run_id}{INCOMPLETE_SUFFIX}",
+    ):
+        resolved_target = target.resolve()
+        if resolved_target == source_run_dir or resolved_target.is_relative_to(source_run_dir):
+            raise RuntimeError(
+                f"{target} resolves into the source run directory, and a rebookend never "
+                "writes into the archive it bookends."
+            )
     lock_fd = _acquire_run_lock(run_dir)
     try:
         return await _rebookend_owned(
@@ -2642,9 +2652,25 @@ async def _rebookend_owned(
     # and blocks a would-be one until the copy is whole, and it is released here, before any
     # spend, so the archive is never held during the eval itself.
     with _holding_source_still(source_run_dir):
-        # The definition this run was planned from must still be the definition on disk: a
-        # mutator that ran between the earlier read and this hold rewrote the archive, and a
-        # snapshot of the new bytes under the old cell would be two runs wearing one name.
+        # Everything the plan relied on is re-proven under the hold, because a mutator that
+        # ran WHOLE between the early checks and this hold left no live lock to refuse. A
+        # suspension is the record such a mutator writes WITHOUT touching the manifest
+        # (reproduced: an owner took the lock, wrote suspended.json, released, and the old
+        # recheck saw an unchanged manifest and copied anyway), so it is rechecked first;
+        # the terminus and its terminal session are rechecked the same way; and the manifest
+        # compare catches every definitional rewrite, since a snapshot of new bytes under
+        # the old cell would be two runs wearing one name.
+        if (source_run_dir / SUSPENSION_FILE).is_file():
+            raise RuntimeError(
+                f"{source_run_dir} was suspended between the plan and the snapshot: the run "
+                "is not finished, and its ending belongs to `shobench resume`."
+            )
+        if terminal_session_in(source_run_dir) is None:
+            raise RuntimeError(
+                f"{source_run_dir}'s rollout terminus changed between the plan and the "
+                "snapshot and no longer names a terminal session. Re-run against the "
+                "settled archive."
+            )
         if json.loads((source_run_dir / "manifest.json").read_text(encoding="utf-8")) != (
             source_manifest
         ):
@@ -2690,6 +2716,9 @@ async def _rebookend_owned(
             phases=("eval_after",),
             results_dir=results_dir,
             observer=observer,
+            # Under the bookend's own name: the cell-name artifact is the source's
+            # measurement, and this run pairs with it rather than replacing it.
+            artifact=run_id,
         )
     finally:
         with contextlib.suppress(Exception):
