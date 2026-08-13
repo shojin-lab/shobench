@@ -35,3 +35,17 @@ rollout_wall_clock_s = 28800
 # The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
 pool_ceiling = 74
 eval_task_timeout_s = 1800
+
+[env_kwargs]
+# gpt-5.6-luna serves tau2's user simulator in place of upstream tau2-bench's canonical
+# gpt-4.1-2025-04-14. All four tau2 cells carry this identical block, so the four stay
+# comparable to each other, but none of them is comparable to published tau2-bench results.
+user_llm = "gpt-5.6-luna"
+
+# Naming this table replaces tau2's DEFAULT_LLM_ARGS_USER wholesale, so both arguments have to
+# appear here. reasoning_effort is required rather than optional: luna refuses any request
+# carrying function tools unless it is set explicitly, and the user simulator always carries
+# the telecom user tools, so omitting it fails every user turn with a 400.
+[env_kwargs.user_llm_args]
+reasoning_effort = "none"
+temperature = 0.0
