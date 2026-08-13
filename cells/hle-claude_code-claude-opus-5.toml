@@ -33,8 +33,29 @@ pool_ceiling = 300
 eval_task_timeout_s = 900
 
 [env_kwargs]
-# Pinned, not changed: gpt-5.4-nano is already shogym's DEFAULT_JUDGE_MODEL for HLE, so this
-# names today's behavior rather than altering it. Writing it down puts the judge in the
-# manifest as an explicit part of the cell, so a later change to the upstream default cannot
-# silently regrade results that were produced under this one.
-judge_model = "gpt-5.4-nano"
+# The judge is a cell axis, so the cell names it rather than inheriting it. gpt-5.6-luna
+# replaces shogym's DEFAULT_JUDGE_MODEL (gpt-5.4-nano) because it grades better, and the swap
+# costs nothing to make now: no hle cell has ever run, so no measurement is disturbed, and all
+# four hle cells carry the identical judge, so they stay comparable to each other.
+#
+# Both judges were measured on 873 real calls each over this split's held-out ids, driving
+# shogym's own OpenAIJudge so the probe exercised the real prompt and the real parser. Parse
+# fidelity matters most, because an unparseable verdict fails closed and reads downstream as
+# the agent answering wrong: luna returned a parseable `correct:` verdict on 873 of 873
+# replies, and so did nano. The two disagree on 19 of 367 graded cases (5.2 percent), and luna
+# was right on all 18 of those disagreements that had an unambiguous right answer. Nano's
+# errors are false negatives, most often refusing a lowercase multiple-choice letter, so nano
+# depresses scores rather than inflating them, and nano flipped its own verdict across repeat
+# draws on 16 of 307 cases against luna's 2. Numerical tolerance is a dead heat: both reject
+# off-by-one and order-of-magnitude misses, and both accept genuinely equivalent forms. Median
+# latency is 1.1s for either judge.
+#
+# Effort is not settable through shogym's judge today, which passes only model and messages,
+# so this judge runs at the model default. Naming the judge here also puts it in the manifest,
+# so a later change to the upstream default cannot silently regrade results produced under
+# this one.
+#
+# Comparability with published HLE leaderboards does not turn on this choice: CAIS grades with
+# a judge of its own, and nano was not that judge either, so that comparability was already
+# absent before this line changed.
+judge_model = "gpt-5.6-luna"
