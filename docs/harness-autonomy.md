@@ -471,6 +471,20 @@ manifest's instruction block records which one eval_after launched with
 (`instruction.eval_prompt_used`), so the artifact says it rather than leaving a reader to
 derive it from the axis.
 
+Runs measured before the resumed default get their bookend through `shobench rebookend`: a
+NEW run that copies the source's accumulated home (transcripts included), inherits the
+source's recorded axes with `eval_context` forced to resumed, and runs exactly the resumed
+eval_after against the source's terminal session, resolved from the source's own stopping
+record and validated by the same preflight inside the copied home. The source run is read and
+never written or locked: it is an archived artifact, and the new run names it in a
+`rebookend` provenance block and publishes under the incomplete name, since a run with no
+eval_before cannot account for the before side; pairing with the source happens post-hoc. A
+source without a terminus, without a resolvable terminal session, or holding a suspension
+record is refused before anything is copied or spent. The terminus is taken exactly where the
+rollout ended, whatever its stop reason: a harness_error ending mid-task resumes from that
+mid-task end, deliberately, because stepping back to a tidier point would resume a
+conversation the rollout never had.
+
 The preflight validates rather than globs, because existence is not resumability. Each
 harness's `session_transcript` resolves the file the way that CLI's own resume lookup does
 (exact naming, never a substring) and then requires the floor that CLI was observed to

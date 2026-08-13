@@ -7,6 +7,7 @@
     shobench run --cell <name> --go         # run one cell (real spend without --go: a plan)
     shobench resume --run <run-dir> --go    # continue a cell a usage limit suspended
     shobench rerun-eval --run <run-dir> --go # finish an eval_after that lost tasks
+    shobench rebookend --run <run-dir> --go # a resumed eval_after for an existing run, as a new run
     shobench report [results/]              # the summary table
 
 ``--go`` is the whole safety story: every command that spends prints its plan and exits unless
@@ -355,6 +356,112 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rebookend(args: argparse.Namespace) -> int:
+    """Give an existing run a resumed eval_after, as a new run; the source stays untouched.
+
+    The plan without ``--go`` names the source, the axes the bookend inherits, the terminal
+    session it will fork, how many held-out tasks a ``--go`` will pay for (all of them: a
+    rebookend is a fresh bookend, not a repair), the size of the home it will copy, and every
+    refusal state, and it spends nothing.
+    """
+    source_dir = Path(args.run)
+    manifest_path = source_dir / "manifest.json"
+    if not manifest_path.is_file():
+        print(f"no manifest at {manifest_path}; this is not a run directory.", file=sys.stderr)
+        return 1
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cell = load_cell_by_name(manifest["cell"]["name"])
+    recorded_arm = runner.recorded_rollout_feedback(manifest)
+    split = load_split_by_name(cell.split)
+    drift = runner.experiment_drift(
+        manifest,
+        cell=cell,
+        split=split,
+        instruction=load_instruction(cell.instruction_arm),
+    )
+    terminal_session = runner.terminal_session_in(source_dir)
+    source_stopping_path = source_dir / runner.ROLLOUT_STOPPING_FILE
+    source_stopping = (
+        json.loads(source_stopping_path.read_text(encoding="utf-8"))
+        if source_stopping_path.is_file()
+        else {}
+    )
+    home_files = [p for p in (source_dir / "home").rglob("*") if p.is_file()]
+    missing_required = [name for name in cell.required_env if not os.environ.get(name)]
+    refusals = {
+        "suspension_present": (source_dir / SUSPENSION_FILE).is_file(),
+        "rollout_terminus_present": source_stopping_path.is_file(),
+        "terminal_session_resolvable": terminal_session is not None,
+        "experiment_drift": drift,
+        "missing_required_env": missing_required,
+    }
+    plan = {
+        "source_run_dir": str(source_dir),
+        "source_run_id": manifest.get("run_id"),
+        "cell": cell.name,
+        "harness": cell.harness,
+        "axes": {
+            "rollout_feedback": recorded_arm,
+            "eval_context": "resumed",
+            "eval_prompt_used": "rollout_system",
+        },
+        "source_stop_reason": source_stopping.get("stop_reason"),
+        "terminal_session_id": terminal_session,
+        # Every held-out task, because a rebookend is a fresh bookend rather than a repair:
+        # nothing is already complete in a run directory that does not exist yet.
+        "heldout_tasks_to_run": len(split.heldout),
+        "source_home": {
+            "files": len(home_files),
+            "bytes": sum(p.stat().st_size for p in home_files),
+        },
+        "credentials_present": credentials.inventory(dict(os.environ)),
+        "refusals": refusals,
+    }
+    tau2_plan = _tau2_plan(cell)
+    if tau2_plan is not None:
+        plan["tau2_data"] = tau2_plan
+    if not args.go:
+        print(json.dumps(plan, indent=2))
+        print(
+            "\n[plan only] a rebookend runs a full held-out eval (real spend). "
+            "Re-run with --go.",
+            file=sys.stderr,
+        )
+        return 0
+    blockers = []
+    if refusals["suspension_present"]:
+        blockers.append("the source holds a suspension record; finish it with `shobench resume`")
+    if not refusals["rollout_terminus_present"]:
+        blockers.append("the source has no rollout terminus, so there is nothing to resume from")
+    elif not refusals["terminal_session_resolvable"]:
+        blockers.append("the source's rollout record names no terminal session")
+    if drift:
+        blockers.append("; ".join(drift))
+    if missing_required:
+        blockers.append(f"the cell needs {missing_required} in the environment")
+    if blockers:
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print("\nBLOCKED: " + "; ".join(blockers) + ". Nothing was spent.", file=sys.stderr)
+        return 1
+    blocked = _set_tau2_data_dir(cell)
+    if blocked:
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(f"\nBLOCKED: {blocked}\nNothing was spent.", file=sys.stderr)
+        return 1
+    results_path = asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=Path(args.runs),
+            results_dir=Path(args.results),
+            agent_image=args.image,
+            credentials=credentials.agent_env(cell.harness, cell.credential_mode, dict(os.environ)),
+            capture_egress=not args.no_egress,
+        )
+    )
+    print(f"results: {results_path}")
+    return 0
+
+
 def _cmd_resume(args: argparse.Namespace) -> int:
     """Continue a cell a provider usage limit suspended, and let it finish.
 
@@ -568,6 +675,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     rerun.add_argument("--image", default=AGENT_IMAGE)
     rerun.add_argument("--no-egress", action="store_true")
     rerun.set_defaults(func=_cmd_rerun_eval)
+
+    rebookend = sub.add_parser(
+        "rebookend",
+        help="give an existing run a resumed eval_after, as a new run; the source is untouched",
+    )
+    rebookend.add_argument("--run", required=True, help="the SOURCE run directory to bookend")
+    rebookend.add_argument(
+        "--go", action="store_true", help="actually run the bookend (real spend)"
+    )
+    rebookend.add_argument("--runs", default="runs", help="where the NEW run directory is made")
+    rebookend.add_argument("--results", default="results")
+    rebookend.add_argument("--image", default=AGENT_IMAGE)
+    rebookend.add_argument("--no-egress", action="store_true")
+    rebookend.set_defaults(func=_cmd_rebookend)
 
     rep = sub.add_parser("report", help="the summary table")
     rep.add_argument("results", nargs="?", default="results")

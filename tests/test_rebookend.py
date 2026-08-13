@@ -1,0 +1,426 @@
+"""Rebookend: a resumed eval_after for an existing run, published as a new run.
+
+The already-run cells measured their after-bookend cold, and the resumed default cannot reach
+them retroactively: their runs are archived artifacts. Rebookend is the entry that gives such
+a run the resumed measurement without touching it. Everything here holds the two properties
+the entry exists for: the SOURCE run is read and never written (its bytes are the experiment's
+record), and the NEW run is an honest artifact of its own (the source's axes inherited, the
+eval context resumed, a provenance block naming what it bookends, and the incomplete name a
+run with no before-side deserves).
+
+None of this needs Docker or a credential. The fan-out is driven through the same fakes the
+resumed eval_after tests use, so the real preflight, home copy, manifest build, and publish
+path all run.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import json
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from shobench import runner
+from shobench.config import load_cell_by_name, load_instruction
+from shobench.containers import CellSandbox
+from shobench.harness import StopKind, StopVerdict
+from shobench.results import TaskResult
+from shobench.runner import (
+    ROLLOUT_STOPPING_FILE,
+    SUSPENSION_FILE,
+    LegRecord,
+    RunContext,
+    build_manifest,
+)
+from shobench.splits import Side, Split, load_split_by_name
+
+_SID = "cccccccc-4444-4444-4444-cccccccccccc"
+
+
+class _FakeStream:
+    async def __aenter__(self) -> _FakeStream:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+@contextlib.asynccontextmanager
+async def _fake_served(stream: object, port: int):
+    yield
+
+
+def _synthetic_definitions(tmp_path: Path):
+    """A cell and split shaped like the archived never-arm sources: wordle over the smoke
+    cell, one-at-a-time eval, the feedback-ablation arm."""
+    cell = replace(
+        load_cell_by_name("smoke-automationbench-claude-code"),
+        env="wordle_v1",
+        rollout_feedback="never",
+        budget=replace(
+            load_cell_by_name("smoke-automationbench-claude-code").budget,
+            eval_concurrency=1,
+            eval_task_timeout_s=120,
+        ),
+    )
+    split = Split(
+        env="wordle_v1",
+        heldout=Side(task_ids=("0", "1", "2")),
+        pool=Side(task_ids=("3", "4")),
+        provenance={"kind": "adopted"},
+        source=tmp_path / "split.json",
+    )
+    return cell, split
+
+
+def _source_run(
+    tmp_path: Path, cell, split, *, session_id: str | None = _SID, with_terminus: bool = True
+) -> Path:
+    """An archived source run: manifest, terminus, and the accumulated post-rollout home.
+
+    The manifest is built by the real builder from a COLD-era cell, because the runs this
+    entry exists for were measured before the resumed default existed; the terminus and the
+    terminal transcript are the ones the resumed fork machinery resolves.
+    """
+    source_dir = tmp_path / "source-run"
+    home = source_dir / "home"
+    memory = home / ".claude" / "projects" / "-work" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "note.md").write_text("accumulated lesson\n", encoding="utf-8")
+    transcript = home / ".claude" / "projects" / "-work" / f"{_SID}.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "kickoff"},
+                "timestamp": "2026-08-12T00:00:00.000Z",
+                "sessionId": _SID,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # Noise the eval copies leave behind but the rebookend home copy must still preserve in
+    # the source: the untouched guarantee is over every byte, not the durable subset.
+    cache = home / ".cache"
+    cache.mkdir()
+    (cache / "blob").write_text("x" * 512, encoding="utf-8")
+    source_cell = replace(cell, eval_context="cold")
+    ctx = RunContext(
+        cell=source_cell,
+        split=split,
+        instruction=load_instruction(source_cell.instruction_arm),
+        harness=runner.harness_for(source_cell.harness),
+        run_id="source-run-20260101T000000Z",
+        run_dir=source_dir,
+        sandbox=CellSandbox(run_id="src", home=home, workdir=source_dir / "work"),
+    )
+    runner.write_json(source_dir / "manifest.json", build_manifest(ctx, probes={"version": "t"}))
+    if with_terminus:
+        runner.write_json(
+            source_dir / ROLLOUT_STOPPING_FILE,
+            {"stop_reason": "agent_stopped_early", "session_id": session_id},
+        )
+    return source_dir
+
+
+def _fingerprint(root: Path) -> dict[str, str]:
+    return {
+        p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+def _wire_fakes(monkeypatch, cell, split, launches: dict[int, dict]) -> None:
+    """The same provider-free fan-out the resumed eval_after tests drive, plus the loaders:
+    the cell under test is synthetic, so the checkout loaders hand back the recorded
+    definitions the drift check verifies, exactly as they would for a committed cell."""
+
+    def fake_run_leg(ctx_arg: RunContext, **kw: object) -> LegRecord:
+        idx = int(kw["task_idx"])  # type: ignore[arg-type]
+        home = Path(kw["home"])  # type: ignore[arg-type]
+        launches[idx] = {
+            "session_id": kw["session_id"],
+            "resume": kw["resume"],
+            "system_prompt": kw["system_prompt"],
+            "transcript_in_copy": (
+                home / ".claude/projects/-work" / f"{_SID}.jsonl"
+            ).is_file(),
+        }
+        return LegRecord(
+            leg=idx,
+            phase=str(kw["phase"]),
+            task_idx=idx,
+            started_at=0.0,
+            ended_at=1.0,
+            returncode=0,
+            verdict=StopVerdict(StopKind.CHOSEN, "it stopped on its own"),
+            tasks_consumed_before=0,
+            tasks_consumed_after=0,
+            trace_path="t",
+            run_dir=ctx_arg.run_dir,
+        )
+
+    def fake_read_phase(prov_dir: Path) -> list[TaskResult]:
+        if not prov_dir.name.startswith("task-"):
+            return []
+        idx = int(prov_dir.name.split("-")[1])
+        if idx not in launches:
+            return []
+        return [
+            TaskResult(
+                seq=idx, position=0, task_idx=idx, closure="sealed", reward=1.0, success=True
+            )
+        ]
+
+    monkeypatch.setattr(runner, "load_cell_by_name", lambda name, **kw: cell)
+    monkeypatch.setattr(runner, "load_split_by_name", lambda name, **kw: split)
+    monkeypatch.setattr(
+        CellSandbox,
+        "up",
+        lambda self, **kw: (
+            self.home.mkdir(parents=True, exist_ok=True),
+            self.workdir.mkdir(parents=True, exist_ok=True),
+        ),
+    )
+    monkeypatch.setattr(CellSandbox, "down", lambda self: None)
+    monkeypatch.setattr(runner, "seed_home", lambda spec, home: {})
+    monkeypatch.setattr(runner, "_probe", lambda *a, **kw: "probe")
+    monkeypatch.setattr(runner, "warm_env", lambda cell_arg: None)
+    monkeypatch.setattr(runner, "build_stream", lambda *a, **kw: _FakeStream())
+    monkeypatch.setattr(runner, "_served", _fake_served)
+    monkeypatch.setattr(runner, "run_leg", fake_run_leg)
+    monkeypatch.setattr(runner, "read_phase", fake_read_phase)
+
+
+def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The whole entry, end to end: the source's bytes are the experiment's record and none of
+    them move, while the new run inherits the source's axes, forces the resumed context, forks
+    the source's terminal session out of its own copied home, and publishes under the
+    incomplete name a before-less run deserves."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    before = _fingerprint(source_dir)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    results_path = asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    # The source is byte-identical: same files, same contents, nothing added or removed.
+    assert _fingerprint(source_dir) == before
+
+    # Every held-out task forked the SOURCE's terminal session under the rollout instruction,
+    # with the transcript present in the fork's own per-task copy: the resumed machinery
+    # composed with the copied home rather than being reimplemented.
+    assert set(launches) == {0, 1, 2}
+    instruction = load_instruction(cell.instruction_arm)
+    for record in launches.values():
+        assert record["session_id"] == _SID
+        assert record["resume"] is True
+        assert record["transcript_in_copy"] is True
+        assert record["system_prompt"] == instruction.rollout_system
+
+    # The new run is its own directory with its own lock and its own copied terminus, so a
+    # usage limit mid-bookend suspends and resumes through the ordinary machinery.
+    run_dirs = [p for p in (tmp_path / "runs").iterdir() if p.is_dir()]
+    assert len(run_dirs) == 1
+    new_run = run_dirs[0]
+    assert new_run.name.startswith(cell.name)
+    assert (new_run / ROLLOUT_STOPPING_FILE).is_file()
+
+    # The manifest says what this run is: the source's arm, the resumed context, the rollout
+    # instruction on the resumed side, and the provenance block naming the source.
+    manifest = json.loads((new_run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cell"]["rollout_feedback"] == "never"
+    assert manifest["cell"]["eval_context"] == "resumed"
+    assert manifest["instruction"]["eval_prompt_used"] == "rollout_system"
+    assert manifest["rebookend"] == {
+        "rebookend_of": "source-run-20260101T000000Z",
+        "source_rollout_feedback": "never",
+        "source_stop_reason": "agent_stopped_early",
+    }
+
+    # Published honestly: a run with no eval_before cannot account for the before side, so it
+    # carries the incomplete name; its after side is whole and pairs with the source post-hoc.
+    assert results_path.name.endswith(".incomplete.json")
+    published = json.loads(results_path.read_text(encoding="utf-8"))
+    assert published["eval_after"]["summary"]["n_scored"] == 3
+    assert all(r["closure"] == "missing" for r in published["eval_before"]["tasks"])
+    assert published["manifest"]["rebookend"]["rebookend_of"] == "source-run-20260101T000000Z"
+
+
+def test_rebookend_refuses_a_source_without_a_terminus(tmp_path: Path, monkeypatch) -> None:
+    """No rollout ending means no conversation end to resume from: the never-terminus sources
+    (a rollout that never reached its stopping record) are correctly unrebookendable."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_terminus=False)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="terminus"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+
+def test_rebookend_refuses_a_terminus_that_names_no_session(tmp_path: Path, monkeypatch) -> None:
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, session_id=None)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="terminal session"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+
+def test_rebookend_refuses_a_suspended_source(tmp_path: Path, monkeypatch) -> None:
+    """A suspended run is not finished: its ending belongs to resume, and bookending a run
+    mid-interruption would measure the far side of a terminus that does not exist yet."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    (source_dir / SUSPENSION_FILE).write_text("{}", encoding="utf-8")
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="suspension"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+
+def test_rebookend_preflight_validates_the_transcript_in_the_copied_home(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The id can be recorded while the conversation is gone; the refusal then comes from the
+    resumed preflight, against the COPIED home, before any task is launched, and the source
+    stays untouched even though the copy was already made."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    (source_dir / "home" / ".claude" / "projects" / "-work" / f"{_SID}.jsonl").unlink()
+    before = _fingerprint(source_dir)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="resumable transcript"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert _fingerprint(source_dir) == before
+
+
+def _real_cell_source(tmp_path: Path) -> Path:
+    """A source built from the committed smoke cell, so the CLI's checkout loaders and drift
+    check run for real."""
+    cell = load_cell_by_name("smoke-automationbench-claude-code")
+    split = load_split_by_name(cell.split)
+    source_dir = tmp_path / "source-run"
+    home = source_dir / "home"
+    home.mkdir(parents=True)
+    (home / "notes.md").write_text("post-rollout self\n", encoding="utf-8")
+    ctx = RunContext(
+        cell=cell,
+        split=split,
+        instruction=load_instruction(cell.instruction_arm),
+        harness=runner.harness_for(cell.harness),
+        run_id="source-run-20260101T000000Z",
+        run_dir=source_dir,
+        sandbox=CellSandbox(run_id="src", home=home, workdir=source_dir / "work"),
+    )
+    runner.write_json(source_dir / "manifest.json", build_manifest(ctx, probes={"version": "t"}))
+    runner.write_json(
+        source_dir / ROLLOUT_STOPPING_FILE,
+        {"stop_reason": "pool_exhausted", "session_id": _SID},
+    )
+    return source_dir
+
+
+def test_cli_rebookend_plans_without_spending(tmp_path: Path, capsys) -> None:
+    """The dry plan names everything a --go would commit to, and exits clean."""
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    cell = load_cell_by_name("smoke-automationbench-claude-code")
+    split = load_split_by_name(cell.split)
+
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+
+    assert plan["source_run_id"] == "source-run-20260101T000000Z"
+    assert plan["cell"] == cell.name
+    assert plan["axes"] == {
+        "rollout_feedback": cell.rollout_feedback,
+        "eval_context": "resumed",
+        "eval_prompt_used": "rollout_system",
+    }
+    assert plan["source_stop_reason"] == "pool_exhausted"
+    assert plan["terminal_session_id"] == _SID
+    # A rebookend is a fresh bookend, never a repair: every held-out task is pending.
+    assert plan["heldout_tasks_to_run"] == len(split.heldout)
+    assert plan["source_home"]["files"] >= 1
+    assert plan["source_home"]["bytes"] > 0
+    assert plan["refusals"]["suspension_present"] is False
+    assert plan["refusals"]["rollout_terminus_present"] is True
+    assert plan["refusals"]["terminal_session_resolvable"] is True
+    assert plan["refusals"]["experiment_drift"] == []
+
+
+def test_cli_rebookend_reports_and_blocks_on_a_refusal_state(tmp_path: Path, capsys) -> None:
+    """A missing terminus is visible in the dry plan and blocks a --go before anything spends:
+    the runner entry is never reached."""
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    (source_dir / ROLLOUT_STOPPING_FILE).unlink()
+
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["refusals"]["rollout_terminus_present"] is False
+    assert plan["terminal_session_id"] is None
+
+    assert cli_main(["rebookend", "--run", str(source_dir), "--go"]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "Nothing was spent" in err
+    assert not (tmp_path / "runs").exists()

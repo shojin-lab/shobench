@@ -815,14 +815,33 @@ def _eval_pending_ids(phase_dir: Path, task_ids: Sequence[str]) -> list[str]:
     ]
 
 
+def terminal_session_in(run_dir: Path) -> str | None:
+    """The rollout's terminal session id as the run's own record names it, or ``None``.
+
+    The stopping record's ``session_id`` is the terminal one (it is updated to the id the last
+    leg really ran under); a record without it falls back to the last rollout leg that names
+    one. Shared between the resumed eval_after preflight and the rebookend entry, which reads
+    it off the SOURCE run it bookends, so the two cannot drift on what "the terminal session"
+    means.
+    """
+    stopping_path = run_dir / ROLLOUT_STOPPING_FILE
+    if not stopping_path.is_file():
+        return None
+    stopping = json.loads(stopping_path.read_text(encoding="utf-8"))
+    session_id = str(stopping.get("session_id") or "") or None
+    if session_id is None:
+        for leg in reversed(stopping.get("legs", [])):
+            if leg.get("session_id"):
+                return str(leg["session_id"])
+    return session_id
+
+
 def _rollout_terminal_session(ctx: RunContext) -> str:
     """The session the rollout ended in, proven forkable from the cell's base home.
 
     Read from the run's own record rather than from live objects, because eval_after does not
     always run in the process that ran the rollout: a fresh cell has just written
-    ``rollout_stopping.json``, while a resume or a reopened run has only the disk. The stopping
-    record's ``session_id`` is the terminal one (it is updated to the id the last leg really ran
-    under); a record without it falls back to the last rollout leg that names one. The id alone
+    ``rollout_stopping.json``, while a resume or a reopened run has only the disk. The id alone
     is not enough: the transcript must be in the base home the forks copy from, since each
     per-task launch would otherwise discover the absence only after its copy, its stream, and
     its container were already paid for, one task at a time.
@@ -832,15 +851,7 @@ def _rollout_terminal_session(ctx: RunContext) -> str:
     measurement has a cell axis that says so.
     """
     stopping_path = ctx.run_dir / ROLLOUT_STOPPING_FILE
-    session_id: str | None = None
-    if stopping_path.is_file():
-        stopping = json.loads(stopping_path.read_text(encoding="utf-8"))
-        session_id = str(stopping.get("session_id") or "") or None
-        if session_id is None:
-            for leg in reversed(stopping.get("legs", [])):
-                if leg.get("session_id"):
-                    session_id = str(leg["session_id"])
-                    break
+    session_id = terminal_session_in(ctx.run_dir)
     if session_id is None:
         raise RuntimeError(
             f"{ctx.cell.name}: eval_context is 'resumed' but the rollout record at "
@@ -2281,6 +2292,177 @@ async def _rerun_eval_owned(
         sandbox.down()
 
 
+async def rebookend_run(
+    source_run_dir: Path,
+    *,
+    runs_dir: Path,
+    results_dir: Path,
+    agent_image: str = AGENT_IMAGE,
+    credentials: dict[str, str] | None = None,
+    capture_egress: bool = True,
+) -> Path:
+    """Give an EXISTING run a resumed eval_after, as a NEW run, and return its results path.
+
+    The source is an archived artifact and stays byte-untouched: it is read, never locked and
+    never written. Everything this creates lives in a fresh run directory whose lock is taken
+    before anything else, exactly as a fresh cell takes its own.
+    """
+    source_run_dir = Path(source_run_dir)
+    manifest_path = source_run_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"{source_run_dir} has no manifest.json; this is not a run directory.")
+    if (source_run_dir / SUSPENSION_FILE).is_file():
+        raise RuntimeError(
+            f"{source_run_dir} holds a suspension record, so the run is not finished: use "
+            "`shobench resume`, which knows what the interruption was waiting for. A rebookend "
+            "measures the far side of a settled terminus."
+        )
+    source_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cell = load_cell_by_name(source_manifest["cell"]["name"])
+    # The recorded arm wins over the checkout's default, exactly as a resume recovers it: the
+    # new measurement inherits the SOURCE's axes and changes exactly one of them, so a never-arm
+    # source publishes honestly as never + resumed.
+    recorded_regime = recorded_rollout_feedback(source_manifest)
+    cell = replace(cell, rollout_feedback=recorded_regime, eval_context="resumed")
+    split = load_split_by_name(cell.split)
+    instruction = load_instruction(cell.instruction_arm)
+    drift = experiment_drift(source_manifest, cell=cell, split=split, instruction=instruction)
+    if drift:
+        raise RuntimeError(
+            "the checkout no longer matches the run being rebookended: "
+            + "; ".join(drift)
+            + ". Restore the recorded definition; a bookend under an edited definition would "
+            "not pair with the run it claims to follow."
+        )
+    stopping_path = source_run_dir / ROLLOUT_STOPPING_FILE
+    if not stopping_path.is_file():
+        raise RuntimeError(
+            f"{source_run_dir} has no rollout terminus, so there is no conversation end to "
+            "resume from: a rebookend belongs on the far side of a real rollout ending, the "
+            "same rule eval_after always follows."
+        )
+    if terminal_session_in(source_run_dir) is None:
+        raise RuntimeError(
+            f"{source_run_dir}'s rollout record names no terminal session, so its conversation "
+            "cannot be resumed. Running the bookend cold instead would publish a mislabeled "
+            "measurement; there is no fallback."
+        )
+    run_id = _run_id(cell)
+    run_dir = Path(runs_dir) / run_id
+    lock_fd = _acquire_run_lock(run_dir)
+    try:
+        return await _rebookend_owned(
+            source_run_dir,
+            source_manifest,
+            cell=cell,
+            split=split,
+            instruction=instruction,
+            run_id=run_id,
+            run_dir=run_dir,
+            results_dir=results_dir,
+            agent_image=agent_image,
+            credentials=credentials,
+            capture_egress=capture_egress,
+        )
+    finally:
+        _release_run_lock(lock_fd)
+
+
+async def _rebookend_owned(
+    source_run_dir: Path,
+    source_manifest: dict[str, Any],
+    *,
+    cell: Cell,
+    split: Split,
+    instruction: Instruction,
+    run_id: str,
+    run_dir: Path,
+    results_dir: Path,
+    agent_image: str,
+    credentials: dict[str, str] | None,
+    capture_egress: bool,
+) -> Path:
+    """The rebookend's own run, under an already-held lock on the NEW directory.
+
+    Three copies make it work, and each has a reason to be a copy rather than a reference.
+    The source's accumulated HOME is copied whole, transcripts included, because the resumed
+    forks reopen the terminal session out of it and the source must stay the archived artifact
+    it is; nothing here ever writes back. The source's stopping record is copied in, because
+    the resumed preflight reads the terminus off the run it is part of, and because it makes
+    the new run self-contained: a usage limit that suspends this bookend resumes through the
+    ordinary `shobench resume`, which re-reads the same copied record. And the manifest is
+    built fresh from the recovered cell rather than copied, so its digests describe the home
+    this run actually starts from, with a provenance block naming the source it bookends.
+
+    What is deliberately NOT copied: the source's provenance rows and legs. This run measures
+    one thing, the after-bookend, and publishes as itself; it pairs with the source post-hoc,
+    the way the deferred baselines pair. Its artifact carries the incomplete name, because a
+    run with no eval_before cannot account for the before side, and that name is the honest
+    one.
+    """
+    sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
+    ctx = RunContext(
+        cell=cell,
+        split=split,
+        instruction=instruction,
+        harness=harness_for(cell.harness),
+        run_id=run_id,
+        run_dir=run_dir,
+        sandbox=sandbox,
+        agent_image=agent_image,
+        credentials=dict(credentials or {}),
+    )
+    # The post-rollout self, whole: durable channels AND session state, because the fork
+    # machinery resolves the terminal transcript inside this copy before any fan-out. Copied
+    # before the sandbox comes up so a failure here leaves nothing running.
+    source_home = source_run_dir / "home"
+    if not source_home.is_dir():
+        raise RuntimeError(f"{source_run_dir} has no home directory to bookend.")
+    shutil.copytree(source_home, sandbox.home, symlinks=True)
+    shutil.copy2(source_run_dir / ROLLOUT_STOPPING_FILE, run_dir / ROLLOUT_STOPPING_FILE)
+    source_stopping = json.loads(
+        (source_run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
+    )
+
+    sandbox.up()
+    spec = spec_for(cell.harness, cell.credential_mode)
+    seeded = seed_home(spec, sandbox.home)
+    _watch_cell_credential(ctx, spec)
+    observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
+    try:
+        probes = {
+            "version": ctx.redactor.text(
+                _probe(ctx.harness.version_probe(), image=agent_image, sandbox=sandbox, env={})
+            )
+        }
+        seeds = _place_runner_files(ctx)
+        manifest = build_manifest(ctx, probes=probes)
+        manifest["credential_seed"] = seeded
+        manifest["home"]["seeded"] = seeds
+        manifest["axes"]["credential_mode"] = credential_effective_mode(
+            spec, sandbox.home, env_names=sorted(ctx.credentials)
+        )
+        # What this run is a bookend OF, by run id rather than by path: a durable artifact
+        # carries no operator layout, and the id is what pairs it with the source post-hoc.
+        manifest["rebookend"] = {
+            "rebookend_of": str(source_manifest.get("run_id", "")),
+            "source_rollout_feedback": cell.rollout_feedback,
+            "source_stop_reason": str(source_stopping.get("stop_reason", "")),
+        }
+        ctx.publish_json(run_dir / "manifest.json", manifest)
+        return await _run_phases(
+            ctx,
+            manifest=manifest,
+            phases=("eval_after",),
+            results_dir=results_dir,
+            observer=observer,
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            observer.stop()
+        sandbox.down()
+
+
 def _migrate_recorded_containers(manifest: dict[str, Any], sandbox: CellSandbox) -> None:
     """One-time migration for a run recorded under the pre-digest container names.
 
@@ -2351,8 +2533,10 @@ __all__ = [
     "durable_filter",
     "cleanup",
     "read_eval_phase",
+    "rebookend_run",
     "resume_cell",
     "run_cell",
+    "terminal_session_in",
     "run_eval_phase",
     "run_leg",
     "run_rollout_phase",
