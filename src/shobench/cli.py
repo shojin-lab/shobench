@@ -389,10 +389,9 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         instruction=load_instruction(cell.instruction_arm),
         scope=runner.DRIFT_BOOKEND,
     )
-    # What the checkout's cell file says where the record says otherwise, against the FILE, so
-    # the operator sees what the bookend is declining to read from it. The two eval-runtime
-    # fields come from the record instead, and the plan states the values that will bound the
-    # legs; everything else refuses, so nothing in here is silently in force.
+    # What the checkout's cell file says where the record says otherwise, so the operator sees
+    # what the bookend is declining to read from it. Nothing in here is silently in force: the
+    # eval runtime comes from the record, and everything else refuses.
     cell_drift = runner.cell_field_drift(manifest.get("cell", {}), cell.to_manifest())
     terminal_session = runner.terminal_session_in(source_dir)
     # The id alone proves only that the stopping record names something; the plan promises the
@@ -447,15 +446,13 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
                     == manifest.get("split", {}).get("id_digest"),
                     "baseline_has_eval_before": runner._has_eval_before(baseline_dir),
                     # The whole pairing verdict, from the same helper the spending path
-                    # raises on, so a dry plan cannot say something a --go will not: every
-                    # definition the baseline's carried before rows were produced by, held
-                    # against the source's. Empty is the passing shape.
+                    # raises on, so a dry plan cannot say something a --go will not. Empty is
+                    # the passing shape.
                     "baseline_pairing_drift": runner.pairing_drift(
                         manifest, baseline_manifest
                     ),
                     # Not a refusal and not nothing: the identities NEITHER archive records,
-                    # named before the spend so the operator sees what this pairing will not
-                    # be able to prove. The bookend's manifest carries the same list.
+                    # named before the spend. The bookend's manifest carries the same list.
                     "baseline_pairing_unproven": runner.pairing_unproven(
                         manifest, baseline_manifest
                     ),
@@ -466,16 +463,14 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     elif source_has_before:
         # Self-paired: the before rows are the source's own, so the pairing is a record against
         # itself and every fact it states matches. What it does NOT state is still evidence the
-        # plan owes an operator, and the manifest carries it either way; computing it only in
-        # the named-baseline branch made the plan quieter than the artifact it precedes.
+        # plan owes an operator, and the manifest carries it either way.
         baseline_states["baseline_pairing_drift"] = runner.pairing_drift(manifest, manifest)
         baseline_states["baseline_pairing_unproven"] = runner.pairing_unproven(
             manifest, manifest
         )
-    # The third comparison, at the only stage a plan can make it: the identity of the run a --go
-    # would start, against the record it would pair with. The facts that exist only after a
-    # container and a credential (the harness probe, the effective credential mode) are checked
-    # by the runner at the moment they become knowable, still before any row.
+    # The third comparison, at the only stage a plan can make it. The facts that exist only
+    # after a container and a credential are checked by the runner at the moment they become
+    # knowable, still before any row.
     execution_lines, execution_unproven = runner.execution_drift(
         manifest,
         runner.current_identity(

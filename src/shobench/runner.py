@@ -1674,36 +1674,14 @@ ROLLOUT_ONLY_CELL_FIELDS = (
     "budget.pool_ceiling",
 )
 
-# The identity a record must STATE for a bookend or a pairing to rest on it, as (label, block,
-# key). A bookend gives up the whole-cell digest, so these are the only proof left that the
-# held-out ids and the prompts are the ones the run measured under, and a record that carries none
-# of them is a record that cannot say what it measured. Absence therefore refuses rather than
-# reading as agreement; the two versioned legacy axes are the only absences with a meaning.
+# The digests a bookend rests on once it has given up the whole-cell one: the only remaining proof
+# that its eval measures the run's held-out ids under the run's prompts.
 IDENTITY_DIGESTS = (
     ("split ids", "split", "id_digest"),
     ("rollout instruction", "instruction", "rollout_system_sha256"),
     ("eval instruction", "instruction", "eval_system_sha256"),
 )
 
-# The rest of a before row's EXECUTION IDENTITY: every recorded fact outside the cell block that
-# shaped the rows a pairing carries. Both archives must STATE each one and agree on it, absence
-# refusing exactly as it does for the digests, because a record that cannot say what produced its
-# rows cannot be shown to have produced them the same way.
-#
-# The held-out ids and the blind-eval prompt are what the row was measured over and under. The
-# kickoff is the user turn every eval leg actually sends, and the cell file's digest does not
-# cover it, the instructions living outside cells/. The agent image tag names the CLI that ran,
-# with its content id handled below, where absence has to be tolerated.
-#
-# The effective credential mode says which KIND of account served the legs (subscription, api_key,
-# or unknown) and no more than that: two different subscription accounts record the same value and
-# compare equal. It is compared because a mode change is a real change to how the legs were
-# served, and account identity is left unestablished deliberately. The auth files carry rotating
-# tokens, so a hash of them fingerprints a credential rather than an account and would refuse a
-# pairing across an ordinary token refresh; the only stable identifiers in them are the account
-# email and id, which must never enter a published artifact. So a pairing cannot tell two
-# subscription accounts apart, and this comment is the whole of the claim: quota and throttling
-# differences between two accounts are not excluded by anything here.
 # WHEN each fact can be compared, which is a property of the fact rather than of the caller. Most
 # are knowable from the checkout and docker before anything runs. Two are not: a harness probe
 # exists only once a container has run one, and the effective credential mode only once a
@@ -1712,6 +1690,16 @@ IDENTITY_DIGESTS = (
 IDENTITY_PRE_SPEND = "pre_spend"
 IDENTITY_AFTER_SETUP = "after_setup"
 
+# A row's EXECUTION IDENTITY outside the cell block: what it was measured over and under, and
+# what ran it. The kickoff is here because no cell digest covers it, the instructions living
+# outside cells/, and the image tag because it names the CLI that ran, with its content id below.
+#
+# The effective credential mode says which KIND of account served the legs (subscription, api_key
+# or unknown) and no more: two different subscription accounts record the same value and compare
+# equal, so account identity is NOT established here. It is not recorded either, deliberately.
+# The auth files carry rotating tokens, so hashing one fingerprints a credential rather than an
+# account and would refuse a pairing across an ordinary refresh, and their only stable
+# identifiers are the account email and id, which must never enter a published artifact.
 PAIRING_IDENTITY_FIELDS = (
     ("split ids", "split.id_digest", IDENTITY_PRE_SPEND),
     ("eval instruction", "instruction.eval_system_sha256", IDENTITY_PRE_SPEND),
@@ -1726,10 +1714,10 @@ PAIRING_IDENTITY_FIELDS = (
 # repo it comes from, the MCP server name the agent's tools appear under, and this runner's own
 # revision, whose absence is handled below.
 # harness_probes is what the harness reported from inside the image.
-# axes.effort is not a restatement of the cell's effort, which is why it moved here from the
-# excluded list: ``requested`` is the cell's ask, and ``applied`` and ``how`` are whether that ask
-# reached the harness at all. A before side that applied an effort the source's did not is a
-# different measurement, and only this block records the difference.
+# axes.effort is not a restatement of the cell's effort: ``requested`` is the cell's ask, and
+# ``applied`` and ``how`` are whether that ask reached the harness at all. A before side that
+# applied an effort the source's did not is a different measurement, and only this block records
+# the difference.
 # split.provenance is what the held-out POSITIONS resolve against. id_digest hashes the env name,
 # the ids and the env kwargs, which is positions rather than content: tau2 resolves those
 # positions against a byte-verified upstream tree whose sha lives here, so two archives can share
@@ -1746,21 +1734,10 @@ PAIRING_IDENTITY_BLOCKS = (
     ("harness_probes", IDENTITY_AFTER_SETUP),
 )
 
-# The identities no archive carries yet, and the one place absence is tolerated rather than
-# refused. Every fact above is in every real archive, so requiring it costs nothing; these two are
-# in none, and requiring them would refuse every pairing that exists, including the two this entry
-# was written to make possible. Recording them starts now, and the comparison is three-way:
-#
-#   both sides state it   -> compared, and a difference refuses like any other identity;
-#   one side states it    -> refuses, because one archive proves what the other cannot;
-#   neither states it     -> passes, and the fact is NAMED as unproven in the plan and in the
-#                            bookend's manifest, so the artifact says what it could not establish
-#                            instead of implying it established everything.
-#
-# This is the same versioned-absence idea as rollout_feedback and eval_context, and the opposite
-# reading of the absence: those two have a known pre-axis meaning, these have none, so they get
-# visibility rather than a default. A dirty runner tree is treated as an absence too, its commit
-# not identifying the code that ran.
+# The identities no archive carries yet, and so the only ones whose absence is tolerated rather
+# than refused: every other fact here is in every real archive, and requiring these would refuse
+# every pairing that exists. Recording them starts now; ``_identity_agreement`` holds the rule.
+# A dirty runner tree reads as an absence too, its commit not identifying the code that ran.
 PAIRING_VERSIONED_IDENTITY = (
     ("agent image digest", "container.image_digest", IDENTITY_PRE_SPEND),
     ("runner revision", "substrate.shobench_rev", IDENTITY_PRE_SPEND),
@@ -1806,13 +1783,11 @@ PAIRING_UNCOMPARED_CELL_FIELDS = (
 # How a missing field is SHOWN, in a refusal line and in the record a bookend publishes.
 CELL_FIELD_ABSENT = "<absent>"
 
-# How a missing field is COMPARED. Absence has to be an identity rather than a spelling: as a
-# string it was indistinguishable from a field whose legitimate value happens to spell the same
-# way, and model and effort take arbitrary text and reach harness session construction, so one
-# accepted value reopened the hole the union comparison exists to close. None cannot serve
-# either, being a legitimate recorded value (a cell with no pool_ceiling records null). This
-# object never leaves the comparison: it becomes the display form only once the two sides are
-# known to differ.
+# How a missing field is COMPARED. Absence has to be an identity rather than a spelling, since
+# model and effort take arbitrary text and reach harness session construction, so a field whose
+# value spells like the marker must not compare equal to a missing one. None cannot serve either,
+# being a legitimate recorded value (a cell with no pool_ceiling records null). This object never
+# leaves the comparison: it becomes the display form only once the two sides are known to differ.
 _MISSING = object()
 
 # The only absences read as values rather than as differences, because each is a versioned axis
@@ -1847,12 +1822,10 @@ def _cell_differences(
     bytes moved: a caller that has to decide whether the difference matters, or that has to tell
     a reader which value ran, gets nothing from it.
 
-    The union is what makes it fail closed, and the intersection was the bug: a field added to
-    the cell after a run was recorded exists on one side only, so comparing only the recorded
-    keys let every historical manifest through no matter how the new axis was classified, and a
-    field REMOVED from the cell went the same way. Presence is compared before values here, so a
-    field that is missing on one side differs from one that is present with any value at all.
-    The two legacy axes are the exception, and only because their pre-axis meaning is known.
+    The union is what makes it fail closed. A field added to the cell after a run was recorded
+    exists on one side only, and so does one since removed, so presence is compared before values
+    and a field missing on one side differs from one present with any value at all. The two
+    legacy axes are the exception, and only because their pre-axis meaning is known.
 
     ``_MISSING`` is kept in the result rather than rendered, so each caller can say absence its
     own way: unambiguously in a refusal line, and as the published string in the record.
@@ -1872,11 +1845,9 @@ def _cell_differences(
 def _shown(value: Any) -> str:
     """A side of a difference as a refusal line says it: no such field, or the value itself.
 
-    The two forms are deliberately not interchangeable. A field missing from the record needs a
-    value added to the checkout or a record repaired; a field whose value merely SPELLS like the
-    absence marker needs neither, and an operator reading the line has to be able to tell which
-    they are looking at. The published record keeps one string for both, where the surrounding
-    block says which fields each side carries.
+    The two forms are deliberately not interchangeable: a field missing from the record needs a
+    value added or a record repaired, and a field whose value merely SPELLS like the absence
+    marker needs neither. The published record keeps one string for both.
 
     Long values are cut, because a harness probe is a page of CLI output and a refusal nobody can
     read is a refusal nobody reads. Both manifests carry the whole value either way.
@@ -1914,11 +1885,10 @@ def bookend_cell(cell: Cell, source_manifest: dict[str, Any]) -> Cell:
     one. The eval context is the single axis a rebookend exists to change, so it is pinned rather
     than inherited.
 
-    The runner and the plan both build the cell here, so the plan's verdict is the runner's
-    verdict rather than a second opinion about it. Where the record carries no eval runtime to
-    inherit, the checkout's value stands and the drift check refuses it: an absence is not a
-    value, and only the operator can say what a run recorded before the field existed was
-    measured under.
+    The runner and the plan both build the cell here, so the plan's verdict is the runner's.
+    Where the record carries no eval runtime to inherit, the checkout's value stands and the
+    drift check refuses it: an absence is not a value, and only the operator can say what a run
+    recorded before the field existed was measured under.
     """
     return replace(
         cell,
@@ -1936,13 +1906,13 @@ def reopened_cell(cell: Cell, manifest: dict[str, Any]) -> Cell:
     reopen the provenance directory under the other regime anyway, so recovering them makes this
     an explicit reconstruction rather than a refusal an operator has to decode.
 
-    The third applies to a BOOKEND, and it is the one the whole-config check cannot catch. A
+    The third applies to a BOOKEND, and it is the one the whole-config check cannot catch: a
     bookend's eval runtime came from the run it bookends, so its record legitimately differs from
-    its cell file while its recorded config_sha256 IS that unchanged file's digest: the digest
-    check passes the reopening, and a reopening that read the budget off the checkout would
-    finish the remaining ids under a rule the finished ids never saw, splicing two stopping rules
-    into one artifact whose manifest names one of them. The recorded cell block is the authority,
-    so a bookend published before the runtime was inherited also reconstructs to what it ran.
+    its cell file while its recorded config_sha256 IS that unchanged file's digest. The digest
+    check therefore passes the reopening, and a reopening that read the budget off the checkout
+    would finish the remaining ids under a rule the finished ones never saw. The recorded cell
+    block is the authority, so a bookend published before the runtime was inherited also
+    reconstructs to what it ran.
     """
     cell = replace(
         cell,
@@ -2015,9 +1985,7 @@ def _versioned_identity(manifest: dict[str, Any], path: str) -> Any:
     """A versioned identity as recorded, with a runner revision from a dirty tree read as absent.
 
     A commit is an identity only when the tree that ran was that commit. A modified one shares
-    the sha and not the code, so treating it as a value would let two edited checkouts prove
-    something about each other; reading it as absence puts it in the unproven list instead, which
-    is what it is.
+    the sha and not the code, so two edited checkouts must not prove anything about each other.
     """
     value = _recorded_path(manifest, path)
     if path == "substrate.shobench_rev" and _recorded_path(manifest, "substrate.shobench_dirty"):
@@ -2060,15 +2028,25 @@ def _identity_agreement(
 ) -> tuple[list[str], list[str]]:
     """Two identities compared fact by fact: what disagrees, and what neither could state.
 
-    ``archives`` picks which absence discipline applies, and the two differ because the sides
-    differ. Two ARCHIVES are finished records of finished runs, so a fact one states and the
-    other does not is a record with a hole in it and refuses; only the versioned facts, which no
-    archive written before them can carry, may be silent on both sides, and then they are named.
-    A CURRENT identity is not a finished record: docker may not answer for a digest, a path may
-    not have taken a probe yet, and the archive it is checked against may predate any of these
-    fields. So there silence on either side is named rather than refused, and only two stated
-    values that disagree refuse. Both disciplines put the same fact in the same list, which is
-    what makes the published unproven list mean one thing.
+    THE absence discipline, stated once here because every comparison in this module routes
+    through it. ``archives`` picks which of the two applies, and they differ because the sides
+    differ.
+
+    Between two ARCHIVES, both are finished records of finished runs, so:
+
+        both state it   -> compared, and a difference refuses;
+        one states it   -> refuses, one record proving what the other cannot;
+        neither         -> refuses, unless the fact is versioned (no archive written before it
+                           can carry it), in which case it is named as unproven instead.
+
+    Against a CURRENT identity, which is not a finished record (docker may not answer for a
+    digest, a path may take no probe, and the archive may predate the field):
+
+        both state it   -> compared, and a difference refuses;
+        either silent   -> named as unproven.
+
+    Both disciplines put the same fact in the same list, which is what makes one published
+    unproven list mean one thing.
     """
     lines: list[str] = []
     unproven: list[str] = []
@@ -2116,7 +2094,7 @@ def _identity_agreement(
 def _identity_lines(
     label: str, left_value: Any, right_value: Any, left_name: str, right_name: str
 ) -> list[str]:
-    """One fact's verdict, absence and difference reading differently on purpose."""
+    """One fact's verdict as a reader sees it, absence and difference worded differently."""
     if left_value is _MISSING or right_value is _MISSING:
         return [
             f"{label} is not recorded on both sides ({left_name} {_shown(left_value)}, "
@@ -2185,16 +2163,13 @@ def execution_drift(
     """The third side: what the run ABOUT TO HAPPEN does not share with the record it continues.
 
     A pairing proves two archives agree with each other and a drift check proves the cell file
-    has not moved, and neither says anything about the image, the substrate, the prompts as
-    sent, or the effort as applied that the new rows will actually be produced under. Recording
-    those in the new manifest documents a mismatch rather than preventing it, so they are
-    compared here, before ``_run_phases``, and a stated disagreement refuses.
+    has not moved, and neither says anything about the image, the substrate, the prompts as sent
+    or the effort as applied that the new rows will actually be produced under. Recording those
+    in the new manifest documents a mismatch rather than preventing it, so they are compared
+    here, before ``_run_phases``, and a stated disagreement refuses.
 
-    ``stage`` says which facts are knowable yet, because some are not knowable pre-spend: see
-    ``IDENTITY_AFTER_SETUP``. Absence on either side is named rather than refused, since the
-    current side may not be able to answer (no docker, no probe on this path) and the archive may
-    predate the field; the caller publishes the names so the artifact says what it could not
-    establish.
+    ``stage`` says which facts are knowable yet: see ``IDENTITY_AFTER_SETUP``. The caller
+    publishes the returned unproven names, so the artifact says what it could not establish.
     """
     return _identity_agreement(
         recorded,
@@ -2231,10 +2206,8 @@ def pairing_unproven(
 ) -> list[str]:
     """The identities NEITHER archive states, named so the artifact can say what it did not prove.
 
-    Every other identity refuses on absence. These cannot, because no archive written before this
-    change records them and refusing would refuse the pairings the entry exists for, so silence
-    passes here and is published rather than swallowed: a reader of the delta sees exactly which
-    facts about the two sides were never established.
+    Published rather than swallowed, so a reader of the delta sees exactly which facts about the
+    two sides were never established. ``_identity_agreement`` decides what silence means.
     """
     return _identity_agreement(
         source_manifest,
@@ -2252,19 +2225,11 @@ def pairing_drift(
     """What the baseline's before rows were measured by that the source's after rows are not.
 
     A rebookend publishes ONE measurement out of two archives: the after rows it runs against the
-    source's definition, and the before rows it carries from the baseline's. The delta between
-    them is only a measurement if both sides were produced the same way, and matching the cell
-    NAME is no evidence of that: two archived runs of one cell name can predate and postdate any
-    edit to the file, so the baseline can carry a different model, a different judge, a different
-    effort, a different account or a different blind-eval prompt and still answer to the name.
-    Reproduced through the real entry: a baseline with an edited model, judge and eval prompt
-    digest was accepted and published as the pairing partner of rows it shares nothing with.
-
-    So the comparison is over the definitions the two RECORDS state, field by field, and it is
-    the same shape as the source-to-checkout one: everything refuses except what provably cannot
-    reach a before row (see ``PAIRING_UNCOMPARED_CELL_FIELDS``), plus the identity a record must
-    state rather than merely agree on: the held-out ids, the blind-eval prompt the before rows
-    were produced under, and the eval runtime that bounded them.
+    source's definition, and the before rows it carries from the baseline's. The delta is only a
+    measurement if both sides were produced the same way, and matching the cell NAME is no
+    evidence of that: two archived runs of one name can sit either side of any edit to the file.
+    So the comparison is over what the two RECORDS state, field by field, and everything refuses
+    except what provably cannot reach a before row (``PAIRING_UNCOMPARED_CELL_FIELDS``).
 
     The ROLLOUT instruction is deliberately not compared. A deferred baseline ran no rollout, and
     its before rows were produced under the eval prompt; the rollout prompt the bookend's own
@@ -2326,15 +2291,12 @@ def experiment_drift(
     half of the rollout would be run under. The digests to compare are already in the manifest,
     written before anything spent, so this is a comparison rather than a new mechanism.
 
-    ``scope`` names which comparison applies, and the difference is which question each caller
-    can answer, not how strict it feels like being. A continuation refuses on the cell file's
-    digest, the strongest statement available: nothing about that run may change. A bookend
-    compares the cell field by field instead, because it publishes a NEW run and the digest
-    cannot tell a rewritten comment from a swapped model; every field the comparison covers
-    still refuses, and the fields the bookend inherits rather than reads (the arm, the eval
-    runtime) are recovered onto the cell before this runs, so the comparison is what proves the
-    inheritance happened. The split and instruction digests are compared under both scopes: they
-    are the held-out ids and the prompts, and neither scope permits those to move.
+    ``scope`` names which comparison applies. A continuation refuses on the cell file's digest,
+    the strongest statement available: nothing about that run may change. A bookend compares the
+    cell field by field instead, because the digest cannot tell a rewritten comment from a
+    swapped model; every field it covers still refuses, and the fields a bookend inherits rather
+    than reads are recovered onto the cell before this runs, so the comparison is what proves the
+    inheritance happened. The split and instruction digests are compared under both scopes.
 
     Returned rather than raised, so a caller can report every difference at once. An operator
     told about the budget, only to be told about the split on the next attempt, learns to stop
@@ -3233,10 +3195,9 @@ async def _resume_cell_owned(
         )
     harness = harness_for(cell.harness)
     image_ref, image_tag, image_id = pinned_image(agent_image)
-    # The third comparison, and the one the cell digest cannot make: this process is about to
-    # write rows into a run that already has some, so what produces them has to be what produced
-    # the others. Everything knowable without a container is checked here, before the sandbox
-    # exists; what is knowable only after setup is checked below, still before any row.
+    # This process writes rows into a run that already has some, so what produces them has to be
+    # what produced the others. Everything knowable without a container is checked here, before
+    # the sandbox exists; the rest below, still before any row.
     unproven = _refuse_execution_drift(
         manifest,
         current_identity(
@@ -3273,10 +3234,9 @@ async def _resume_cell_owned(
     spec = spec_for(cell.harness, cell.credential_mode)
     seed_home(spec, sandbox.home)
     _watch_cell_credential(ctx, spec)
-    # The rest of the third comparison, at the first moment it can be made: the effective
-    # credential mode exists only once a credential is placed. No probe is taken on this path, so
-    # the harness probe is named unproven rather than invented; the image content id, already
-    # compared above, is the stricter statement about the same image.
+    # The effective credential mode exists only once a credential is placed, so it is compared
+    # here. No probe is taken on this path, so the harness probe is named unproven rather than
+    # invented; the image content id, compared above, is the stricter statement about that image.
     unproven += _refuse_execution_drift(
         manifest,
         after_setup_identity(
@@ -3447,9 +3407,8 @@ async def _rerun_eval_owned(
             "phase with `shobench run --phases eval_before` instead."
         )
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    # Same reconstruction as a resume, and a repair needs it for the same reason a resume does:
-    # the holes are re-run under the posture and the stopping rule the finished ids were
-    # measured under, never today's, or one artifact would carry rows scored two ways.
+    # Same reconstruction as a resume: the holes are re-run under the posture and the stopping
+    # rule the finished ids were measured under, never today's.
     cell = reopened_cell(load_cell_by_name(manifest["cell"]["name"]), manifest)
     manifest["cell"]["rollout_feedback"] = cell.rollout_feedback
     manifest["cell"]["eval_context"] = cell.eval_context
@@ -3460,12 +3419,9 @@ async def _rerun_eval_owned(
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
     # The whole-file comparison, and a repaired BOOKEND gets it too, though a rebookend does
-    # not. The difference is what each entry produces. A rebookend runs every held-out task
-    # under one definition, so it can be the current one and the artifact can say so; a repair
-    # splices rows into an eval whose other rows are already measured, so a definitional edit
-    # would put two runtimes inside one artifact with nothing to tell them apart per row. An
-    # operator refused here still has a way through that costs no honesty: rebookend the source
-    # again, which measures the whole set under one definition.
+    # not: a rebookend measures every held-out task under one definition, while a repair splices
+    # rows into an eval whose other rows are already measured, and nothing in a row would say
+    # which definition produced it. An operator refused here can rebookend the source instead.
     drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)
     if drift:
         raise RuntimeError(
@@ -3475,9 +3431,8 @@ async def _rerun_eval_owned(
         )
     harness = harness_for(cell.harness)
     image_ref, image_tag, image_id = pinned_image(agent_image)
-    # A repair splices rows in beside rows this run already has, so the same third comparison a
-    # resume makes applies here with more force: rows produced by another image or another
-    # runner would sit in one artifact with the ones they claim to complete.
+    # A repair splices rows in beside rows this run already has, so rows produced by another
+    # image or another runner would sit in one artifact with the ones they claim to complete.
     unproven = _refuse_execution_drift(
         manifest,
         current_identity(
@@ -3835,13 +3790,9 @@ async def rebookend_run(
                 f"the baseline {baseline_dir} has no eval_before provenance of its own, so "
                 "it holds no before rows to pair with."
             )
-        # The definition, compared as strictly as the held-out ids and for the same reason. The
-        # bookend runs its after side against the SOURCE's definition and carries this run's
-        # before rows, so anything that shaped those rows differently makes the published delta
-        # a comparison of two measurements: a different model or judge, a different blind-eval
-        # prompt, a different stopping rule. The cell NAME proves none of that, two archives of
-        # one name being able to sit either side of any edit to the file. Refused rather than
-        # reconciled, since nothing here can say which definition the pair should have had.
+        # The bookend runs its after side against the SOURCE's definition and carries THIS
+        # run's before rows, so the two definitions have to be one. Refused rather than
+        # reconciled, since nothing here can say which of them the pair should have had.
         pairing = pairing_drift(source_manifest, baseline_manifest)
         if pairing:
             raise RuntimeError(
@@ -3865,10 +3816,9 @@ async def rebookend_run(
             "run), so the bookend would have nothing to pair with. Name the run that "
             "measured this cell's baseline with --baseline."
         )
-    # What the checkout's cell file states differently from the record, taken against the FILE
-    # rather than against the cell this run will build from it. It is the reader's answer to
-    # "the file changed, so what governed this run?", and it goes into the manifest beside both
-    # blocks; the refusal below is a different comparison, against the cell that actually runs.
+    # Taken against the cell FILE rather than against the cell this run will build from it: the
+    # reader's answer to "the file changed, so what governed this run?". The refusal below is a
+    # different comparison, against the cell that actually runs.
     checkout_drift = cell_field_drift(source_manifest.get("cell", {}), cell.to_manifest())
     # What the pairing could not establish, computed where both records are in hand and carried
     # into the bookend's own manifest, so the artifact states it rather than a reader assuming.
@@ -3878,10 +3828,8 @@ async def rebookend_run(
     cell = bookend_cell(cell, source_manifest)
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
-    # Compared field by field rather than by the cell file's bytes, which move for a rewritten
-    # comment as readily as for a swapped model. Nothing is permitted to drift: the fields this
-    # run inherits were just recovered onto the cell, so the comparison holds that recovery to
-    # its word, and every other field refuses.
+    # Field by field rather than by the cell file's bytes. The fields this run inherits were
+    # just recovered onto the cell, so this holds that recovery to its word.
     drift = experiment_drift(
         source_manifest,
         cell=cell,
@@ -3896,10 +3844,7 @@ async def rebookend_run(
             + ". Restore the recorded definition; a bookend under an edited definition would "
             "not pair with the run it claims to follow."
         )
-    # The third side. The pairing proves the two archives agree with each other and the check
-    # above proves the cell file has not moved; neither says anything about the image, the
-    # substrate, the prompt as sent or the effort as applied that the new after rows will be
-    # produced under. Compared here, before a byte is copied, and again after setup for the
+    # The third side, compared here before a byte is copied, and again after setup for the two
     # facts that do not exist yet.
     image_ref, image_tag, image_id = pinned_image(agent_image)
     unproven_execution = _refuse_execution_drift(

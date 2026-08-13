@@ -38,15 +38,14 @@ def shobench_revision() -> tuple[str | None, bool]:
     tarball, no git on the host) records nothing rather than guessing, and nothing reads as the
     honest absence it is.
 
-    Two ways to answer WRONGLY are closed here, both of which beat absence only for a reader who
-    is not checking, which is nobody this field exists for. Every git command has to succeed: a
-    failed ``status`` beside a successful ``rev-parse`` once answered "this commit, clean", which
-    attests to bytes nobody looked at. And the repository has to be THIS package's own: git
-    searches upward, so a wheel installed under someone else's checkout finds their repository
-    and would report their HEAD as the identity of the installed bytes. The toplevel counts only
-    when the file being imported is the file that toplevel tracks.
+    A wrong answer is worse than none, so two ways to give one are closed. Every git command has
+    to succeed, since a failed ``status`` beside a successful ``rev-parse`` would attest "this
+    commit, clean" about bytes nobody looked at. And the repository has to be THIS package's own:
+    git searches upward, so a wheel installed under someone else's checkout finds their
+    repository, and the toplevel counts only when it tracks the file being imported.
 
-    Cached because a process writes several manifests and the answer cannot change under it.
+    Cached for the process, unlike the agent image: the imported code cannot change under a
+    running process, so the answer at import time is the answer for every run in it.
     """
     module = Path(__file__).resolve()
     top = _git(module.parent, "rev-parse", "--show-toplevel")

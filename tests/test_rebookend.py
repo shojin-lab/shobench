@@ -2034,9 +2034,8 @@ def test_an_axis_the_record_predates_refuses() -> None:
     """The comparison walks the UNION of the two field sets, so a cell axis added after a run
     was recorded surfaces instead of passing.
 
-    Comparing only the recorded fields was the hole: every historical manifest lacks a newly
-    added field, so classifying the new axis as measurement-defining changed nothing and the
-    fail-closed rule was an enumeration nobody enforced.
+    Comparing only the recorded fields would let every historical manifest through no matter how
+    a new axis was classified, which makes a fail-closed rule an enumeration nobody enforces.
     """
     manifest, cell, split, instruction = _retuned_timeout_source(
         "automationbench-prime_agent-claude-opus-5"
@@ -2406,10 +2405,9 @@ def test_a_resumed_bookend_keeps_the_runtime_it_inherited(tmp_path: Path, monkey
 def test_a_value_that_spells_like_absence_still_refuses() -> None:
     """Absence is compared as an identity, not as a spelling.
 
-    While the missing-key default WAS the display string, a field whose legitimate value spelled
-    the same way compared equal to a missing one in either direction, which reopened the union's
-    fail-closed hole for that one value. model and effort accept arbitrary text and reach harness
-    session construction, so the hole was reachable rather than theoretical.
+    A field whose legitimate value spells like the display marker must not compare equal to a
+    missing one in either direction: model and effort accept arbitrary text and reach harness
+    session construction, so that hole is reachable rather than theoretical.
     """
     assert runner.cell_field_drift({}, {"model": runner.CELL_FIELD_ABSENT}) != {}
     assert runner.cell_field_drift({"model": runner.CELL_FIELD_ABSENT}, {}) != {}
@@ -2748,8 +2746,8 @@ def test_the_pairing_identity_set_is_the_decided_one() -> None:
 def test_a_baseline_with_another_kickoff_is_refused_through_the_entry(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """One of the three the review mutated, driven through the real entry rather than the
-    helper, so the refusal is proven where the spend would have happened."""
+    """Driven through the real entry rather than the helper, so the refusal is proven where the
+    spend would have happened."""
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split, with_before=False)
     baseline_dir = _baseline_run(tmp_path, cell, split)

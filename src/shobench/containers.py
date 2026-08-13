@@ -72,10 +72,9 @@ def image_digest(image: str) -> str | None:
     raising or guessing: a manifest that records an honest absence is what lets a reader see the
     identity was never established, and this is not worth failing a run over.
 
-    Deliberately uncached. The runner asks once per run and carries the answer in the run's
-    context, which is the scope that means anything: a process-lifetime cache made a second run
-    in one process pin the image the FIRST run resolved, so a deliberate rebuild between two
-    calls of the exported async API published the old id for the new run's rows.
+    Deliberately uncached, unlike the runner revision: an image is re-read from the daemon at
+    container start, so a rebuild between two runs in one process is real. The runner asks once
+    per run and carries the answer in that run's context, which is the scope that means anything.
     """
     if shutil.which("docker") is None:
         return None
