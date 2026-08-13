@@ -24,6 +24,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          # checkout stores its token in the local git config by default, where ruff or pytest
+          # code from a pull request could read it back out. Nothing here pushes or calls the
+          # API, so the checkout keeps no credential and the boundary stated above holds.
+          persist-credentials: false
 
       - uses: astral-sh/setup-uv@v9.0.0
         with:
