@@ -8,12 +8,13 @@
 # a green run that skipped everything is visible rather than silent. A step here that needs a
 # provider credential does not belong in this workflow.
 #
-# One credential is present, and it is GitHub's own: the ephemeral job token, scoped by the
-# permissions block below to reading this repository and dead when the job ends. actions/checkout
-# is handed it and fetches with it, and the runner's cache service takes its own token from the
-# same source. Neither is a spend path and neither reaches the steps that run repository code:
-# the checkout is told not to leave it in the git config, the uv setup is told to decline it, and
-# no later step is passed it. That is the true statement, and it is worth more here than the
+# Two credentials are present, both issued by GitHub and both dead when the job ends. The job
+# token, scoped by the permissions block below to reading this repository, is handed to
+# actions/checkout, which fetches with it. The runner injects a separate cache-service token into
+# every Node action, and the uv setup's cache runs on that one. Neither is a spend path, and
+# neither reaches a step that runs repository code: the checkout is told not to leave its token in
+# the git config, the uv setup is told to decline the job token it would otherwise be handed, and
+# no later step is passed either. That is the true statement, and it is worth more here than the
 # rounder claim that the job touches no credential at all.
 name: ci
 
