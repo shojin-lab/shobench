@@ -34,8 +34,16 @@ jobs:
         with:
           version: "0.12.3"
           python-version: "3.12"
+          # The action takes the job's token by default and holds it for the length of the step.
+          # It attaches it to nothing but a download from github.com, and the pinned version comes
+          # off Astral's mirror, so declining it costs this job nothing. The tradeoff sits on the
+          # fallback path: if the mirror is unreachable, the retry against GitHub releases goes out
+          # anonymously and shares the runner's rate limit. A slower cold install is the cheaper
+          # thing to spend than a credential nothing here has a use for.
+          github-token: ""
           # uv's download cache, keyed on the lock. shogym is a git dependency, so a cold cache
-          # is a clone rather than a wheel pull.
+          # is a clone rather than a wheel pull. The cache service takes the runner's own token,
+          # not the one declined above.
           enable-cache: true
           cache-dependency-glob: uv.lock
 
