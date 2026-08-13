@@ -273,7 +273,8 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
     assert manifest["cell"]["rollout_feedback"] == "never"
     assert manifest["cell"]["eval_context"] == "resumed"
     assert manifest["instruction"]["eval_prompt_used"] == "rollout_system"
-    assert manifest["rebookend"] == {
+    marker = manifest["rebookend"]
+    assert {key: marker[key] for key in marker if key not in ("source_cell", "cell_drift")} == {
         "rebookend_of": "source-run-20260101T000000Z",
         # The source measured its own eval_before, so the baseline defaults to it: the
         # self-paired case, stated in the marker rather than assumed by the reader.
@@ -281,6 +282,12 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
         "source_rollout_feedback": "never",
         "source_stop_reason": "agent_stopped_early",
     }
+    # The source's recorded cell block is kept whole beside the block this run ran under, and
+    # every field the two state differently is named with both values. Nothing but the axis a
+    # rebookend exists to change moved here, and that is what the record says.
+    source_manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert marker["source_cell"] == source_manifest["cell"]
+    assert marker["cell_drift"] == {"eval_context": {"recorded": "cold", "now": "resumed"}}
 
     # Published honestly, under its OWN name, and SELF-CONTAINED: the before block is the
     # baseline's carried rows, labeled with the run they came from, so the paired delta

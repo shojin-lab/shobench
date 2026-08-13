@@ -22,6 +22,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from shobench import credentials, report, runner, tau2_data
@@ -378,12 +379,21 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     cell = load_cell_by_name(manifest["cell"]["name"])
     recorded_arm = runner.recorded_rollout_feedback(manifest)
     split = load_split_by_name(cell.split)
+    # The plan's verdict has to be the runner's verdict, so the plan applies the runner's own
+    # recovery before comparing: the bookend inherits the source's recorded feedback arm and
+    # pins the eval context to resumed, whatever the checkout's defaults are today. Compared
+    # without it, a moved default would read as drift here and pass there.
+    bookend_cell = replace(cell, rollout_feedback=recorded_arm, eval_context="resumed")
     drift = runner.experiment_drift(
         manifest,
-        cell=cell,
+        cell=bookend_cell,
         split=split,
         instruction=load_instruction(cell.instruction_arm),
+        scope=runner.DRIFT_BOOKEND,
     )
+    # What the bookend WILL run under where the source recorded something else. Empty for a
+    # settled checkout; a refusing field never reaches it, since drift above blocks the --go.
+    cell_drift = runner.cell_field_drift(manifest.get("cell", {}), bookend_cell.to_manifest())
     terminal_session = runner.terminal_session_in(source_dir)
     # The id alone proves only that the stopping record names something; the plan promises the
     # session it will fork, so the transcript is resolved in the SOURCE home with the same
@@ -470,6 +480,9 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             "eval_context": "resumed",
             "eval_prompt_used": "rollout_system",
         },
+        # The fields the bookend's eval will run under a different value of than the source
+        # recorded, named before anything spends and recorded again in the bookend's manifest.
+        "cell_drift": cell_drift,
         "source_stop_reason": source_stopping.get("stop_reason"),
         "terminal_session_id": terminal_session,
         "baseline_run_id": baseline_run_id,
