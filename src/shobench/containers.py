@@ -29,7 +29,6 @@ import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 
 # Given a POSIX-relative path inside the agent's HOME, is this file noise rather than part of
@@ -61,7 +60,6 @@ def daemon_available() -> bool:
     return shutil.which("docker") is not None and docker("info", check=False).returncode == 0
 
 
-@lru_cache(maxsize=8)
 def image_digest(image: str) -> str | None:
     """The image's content id, which is exactly what a tag is not.
 
@@ -74,8 +72,10 @@ def image_digest(image: str) -> str | None:
     raising or guessing: a manifest that records an honest absence is what lets a reader see the
     identity was never established, and this is not worth failing a run over.
 
-    Cached per image name, a run writing several manifests and rebuilding an image mid-run not
-    being a thing this benchmark does.
+    Deliberately uncached. The runner asks once per run and carries the answer in the run's
+    context, which is the scope that means anything: a process-lifetime cache made a second run
+    in one process pin the image the FIRST run resolved, so a deliberate rebuild between two
+    calls of the exported async API published the old id for the new run's rows.
     """
     if shutil.which("docker") is None:
         return None

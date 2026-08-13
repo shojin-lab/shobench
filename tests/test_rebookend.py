@@ -190,10 +190,16 @@ def _fingerprint(root: Path) -> dict[str, str]:
     }
 
 
-def _wire_fakes(monkeypatch, cell, split, launches: dict[int, dict]) -> None:
+def _wire_fakes(
+    monkeypatch, cell, split, launches: dict[int, dict], probes: list | None = None
+) -> None:
     """The same provider-free fan-out the resumed eval_after tests drive, plus the loaders:
     the cell under test is synthetic, so the checkout loaders hand back the recorded
-    definitions the drift check verifies, exactly as they would for a committed cell."""
+    definitions the drift check verifies, exactly as they would for a committed cell.
+
+    ``probes`` collects the image reference each probe was run against, which is how a test
+    proves the probe and the legs saw the same bytes."""
+    probes = [] if probes is None else probes
 
     def fake_run_leg(ctx_arg: RunContext, **kw: object) -> LegRecord:
         idx = int(kw["task_idx"])  # type: ignore[arg-type]
@@ -255,7 +261,9 @@ def _wire_fakes(monkeypatch, cell, split, launches: dict[int, dict]) -> None:
     )
     monkeypatch.setattr(CellSandbox, "down", lambda self: None)
     monkeypatch.setattr(runner, "seed_home", lambda spec, home: {})
-    monkeypatch.setattr(runner, "_probe", lambda *a, **kw: "probe")
+    monkeypatch.setattr(
+        runner, "_probe", lambda *a, **kw: probes.append(kw.get("image")) or "probe"
+    )
     monkeypatch.setattr(runner, "warm_env", lambda cell_arg: None)
     monkeypatch.setattr(runner, "build_stream", lambda *a, **kw: _FakeStream())
     monkeypatch.setattr(runner, "_served", _fake_served)
@@ -3085,3 +3093,34 @@ def test_the_plan_reports_the_execution_check_before_any_spend(
     err = capsys.readouterr().err
     assert "BLOCKED" in err and "execution identity" in err
     assert not (tmp_path / "runs").exists()
+
+
+def test_a_bookend_probes_the_image_its_legs_will_run(tmp_path: Path, monkeypatch) -> None:
+    """The probe and the legs are one image or the record describes a run that did not happen.
+
+    The probe took the mutable TAG while the legs took the pinned id, so a rebuild between the
+    two put image B in the probe and image A in the manifest and the rows; two builds printing
+    one version string is exactly the case the content id exists to tell apart, so the version
+    probe cannot be what notices.
+    """
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    launches: dict[int, dict] = {}
+    probes: list[str] = []
+    _wire_fakes(monkeypatch, cell, split, launches, probes)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    pinned = runner.image_digest("shobench-agent:v0")
+    assert probes == [pinned], probes
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((new_run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["container"]["image_digest"] == pinned
+    assert manifest["container"]["agent_image"] == "shobench-agent:v0"

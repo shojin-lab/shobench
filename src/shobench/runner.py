@@ -3062,6 +3062,12 @@ async def _run_cell_owned(
 ) -> Path:
     instruction = load_instruction(cell.instruction_arm)
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
+    # A fresh run pins its image exactly as a reopening does, and for the same two reasons: its
+    # probes and its legs must be the same bytes, and the archive it becomes has to STATE which
+    # bytes those were. A fresh run that skipped this recorded no content id at all, so every
+    # pairing it ever took part in would have called the image unproven for the life of the
+    # archive, and the promise that recording starts now would have been empty.
+    image_ref, image_tag, image_id = pinned_image(agent_image)
     ctx = RunContext(
         cell=cell,
         split=split,
@@ -3071,7 +3077,9 @@ async def _run_cell_owned(
         run_dir=run_dir,
         sandbox=sandbox,
         port=port,
-        agent_image=agent_image,
+        agent_image=image_ref,
+        image_tag=image_tag,
+        image_digest=image_id,
         credentials=dict(credentials or {}),
     )
 
@@ -3089,7 +3097,16 @@ async def _run_cell_owned(
             # No credential: a version probe reports what the image installed, which no harness
             # needs to authenticate to answer. The model probe is the one that does.
             "version": ctx.redactor.text(
-                _probe(ctx.harness.version_probe(), image=agent_image, sandbox=sandbox, env={})
+                _probe(
+                    ctx.harness.version_probe(),
+                    # The pinned reference, never the tag: a probe from one image beside legs
+                    # from another describes a run that did not happen, and two builds printing
+                    # one version string is precisely the case the content id exists to tell
+                    # apart, so the version probe cannot be the thing that notices.
+                    image=ctx.agent_image,
+                    sandbox=sandbox,
+                    env={},
+                )
             )
         }
         model_probe = ctx.harness.model_probe()
@@ -3100,7 +3117,7 @@ async def _run_cell_owned(
             # twice would otherwise put the first of the two into the manifest it feeds.
             with _watching_credentials(ctx, sandbox.home):
                 output = _probe(
-                    model_probe, image=agent_image, sandbox=sandbox, env=ctx.credentials
+                    model_probe, image=ctx.agent_image, sandbox=sandbox, env=ctx.credentials
                 )
             ctx.watch_credentials(sandbox.home)
             probes["model"] = ctx.redactor.text(output)
@@ -4102,7 +4119,16 @@ async def _rebookend_owned(
     try:
         probes = {
             "version": ctx.redactor.text(
-                _probe(ctx.harness.version_probe(), image=agent_image, sandbox=sandbox, env={})
+                _probe(
+                    ctx.harness.version_probe(),
+                    # The pinned reference, never the tag: a probe from one image beside legs
+                    # from another describes a run that did not happen, and two builds printing
+                    # one version string is precisely the case the content id exists to tell
+                    # apart, so the version probe cannot be the thing that notices.
+                    image=ctx.agent_image,
+                    sandbox=sandbox,
+                    env={},
+                )
             )
         }
         seeds = _place_runner_files(ctx)
