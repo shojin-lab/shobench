@@ -41,7 +41,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -1080,6 +1080,13 @@ def _single_task_split(split: Split, phase: str, task_id: str) -> Split:
 
 
 SUSPENSION_FILE = "suspended.json"
+# The baseline's eval_before rows, carried INTO a bookend run directory at creation and
+# published as the bookend artifact's own before block. The baseline's result artifact lives
+# under the shared cell stem and is routinely evicted by later same-cell publications, so an
+# artifact that depended on it could stop assembling the day another run of the cell
+# published; carrying the rows makes the bookend artifact self-contained, and the block is
+# labeled with the run id it came from so no reader mistakes it for rows this run measured.
+BASELINE_BEFORE_FILE = "baseline_before.json"
 # The rollout's stop classification, persisted beside its provenance the moment the rollout ends.
 # Only the runner sees how a leg ended, so this is the one piece of the rollout that cannot be
 # re-read from the shogym record. An eval_after suspension leaves the rollout finished but the
@@ -1671,6 +1678,25 @@ async def _run_phases(
     manifest["ended_at"] = time.time()
     ctx.publish_json(ctx.run_dir / "manifest.json", manifest)
 
+    # A bookend publishes the BASELINE's before rows as its own block, labeled with the run
+    # they came from, so the artifact carries its whole pairing and depends on no other file:
+    # the baseline's own artifact lives under the shared cell stem and is routinely evicted
+    # by later same-cell publications. The carried rows were persisted at creation; a
+    # marker-bearing run whose carry is gone cannot publish self-contained and must not
+    # publish an empty before under the resumed label, so it refuses.
+    before_source_run_id: str | None = None
+    baseline_payload_path = ctx.run_dir / BASELINE_BEFORE_FILE
+    if "rebookend" in manifest:
+        if not baseline_payload_path.is_file():
+            raise RuntimeError(
+                f"{ctx.run_dir} is a rebookend but its carried baseline rows "
+                f"({BASELINE_BEFORE_FILE}) cannot be read, so the artifact cannot be "
+                "published self-contained. The file is written at creation; restore it or "
+                "recreate the bookend."
+            )
+        payload = json.loads(baseline_payload_path.read_text(encoding="utf-8"))
+        phase_rows["eval_before"] = [TaskResult(**row) for row in payload["rows"]]
+        before_source_run_id = str(payload.get("source_run_id") or "") or None
     egress_summary = observer.stop()
     results_path = write_results(
         results_dir / f"{artifact or ctx.cell.name}.json",
@@ -1680,6 +1706,7 @@ async def _run_phases(
         heldout_ids=heldout_ids,
         egress=egress_summary,
         redact=ctx.redactor.json,
+        before_source_run_id=before_source_run_id,
     )
     # Said out loud as well as written down. A cell that cannot account for every held-out id is
     # not this cell's result, and the operator who ran it is the one who can decide what to do
@@ -2593,8 +2620,10 @@ async def rebookend_run(
                 "it holds no before rows to pair with."
             )
         baseline_run_id = str(baseline_manifest.get("run_id", ""))
+        baseline_dir_resolved = baseline_dir
     elif _has_eval_before(source_run_dir):
         baseline_run_id = str(source_manifest.get("run_id", ""))
+        baseline_dir_resolved = source_run_dir
     else:
         raise RuntimeError(
             f"{source_run_dir} has no eval_before of its own (a rollout-only or after-only "
@@ -2662,6 +2691,7 @@ async def rebookend_run(
             split=split,
             instruction=instruction,
             baseline_run_id=baseline_run_id,
+            baseline_dir=baseline_dir_resolved,
             run_id=run_id,
             run_dir=run_dir,
             results_dir=results_dir,
@@ -2681,6 +2711,7 @@ async def _rebookend_owned(
     split: Split,
     instruction: Instruction,
     baseline_run_id: str,
+    baseline_dir: Path,
     run_id: str,
     run_dir: Path,
     results_dir: Path,
@@ -2770,6 +2801,31 @@ async def _rebookend_owned(
         source_stopping = json.loads(
             (source_run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
         )
+
+    # The baseline's before rows, carried in at creation and published later as this
+    # artifact's own before block. Read PRE-SPEND, so a baseline whose provenance cannot be
+    # read refuses before anything is paid for, and persisted into the new run directory, so
+    # every publication of this run (the first, a resumed one, a repaired one) reads the same
+    # carried rows. Held still when the baseline carries a lock file; the pre-lock-era
+    # baselines have none, and their row files are append-only JSONL written by archived
+    # runs, so a plain read is honest there.
+    heldout_ids = [int(t) for t in side_for_phase(split, "eval_before").task_ids]
+    baseline_hold = (
+        _holding_source_still(baseline_dir)
+        if (baseline_dir / RUN_LOCK_FILE).is_file()
+        else contextlib.nullcontext()
+    )
+    with baseline_hold:
+        baseline_rows = read_eval_phase(baseline_dir / "eval_before", heldout_ids)
+    if not any(row.scored for row in baseline_rows):
+        raise RuntimeError(
+            f"the baseline {baseline_dir} holds no readable scored eval_before rows, so the "
+            "bookend would have nothing to pair with. Nothing has been spent."
+        )
+    ctx.publish_json(
+        run_dir / BASELINE_BEFORE_FILE,
+        {"source_run_id": baseline_run_id, "rows": [asdict(row) for row in baseline_rows]},
+    )
 
     sandbox.up()
     spec = spec_for(cell.harness, cell.credential_mode)

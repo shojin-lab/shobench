@@ -495,13 +495,20 @@ default; a rollout-only or after-only source (every v0 source, whose baselines a
 deferred runs) REQUIRES `--baseline`, validated before anything spends: a real run, not
 itself a bookend, the same cell, the same split id digest (the load-bearing check, because
 before rows over different held-out ids would pair task numbers that are not the same
-tasks), and carrying eval_before provenance of its own. The report is where the halves
-meet: `shobench report` assembles each bookend with the BASELINE its marker names, pairing
-the baseline's eval_before rows with the BOOKEND's eval_after rows through the same pairing
-every publisher uses, and every reported row carries its run id, its arm axes (pre-axis
-artifacts render their recorded arms, never plus cold, exactly as the recorded-axis helpers
-define absence), and its pairing, with a bookend whose baseline is not among the loaded
-files surfaced explicitly as BASELINE MISSING rather than reported as an unpaired zero. Chains are refused, not walked: a bookend of a bookend re-measures the same
+tasks), and carrying eval_before provenance of its own. The artifact is SELF-CONTAINED: at
+creation the baseline's eval_before rows are read from its run directory (refusing before
+any spend when none are readable) and persisted into the bookend's own run directory, and
+every publication of the bookend, first or reopened, publishes those rows as its own before
+block, labeled `eval_before.source_run_id`, so the paired delta lives inside the artifact
+and names both runs it derives from. That matters because baseline artifacts live under the
+shared cell stem and are routinely evicted by later same-cell publications; a bookend that
+depended on the baseline's artifact stopped assembling the day another run of the cell
+published. The reporter therefore needs no join for a self-contained bookend; the join
+survives only for LEGACY bookends published before the carry, where a baseline missing from
+the loaded files still surfaces explicitly as BASELINE MISSING and a bookend-shaped
+baseline as INVALID PROVENANCE, never silently. Every reported row carries its run id, its
+arm axes (pre-axis artifacts render their recorded arms, never plus cold, exactly as the
+recorded-axis helpers define absence), and its pairing. Chains are refused, not walked: a bookend of a bookend re-measures the same
 terminal state as rebookending the original directly (the bookend's home is the source's
 terminal home, copied, and its own eval_after advanced no rollout), so the runner and the
 plan refuse a source that is itself a rebookend, naming the original to bookend instead, and

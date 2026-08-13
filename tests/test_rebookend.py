@@ -187,6 +187,14 @@ def _wire_fakes(monkeypatch, cell, split, launches: dict[int, dict]) -> None:
         if not prov_dir.name.startswith("task-"):
             return []
         idx = int(prov_dir.name.split("-")[1])
+        if "eval_before" in prov_dir.parts:
+            # Baseline provenance: the archived before row the creation-time carry reads.
+            return [
+                TaskResult(
+                    seq=idx, position=0, task_idx=idx, closure="sealed", reward=0.25,
+                    success=False,
+                )
+            ]
         if idx not in launches:
             return []
         return [
@@ -274,13 +282,17 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
         "source_stop_reason": "agent_stopped_early",
     }
 
-    # Published honestly and under its OWN name: a run with no eval_before cannot account for
-    # the before side, so it carries the incomplete name, and the stem is the bookend's run
-    # id, never the cell name, which is the source's artifact.
-    assert results_path.name == f"{new_run.name}.incomplete.json"
+    # Published honestly, under its OWN name, and SELF-CONTAINED: the before block is the
+    # baseline's carried rows, labeled with the run they came from, so the paired delta
+    # lives inside the artifact and no other file is needed to read it. The carried before
+    # side is whole here, so the artifact accounts for every id and takes the finished name.
+    assert results_path.name == f"{new_run.name}.json"
     published = json.loads(results_path.read_text(encoding="utf-8"))
     assert published["eval_after"]["summary"]["n_scored"] == 3
-    assert all(r["closure"] == "missing" for r in published["eval_before"]["tasks"])
+    assert published["eval_before"]["source_run_id"] == "source-run-20260101T000000Z"
+    assert published["eval_before"]["summary"]["n_scored"] == 3
+    assert len(published["paired"]) == 3
+    assert all(p["reward_delta"] == pytest.approx(0.75) for p in published["paired"])
     assert published["manifest"]["rebookend"]["rebookend_of"] == "source-run-20260101T000000Z"
 
 
@@ -639,7 +651,7 @@ def test_two_rebookends_of_one_source_in_one_second_get_distinct_runs(
     # And two coexisting artifacts, one per bookend, neither under the cell name.
     artifacts = sorted(p.name for p in (tmp_path / "results").iterdir())
     assert len(artifacts) == 2
-    assert artifacts == sorted(f"{p.name}.incomplete.json" for p in run_dirs)
+    assert artifacts == sorted(f"{p.name}.json" for p in run_dirs)
 
 
 def test_a_suspended_bookend_resumes_with_nothing_recorded(tmp_path: Path, monkeypatch) -> None:
@@ -1064,6 +1076,15 @@ def test_a_rollout_only_source_pairs_through_its_named_baseline(
     assert manifest["rebookend"]["rebookend_of"] == "source-run-20260101T000000Z"
     assert manifest["rebookend"]["baseline_run_id"] == "baseline-run-20260101T000000Z"
     assert set(launches) == {0, 1, 2}
+    # The artifact self-contains the BASELINE's before rows, labeled, and pairs inside.
+    artifact = json.loads(
+        next((tmp_path / "results").glob(f"{new_run.name}*.json")).read_text(encoding="utf-8")
+    )
+    assert artifact["eval_before"]["source_run_id"] == "baseline-run-20260101T000000Z"
+    assert artifact["eval_before"]["summary"]["n_scored"] == 3
+    assert len(artifact["paired"]) == 3
+    # And the carry survives in the run dir for any reopening to republish from.
+    assert (new_run / runner.BASELINE_BEFORE_FILE).is_file()
 
 
 def test_a_before_less_source_requires_a_named_baseline(tmp_path: Path, monkeypatch) -> None:
@@ -1183,13 +1204,12 @@ def test_a_baseline_over_a_different_split_or_cell_refuses(
     assert not (tmp_path / "runs").exists()
 
 
-def test_the_v0_shape_assembles_against_the_separate_baseline_artifact(
+def test_a_legacy_bookend_still_joins_against_a_loaded_baseline_artifact(
     tmp_path: Path,
 ) -> None:
-    """The reviewer's end-to-end render, at the real scale: a rollout-only source artifact
-    with an all-missing before side, a separate baseline artifact with 118 of 120 scored
-    before rows, and a bookend whose marker names the source as lineage and the baseline as
-    the pairing partner. Assembled: 118 pairs, 2 unpaired, deltas over exactly the 118."""
+    """The LEGACY path: a bookend published before the carry existed has no rows of its own
+    and no source_run_id label, so the assembler joins it against the loaded baseline
+    artifact, exactly as before. New bookends are self-contained and never reach this join."""
     from shobench.report import assemble, load_results, report_cell
     from shobench.results import TaskResult, write_results
 
@@ -1257,6 +1277,116 @@ def test_the_v0_shape_assembles_against_the_separate_baseline_artifact(
     assert bookend.n_paired == 118
     assert bookend.n_unpaired == 2
     assert bookend.mean_delta == pytest.approx(0.5)
+
+
+def _self_contained_bookend(results: Path, *, ids: list[int], before_holes: tuple[int, ...]) -> str:
+    """A bookend artifact published the way the runner now publishes one: the baseline's
+    before rows carried in and labeled, the pairing computed inside write_results."""
+    from shobench.results import TaskResult, write_results
+
+    def row(idx: int, reward: float) -> TaskResult:
+        return TaskResult(
+            seq=idx, position=idx, task_idx=idx, closure="sealed", reward=reward,
+            success=False,
+        )
+
+    run_id = "cell-a-20260105T000000Z-rbc0ffee00"
+    write_results(
+        results / f"{run_id}.json",
+        manifest={
+            "run_id": run_id,
+            "cell": {"name": "cell-a", "rollout_feedback": "never", "eval_context": "resumed"},
+            "rebookend": {
+                "rebookend_of": "rollout-source",
+                "baseline_run_id": "baseline-run",
+                "source_rollout_feedback": "never",
+                "source_stop_reason": "agent_stopped_early",
+            },
+        },
+        phases={
+            "eval_before": [row(i, 0.25) for i in ids if i not in before_holes],
+            "eval_after": [row(i, 0.75) for i in ids],
+            "rollout": [],
+        },
+        stopping={},
+        heldout_ids=ids,
+        before_source_run_id="baseline-run",
+    )
+    return run_id
+
+
+def test_a_self_contained_bookend_reports_with_zero_cross_file_dependence(
+    tmp_path: Path,
+) -> None:
+    """The round-9 property, at the real scale: the artifact carries the baseline's 118 of
+    120 scored before rows, labeled, and the 118/120 pairing lives INSIDE it, so the report
+    renders it correctly with no other file loaded at all: the baseline artifact being
+    evicted by a later same-cell publication (the real report directory's state for three of
+    the four baselines) changes nothing."""
+    from shobench.report import assemble, load_results, render_table, report_cell
+
+    results = tmp_path / "results"
+    results.mkdir()
+    ids = list(range(120))
+    run_id = _self_contained_bookend(results, ids=ids, before_holes=(7, 11))
+
+    # The artifact itself carries the pairing.
+    artifact = json.loads((results / f"{run_id}.incomplete.json").read_text(encoding="utf-8"))
+    assert artifact["eval_before"]["source_run_id"] == "baseline-run"
+    assert len(artifact["paired"]) == 118
+
+    # And the report needs nothing else: this is the ONLY file in the directory.
+    docs = assemble(load_results(results))
+    (report,) = [report_cell(d, resamples=100, seed=1) for d in docs]
+    assert report.pairing == "assembled"
+    assert report.n_paired == 118
+    assert report.n_unpaired == 2
+    assert report.mean_delta == pytest.approx(0.5)
+    assert report.baseline_run_id == "baseline-run"
+    assert report.rebookend_of == "rollout-source"
+    table = render_table([report])
+    assert "of baseline-run" in table
+
+
+def test_a_marker_bearing_run_refuses_to_publish_without_its_carried_rows(
+    tmp_path: Path,
+) -> None:
+    """Publication is where self-containment is enforced: a rebookend whose carried baseline
+    rows are gone must not publish an empty before under the resumed label, whichever
+    process is publishing (the first run, a resume, a repair)."""
+    cell, split = _synthetic_definitions(tmp_path)
+    run_dir = tmp_path / "bookend-run"
+    home = run_dir / "home"
+    home.mkdir(parents=True)
+    ctx = RunContext(
+        cell=replace(cell, eval_context="resumed"),
+        split=split,
+        instruction=load_instruction(cell.instruction_arm),
+        harness=runner.harness_for(cell.harness),
+        run_id="bookend-run-1",
+        run_dir=run_dir,
+        sandbox=CellSandbox(run_id="b", home=home, workdir=run_dir / "work"),
+    )
+    manifest = build_manifest(ctx, probes={"version": "t"})
+    manifest["rebookend"] = {
+        "rebookend_of": "src",
+        "baseline_run_id": "baseline",
+        "source_rollout_feedback": "never",
+        "source_stop_reason": "agent_stopped_early",
+    }
+
+    with pytest.raises(RuntimeError, match="carried baseline rows"):
+        asyncio.run(
+            runner._run_phases(
+                ctx,
+                manifest=manifest,
+                phases=(),
+                results_dir=tmp_path / "results",
+                observer=runner._Egress(None, run_dir),
+                artifact="bookend-run-1",
+            )
+        )
+    assert not (tmp_path / "results").exists()
 
 
 def test_the_source_is_held_still_for_the_whole_snapshot(tmp_path: Path, monkeypatch) -> None:
@@ -1477,14 +1607,16 @@ def test_cli_rebookend_plans_without_spending(tmp_path: Path, capsys) -> None:
     assert plan["refusals"]["source_live"] is False
     assert plan["refusals"]["outputs_inside_source"] == []
     assert "result_leaves_inside_source" not in plan["refusals"]
-    assert plan["result_artifact"].startswith("<bookend-run-id>.incomplete.json")
+    assert plan["result_artifact"].startswith("<bookend-run-id>.json")
     assert plan["refusals"]["rollout_terminus_present"] is True
     assert plan["refusals"]["terminal_session_resolvable"] is True
     assert plan["refusals"]["terminal_transcript_resolvable"] is True
     assert plan["refusals"]["experiment_drift"] == []
-    # The leaf named is the one a before-less bookend actually writes.
-    assert plan["result_artifact"].startswith("<bookend-run-id>.incomplete.json")
-    assert "assembles them by run id" in plan["result_artifact"]
+    # The plan names the real partner: the artifact is self-contained, carrying the
+    # baseline run's before rows under an explicit label.
+    assert plan["result_artifact"].startswith("<bookend-run-id>.json")
+    assert "source-run-20260101T000000Z" in plan["result_artifact"]
+    assert "eval_before.source_run_id" in plan["result_artifact"]
 
 
 def test_cli_plan_refuses_an_unresolvable_transcript(tmp_path: Path, capsys) -> None:
@@ -1553,7 +1685,7 @@ def test_the_bookend_and_the_source_results_coexist(tmp_path: Path, monkeypatch)
     )
 
     new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
-    assert results_path.name == f"{new_run.name}.incomplete.json"
+    assert results_path.name == f"{new_run.name}.json"
     assert (results / f"{cell.name}.incomplete.json").read_text() == '{"marker": "SOURCE"}'
     assert json.loads(results_path.read_text())["manifest"]["rebookend"][
         "rebookend_of"

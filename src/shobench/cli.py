@@ -30,7 +30,6 @@ from shobench.containers import AGENT_IMAGE, NETNS_IMAGE, CellSandbox, build_ima
 from shobench.egress import EGRESS_IMAGE
 from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REV
-from shobench.results import INCOMPLETE_SUFFIX
 from shobench.runner import SUSPENSION_FILE, resume_cell, run_cell
 from shobench.serving import DEFAULT_PORT
 from shobench.splits import load_split_by_name
@@ -477,15 +476,15 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         # Every held-out task, because a rebookend is a fresh bookend rather than a repair:
         # nothing is already complete in a run directory that does not exist yet.
         "heldout_tasks_to_run": len(split.heldout),
-        # The leaf a before-less bookend actually writes is the incomplete shape, always:
-        # with no eval_before it cannot account for the before side. The pairing partner is
-        # the source's own artifact, in whichever shape the source published (the report-set
-        # sources are the incomplete shape), and `shobench report` assembles the two by run
-        # id.
-        "result_artifact": f"<bookend-run-id>{INCOMPLETE_SUFFIX} under {args.results} "
-        f"(pairs post-hoc with the source's {cell.name}.json or "
-        f"{cell.name}{INCOMPLETE_SUFFIX}, which is never touched; `shobench report` "
-        "assembles them by run id)",
+        # The artifact is SELF-CONTAINED: it carries the baseline run's eval_before rows
+        # as its own before block, labeled eval_before.source_run_id, so the paired delta
+        # lives inside the artifact and survives the baseline's cell-stem artifact being
+        # evicted by a later same-cell publication. Its name reflects whatever the carried
+        # before side can account for; a baseline with holes publishes the incomplete shape.
+        "result_artifact": f"<bookend-run-id>.json under {args.results} "
+        f"(self-contained: carries eval_before rows from the baseline run "
+        f"{baseline_run_id or '<named via --baseline>'}, labeled "
+        "eval_before.source_run_id; the source's cell artifact is never touched)",
         "source_home": {
             "files": len(home_files),
             "bytes": sum(p.stat().st_size for p in home_files),

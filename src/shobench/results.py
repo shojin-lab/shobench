@@ -342,6 +342,7 @@ def write_results(
     heldout_ids: Sequence[int],
     egress: dict[str, Any] | None = None,
     redact: Callable[[Any], Any] | None = None,
+    before_source_run_id: str | None = None,
 ) -> Path:
     """Write the cell's results JSON: the manifest, the per-task scores, and the summaries.
 
@@ -400,6 +401,10 @@ def write_results(
         "eval_before": {
             "summary": eval_summary(before, task_ids=ids),
             "tasks": [asdict(r) for r in before],
+            # Present only when the rows were measured by ANOTHER run and carried in (a
+            # rebookend publishing its baseline's before block): the label is what keeps a
+            # reader from taking them for rows this run measured.
+            **({"source_run_id": before_source_run_id} if before_source_run_id else {}),
         },
         "eval_after": {
             "summary": eval_summary(after, task_ids=ids),

@@ -171,6 +171,13 @@ def assemble(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not marker:
             assembled.append(doc)
             continue
+        if doc.get("eval_before", {}).get("source_run_id"):
+            # Self-contained: publication already carried the baseline's before rows in,
+            # labeled with the run they came from, and paired them inside the artifact.
+            # There is nothing to join and no other file to depend on; the join below exists
+            # for LEGACY bookends published before the carry.
+            assembled.append(doc)
+            continue
         # The before-side comes from the BASELINE identity, which is the pairing partner the
         # marker records beside the lineage: the rollout source (rebookend_of) may be an
         # after-only or rollout-only run whose eval_before never existed, measured instead by
@@ -247,7 +254,7 @@ def report_cell(
     assembly = doc.get("assembly", {})
     if not marker:
         pairing = "self"
-    elif assembly.get("paired_with"):
+    elif doc.get("eval_before", {}).get("source_run_id") or assembly.get("paired_with"):
         pairing = "assembled"
     elif "invalid_provenance" in assembly:
         pairing = "invalid_provenance"
