@@ -2,10 +2,11 @@
 #
 # This workflow must never be able to spend money. No provider credential exists anywhere in this
 # job: it reads no secret, sets no provider key, and runs no cell, no eval, and no harness. The
-# suite it runs holds to the same line: every test that would reach a network or a paid API skips
-# itself instead, and the skip list is printed so a green run that skipped everything is visible
-# rather than silent. A step here that needs a provider credential does not belong in this
-# workflow.
+# suite it runs holds to the same line: it goes nowhere. The clients in it that would reach out on
+# their own are pinned shut at import, in tests/conftest.py, and what a test needs and cannot find
+# on the machine becomes a skip with a reason rather than a download. The skip list is printed, so
+# a green run that skipped everything is visible rather than silent. A step here that needs a
+# provider credential does not belong in this workflow.
 #
 # One credential is present, and it is GitHub's own: the ephemeral job token, scoped by the
 # permissions block below to reading this repository and dead when the job ends. actions/checkout
