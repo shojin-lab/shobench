@@ -463,6 +463,31 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             )
         else:
             baseline_states["baseline_is_run_dir"] = False
+    elif source_has_before:
+        # Self-paired: the before rows are the source's own, so the pairing is a record against
+        # itself and every fact it states matches. What it does NOT state is still evidence the
+        # plan owes an operator, and the manifest carries it either way; computing it only in
+        # the named-baseline branch made the plan quieter than the artifact it precedes.
+        baseline_states["baseline_pairing_drift"] = runner.pairing_drift(manifest, manifest)
+        baseline_states["baseline_pairing_unproven"] = runner.pairing_unproven(
+            manifest, manifest
+        )
+    # The third comparison, at the only stage a plan can make it: the identity of the run a --go
+    # would start, against the record it would pair with. The facts that exist only after a
+    # container and a credential (the harness probe, the effective credential mode) are checked
+    # by the runner at the moment they become knowable, still before any row.
+    execution_lines, execution_unproven = runner.execution_drift(
+        manifest,
+        runner.current_identity(
+            cell=will_run,
+            split=split,
+            instruction=load_instruction(cell.instruction_arm),
+            harness=harness_for(cell.harness),
+            image_tag=args.image,
+            image_digest_value=runner.image_digest(args.image),
+        ),
+        stage=runner.IDENTITY_PRE_SPEND,
+    )
     source_lock_present = (source_dir / runner.RUN_LOCK_FILE).is_file()
     source_live = False
     if source_lock_present:
@@ -480,6 +505,8 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         "terminal_session_resolvable": terminal_session is not None,
         "terminal_transcript_resolvable": terminal_transcript is not None,
         "experiment_drift": drift,
+        "execution_identity_drift": execution_lines,
+        "execution_identity_unproven": execution_unproven,
         "missing_required_env": missing_required,
         **baseline_states,
     }
@@ -557,6 +584,11 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
                 blockers.append("the named baseline is itself a rebookend")
         elif value is False:
             blockers.append(why)
+    if refusals["execution_identity_drift"]:
+        blockers.append(
+            "the execution identity of this checkout does not match the source's record: "
+            + "; ".join(refusals["execution_identity_drift"])
+        )
     if refusals.get("baseline_pairing_drift"):
         blockers.append(
             "the named baseline was not measured by the same definition as the source: "

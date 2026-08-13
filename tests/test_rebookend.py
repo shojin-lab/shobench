@@ -43,6 +43,17 @@ from shobench.splits import Side, Split, load_split_by_name
 _SID = "cccccccc-4444-4444-4444-cccccccccccc"
 
 
+@pytest.fixture(autouse=True)
+def _pinned_execution_identity(monkeypatch):
+    """Docker and git answer for real inside these functions, so both sides of every identity
+    check would otherwise move with the machine: a host without docker records no image id, and
+    a dirty checkout records no usable revision. Pinned at the source rather than in the
+    fixtures, so the archives these tests write and the current identity they are checked
+    against come from the same values, which is what a real run on one machine looks like."""
+    monkeypatch.setattr(runner, "image_digest", lambda image: "sha256:" + "a" * 64)
+    monkeypatch.setattr(runner, "shobench_revision", lambda: ("b" * 40, False))
+
+
 class _FakeStream:
     async def __aenter__(self) -> _FakeStream:
         return self
@@ -153,21 +164,21 @@ def _archived_manifest(ctx) -> dict:
     and written straight out would be missing a field every archived run carries, and the pairing
     identity would refuse fixtures for a reason no real archive has.
     """
-    manifest = build_manifest(ctx, probes={"version": "t"})
+    # The probe value the stubbed ``_probe`` returns and the credential mode an unseeded home
+    # computes, because that is what a run in this test environment records. A fixture that
+    # recorded something prettier would model an archive no run here could have produced, and
+    # the execution-identity check compares exactly these.
+    manifest = build_manifest(ctx, probes={"version": "probe"})
     manifest["axes"]["credential_mode"] = {
         "requested": ctx.cell.credential_mode,
-        "effective": ctx.cell.credential_mode,
-        "matches_requested": True,
-        "source": "seeded file",
+        "effective": "unknown",
+        "matches_requested": False,
+        "source": "nothing found",
         "evidence": "",
     }
-    # Pinned rather than inherited from the machine. The builder asks docker for the image id
-    # and git for the runner revision, so a fixture that kept whatever they answered would
-    # model a different archive on a host without docker, and a dirty checkout would move the
-    # unproven list under a test that is not about either.
-    manifest["container"]["image_digest"] = "sha256:" + "a" * 64
-    manifest["substrate"]["shobench_rev"] = "b" * 40
-    manifest["substrate"]["shobench_dirty"] = False
+    # The fixture builds its context by hand, so the image the run pinned is set here from the
+    # same function the runner resolves it with rather than from a literal.
+    manifest["container"]["image_digest"] = runner.image_digest(ctx.agent_image)
     return manifest
 
 
@@ -320,6 +331,9 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
         # Both archives record the image id and the runner revision, so the pairing proved
         # every identity it names and the list of what it could not prove is empty.
         "pairing_identity_unproven": [],
+        # And the run that produced these after rows was checked against the source's record
+        # too, image and substrate and probe and credential mode, with nothing left unproven.
+        "execution_identity_unproven": [],
     }
     # The source's recorded cell block is kept whole beside the block this run ran under, and
     # every field the checkout's file states differently is named with both values. Nothing but
@@ -2642,7 +2656,7 @@ def test_two_archives_of_one_definition_pair(tmp_path: Path) -> None:
     assert runner.pairing_drift(source, baseline) == []
 
 
-@pytest.mark.parametrize("path", [path for _, path in runner.PAIRING_IDENTITY_FIELDS])
+@pytest.mark.parametrize("path", [path for _, path, _stage in runner.PAIRING_IDENTITY_FIELDS])
 def test_a_pairing_identity_that_differs_refuses(tmp_path: Path, path: str) -> None:
     """Generated from the identity set itself, so a field added to it is exercised the day it
     is added rather than the day someone remembers to test it."""
@@ -2653,7 +2667,7 @@ def test_a_pairing_identity_that_differs_refuses(tmp_path: Path, path: str) -> N
     assert drift and any(path in line for line in drift), drift
 
 
-@pytest.mark.parametrize("path", [path for _, path in runner.PAIRING_IDENTITY_FIELDS])
+@pytest.mark.parametrize("path", [path for _, path, _stage in runner.PAIRING_IDENTITY_FIELDS])
 def test_a_pairing_identity_that_is_unrecorded_refuses(tmp_path: Path, path: str) -> None:
     """Absent on one side or on both. An identity is a record ASSERTING what produced its rows,
     so silence proves nothing and two silences agree about nothing."""
@@ -2668,13 +2682,13 @@ def test_a_pairing_identity_that_is_unrecorded_refuses(tmp_path: Path, path: str
     assert unrecorded(), path
 
 
-@pytest.mark.parametrize("block", runner.PAIRING_IDENTITY_BLOCKS)
+@pytest.mark.parametrize("block", [block for block, _stage in runner.PAIRING_IDENTITY_BLOCKS])
 def test_a_pairing_identity_block_is_compared_key_by_key(tmp_path: Path, block: str) -> None:
     """These blocks are compared whole rather than field by named field, so a key added to any of
     them is eval-defining until someone judges otherwise. A block missing altogether names none
     of what its rows were produced by, which is a refusal of its own."""
     source, baseline = _paired_manifests(tmp_path)
-    owned_elsewhere = {path for _, path in runner.PAIRING_VERSIONED_IDENTITY} | set(
+    owned_elsewhere = {path for _, path, _s in runner.PAIRING_VERSIONED_IDENTITY} | set(
         runner.PAIRING_UNCOMPARED_IDENTITY_PATHS
     )
     recorded = runner._recorded_path(baseline, block)
@@ -2703,23 +2717,23 @@ def test_the_pairing_identity_set_is_the_decided_one() -> None:
     listed beside the constants in the runner, each with its reason.
     """
     assert runner.PAIRING_IDENTITY_FIELDS == (
-        ("split ids", "split.id_digest"),
-        ("eval instruction", "instruction.eval_system_sha256"),
-        ("eval kickoff", "instruction.kickoff"),
-        ("agent image tag", "container.agent_image"),
-        ("credential mode", "axes.credential_mode.effective"),
+        ("split ids", "split.id_digest", runner.IDENTITY_PRE_SPEND),
+        ("eval instruction", "instruction.eval_system_sha256", runner.IDENTITY_PRE_SPEND),
+        ("eval kickoff", "instruction.kickoff", runner.IDENTITY_PRE_SPEND),
+        ("agent image tag", "container.agent_image", runner.IDENTITY_PRE_SPEND),
+        ("credential mode", "axes.credential_mode.effective", runner.IDENTITY_AFTER_SETUP),
     )
     assert runner.PAIRING_IDENTITY_BLOCKS == (
-        "substrate",
-        "harness_probes",
-        "axes.effort",
-        "split.provenance",
+        ("substrate", runner.IDENTITY_PRE_SPEND),
+        ("split.provenance", runner.IDENTITY_PRE_SPEND),
+        ("axes.effort", runner.IDENTITY_PRE_SPEND),
+        ("harness_probes", runner.IDENTITY_AFTER_SETUP),
     )
     # The two facts no archive written before this change carries, and the only place absence
     # is tolerated rather than refused.
     assert runner.PAIRING_VERSIONED_IDENTITY == (
-        ("agent image digest", "container.image_digest"),
-        ("runner revision", "substrate.shobench_rev"),
+        ("agent image digest", "container.image_digest", runner.IDENTITY_PRE_SPEND),
+        ("runner revision", "substrate.shobench_rev", runner.IDENTITY_PRE_SPEND),
     )
 
 
@@ -2758,7 +2772,10 @@ def test_a_baseline_with_another_kickoff_is_refused_through_the_entry(
 # this entry exists for. They get a three-way rule instead, and the silence is published.
 
 
-@pytest.mark.parametrize(("label", "path"), runner.PAIRING_VERSIONED_IDENTITY)
+@pytest.mark.parametrize(
+    ("label", "path"),
+    [(label, path) for label, path, _stage in runner.PAIRING_VERSIONED_IDENTITY],
+)
 def test_a_versioned_identity_refuses_when_only_one_side_states_it(
     tmp_path: Path, label: str, path: str
 ) -> None:
@@ -2772,7 +2789,10 @@ def test_a_versioned_identity_refuses_when_only_one_side_states_it(
     assert runner.pairing_unproven(source, baseline) == [], "one side does state it"
 
 
-@pytest.mark.parametrize(("label", "path"), runner.PAIRING_VERSIONED_IDENTITY)
+@pytest.mark.parametrize(
+    ("label", "path"),
+    [(label, path) for label, path, _stage in runner.PAIRING_VERSIONED_IDENTITY],
+)
 def test_a_versioned_identity_that_differs_refuses(tmp_path: Path, label: str, path: str) -> None:
     """Stated on both sides, it is an identity like any other."""
     source, baseline = _paired_manifests(tmp_path)
@@ -2793,15 +2813,15 @@ def test_two_silent_archives_pair_and_the_silence_is_published(
     baseline_dir = _baseline_run(tmp_path, cell, split)
     for run_dir in (source_dir, baseline_dir):
         manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-        for _, path in runner.PAIRING_VERSIONED_IDENTITY:
+        for _, path, _stage in runner.PAIRING_VERSIONED_IDENTITY:
             _drop_path(manifest, path)
         runner.write_json(run_dir / "manifest.json", manifest)
     source = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
     baseline = json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8"))
     assert runner.pairing_drift(source, baseline) == []
-    assert runner.pairing_unproven(source, baseline) == [
-        path for _, path in runner.PAIRING_VERSIONED_IDENTITY
-    ]
+    assert runner.pairing_unproven(source, baseline) == sorted(
+        path for _, path, _stage in runner.PAIRING_VERSIONED_IDENTITY
+    )
 
     launches: dict[int, dict] = {}
     _wire_fakes(monkeypatch, cell, split, launches)
@@ -2876,3 +2896,192 @@ def test_the_split_provenance_is_compared(tmp_path: Path) -> None:
     assert source["split"]["id_digest"] == baseline["split"]["id_digest"], (
         "the point of the check is that the positions still agree"
     )
+
+
+# ----- the third side: what will actually produce the new rows ----------------------------------
+#
+# A pairing proves two archives agree with each other and the drift check proves the cell file has
+# not moved. Neither says anything about the image, the substrate, the prompt as sent or the effort
+# as applied that the NEW rows will be produced under, and recording those in the new manifest
+# documents a mismatch rather than preventing it.
+
+
+def _current_identity_for(cell, split, image_tag="shobench-agent:v0"):
+    return runner.current_identity(
+        cell=cell,
+        split=split,
+        instruction=load_instruction(cell.instruction_arm),
+        harness=runner.harness_for(cell.harness),
+        image_tag=image_tag,
+        image_digest_value=runner.image_digest(image_tag),
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("substrate.shogym_rev", "0" * 40),
+        ("substrate.shobench_rev", "c" * 40),
+        ("container.image_digest", "sha256:" + "d" * 64),
+        ("container.agent_image", "another-image:v9"),
+        ("instruction.kickoff", "A different opener.\n"),
+        # A key both records carry. A key only ONE side carries is an absence, which this
+        # comparison names rather than refuses, and the image-digest test covers that path.
+        ("split.provenance.kind", "regenerated"),
+        ("axes.effort.applied", True),
+    ],
+)
+def test_a_checkout_that_would_produce_rows_differently_refuses(
+    tmp_path: Path, monkeypatch, path: str, value
+) -> None:
+    """Every pre-spend fact, driven through the real entry. The archives agree with each other
+    and the cell file has not moved; what has moved is the thing about to produce the rows."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    _set_path(manifest, path, value)
+    runner.write_json(source_dir / "manifest.json", manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="execution identity no longer matches"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}, "the refusal lands before anything is copied or run"
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("harness_probes.version", "a version this image never printed"),
+        ("axes.credential_mode.effective", "api_key"),
+    ],
+)
+def test_an_after_setup_fact_refuses_before_any_row(
+    tmp_path: Path, monkeypatch, path: str, value
+) -> None:
+    """The two facts that do not exist until a container has run and a credential is placed.
+    They are checked at the moment they become knowable, which is still before the first leg."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    _set_path(manifest, path, value)
+    runner.write_json(source_dir / "manifest.json", manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="execution identity no longer matches"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}, "no leg ran, so no row exists to be wrong"
+
+
+def test_an_unstatable_current_fact_is_named_rather_than_refused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The current side can fail to answer: docker may not be there to resolve a digest, and no
+    reopen path takes a probe. That is not a disagreement and it is not nothing, so it lands in
+    the published unproven list rather than refusing or passing in silence."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    monkeypatch.setattr(runner, "image_digest", lambda image: None)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((new_run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["rebookend"]["execution_identity_unproven"] == ["container.image_digest"]
+    assert manifest["container"]["image_digest"] is None
+
+
+@pytest.mark.parametrize("reopen", ["resume", "rerun"])
+def test_a_reopening_refuses_a_changed_execution_identity(
+    tmp_path: Path, monkeypatch, reopen: str
+) -> None:
+    """Both reopen paths get the same check, and for the sharper reason: they fill rows beside
+    rows a run already has, so an image or a substrate that moved under them would put two
+    executions inside one artifact that names one."""
+    launches: dict[int, dict] = {}
+    run_dir, cell = _bookend_recording_another_runtime(tmp_path, monkeypatch, launches)
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    _set_path(manifest, "substrate.shogym_rev", "0" * 40)
+    if reopen == "resume":
+        manifest_extra = {
+            "schema": "shobench.suspension/1",
+            "run_id": manifest["run_id"],
+            "cell": cell.name,
+            "harness": cell.harness,
+            "phase": "eval_after",
+            "completed_task_ids": [0],
+            "pending_task_ids": [1, 2],
+            "stop_evidence": StopVerdict(StopKind.USAGE_LIMIT, "the window closed").to_json(),
+            "suspended_at": 1.0,
+        }
+        runner.write_json(run_dir / SUSPENSION_FILE, manifest_extra)
+    runner.write_json(run_dir / "manifest.json", manifest)
+    _capture_reopened_cell(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="execution identity no longer matches"):
+        if reopen == "resume":
+            asyncio.run(
+                runner.resume_cell(run_dir, results_dir=tmp_path / "out", capture_egress=False)
+            )
+        else:
+            asyncio.run(
+                runner.rerun_eval(run_dir, results_dir=tmp_path / "out", capture_egress=False)
+            )
+
+
+def test_the_plan_reports_the_execution_check_before_any_spend(
+    tmp_path: Path, capsys
+) -> None:
+    """The operator's view of the third comparison, and the self-paired plan publishing the same
+    evidence the manifest would: a plan that says less than the artifact is a plan nobody can
+    act on."""
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["refusals"]["source_has_own_eval_before"] is True
+    # Self-paired, so the pairing is a record against itself: nothing differs, and what the
+    # record cannot state is named rather than omitted.
+    assert plan["refusals"]["baseline_pairing_drift"] == []
+    assert "baseline_pairing_unproven" in plan["refusals"]
+    assert "execution_identity_drift" in plan["refusals"]
+
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    _set_path(manifest, "substrate.shogym_rev", "0" * 40)
+    runner.write_json(source_dir / "manifest.json", manifest)
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert any(
+        "substrate.shogym_rev" in line for line in plan["refusals"]["execution_identity_drift"]
+    )
+
+    assert cli_main(["rebookend", "--run", str(source_dir), "--go"]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "execution identity" in err
+    assert not (tmp_path / "runs").exists()

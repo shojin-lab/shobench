@@ -604,7 +604,28 @@ tokens (a hash of one fingerprints a credential rather than an account and would
 across an ordinary refresh) and their only stable identifiers are the account email and id, which
 must never enter a published artifact.
 
-Two identities get a THREE-WAY rule instead of fail-closed absence, because fail-closed absence
+The identity is checked THREE ways, not two, and they are one enumerated fact set with one
+absence discipline. Archive to archive is the pairing above. Archive to checkout is
+`experiment_drift`, which guards the cell definition and the prompts. Archive to EFFECTIVE
+EXECUTION is the third: the run about to happen has an identity of its own (the image it resolved,
+the substrate it imports, the split provenance and prompts it will send, the effort the harness
+will apply, the probe the image prints, the credential mode the seeded home reports), and
+recording that in the new manifest documents a mismatch rather than preventing one. So the
+spending path builds the current identity and compares it against the record before
+`_run_phases`, on every path that adds rows to an existing measurement: a rebookend, a resume and
+a rerun-eval alike. Where each fact is checked follows from when it can be known. Everything
+derivable from the checkout and docker is compared before a byte is copied. The harness probe
+exists only once a container has printed it and the effective credential mode only once a
+credential is placed, so those two are compared at that moment, after setup and before the first
+leg, which is the last point at which no row exists yet. A reopen path takes no probe, so it
+compares the image content id instead, a stricter statement about the same image, and names the
+probe unproven rather than inventing one. Absence on either side is named rather than refused
+here, because the current side may be unable to answer (no docker for a digest, no probe on this
+path) and the archive may predate the field; a stated disagreement refuses. The image is resolved
+to its content id ONCE per run and that id is what every probe and every leg is given, so a
+concurrent rebuild or retag cannot slide different bytes under a run whose manifest names the tag.
+
+Two identities also get a THREE-WAY rule against fail-closed absence, because fail-closed absence
 refuses history: no archive written before this change records the agent image's content id or the
 runner's own revision, and requiring them would refuse the pairings this entry exists for. Every
 run records both from now on (`container.image_digest` from `docker image inspect`, and

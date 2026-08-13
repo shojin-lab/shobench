@@ -239,7 +239,12 @@ class RunContext:
     run_dir: Path
     sandbox: CellSandbox
     port: int = DEFAULT_PORT
+    # What docker is actually given: the image's content id once it resolves, so every probe and
+    # every leg of one run uses the same bytes even if the tag is moved under it mid-run. The tag
+    # it was asked for and the id it resolved to are carried beside it for the record.
     agent_image: str = AGENT_IMAGE
+    image_tag: str = ""
+    image_digest: str | None = None
     credentials: dict[str, str] = field(default_factory=dict)
     legs: list[LegRecord] = field(default_factory=list)
     # Legs this process did not run: the record a suspended run left behind. A continuation is
@@ -349,6 +354,56 @@ def _probe(
     return (result.stdout + result.stderr).strip()
 
 
+def substrate_block() -> dict[str, Any]:
+    """What a row is produced ON, in the shape the manifest records and a comparison reads.
+
+    shogym serves and scores the task; this package decides how it is launched and supervised,
+    which is the other half, so its revision sits beside shogym's. Built here rather than inline
+    because the same block is what a later run compares itself against: one function means the
+    recorded fact and the checked fact cannot drift apart.
+    """
+    revision, dirty = shobench_revision()
+    return {
+        "shogym_repo": SHOGYM_REPO,
+        "shogym_rev": SHOGYM_REV,
+        "mcp_server_name": SERVER_NAME,
+        "shobench_rev": revision,
+        "shobench_dirty": dirty,
+    }
+
+
+def effort_axis(cell: Cell, harness: Harness) -> dict[str, Any]:
+    """What the cell asked of the harness, and what the harness will do with it.
+
+    ``requested`` is the ask and ``applied``/``how`` are whether it reaches the CLI at all, which
+    is a property of the harness rather than of the cell: every prime_agent cell requests an
+    effort no prime_agent build can apply. Shared with the comparison for the same reason as the
+    substrate block.
+    """
+    return {
+        "requested": cell.effort,
+        "applied": bool(cell.effort and harness.effort_flag),
+        "how": (
+            harness.effort_flag
+            or f"{harness.name} exposes no reasoning-effort control; it is ignored"
+        ),
+    }
+
+
+def pinned_image(agent_image: str) -> tuple[str, str, str | None]:
+    """The image a run pins itself to: what to run, the tag asked for, and the content id.
+
+    A tag is mutable and a run is long. Resolving it once, here, and handing the ID to every
+    probe and every leg is what makes the recorded digest a statement about the bytes that ran
+    rather than about what the tag happened to point at when the manifest was written; a
+    concurrent rebuild or retag then cannot slide a different image under the run. Resolution
+    that fails leaves the tag in place and records no digest, which is the honest absence: a
+    host without docker is about to fail for better reasons anyway.
+    """
+    digest = image_digest(agent_image)
+    return digest or agent_image, agent_image, digest
+
+
 def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]:
     """The record of what this cell was, written before anything spends.
 
@@ -362,7 +417,6 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
     something the rollout wrote.
     """
     exclude = ctx.durable
-    runner_rev, runner_dirty = shobench_revision()
     return {
         "schema": "shobench.manifest/1",
         "run_id": ctx.run_id,
@@ -386,13 +440,7 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
         # recorded beside shogym's rather than left for a reader to infer from a timestamp. The
         # dirty flag says whether that revision identifies the code: a modified tree's commit
         # does not, and a comparison has to be able to tell.
-        "substrate": {
-            "shogym_repo": SHOGYM_REPO,
-            "shogym_rev": SHOGYM_REV,
-            "mcp_server_name": SERVER_NAME,
-            "shobench_rev": runner_rev,
-            "shobench_dirty": runner_dirty,
-        },
+        "substrate": substrate_block(),
         "harness_probes": probes,
         # What the cell asked for, and what the harness will actually do with it. These used to
         # be one field each, copied out of the cell file, which made the manifest a restatement
@@ -411,22 +459,17 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
                     else f"{ctx.harness.name} names no model in its trace; nothing observes it"
                 ),
             },
-            "effort": {
-                "requested": ctx.cell.effort,
-                "applied": bool(ctx.cell.effort and ctx.harness.effort_flag),
-                "how": (
-                    ctx.harness.effort_flag
-                    or f"{ctx.harness.name} exposes no reasoning-effort control; it is ignored"
-                ),
-            },
+            "effort": effort_axis(ctx.cell, ctx.harness),
         },
         "container": {
-            "agent_image": ctx.agent_image,
+            "agent_image": ctx.image_tag or ctx.agent_image,
             # The tag names the image; this identifies it. Rebuilding one tag on a newer base
             # or a different runtime leaves the tag and the harness version probe unchanged
-            # while changing the agent, so the content id is what a later comparison can rest
-            # on. Null where docker could not answer, which reads as the absence it is.
-            "image_digest": image_digest(ctx.agent_image),
+            # while changing the agent, so the content id is what a later comparison rests on.
+            # Resolved ONCE, before the first container, and reused for every probe and leg, so
+            # what is recorded is what ran rather than what the tag pointed at when asked. Null
+            # where docker could not answer, which reads as the absence it is.
+            "image_digest": ctx.image_digest,
             "network": ctx.sandbox.network,
             "netns_container": ctx.sandbox.netns_container,
             "home": run_relative(ctx.sandbox.home, ctx.run_dir),
@@ -1661,12 +1704,20 @@ IDENTITY_DIGESTS = (
 # email and id, which must never enter a published artifact. So a pairing cannot tell two
 # subscription accounts apart, and this comment is the whole of the claim: quota and throttling
 # differences between two accounts are not excluded by anything here.
+# WHEN each fact can be compared, which is a property of the fact rather than of the caller. Most
+# are knowable from the checkout and docker before anything runs. Two are not: a harness probe
+# exists only once a container has run one, and the effective credential mode only once a
+# credential has been seeded, so those are checked at the point they become known, before any row
+# is filled, rather than being dropped for being awkward.
+IDENTITY_PRE_SPEND = "pre_spend"
+IDENTITY_AFTER_SETUP = "after_setup"
+
 PAIRING_IDENTITY_FIELDS = (
-    ("split ids", "split.id_digest"),
-    ("eval instruction", "instruction.eval_system_sha256"),
-    ("eval kickoff", "instruction.kickoff"),
-    ("agent image tag", "container.agent_image"),
-    ("credential mode", "axes.credential_mode.effective"),
+    ("split ids", "split.id_digest", IDENTITY_PRE_SPEND),
+    ("eval instruction", "instruction.eval_system_sha256", IDENTITY_PRE_SPEND),
+    ("eval kickoff", "instruction.kickoff", IDENTITY_PRE_SPEND),
+    ("agent image tag", "container.agent_image", IDENTITY_PRE_SPEND),
+    ("credential mode", "axes.credential_mode.effective", IDENTITY_AFTER_SETUP),
 )
 
 # Blocks compared whole, key by key, because pinning what produced a row is their entire purpose.
@@ -1688,7 +1739,12 @@ PAIRING_IDENTITY_FIELDS = (
 #
 # A key added to any of these is eval-defining until someone judges otherwise, which is the
 # fail-closed direction and the reason they are compared whole rather than field by named field.
-PAIRING_IDENTITY_BLOCKS = ("substrate", "harness_probes", "axes.effort", "split.provenance")
+PAIRING_IDENTITY_BLOCKS = (
+    ("substrate", IDENTITY_PRE_SPEND),
+    ("split.provenance", IDENTITY_PRE_SPEND),
+    ("axes.effort", IDENTITY_PRE_SPEND),
+    ("harness_probes", IDENTITY_AFTER_SETUP),
+)
 
 # The identities no archive carries yet, and the one place absence is tolerated rather than
 # refused. Every fact above is in every real archive, so requiring it costs nothing; these two are
@@ -1706,8 +1762,8 @@ PAIRING_IDENTITY_BLOCKS = ("substrate", "harness_probes", "axes.effort", "split.
 # visibility rather than a default. A dirty runner tree is treated as an absence too, its commit
 # not identifying the code that ran.
 PAIRING_VERSIONED_IDENTITY = (
-    ("agent image digest", "container.image_digest"),
-    ("runner revision", "substrate.shobench_rev"),
+    ("agent image digest", "container.image_digest", IDENTITY_PRE_SPEND),
+    ("runner revision", "substrate.shobench_rev", IDENTITY_PRE_SPEND),
 )
 
 # Keys inside the compared blocks that identify nothing on their own. ``shobench_dirty`` says
@@ -1969,6 +2025,207 @@ def _versioned_identity(manifest: dict[str, Any], path: str) -> Any:
     return value
 
 
+def identity_facts(stage: str | None = None) -> tuple[tuple[str, str, bool], ...]:
+    """The enumerated identity as (label, path, versioned) triples, optionally for one stage.
+
+    One list, read by all three comparisons, so archive-to-archive, archive-to-checkout and
+    archive-to-execution can never be checking different things. Block members expand to their
+    keys at comparison time, since a block's keys are whatever the two records carry.
+    """
+    facts: list[tuple[str, str, bool]] = []
+    for label, path, fact_stage in PAIRING_IDENTITY_FIELDS:
+        if stage in (None, fact_stage):
+            facts.append((f"{label} ({path})", path, False))
+    for label, path, fact_stage in PAIRING_VERSIONED_IDENTITY:
+        if stage in (None, fact_stage):
+            facts.append((f"{label} ({path})", path, True))
+    return tuple(facts)
+
+
+def identity_blocks(stage: str | None = None) -> tuple[str, ...]:
+    """The blocks compared key by key, optionally for one stage."""
+    return tuple(
+        block for block, fact_stage in PAIRING_IDENTITY_BLOCKS if stage in (None, fact_stage)
+    )
+
+
+def _identity_agreement(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    left_name: str,
+    right_name: str,
+    stage: str | None,
+    archives: bool,
+) -> tuple[list[str], list[str]]:
+    """Two identities compared fact by fact: what disagrees, and what neither could state.
+
+    ``archives`` picks which absence discipline applies, and the two differ because the sides
+    differ. Two ARCHIVES are finished records of finished runs, so a fact one states and the
+    other does not is a record with a hole in it and refuses; only the versioned facts, which no
+    archive written before them can carry, may be silent on both sides, and then they are named.
+    A CURRENT identity is not a finished record: docker may not answer for a digest, a path may
+    not have taken a probe yet, and the archive it is checked against may predate any of these
+    fields. So there silence on either side is named rather than refused, and only two stated
+    values that disagree refuse. Both disciplines put the same fact in the same list, which is
+    what makes the published unproven list mean one thing.
+    """
+    lines: list[str] = []
+    unproven: list[str] = []
+    for label, path, versioned in identity_facts(stage):
+        left_value = _versioned_identity(left, path) if versioned else _recorded_path(left, path)
+        right_value = (
+            _versioned_identity(right, path) if versioned else _recorded_path(right, path)
+        )
+        missing = left_value is _MISSING or right_value is _MISSING
+        if missing and (not archives or (versioned and left_value is right_value)):
+            unproven.append(path)
+            continue
+        lines += _identity_lines(label, left_value, right_value, left_name, right_name)
+    versioned_paths = {path for _, path, _stage in PAIRING_VERSIONED_IDENTITY}
+    for block in identity_blocks(stage):
+        left_block = _recorded_path(left, block)
+        right_block = _recorded_path(right, block)
+        left_keys = set(left_block) if isinstance(left_block, dict) else set()
+        right_keys = set(right_block) if isinstance(right_block, dict) else set()
+        if archives and not (left_keys and right_keys):
+            # An absent block in an archive is not an empty difference: it is a record that names
+            # none of what its rows were produced by, leaving nothing to compare.
+            lines.append(
+                f"{block} is not recorded on both sides ({left_name} "
+                f"{'recorded' if left_keys else 'no such block'}, {right_name} "
+                f"{'recorded' if right_keys else 'no such block'}), so nothing proves the two "
+                "were produced the same way"
+            )
+            continue
+        for key in sorted(left_keys | right_keys):
+            path = f"{block}.{key}"
+            if path in versioned_paths or path in PAIRING_UNCOMPARED_IDENTITY_PATHS:
+                # Owned by the versioned rule, or judged to identify nothing on its own.
+                continue
+            left_value = _recorded_path(left, path)
+            right_value = _recorded_path(right, path)
+            if left_value is _MISSING or right_value is _MISSING:
+                if not archives:
+                    unproven.append(path)
+                    continue
+            lines += _identity_lines(path, left_value, right_value, left_name, right_name)
+    return lines, sorted(set(unproven))
+
+
+def _identity_lines(
+    label: str, left_value: Any, right_value: Any, left_name: str, right_name: str
+) -> list[str]:
+    """One fact's verdict, absence and difference reading differently on purpose."""
+    if left_value is _MISSING or right_value is _MISSING:
+        return [
+            f"{label} is not recorded on both sides ({left_name} {_shown(left_value)}, "
+            f"{right_name} {_shown(right_value)}), so nothing proves the two measured the same way"
+        ]
+    if left_value != right_value:
+        return [
+            f"{label} differs ({left_name} {_shown(left_value)}, "
+            f"{right_name} {_shown(right_value)})"
+        ]
+    return []
+
+
+def current_identity(
+    *,
+    cell: Cell,
+    split: Split,
+    instruction: Instruction,
+    harness: Harness,
+    image_tag: str,
+    image_digest_value: str | None,
+) -> dict[str, Any]:
+    """The identity of the run about to happen, in manifest shape, for what is knowable pre-spend.
+
+    Manifest shape rather than a bespoke structure, so the same paths name the same facts on both
+    sides of the comparison and a field added to the manifest is a field the comparison can be
+    taught in one place. Everything here is knowable before a container exists: the checkout's
+    split and prompts, the resolved image, the substrate, and the effort the harness will or will
+    not apply. What is not knowable yet is in ``after_setup_identity``.
+    """
+    return {
+        "split": {
+            "id_digest": split.to_manifest().get("id_digest"),
+            "provenance": dict(split.provenance),
+        },
+        "instruction": {
+            "eval_system_sha256": instruction.eval_system_sha256,
+            "kickoff": instruction.kickoff,
+        },
+        "container": {"agent_image": image_tag, "image_digest": image_digest_value},
+        "substrate": substrate_block(),
+        "axes": {"effort": effort_axis(cell, harness)},
+    }
+
+
+def after_setup_identity(
+    *, probes: dict[str, str] | None, credential_mode: dict[str, Any] | None
+) -> dict[str, Any]:
+    """The identity facts that exist only once a container has run and a credential is placed.
+
+    A harness probe is output from inside the image and the effective credential mode is read off
+    the seeded home, so neither can be compared before setup. A path that takes no probe passes
+    none, and the facts it cannot state are named as unproven rather than assumed: the reopen
+    paths are that case, and the image content id, compared pre-spend, is a stricter statement
+    about the same image than a version string would be.
+    """
+    identity: dict[str, Any] = {"harness_probes": dict(probes or {})}
+    if credential_mode is not None:
+        identity["axes"] = {"credential_mode": credential_mode}
+    return identity
+
+
+def execution_drift(
+    recorded: dict[str, Any], current: dict[str, Any], *, stage: str
+) -> tuple[list[str], list[str]]:
+    """The third side: what the run ABOUT TO HAPPEN does not share with the record it continues.
+
+    A pairing proves two archives agree with each other and a drift check proves the cell file
+    has not moved, and neither says anything about the image, the substrate, the prompts as
+    sent, or the effort as applied that the new rows will actually be produced under. Recording
+    those in the new manifest documents a mismatch rather than preventing it, so they are
+    compared here, before ``_run_phases``, and a stated disagreement refuses.
+
+    ``stage`` says which facts are knowable yet, because some are not knowable pre-spend: see
+    ``IDENTITY_AFTER_SETUP``. Absence on either side is named rather than refused, since the
+    current side may not be able to answer (no docker, no probe on this path) and the archive may
+    predate the field; the caller publishes the names so the artifact says what it could not
+    establish.
+    """
+    return _identity_agreement(
+        recorded,
+        current,
+        left_name="recorded",
+        right_name="current",
+        stage=stage,
+        archives=False,
+    )
+
+
+def _refuse_execution_drift(
+    recorded: dict[str, Any], current: dict[str, Any], *, stage: str, what: str
+) -> list[str]:
+    """Refuse a stated disagreement with the record, and hand back what could not be stated.
+
+    Raised rather than returned, unlike the plan-facing checks, because by the time a caller has
+    a current identity in hand it has decided to spend: the only useful thing to do with a
+    disagreement here is to stop before a row exists.
+    """
+    lines, unproven = execution_drift(recorded, current, stage=stage)
+    if lines:
+        raise RuntimeError(
+            f"the execution identity no longer matches the run {what}: "
+            + "; ".join(lines)
+            + ". Rows produced here would not belong to the measurement they would be published "
+            "as."
+        )
+    return unproven
+
+
 def pairing_unproven(
     source_manifest: dict[str, Any], baseline_manifest: dict[str, Any]
 ) -> list[str]:
@@ -1979,12 +2236,14 @@ def pairing_unproven(
     passes here and is published rather than swallowed: a reader of the delta sees exactly which
     facts about the two sides were never established.
     """
-    return [
-        path
-        for _, path in PAIRING_VERSIONED_IDENTITY
-        if _versioned_identity(source_manifest, path) is _MISSING
-        and _versioned_identity(baseline_manifest, path) is _MISSING
-    ]
+    return _identity_agreement(
+        source_manifest,
+        baseline_manifest,
+        left_name="source",
+        right_name="baseline",
+        stage=None,
+        archives=True,
+    )[1]
 
 
 def pairing_drift(
@@ -2022,45 +2281,17 @@ def pairing_drift(
         )
         if name not in PAIRING_UNCOMPARED_CELL_FIELDS
     ]
-    for label, path in PAIRING_IDENTITY_FIELDS:
-        lines += _pairing_identity_lines(
-            f"{label} ({path})",
-            _recorded_path(source_manifest, path),
-            _recorded_path(baseline_manifest, path),
-        )
-    versioned = {path for _, path in PAIRING_VERSIONED_IDENTITY}
-    for block in PAIRING_IDENTITY_BLOCKS:
-        source_block = _recorded_path(source_manifest, block)
-        baseline_block = _recorded_path(baseline_manifest, block)
-        if not isinstance(source_block, dict) or not isinstance(baseline_block, dict):
-            # An absent block is not an empty difference: it is a record that names none of what
-            # its rows were produced by, leaving nothing to compare.
-            lines.append(
-                f"{block} is not recorded on both sides (source "
-                f"{'recorded' if isinstance(source_block, dict) else 'no such block'}, baseline "
-                f"{'recorded' if isinstance(baseline_block, dict) else 'no such block'}), so "
-                "nothing proves the two archives were produced the same way"
-            )
-            continue
-        for key in sorted(set(source_block) | set(baseline_block)):
-            path = f"{block}.{key}"
-            if path in versioned or path in PAIRING_UNCOMPARED_IDENTITY_PATHS:
-                # Owned by the three-way rule below, or judged not to identify anything on its
-                # own. Comparing here as well would give one fact two verdicts.
-                continue
-            lines += _pairing_identity_lines(
-                path,
-                _recorded_path(source_manifest, path),
-                _recorded_path(baseline_manifest, path),
-            )
-    for label, path in PAIRING_VERSIONED_IDENTITY:
-        source_value = _versioned_identity(source_manifest, path)
-        baseline_value = _versioned_identity(baseline_manifest, path)
-        if source_value is _MISSING and baseline_value is _MISSING:
-            # Neither archive can say. Passing here is what keeps the archives that predate the
-            # recording usable; ``pairing_unproven`` is where the silence becomes visible.
-            continue
-        lines += _pairing_identity_lines(f"{label} ({path})", source_value, baseline_value)
+    # Every stage, because both sides are finished records: a probe and a credential mode are as
+    # available in an archive as a split digest is. The stages only matter to the third
+    # comparison, where the current side is still becoming knowable.
+    lines += _identity_agreement(
+        source_manifest,
+        baseline_manifest,
+        left_name="source",
+        right_name="baseline",
+        stage=None,
+        archives=True,
+    )[0]
     source_runtime = _inheritable_eval_runtime(source_manifest)
     baseline_runtime = _inheritable_eval_runtime(baseline_manifest)
     for bound in BOOKEND_EVAL_RUNTIME_FIELDS:
@@ -2983,6 +3214,25 @@ async def _resume_cell_owned(
             + "; ".join(drift)
             + ". Restore the recorded definition, or start a fresh cell."
         )
+    harness = harness_for(cell.harness)
+    image_ref, image_tag, image_id = pinned_image(agent_image)
+    # The third comparison, and the one the cell digest cannot make: this process is about to
+    # write rows into a run that already has some, so what produces them has to be what produced
+    # the others. Everything knowable without a container is checked here, before the sandbox
+    # exists; what is knowable only after setup is checked below, still before any row.
+    unproven = _refuse_execution_drift(
+        manifest,
+        current_identity(
+            cell=cell,
+            split=split,
+            instruction=instruction,
+            harness=harness,
+            image_tag=image_tag,
+            image_digest_value=image_id,
+        ),
+        stage=IDENTITY_PRE_SPEND,
+        what="being continued",
+    )
     run_id = record["run_id"]
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
     _migrate_recorded_containers(manifest, sandbox)
@@ -2990,11 +3240,13 @@ async def _resume_cell_owned(
         cell=cell,
         split=split,
         instruction=instruction,
-        harness=harness_for(cell.harness),
+        harness=harness,
         run_id=run_id,
         run_dir=run_dir,
         sandbox=sandbox,
-        agent_image=agent_image,
+        agent_image=image_ref,
+        image_tag=image_tag,
+        image_digest=image_id,
         credentials=dict(credentials or {}),
     )
     # The credential is placed again because the sandbox is new even though the home is not;
@@ -3004,6 +3256,22 @@ async def _resume_cell_owned(
     spec = spec_for(cell.harness, cell.credential_mode)
     seed_home(spec, sandbox.home)
     _watch_cell_credential(ctx, spec)
+    # The rest of the third comparison, at the first moment it can be made: the effective
+    # credential mode exists only once a credential is placed. No probe is taken on this path, so
+    # the harness probe is named unproven rather than invented; the image content id, already
+    # compared above, is the stricter statement about the same image.
+    unproven += _refuse_execution_drift(
+        manifest,
+        after_setup_identity(
+            probes=None,
+            credential_mode=credential_effective_mode(
+                spec, sandbox.home, env_names=sorted(ctx.credentials)
+            ),
+        ),
+        stage=IDENTITY_AFTER_SETUP,
+        what="being continued",
+    )
+    manifest["identity_unproven"] = sorted(set(unproven))
     legs_path = run_dir / "legs.json"
     if legs_path.is_file():
         # The legs the suspended run recorded. This process appends to that record rather than
@@ -3188,6 +3456,24 @@ async def _rerun_eval_owned(
             + "; ".join(drift)
             + ". Restore the recorded definition, or start a fresh cell."
         )
+    harness = harness_for(cell.harness)
+    image_ref, image_tag, image_id = pinned_image(agent_image)
+    # A repair splices rows in beside rows this run already has, so the same third comparison a
+    # resume makes applies here with more force: rows produced by another image or another
+    # runner would sit in one artifact with the ones they claim to complete.
+    unproven = _refuse_execution_drift(
+        manifest,
+        current_identity(
+            cell=cell,
+            split=split,
+            instruction=instruction,
+            harness=harness,
+            image_tag=image_tag,
+            image_digest_value=image_id,
+        ),
+        stage=IDENTITY_PRE_SPEND,
+        what="being reopened",
+    )
     run_id = str(manifest["run_id"])
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
     _migrate_recorded_containers(manifest, sandbox)
@@ -3195,11 +3481,13 @@ async def _rerun_eval_owned(
         cell=cell,
         split=split,
         instruction=instruction,
-        harness=harness_for(cell.harness),
+        harness=harness,
         run_id=run_id,
         run_dir=run_dir,
         sandbox=sandbox,
-        agent_image=agent_image,
+        agent_image=image_ref,
+        image_tag=image_tag,
+        image_digest=image_id,
         credentials=dict(credentials or {}),
     )
     # Re-seeded for the same reason a resume re-seeds: the sandbox is new even though the home
@@ -3208,6 +3496,18 @@ async def _rerun_eval_owned(
     spec = spec_for(cell.harness, cell.credential_mode)
     seed_home(spec, sandbox.home)
     _watch_cell_credential(ctx, spec)
+    unproven += _refuse_execution_drift(
+        manifest,
+        after_setup_identity(
+            probes=None,
+            credential_mode=credential_effective_mode(
+                spec, sandbox.home, env_names=sorted(ctx.credentials)
+            ),
+        ),
+        stage=IDENTITY_AFTER_SETUP,
+        what="being reopened",
+    )
+    manifest["identity_unproven"] = sorted(set(unproven))
     legs_path = run_dir / "legs.json"
     if legs_path.is_file():
         ctx.prior_legs = json.loads(legs_path.read_text(encoding="utf-8"))
@@ -3579,6 +3879,25 @@ async def rebookend_run(
             + ". Restore the recorded definition; a bookend under an edited definition would "
             "not pair with the run it claims to follow."
         )
+    # The third side. The pairing proves the two archives agree with each other and the check
+    # above proves the cell file has not moved; neither says anything about the image, the
+    # substrate, the prompt as sent or the effort as applied that the new after rows will be
+    # produced under. Compared here, before a byte is copied, and again after setup for the
+    # facts that do not exist yet.
+    image_ref, image_tag, image_id = pinned_image(agent_image)
+    unproven_execution = _refuse_execution_drift(
+        source_manifest,
+        current_identity(
+            cell=cell,
+            split=split,
+            instruction=instruction,
+            harness=harness_for(cell.harness),
+            image_tag=image_tag,
+            image_digest_value=image_id,
+        ),
+        stage=IDENTITY_PRE_SPEND,
+        what="being rebookended",
+    )
     stopping_path = source_run_dir / ROLLOUT_STOPPING_FILE
     if not stopping_path.is_file():
         raise RuntimeError(
@@ -3628,6 +3947,10 @@ async def rebookend_run(
             baseline_dir=baseline_dir_resolved,
             checkout_drift=checkout_drift,
             unproven_identities=unproven_identities,
+            unproven_execution=unproven_execution,
+            image_ref=image_ref,
+            image_tag=image_tag,
+            image_id=image_id,
             run_id=run_id,
             run_dir=run_dir,
             results_dir=results_dir,
@@ -3650,6 +3973,10 @@ async def _rebookend_owned(
     baseline_dir: Path,
     checkout_drift: dict[str, dict[str, Any]],
     unproven_identities: list[str],
+    unproven_execution: list[str],
+    image_ref: str,
+    image_tag: str,
+    image_id: str | None,
     run_id: str,
     run_dir: Path,
     results_dir: Path,
@@ -3684,7 +4011,9 @@ async def _rebookend_owned(
         run_id=run_id,
         run_dir=run_dir,
         sandbox=sandbox,
-        agent_image=agent_image,
+        agent_image=image_ref,
+        image_tag=image_tag,
+        image_digest=image_id,
         credentials=dict(credentials or {}),
     )
     # The post-rollout self, whole: durable channels AND session state, because the fork
@@ -3783,6 +4112,20 @@ async def _rebookend_owned(
         manifest["axes"]["credential_mode"] = credential_effective_mode(
             spec, sandbox.home, env_names=sorted(ctx.credentials)
         )
+        # The facts that did not exist until now: the probe came out of the image a moment ago
+        # and the credential mode off the home it was seeded into. Checked here, after the
+        # manifest is built and before ``_run_phases``, which is the last moment before a row
+        # can exist. The manifest this run publishes is its own; what it is checked against is
+        # the SOURCE's record, the run whose measurement these rows will be paired with.
+        unproven = unproven_execution + _refuse_execution_drift(
+            source_manifest,
+            after_setup_identity(
+                probes=manifest["harness_probes"],
+                credential_mode=manifest["axes"]["credential_mode"],
+            ),
+            stage=IDENTITY_AFTER_SETUP,
+            what="being rebookended",
+        )
         # What this run is a bookend OF, by run id rather than by path: a durable artifact
         # carries no operator layout, and the id is what pairs it with the source post-hoc.
         manifest["rebookend"] = {
@@ -3816,6 +4159,10 @@ async def _rebookend_owned(
             # Every other identity refused before this run spent, so this list is the whole of
             # what the published delta rests on trust for.
             "pairing_identity_unproven": unproven_identities,
+            # And what THIS run could not prove about itself against the source's record: the
+            # same discipline one comparison further out, so the artifact names every identity
+            # it rests on trust for rather than only the ones between the two archives.
+            "execution_identity_unproven": sorted(set(unproven)),
         }
         ctx.publish_json(run_dir / "manifest.json", manifest)
         return await _run_phases(

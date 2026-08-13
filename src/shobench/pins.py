@@ -38,27 +38,42 @@ def shobench_revision() -> tuple[str | None, bool]:
     tarball, no git on the host) records nothing rather than guessing, and nothing reads as the
     honest absence it is.
 
+    Two ways to answer WRONGLY are closed here, both of which beat absence only for a reader who
+    is not checking, which is nobody this field exists for. Every git command has to succeed: a
+    failed ``status`` beside a successful ``rev-parse`` once answered "this commit, clean", which
+    attests to bytes nobody looked at. And the repository has to be THIS package's own: git
+    searches upward, so a wheel installed under someone else's checkout finds their repository
+    and would report their HEAD as the identity of the installed bytes. The toplevel counts only
+    when the file being imported is the file that toplevel tracks.
+
     Cached because a process writes several manifests and the answer cannot change under it.
     """
-    root = Path(__file__).resolve().parents[2]
-    try:
-        rev = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if rev.returncode != 0:
-            return None, False
-        status = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return rev.stdout.strip() or None, bool(status.stdout.strip())
-    except (OSError, subprocess.SubprocessError):
+    module = Path(__file__).resolve()
+    top = _git(module.parent, "rev-parse", "--show-toplevel")
+    if top is None:
         return None, False
+    root = Path(top)
+    if (root / "src" / "shobench" / "pins.py").resolve() != module:
+        # An installed build, or a checkout inside another repository. There is no revision that
+        # identifies these bytes, and the package version is a static 0.0.1 that identifies
+        # nothing either, so the honest answer is that nothing is known.
+        return None, False
+    rev = _git(root, "rev-parse", "HEAD")
+    status = _git(root, "status", "--porcelain")
+    if rev is None or status is None:
+        return None, False
+    return rev or None, bool(status)
+
+
+def _git(cwd: Path, *args: str) -> str | None:
+    """One git command's output, or nothing at all when it did not succeed."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 __all__ = ["SHOGYM_REPO", "SHOGYM_REV", "TAU2_UPSTREAM_SHA", "shobench_revision"]
