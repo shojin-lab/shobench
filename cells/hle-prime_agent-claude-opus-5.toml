@@ -35,46 +35,8 @@ eval_task_timeout_s = 900
 
 [env_kwargs]
 # The judge is a cell axis, so the cell names it rather than inheriting it. gpt-5.6-luna
-# replaces shogym's DEFAULT_JUDGE_MODEL (gpt-5.4-nano) because it grades better, and the swap
-# costs nothing to make now: no hle cell has ever run, so no measurement is disturbed, and all
-# four hle cells carry the identical judge, so they stay comparable to each other.
-#
-# Both judges were measured on 873 real calls each over this split's held-out ids, driving
-# shogym's own OpenAIJudge so the probe exercised the real prompt and the real parser. Parse
-# fidelity matters most, because an unparseable verdict fails closed and reads downstream as
-# the agent answering wrong: luna returned a parseable `correct:` verdict on 873 of 873
-# replies, and so did nano.
-#
-# Grading quality is the three separate statistics below, each with its own counting rule and
-# none restated from another. Candidates were built from each item's own reference answer, so
-# the right verdict is known by construction: 307 such cases, plus 60 numeric near-misses
-# where the right verdict is deliberately arguable. Every candidate was graded repeatedly, 2
-# draws per judge on the general cases and 3 on the multiple-choice cases.
-#
-#   Majority verdict against the verdict known by construction, over the 307 cases that have
-#   one: luna 307, nano 289. A 2-draw tie has no majority and counts against the judge, which
-#   covers 6 of nano's 18 misses; nano was unanimously wrong on 10, a floor that holds under
-#   any tie rule.
-#
-#   Repeat-draw instability, computed from the repeated draws alone with the known verdict
-#   ignored: a case is unstable when one judge's draws on the byte-identical case disagree
-#   with each other. Luna 2 of 307, nano 16 of 307. This is not the statistic above in
-#   different clothes: 8 of nano's 16 unstable cases still reached the right majority verdict.
-#
-#   Judge against judge, over all 367 cases: the two return different majority verdicts on
-#   19, and luna is right on all 18 of those that have a verdict known by construction.
-#
-# Nano's misses are false negatives, most often refusing a lowercase multiple-choice letter,
-# so nano depresses scores rather than inflating them. Numerical tolerance is a dead heat:
-# both reject off-by-one and order-of-magnitude misses, and both accept genuinely equivalent
-# forms. Median latency is 1.1s for either judge.
-#
-# Effort is not settable through shogym's judge today, which passes only model and messages,
-# so this judge runs at the model default. Naming the judge here also puts it in the manifest,
-# so a later change to the upstream default cannot silently regrade results produced under
-# this one.
-#
-# Comparability with published HLE leaderboards does not turn on this choice: CAIS grades with
-# a judge of its own, and nano was not that judge either, so that comparability was already
-# absent before this line changed.
+# replaces shogym's DEFAULT_JUDGE_MODEL (gpt-5.4-nano) because it grades measurably better,
+# and the choice was made before any hle cell ran, so no measurement is disturbed and all four
+# hle cells carry the identical judge. Effort is not settable through the pinned shogym judge,
+# which passes only model and messages, so this judge runs at the model default.
 judge_model = "gpt-5.6-luna"
