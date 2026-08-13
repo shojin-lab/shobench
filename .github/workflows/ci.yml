@@ -1,10 +1,17 @@
 # The checks that cost nothing but runner minutes: ruff and the offline test suite.
 #
-# This workflow must never be able to spend money. It reads no secret, sets no provider key, and
-# runs no cell, no eval, and no harness. The suite it runs holds to the same line: every test that
-# would reach a network or a paid API skips itself instead, and the skip list is printed so a
-# green run that skipped everything is visible rather than silent. If a step here ever needs a
-# credential, it does not belong in this workflow.
+# This workflow must never be able to spend money. No provider credential exists anywhere in this
+# job: it reads no secret, sets no provider key, and runs no cell, no eval, and no harness. The
+# suite it runs goes nowhere either: the clients in it that would reach out on their own are
+# pinned shut at import, in tests/conftest.py, and data a test cannot find on the machine becomes
+# a skip with a reason rather than a download. A step here that needs a provider credential does
+# not belong in this workflow.
+#
+# Two credentials are present, both issued by GitHub and both dead when the job ends: the job
+# token, scoped by the permissions block below to reading this repository, which actions/checkout
+# fetches with, and a separate cache-service token the runner injects into every Node action,
+# which is what the uv setup's cache runs on. Neither is a spend path, and neither reaches a step
+# that runs repository code.
 name: ci
 
 on:
@@ -24,25 +31,52 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          # The action fetches with the job token either way. What this changes is the after: by
+          # default the token is written into the local git config and stays there, where ruff or
+          # pytest code from a pull request could read it back. Nothing here pushes or calls the
+          # API, so the token's work ends with the fetch.
+          persist-credentials: false
 
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.12.3"
           python-version: "3.12"
-          # uv's download cache, keyed on the lock. shogym is a git dependency, so a cold cache
-          # is a clone rather than a wheel pull.
+          # Declined: the action attaches this to nothing but a download from github.com, and the
+          # pinned version comes off Astral's mirror. The tradeoff is the fallback path, where a
+          # mirror outage means an anonymous retry against GitHub releases on the runner's shared
+          # rate limit, which is the cheaper thing to spend.
+          github-token: ""
+          # uv's download cache, keyed on the lock. shogym is a git dependency, so a cold cache is
+          # a clone rather than a wheel pull. This runs on the runner's cache-service token, not
+          # the one declined above.
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      # --frozen so a lock that drifted from pyproject.toml is a failure here rather than a
-      # silent re-resolve that tests something other than what a developer runs.
-      - run: uv sync --frozen
+      # --locked, because drift is what --frozen does not look at: --frozen installs the lock as
+      # written, so a dependency added to pyproject.toml and never locked is missing here and the
+      # job stays green without it. The run steps keep --frozen; the gate has been passed by then.
+      - run: uv sync --locked
 
       - run: uv run --frozen ruff check .
 
-      # -rs names every skip. Nothing in the suite needs a provider, a docker daemon, or a
-      # dataset; what is absent on a runner skips with a reason, and that reason is in the log.
-      # The docker marker is what pyproject.toml already says it is, a test needing a live
-      # daemon, and a runner has none. No test carries it today, so this deselects nothing and
-      # says so in the summary line the day one does.
-      - run: uv run --frozen pytest -q -rs -m "not docker"
+      # -rs prints every skip with its reason, so a run that skipped something says which and why
+      # rather than leaving a silent gap. The docker marker is what pyproject.toml says it is, a
+      # test needing a live daemon, and a runner has none; no test carries it today.
+      - run: uv run --frozen pytest -q -rs -m "not docker" --junitxml=$RUNNER_TEMP/pytest.xml
+
+      # pytest exits 0 for a selection that skipped or deselected everything, so green can mean
+      # nothing ran. The floor is a tripwire and not a target: it sits far below the suite's real
+      # count and does not want raising as that count grows.
+      - run: |
+          uv run --frozen python - "$RUNNER_TEMP/pytest.xml" <<'PY'
+          import sys
+          from xml.etree import ElementTree
+
+          root = ElementTree.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          executed = int(suite.get("tests")) - int(suite.get("skipped"))
+          print(f"{executed} tests executed")
+          if executed < 250:
+              sys.exit(f"the suite executed {executed} tests, which is too few to call this a run")
+          PY

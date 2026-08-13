@@ -15,17 +15,31 @@ quietly paid for one would tie this file's verdict to a third-party host being r
 would make the same test pass on a machine with a network and skip on one without, which is a
 skip reason nobody can read. So the fetch is refused here and the absence is what gets
 reported. The tests themselves are unchanged: where the data is provisioned, they run in full.
+
+Two doors, so two mechanisms: the tarball fetch is shogym's own function, refused by the fixture
+below, and the Hub fetch belongs to ``datasets``, stopped process-wide by ``conftest.py``.
+
+What is left here is naming the absence, and naming it only when it is real. These tests skip on
+a refused fetch and on a cache the loader would not reach for, and on nothing else. Data that is
+present and will not load fails instead, because a green run reporting absent data the machine is
+holding is worse than a red one.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
+from shogym.envs.hle import data as hle_data
 
 from shobench import tau2_data
 from shobench.serving import env_factory
 from shobench.splits import load_split_by_name
+
+
+class _RefusedFetch(RuntimeError):
+    """Raised where a download would have been. It is the one absence this file can skip on."""
 
 
 @pytest.fixture(autouse=True)
@@ -41,18 +55,86 @@ def _no_upstream_fetch(monkeypatch):
     from shogym.envs import _upstream
 
     def refuse(package: str, *_rest: object) -> None:
-        raise RuntimeError(
+        raise _RefusedFetch(
             f"the pinned {package} source is not cached here, and a test will not download it"
         )
 
     monkeypatch.setattr(_upstream, "_download_package", refuse)
 
 
+def _hle_is_cached(cache: Path) -> bool:
+    """Whether ``datasets`` considers the hle dataset cached under ``cache``.
+
+    Put to the factory the offline load path falls back to rather than to a copy of its glob. Its
+    answer is coarser than "loadable" on purpose: a directory where builds live is enough, even a
+    half-written one. The factory reaching for a directory is what makes absence untrue, and
+    everything past this line is then free to fail rather than obliged to skip.
+    """
+    from datasets.load import CachedDatasetModuleFactory
+
+    try:
+        CachedDatasetModuleFactory(hle_data.HF_DATASET, cache_dir=str(cache)).get_module()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _hle_builder(cache: Path):
+    """The builder object the loader will read through, built the way the loader builds it.
+
+    Predicting where the loader ends up is the mistake this exists to stop making: selection is
+    only its first move, and the builder can then replace the selected directory with a
+    legacy-layout one beside it and read the files under a different name. ``load_dataset`` builds
+    this object and reads through it, so this builds the same object from the same arguments and
+    asks it what it resolved to. Constructing a builder settles paths and metadata and opens
+    nothing; the read comes later, through the env the runner would use.
+
+    An error here fails rather than skips, absence having been settled before it was called.
+    """
+    from datasets import load_dataset_builder
+
+    try:
+        return load_dataset_builder(hle_data.HF_DATASET, cache_dir=str(cache))
+    except Exception as exc:
+        raise AssertionError(
+            f"datasets cannot open a builder over {cache}, and the hle data is cached there: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _hle_files_datasets_will_read(builder) -> list[Path]:
+    """The exact files the reader is instructed to open for the requested split.
+
+    The reader is handed a file list rather than globbing the directory, so that list is what has
+    to be there, and the arrow files that can sit beside it (another split's shards, residue from
+    an older prepare) are not this test's business. The list comes from the reader's own
+    instruction builder, off the resolved directory and split metadata, under the name the read
+    path would use, which on the legacy branch is the builder's rather than the dataset's.
+    """
+    from datasets.arrow_reader import make_file_instructions
+
+    name = builder.name if builder._check_legacy_cache() else builder.dataset_name
+    instructions = make_file_instructions(
+        name=name,
+        split_infos=list(builder.info.splits.values()),
+        instruction=hle_data.HF_SPLIT,
+        filetype_suffix="arrow",
+        prefix_path=str(builder.cache_dir),
+    )
+    return [Path(instruction["filename"]) for instruction in instructions.file_instructions]
+
+
 def _env(name: str, kwargs: dict):
+    """Construct the env the way the runner does.
+
+    One failure skips here, the refused fetch, which says the source is not on this machine. Every
+    other failure fails: a test reaches this line having established that its data is present, so
+    "not provisioned" over a machine holding the data would be a false reason for a green run.
+    """
     try:
         return env_factory(name, kwargs)(name)
-    except Exception as exc:  # noqa: BLE001 - the message is the skip reason
-        pytest.skip(f"{name} data not provisioned here: {type(exc).__name__}: {exc}")
+    except _RefusedFetch as exc:
+        pytest.skip(f"{name} data not provisioned here: {exc}")
 
 
 def test_tau2_manifest_ids_resolve_to_the_labels_it_records() -> None:
@@ -79,16 +161,24 @@ def test_automationbench_manifest_covers_the_env_exactly() -> None:
 
 
 def test_hle_manifest_ids_resolve_to_the_question_ids_it_records() -> None:
-    # hle's tasks come off the Hub through ``datasets``, which the fixture above cannot cover:
-    # huggingface_hub reads HF_HUB_OFFLINE once, at import, so setting it from a test is read
-    # too late to stop anything. The cache the loader is pointed at is checked instead, before
-    # the loader is called at all. A dir that is present but stale still reaches the Hub, which
-    # is the developer machine this runs on and not a runner.
-    from shogym.envs.hle import data as hle_data
-
+    # hle's tasks come off the Hub through ``datasets``, which the fixture above cannot cover: the
+    # download is not shogym's function. conftest.py pins that client offline for the whole
+    # process, so the loader below reads this cache or raises, and every check between here and it
+    # is about that cache. Whether anything is cached at all decides the skip; past that, every
+    # disagreement with what the loader resolved to is a failure.
     cache = hle_data.cache_dir()
-    if not (cache.is_dir() and any(cache.iterdir())):
+    if not _hle_is_cached(cache):
         pytest.skip(f"the gated hle dataset is not cached at {cache}, and a test will not fetch it")
+    builder = _hle_builder(cache)
+    build = Path(builder.cache_dir)
+    assert hle_data.HF_SPLIT in (builder.info.splits or {}), (
+        f"datasets resolves to {build}, which records no {hle_data.HF_SPLIT!r} split"
+    )
+    files = _hle_files_datasets_will_read(builder)
+    unusable = [f.name for f in files if not (f.is_file() and f.stat().st_size)]
+    assert not unusable, (
+        f"datasets reads {hle_data.HF_SPLIT!r} out of {build}, and {unusable} is missing or empty"
+    )
     split = load_split_by_name("hle")
     env = _env("hle", split.heldout.env_kwargs)
     assert env.num_tasks == split.total_tasks
