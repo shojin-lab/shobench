@@ -471,6 +471,81 @@ manifest's instruction block records which one eval_after launched with
 (`instruction.eval_prompt_used`), so the artifact says it rather than leaving a reader to
 derive it from the axis.
 
+Runs measured before the resumed default get their bookend through `shobench rebookend`: a
+NEW run (fresh unique id, its own lock) that copies the source's accumulated home, inherits
+the source's recorded axes with `eval_context` forced to resumed, and runs exactly the
+resumed eval_after against the source's terminal session, resolved from the source's own
+stopping record and validated by the same preflight inside the copied home. The source run
+is read and never written: it is an archived artifact, and the new run names it in a
+`rebookend` provenance block and publishes under the incomplete name, since a run with no
+eval_before cannot account for the before side; pairing with the source happens post-hoc.
+The published artifact is named by the BOOKEND's run id, never the cell name. The cell-name
+artifact is the source's own measurement, the one the bookend exists to pair with, and the
+one-artifact-per-cell rule (`write_results` replaces the stem's other shape) would have
+destroyed it; the run-id stem keeps the source result and every bookend of every source
+coexisting, self-paired through the provenance block, and it makes the leaf unpredictable
+before the run mints its id, so nothing can pre-occupy it, with the minted names still
+bounded against the source before the lock; the stem rides through every reopening (a
+resumed or repaired bookend republishes under its own run id, never the cell name). The
+marker carries two identities, deliberately: `rebookend_of` is the terminal-state lineage
+(the run whose conversation this bookend resumes), and `baseline_run_id` is the pairing
+identity (the run whose eval_before rows the report joins with this bookend's after rows).
+They coincide only when the source measured its own before-side, which is the stated
+default; a rollout-only or after-only source (every v0 source, whose baselines are separate
+deferred runs) REQUIRES `--baseline`, validated before anything spends: a real run, not
+itself a bookend, the same cell, the same split id digest (the load-bearing check, because
+before rows over different held-out ids would pair task numbers that are not the same
+tasks), and carrying eval_before provenance of its own. The artifact is SELF-CONTAINED: at
+creation the baseline's eval_before rows are read from its run directory (refusing before
+any spend when none are readable) and persisted into the bookend's own run directory, and
+every publication of the bookend, first or reopened, publishes those rows as its own before
+block, labeled `eval_before.source_run_id`, so the paired delta lives inside the artifact
+and names both runs it derives from. That matters because baseline artifacts live under the
+shared cell stem and are routinely evicted by later same-cell publications; a bookend that
+depended on the baseline's artifact stopped assembling the day another run of the cell
+published. The reporter therefore needs no join for a self-contained bookend; the join
+survives only for LEGACY bookends published before the carry, where a baseline missing from
+the loaded files still surfaces explicitly as BASELINE MISSING and a bookend-shaped
+baseline as INVALID PROVENANCE, never silently. Every reported row carries its run id, its
+arm axes (pre-axis artifacts render their recorded arms, never plus cold, exactly as the
+recorded-axis helpers define absence), and its pairing. Chains are refused, not walked: a bookend of a bookend re-measures the same
+terminal state as rebookending the original directly (the bookend's home is the source's
+terminal home, copied, and its own eval_after advanced no rollout), so the runner and the
+plan refuse a source that is itself a rebookend, naming the original to bookend instead, and
+the reporter independently labels any artifact whose named source is a bookend (a chain or a
+cycle) INVALID PROVENANCE rather than assembled, because a bookend's before-side does not
+exist to pair against. The source's lock file is held SHARED for
+exactly the duration of the snapshot: shared refuses a live mutator and blocks a would-be
+one (every mutating owner takes the lock exclusive) without writing a byte, and it is
+released before any spend. A source WITHOUT a lock file is refused as unholdable rather than
+copied unheld, because every mutator creates the lock on its way in and would write mid-copy
+under an empty hold; creating the lock from the rebookend would itself write into the
+archive, so the refusal names the operator's own one-file workaround, and every run since
+the lock landed carries one, so only pre-lock-era directories are affected. Under the hold,
+everything the plan relied on is re-proven before the copy: a suspension written without a
+manifest change refuses, a terminus that stopped naming a terminal session refuses, and a
+rewritten manifest refuses, so a mutation that ran whole between the plan read and the hold
+cannot be snapshotted under the old definition.
+The snapshot is MATERIALIZED, transcripts included: every symlink becomes the bytes it
+names, resolved from the link's own parent (a valid relative link, the shape of every link in
+the real prime homes, materializes wherever the process happens to run; the stdlib copy read
+those as dangling and silently dropped them). Nothing in the new tree references the source,
+so no later writer (the credential reseed was the demonstrated case) can reach the archive
+through a preserved link; a genuinely dangling link drops, and a link resolving outside the
+source home, a cycle, or a special file refuses loudly. Publication is atomic everywhere
+(``write_results`` swaps the leaf entry in with ``os.replace``), and a rebookend additionally
+refuses up front any output directory, result leaf, or new run path that resolves into the
+source, so a link planted at a deterministic name is refused or replaced, never followed.
+Refused before anything is copied or spent: a source without a terminus, without a
+resolvable terminal session, holding a suspension record, or still owned by a live process,
+and any output path, result leaf, or new run path at or under the source. A
+bookend that a usage limit suspends resumes through the ordinary machinery and publishes the
+same shape an uninterrupted bookend does: its copied stopping record serves the preflight
+only and is never republished as the new run's rollout. The terminus is taken exactly where
+the rollout ended, whatever its stop reason: a harness_error ending mid-task resumes from
+that mid-task end, deliberately, because stepping back to a tidier point would resume a
+conversation the rollout never had.
+
 The preflight validates rather than globs, because existence is not resumability. Each
 harness's `session_transcript` resolves the file the way that CLI's own resume lookup does
 (exact naming, never a substring) and then requires the floor that CLI was observed to
@@ -610,7 +685,15 @@ all, resumed to the auth boundary in a pristine home. Three things the CLI refus
 that. Anchoring: its scanner gives up on a file whose first parseable entry is not the
 header (source: `scanSessionInfo`), and a message line above a fully valid header is
 `No session found matching` for that id, the same answer a mismatched header id gets,
-because the scanner indexes by the header id and never the filename. The dialect: the
+because the scanner indexes by the header id and never the filename. The filename is in
+fact a DIFFERENT identifier space, and requiring it refused real runs: the daemon mints the
+session file under one id and the print run's header carries another, rewritten into that
+same file (observed on a session the pinned CLI itself wrote, and the shape of both real
+prime rollouts, whose recorded terminal id sits inside a file named for a different id).
+The CLI resolves the header id out of the differently named file and appends to it
+(observed, network off), so the preflight scans the flat sessions directory for exact
+header matches instead of trusting a name, and refuses two files carrying the same header
+id, because the resolver refuses an ambiguous selector (source: `resolveUniqueMatch`). The dialect: the
 scanner's parser is JSON.parse, so a header line carrying a NaN-family constant is
 unparseable to it and the session is `No session found matching`; the skipping cuts the
 other way too, since a NaN-poisoned junk line ABOVE a valid header is skipped and the

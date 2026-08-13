@@ -8,6 +8,7 @@ interval is computed over, and how a leg's ending is classified.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -1002,6 +1003,41 @@ def test_prime_resumes_only_a_session_recorded_at_the_leg_cwd(tmp_path: Path) ->
     assert harness.session_transcript(at_work, _SID) == at_work / rel
 
 
+def test_prime_resolves_the_header_id_whatever_the_file_is_called(tmp_path: Path) -> None:
+    """The filename is not the identity, and requiring it refused real runs.
+
+    The daemon mints the session file under one id and the print run's header carries
+    another, rewritten into that same file: observed on a session the pinned CLI itself wrote,
+    and the shape of both real prime rollouts, whose recorded terminal id sits inside a file
+    named for a different id. The CLI resolves the HEADER id out of the differently named
+    file and appends to it (observed, network off), because its scanner indexes header ids
+    and never filenames (source). Ambiguity is the one thing the scan must not paper over:
+    the resolver refuses a selector matching two sessions (source), so two files carrying the
+    same header id refuse here too.
+    """
+    harness = harness_for("prime_agent")
+    header = json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/work"}) + "\n"
+
+    # The real layout: recorded id inside a file named for the daemon's earlier id.
+    renamed = _home_with(
+        tmp_path / "renamed",
+        ".prime/agent/sessions/019ff888-9193-77ab-b62b-56f86da868f0.jsonl",
+        header,
+    )
+    assert (
+        harness.session_transcript(renamed, _SID)
+        == renamed / ".prime/agent/sessions/019ff888-9193-77ab-b62b-56f86da868f0.jsonl"
+    )
+
+    # Two files carrying the same header id: the CLI's resolver would refuse the selector as
+    # ambiguous, so the preflight must not pick one.
+    ambiguous = _home_with(
+        tmp_path / "ambiguous", ".prime/agent/sessions/aaaa-file.jsonl", header
+    )
+    _home_with(tmp_path / "ambiguous", ".prime/agent/sessions/bbbb-file.jsonl", header)
+    assert harness.session_transcript(ambiguous, _SID) is None
+
+
 def test_codex_meta_values_are_unconstrained_because_the_cli_constrains_none(
     tmp_path: Path,
 ) -> None:
@@ -1385,6 +1421,133 @@ def test_no_durable_artifact_the_runner_writes_carries_an_absolute_path(tmp_path
     for path in (manifest_path, results_path):
         doc = json.loads(path.read_text(encoding="utf-8"))
         assert _absolute_path_values(doc) == [], f"{path.name} leaks an absolute path"
+
+
+def test_publication_replaces_a_planted_leaf_and_never_writes_through_it(
+    tmp_path: Path,
+) -> None:
+    """The result leaf names are deterministic, so an entry can be waiting there before the
+    run publishes: a symlink at the leaf turned publication into a write through the results
+    directory into wherever it pointed (an archived run, in review). Publication now swaps
+    the entry atomically, so whatever held the name is replaced and nothing is followed."""
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text("UNTOUCHED", encoding="utf-8")
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / "cell.incomplete.json").symlink_to(elsewhere)
+
+    path = write_results(
+        results / "cell.json",
+        manifest={},
+        phases={"eval_before": [], "eval_after": [], "rollout": []},
+        stopping={},
+        heldout_ids=[1],
+    )
+
+    assert path.name == "cell.incomplete.json"
+    assert not path.is_symlink()
+    assert elsewhere.read_text() == "UNTOUCHED"
+    assert json.loads(path.read_text(encoding="utf-8"))["schema"] == "shobench.results/1"
+
+
+def test_concurrent_publications_of_one_leaf_each_land_whole(tmp_path: Path) -> None:
+    """Two publishers of one leaf must never braid: a per-process scratch name let publisher
+    B unlink A's scratch mid-write, so A swapped B's half-written inode into the leaf and
+    reported success (reproduced). Each publication now mints its own exclusive scratch, so
+    whatever the interleaving, the final artifact is one publisher's WHOLE body and no
+    scratch survives."""
+    import threading
+
+    results = tmp_path / "results"
+    results.mkdir()
+    errors: list[str] = []
+
+    def publish(marker: str) -> None:
+        try:
+            write_results(
+                results / "cell.json",
+                manifest={"cell": {"name": marker}},
+                phases={"eval_before": [], "eval_after": [], "rollout": []},
+                stopping={},
+                heldout_ids=(),
+            )
+        except Exception as exc:  # noqa: BLE001 - the failure mode IS the assertion
+            errors.append(f"{marker}: {type(exc).__name__}")
+
+    for _ in range(40):
+        a = threading.Thread(target=publish, args=("AAA",))
+        b = threading.Thread(target=publish, args=("BBB",))
+        a.start()
+        b.start()
+        a.join()
+        b.join()
+        published = json.loads((results / "cell.json").read_text(encoding="utf-8"))
+        assert published["manifest"]["cell"]["name"] in ("AAA", "BBB")
+        assert published["schema"] == "shobench.results/1"
+    assert errors == []
+    assert list(results.glob(".*tmp")) == []
+
+
+def test_publication_lands_with_ordinary_modes_not_the_scratch_mode(tmp_path: Path) -> None:
+    """The swap carries the scratch's mode onto the leaf, and mkstemp mints 0600: unfixed, a
+    fresh artifact landed owner-only and a republish downgraded an existing shared-readable
+    result (both reproduced). A fresh leaf gets what an ordinary creation would get under the
+    process umask, and an existing regular leaf keeps its own mode across republication."""
+    import stat as stat_module
+
+    old_umask = os.umask(0o022)
+    try:
+        fresh_dir = tmp_path / "fresh"
+        fresh_dir.mkdir()
+        fresh = write_results(
+            fresh_dir / "cell.json",
+            manifest={},
+            phases={"eval_before": [], "eval_after": [], "rollout": []},
+            stopping={},
+            heldout_ids=(),
+        )
+        assert stat_module.S_IMODE(fresh.stat().st_mode) == 0o644
+
+        re_dir = tmp_path / "re"
+        re_dir.mkdir()
+        existing = re_dir / "cell.json"
+        existing.write_text("{}", encoding="utf-8")
+        os.chmod(existing, 0o664)
+        republished = write_results(
+            re_dir / "cell.json",
+            manifest={},
+            phases={"eval_before": [], "eval_after": [], "rollout": []},
+            stopping={},
+            heldout_ids=(),
+        )
+        assert stat_module.S_IMODE(republished.stat().st_mode) == 0o664
+        # No probe or scratch survives either publication.
+        assert sorted(p.name for p in fresh_dir.iterdir()) == ["cell.json"]
+        assert sorted(p.name for p in re_dir.iterdir()) == ["cell.json"]
+    finally:
+        os.umask(old_umask)
+
+
+def test_a_failed_publication_leaves_no_scratch_behind(tmp_path: Path, monkeypatch) -> None:
+    """A publication that dies mid-flight must not leave its scratch entry in the results
+    directory: an orphan there is a file a reader can find and believe."""
+
+    def refuse_replace(src: object, dst: object) -> None:
+        raise OSError("simulated failure at the swap")
+
+    monkeypatch.setattr(os, "replace", refuse_replace)
+    results = tmp_path / "results"
+    results.mkdir()
+
+    with pytest.raises(OSError, match="simulated failure"):
+        write_results(
+            results / "cell.json",
+            manifest={},
+            phases={"eval_before": [], "eval_after": [], "rollout": []},
+            stopping={},
+            heldout_ids=(),
+        )
+    assert list(results.iterdir()) == []
 
 
 def test_a_cell_leaves_one_results_file_whichever_way_its_run_ended(tmp_path: Path) -> None:

@@ -216,33 +216,47 @@ class PrimeAgent(Harness):
     LEG_CWD = "/work"
 
     def session_transcript(self, home: Path, session_id: str) -> Path | None:
-        """The exactly-named session file, whose FIRST parseable line is a header naming this
-        id and recorded at the cwd the fork resumes in.
+        """The one session file whose FIRST parseable line is a header naming this id,
+        recorded at the cwd the fork resumes in, whatever the file is called.
 
-        None of that is extra strictness; all of it is the CLI's own scanner and resolver. It
-        indexes saved sessions by the header id and never the filename (source:
-        ``scanSessionInfo``, and observed: a mismatched header is "No session found matching"
-        for the filename's id), it gives up on a file whose first parseable entry is not the
-        header (source: the scanner returns nothing for it, and observed: a message line
-        above a valid header is the same "No session found matching"), and it resumes in
-        place only a session whose header cwd matches the resuming cwd; recorded elsewhere,
-        the run dies on the interactive fork prompt (observed for an absent cwd and for a
-        different one). A header with the matching cwd is the whole floor: such a one-line
-        file, timestamp absent and all, resumed to the auth boundary against the pinned CLI
-        (observed, network off). An empty file has no header and is not found either.
+        The filename is NOT the identity, and requiring it broke real runs. The daemon mints
+        a session file under one id and the print run's header carries another, rewritten
+        into that same file: observed on a CLI-written session (a failed-auth run persisted a
+        file whose header id differed from its filename), and on both real prime rollouts,
+        whose recorded terminal id sits inside a file named for a different id. The CLI's
+        resolver never looks at the name: it indexes saved sessions by the header id
+        (source: ``scanSessionInfo`` walks ``readdir`` of the flat sessions dir), a file
+        named for one id whose header names another is "No session found matching" for the
+        FILENAME's id (observed), and resuming the HEADER id out of a differently named file
+        resolves and appends to that file (observed). So this scans the flat sessions dir for
+        header matches, and requires exactly one: the resolver refuses an ambiguous selector
+        (source: ``resolveUniqueMatch`` raises on more than one match), so two files carrying
+        the same header id are a refusal here too.
+
+        The rest of the floor is unchanged and still the CLI's own: the header must be the
+        first parseable line (a message line above it is "No session found matching",
+        observed), must name this id, and must be recorded at the resuming cwd; recorded
+        elsewhere or nowhere, the run dies on the interactive fork prompt (observed for an
+        absent cwd and for a different one). A header alone is the whole floor: such a
+        one-line file, timestamp absent and all, resumed to the auth boundary (observed,
+        network off). An empty file has no header and is not found either.
         """
-        path = home / ".prime" / "agent" / "sessions" / f"{session_id}.jsonl"
-        if not path.is_file():
+        sessions = home / ".prime" / "agent" / "sessions"
+        if not sessions.is_dir():
             return None
-        header = _first_parseable_event(path)
-        if (
-            header is not None
-            and header.get("type") == "session"
-            and str(header.get("id") or "") == session_id
-            and header.get("cwd") == self.LEG_CWD
-        ):
-            return path
-        return None
+        matches = []
+        for path in sorted(sessions.glob("*.jsonl")):
+            if not path.is_file():
+                continue
+            header = _first_parseable_event(path)
+            if (
+                header is not None
+                and header.get("type") == "session"
+                and str(header.get("id") or "") == session_id
+                and header.get("cwd") == self.LEG_CWD
+            ):
+                matches.append(path)
+        return matches[0] if len(matches) == 1 else None
 
     def observed_models(self, trace_path: Path) -> list[str]:
         """Which model actually answered, off prime-agent's own assistant messages.

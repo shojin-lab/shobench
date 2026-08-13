@@ -41,7 +41,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +66,7 @@ from shobench.pins import SHOGYM_REPO, SHOGYM_REV
 from shobench.redact import MARKER as redact_marker
 from shobench.redact import Redactor, redactor_for, secrets_in_file
 from shobench.results import (
+    INCOMPLETE_SUFFIX,
     TaskResult,
     dispensed_positions,
     fill_missing,
@@ -815,14 +816,33 @@ def _eval_pending_ids(phase_dir: Path, task_ids: Sequence[str]) -> list[str]:
     ]
 
 
+def terminal_session_in(run_dir: Path) -> str | None:
+    """The rollout's terminal session id as the run's own record names it, or ``None``.
+
+    The stopping record's ``session_id`` is the terminal one (it is updated to the id the last
+    leg really ran under); a record without it falls back to the last rollout leg that names
+    one. Shared between the resumed eval_after preflight and the rebookend entry, which reads
+    it off the SOURCE run it bookends, so the two cannot drift on what "the terminal session"
+    means.
+    """
+    stopping_path = run_dir / ROLLOUT_STOPPING_FILE
+    if not stopping_path.is_file():
+        return None
+    stopping = json.loads(stopping_path.read_text(encoding="utf-8"))
+    session_id = str(stopping.get("session_id") or "") or None
+    if session_id is None:
+        for leg in reversed(stopping.get("legs", [])):
+            if leg.get("session_id"):
+                return str(leg["session_id"])
+    return session_id
+
+
 def _rollout_terminal_session(ctx: RunContext) -> str:
     """The session the rollout ended in, proven forkable from the cell's base home.
 
     Read from the run's own record rather than from live objects, because eval_after does not
     always run in the process that ran the rollout: a fresh cell has just written
-    ``rollout_stopping.json``, while a resume or a reopened run has only the disk. The stopping
-    record's ``session_id`` is the terminal one (it is updated to the id the last leg really ran
-    under); a record without it falls back to the last rollout leg that names one. The id alone
+    ``rollout_stopping.json``, while a resume or a reopened run has only the disk. The id alone
     is not enough: the transcript must be in the base home the forks copy from, since each
     per-task launch would otherwise discover the absence only after its copy, its stream, and
     its container were already paid for, one task at a time.
@@ -832,15 +852,7 @@ def _rollout_terminal_session(ctx: RunContext) -> str:
     measurement has a cell axis that says so.
     """
     stopping_path = ctx.run_dir / ROLLOUT_STOPPING_FILE
-    session_id: str | None = None
-    if stopping_path.is_file():
-        stopping = json.loads(stopping_path.read_text(encoding="utf-8"))
-        session_id = str(stopping.get("session_id") or "") or None
-        if session_id is None:
-            for leg in reversed(stopping.get("legs", [])):
-                if leg.get("session_id"):
-                    session_id = str(leg["session_id"])
-                    break
+    session_id = terminal_session_in(ctx.run_dir)
     if session_id is None:
         raise RuntimeError(
             f"{ctx.cell.name}: eval_context is 'resumed' but the rollout record at "
@@ -1068,6 +1080,13 @@ def _single_task_split(split: Split, phase: str, task_id: str) -> Split:
 
 
 SUSPENSION_FILE = "suspended.json"
+# The baseline's eval_before rows, carried INTO a bookend run directory at creation and
+# published as the bookend artifact's own before block. The baseline's result artifact lives
+# under the shared cell stem and is routinely evicted by later same-cell publications, so an
+# artifact that depended on it could stop assembling the day another run of the cell
+# published; carrying the rows makes the bookend artifact self-contained, and the block is
+# labeled with the run id it came from so no reader mistakes it for rows this run measured.
+BASELINE_BEFORE_FILE = "baseline_before.json"
 # The rollout's stop classification, persisted beside its provenance the moment the rollout ends.
 # Only the runner sees how a leg ended, so this is the one piece of the rollout that cannot be
 # re-read from the shogym record. An eval_after suspension leaves the rollout finished but the
@@ -1554,6 +1573,7 @@ async def _run_phases(
     observer: _Egress,
     suspended: Suspension | None = None,
     recorded_phases: tuple[str, ...] = (),
+    artifact: str | None = None,
 ) -> Path:
     """Run this cell's phases, then finalize the manifest and publish the results.
 
@@ -1568,6 +1588,12 @@ async def _run_phases(
     forward: eval_before for a rollout suspension, and both eval_before and the rollout for an
     eval_after suspension, since an eval_after limit falls after the rollout is already paid for
     and must not lose it.
+
+    ``artifact`` overrides the published result's stem. The default, the cell name, is right
+    for every run that IS the cell's measurement, because a rerun replacing the cell's last
+    artifact is the intended one-artifact-per-cell rule. A rebookend is not that run: it
+    pairs WITH the cell's artifact, and publishing under the same stem destroyed the very
+    result it must pair with, so it publishes under its own run id instead.
     """
 
     def teardown() -> None:
@@ -1652,15 +1678,35 @@ async def _run_phases(
     manifest["ended_at"] = time.time()
     ctx.publish_json(ctx.run_dir / "manifest.json", manifest)
 
+    # A bookend publishes the BASELINE's before rows as its own block, labeled with the run
+    # they came from, so the artifact carries its whole pairing and depends on no other file:
+    # the baseline's own artifact lives under the shared cell stem and is routinely evicted
+    # by later same-cell publications. The carried rows were persisted at creation; a
+    # marker-bearing run whose carry is gone cannot publish self-contained and must not
+    # publish an empty before under the resumed label, so it refuses.
+    before_source_run_id: str | None = None
+    baseline_payload_path = ctx.run_dir / BASELINE_BEFORE_FILE
+    if "rebookend" in manifest:
+        if not baseline_payload_path.is_file():
+            raise RuntimeError(
+                f"{ctx.run_dir} is a rebookend but its carried baseline rows "
+                f"({BASELINE_BEFORE_FILE}) cannot be read, so the artifact cannot be "
+                "published self-contained. The file is written at creation; restore it or "
+                "recreate the bookend."
+            )
+        payload = json.loads(baseline_payload_path.read_text(encoding="utf-8"))
+        phase_rows["eval_before"] = [TaskResult(**row) for row in payload["rows"]]
+        before_source_run_id = str(payload.get("source_run_id") or "") or None
     egress_summary = observer.stop()
     results_path = write_results(
-        results_dir / f"{ctx.cell.name}.json",
+        results_dir / f"{artifact or ctx.cell.name}.json",
         manifest=manifest,
         phases=phase_rows,
         stopping=stopping,
         heldout_ids=heldout_ids,
         egress=egress_summary,
         redact=ctx.redactor.json,
+        before_source_run_id=before_source_run_id,
     )
     # Said out loud as well as written down. A cell that cannot account for every held-out id is
     # not this cell's result, and the operator who ran it is the one who can decide what to do
@@ -2078,6 +2124,14 @@ async def _resume_cell_owned(
     elif interrupted_phase == "eval_after":
         phases = ("eval_after",)
         recorded_phases = ("eval_before", "rollout")
+        if "rebookend" in manifest:
+            # A bookend never ran an eval_before or a rollout of its own: its stopping file
+            # is the SOURCE's terminus, copied in for the resumed preflight, and carrying it
+            # as a recorded phase would publish it as this run's rollout. The identical
+            # after-measurement must not change artifact shape just because it hit a usage
+            # limit, so a resumed bookend records nothing and publishes the same empty
+            # rollout an uninterrupted one does.
+            recorded_phases = ()
     else:
         raise RuntimeError(f"suspension names an unknown phase {interrupted_phase!r}")
     # Written before anything can suspend again, because a manifest that lives only in memory
@@ -2106,6 +2160,11 @@ async def _resume_cell_owned(
             observer=observer,
             suspended=suspended,
             recorded_phases=recorded_phases,
+            # A bookend keeps its own artifact stem across every reopening: the cell-name
+            # fallback is the SOURCE's artifact, and a resumed bookend publishing under it
+            # would destroy the result it pairs with, exactly the destruction the run-id
+            # namespace exists to prevent.
+            artifact=run_id if "rebookend" in manifest else None,
         )
         # Only now is the record spent. It is this run's one retry handle, and everything
         # between here and the top of this function can fail: a stream that will not open, a
@@ -2259,7 +2318,10 @@ async def _rerun_eval_owned(
     recorded: list[str] = []
     if phase != "eval_before" and (run_dir / "eval_before").is_dir():
         recorded.append("eval_before")
-    if (run_dir / "rollout_stopping.json").is_file():
+    # A bookend's stopping file is the SOURCE's terminus, copied in for the resumed preflight
+    # and never this run's own rollout, so a rerun must not republish it as one: the same
+    # narrowing the resume applies, or a repaired bookend would change artifact shape.
+    if (run_dir / "rollout_stopping.json").is_file() and "rebookend" not in manifest:
         recorded.append("rollout")
     recorded_phases = tuple(recorded)
     manifest.setdefault("eval_reruns", []).append({"at": time.time(), "phase": phase})
@@ -2274,6 +2336,537 @@ async def _rerun_eval_owned(
             results_dir=results_dir,
             observer=observer,
             recorded_phases=recorded_phases,
+            # Same rule as a resume: a reopened bookend republishes under its own run id.
+            artifact=run_id if "rebookend" in manifest else None,
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            observer.stop()
+        sandbox.down()
+
+
+def _materialize_home(
+    source: Path,
+    destination: Path,
+    *,
+    root: Path | None = None,
+    active: set[Path] | None = None,
+) -> None:
+    """Copy ``source`` into ``destination`` with every symlink turned into the bytes it names.
+
+    ``shutil.copytree(symlinks=False, ignore_dangling_symlinks=True)`` was not this: CPython
+    tests a link's TEXTUAL target against the process cwd rather than the link's parent, so a
+    valid relative link (the shape of every link in the real prime homes: in-home cache links,
+    all relative, all resolving) read as dangling and silently vanished from the snapshot.
+    Here each link resolves the way the filesystem resolves it, from its own parent:
+
+    - a link to a file inside the source home becomes that file's bytes;
+    - a link to a directory inside the source home becomes that tree, links within it
+      materialized the same way, with the chain of directories currently being materialized
+      tracked so a cycle fails loudly instead of recursing forever (two links to ONE target
+      are fine; a link into its own ancestry is not);
+    - a genuinely dangling link is dropped: it names no bytes, and the CLIs resolve it to
+      nothing as well;
+    - a link resolving OUTSIDE the source home is refused loudly. The snapshot must be of the
+      source, and importing whatever the operator's host keeps at that path would be
+      contamination wearing the archive's name; a container-absolute link (``/root/...``)
+      usually names nothing on the host and is dropped as dangling, but one that does resolve
+      here names bytes the run never saw, and that is a refusal, not an import;
+    - a special file (FIFO, socket) fails loudly, as the copy always did.
+    """
+    root = root if root is not None else source.resolve()
+    root_stat = os.stat(root)
+    if active is None:
+        active = {(root_stat.st_dev, root_stat.st_ino)}
+    destination.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(source.iterdir()):
+        target_path = destination / entry.name
+        if entry.is_symlink():
+            try:
+                resolved = Path(os.path.realpath(entry, strict=True))
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(f"cannot materialize the symlink {entry}: {exc}") from exc
+            if not _same_or_under(resolved, root_stat):
+                raise RuntimeError(
+                    f"the symlink {entry} resolves outside the source home ({resolved}); a "
+                    "snapshot that imported those bytes would not be of the source. Remove "
+                    "the link from the archive copy, or bookend a source without it."
+                )
+            if resolved.is_dir():
+                resolved_stat = os.stat(resolved)
+                key = (resolved_stat.st_dev, resolved_stat.st_ino)
+                if key in active:
+                    raise RuntimeError(
+                        f"the symlink {entry} cycles into a directory already being "
+                        f"materialized ({resolved})"
+                    )
+                active.add(key)
+                _materialize_home(resolved, target_path, root=root, active=active)
+                active.discard(key)
+            elif resolved.is_file():
+                shutil.copy2(resolved, target_path)
+            else:
+                raise RuntimeError(
+                    f"the symlink {entry} resolves to {resolved}, which is neither a file "
+                    "nor a directory; a special file cannot be part of the snapshot"
+                )
+        elif entry.is_dir():
+            _materialize_home(entry, target_path, root=root, active=active)
+        elif entry.is_file():
+            shutil.copy2(entry, target_path)
+        else:
+            raise RuntimeError(
+                f"{entry} is neither a file, a directory, nor a symlink; a special file "
+                "cannot be part of the snapshot"
+            )
+    # The directory's own metadata, applied after its contents so the content writes cannot
+    # re-stamp it. mkdir alone left every directory with the process defaults, which widened
+    # the real homes' 0700 directories (session leases and daemon caches among them) to 0755:
+    # a loosened mode is not the snapshot, and a resumed CLI can behave differently over it.
+    # Every directory passes through here, ordinary ones and materialized link targets alike,
+    # because both recurse through this function.
+    shutil.copystat(source, destination)
+
+
+def _same_or_under(resolved: Path, root_stat: os.stat_result) -> bool:
+    """Is this resolved path the source home or inside it, by filesystem identity?
+
+    Identity, not spelling: on a case-insensitive volume one directory answers to many
+    spellings, ``realpath`` keeps whichever spelling the link used, and a lexical prefix test
+    refused valid in-home links over casing alone (observed on APFS). The test that cannot be
+    fooled by spelling is ``samestat`` against the root's device and inode, walked up the
+    resolved target's ancestry.
+    """
+    for candidate in (resolved, *resolved.parents):
+        try:
+            candidate_stat = os.stat(candidate)
+        except OSError:
+            continue
+        if os.path.samestat(candidate_stat, root_stat):
+            return True
+    return False
+
+
+def _has_eval_before(run_dir: Path) -> bool:
+    """Did this run measure an eval_before of its own: per-task provenance, not rows.
+
+    The eval phase records one directory per held-out task, so presence of any is what
+    distinguishes a run that measured a before-side from a rollout-only or after-only run.
+    """
+    phase_dir = run_dir / "eval_before"
+    if not phase_dir.is_dir():
+        return False
+    return any(p.is_dir() and p.name.startswith("task-") for p in phase_dir.iterdir())
+
+
+def _refuse_live_source(source_run_dir: Path) -> None:
+    """Refuse a source whose run lock a live process still holds, without mutating the source.
+
+    A source can hold a settled-looking terminus while its own eval_after or a later rerun
+    still owns the directory, and a snapshot taken under a live writer is not an archived
+    state. The probe is a moment of :func:`_holding_source_still`: acquired and released the
+    instant it answers, for the fast refusal before anything is created; the snapshot itself
+    is taken under the held form.
+    """
+    with _holding_source_still(source_run_dir):
+        pass
+
+
+@contextlib.contextmanager
+def _holding_source_still(source_run_dir: Path):
+    """Hold the source still for the body of the block, without ever mutating the source.
+
+    A SHARED flock on the source's EXISTING lock file, opened read-only and never created.
+    Shared is exactly sufficient: every mutating owner (a run, a resume, a rerun) takes the
+    lock EXCLUSIVE through ``_acquire_run_lock``, so a held shared lock refuses acquisition
+    to any would-be mutator for as long as the block runs, a live mutator refuses THIS
+    acquisition, and concurrent rebookends of one source, which only read, can hold it
+    together. Releasing on the way out is what lets the archive be mutated again the moment
+    the snapshot no longer depends on it; the probe form releases immediately, and the
+    snapshot form holds across the whole materialization, because a lock released after a
+    probe left the copy racing any mutator that acquired in between (a concurrent rerun's
+    mid-copy write landed in the published snapshot, in review).
+
+    A missing lock file is a refusal, not an empty hold. Every mutator would CREATE the lock
+    on its way in (``_acquire_run_lock`` opens with O_CREAT), so a source without one is not
+    quiet, it is unholdable: a resume or rerun starting mid-copy would mint the lock and
+    mutate under the advertised hold (reproduced). Creating the lock from here would itself
+    write into the archive, so the honest options are refusing or copy-and-revalidate, and
+    refusal is chosen because it is simple and the archives this entry exists for all carry
+    their locks (every run since the lock landed writes one; only pre-lock-era directories
+    lack it). The message names the workaround, which is the operator's deliberate one-file
+    write, never this runner's.
+    """
+    import fcntl
+
+    lock_path = source_run_dir / RUN_LOCK_FILE
+    if not lock_path.is_file():
+        raise RuntimeError(
+            f"{source_run_dir} has no {RUN_LOCK_FILE}, so it cannot be held still while the "
+            "snapshot is taken: a mutator would create the lock and write mid-copy. If the "
+            "archive is genuinely settled and you accept adding one file to it, create the "
+            f"lock yourself (touch {source_run_dir / RUN_LOCK_FILE}) and re-run."
+        )
+    fd = os.open(lock_path, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            raise RuntimeError(
+                f"{source_run_dir} is owned by a live process, so its state is still moving: "
+                "a snapshot taken now would not be the archived run. Wait for it to finish, "
+                "or stop it first."
+            ) from None
+        yield
+    finally:
+        os.close(fd)
+
+
+async def rebookend_run(
+    source_run_dir: Path,
+    *,
+    runs_dir: Path,
+    results_dir: Path,
+    baseline_run_dir: Path | None = None,
+    agent_image: str = AGENT_IMAGE,
+    credentials: dict[str, str] | None = None,
+    capture_egress: bool = True,
+) -> Path:
+    """Give an EXISTING run a resumed eval_after, as a NEW run, and return its results path.
+
+    The source is an archived artifact and stays byte-untouched: it is read, never locked and
+    never written. Everything this creates lives in a fresh run directory whose lock is taken
+    before anything else, exactly as a fresh cell takes its own.
+    """
+    source_run_dir = Path(source_run_dir).resolve()
+    manifest_path = source_run_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"{source_run_dir} has no manifest.json; this is not a run directory.")
+    # No output may land at or under the source, whatever the operator typed: the untouched
+    # guarantee is over the tree, and `--runs <source>` or `--results <source>` would write the
+    # new lock, the run directory, or the published JSON straight into the archive.
+    for label, out_dir in (("runs_dir", Path(runs_dir)), ("results_dir", Path(results_dir))):
+        resolved = out_dir.resolve()
+        if resolved == source_run_dir or resolved.is_relative_to(source_run_dir):
+            raise RuntimeError(
+                f"{label} {out_dir} is inside the source run directory, and a rebookend never "
+                "writes into the archive it bookends. Point it elsewhere."
+            )
+    if (source_run_dir / SUSPENSION_FILE).is_file():
+        raise RuntimeError(
+            f"{source_run_dir} holds a suspension record, so the run is not finished: use "
+            "`shobench resume`, which knows what the interruption was waiting for. A rebookend "
+            "measures the far side of a settled terminus."
+        )
+    _refuse_live_source(source_run_dir)
+    source_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if "rebookend" in source_manifest:
+        # A bookend of a bookend expresses nothing a direct rebookend does not express
+        # better. The bookend's home IS the source's terminal home, copied; its own
+        # eval_after advanced no rollout and left no new terminus, so chaining re-measures
+        # the same terminal state with an extra hop of provenance for a reader to unwind,
+        # and the reporter would have to walk chains to find the one real before-side.
+        # Refused, with the original named, because the original is the run to bookend.
+        original = source_manifest["rebookend"].get("rebookend_of", "unknown")
+        raise RuntimeError(
+            f"{source_run_dir} is itself a rebookend (of {original}), and a bookend of a "
+            "bookend re-measures the same terminal state as rebookending the original "
+            f"directly. Rebookend the original run ({original}) instead."
+        )
+    cell = load_cell_by_name(source_manifest["cell"]["name"])
+    # The baseline is its own identity, not an assumption about the source. The v0 sources
+    # are rollout-only or after-only runs whose before-side was measured by a SEPARATE
+    # deferred-baseline run, so a marker that named only the rollout source left the
+    # assembler pairing against emptiness. A source that measured its own eval_before
+    # defaults to itself, which is the self-paired case stated rather than assumed; a source
+    # that did not REQUIRES the baseline run to be named, and every named baseline is
+    # validated here, before anything spends: it must be a run, must not itself be a bookend
+    # (the chain rule, for the same reason), must be the same cell, and, the load-bearing
+    # check, must carry the same split id digest, because before rows over different held-out
+    # ids would pair task numbers that are not the same tasks.
+    if baseline_run_dir is not None:
+        baseline_dir = Path(baseline_run_dir).resolve()
+        baseline_manifest_path = baseline_dir / "manifest.json"
+        if not baseline_manifest_path.is_file():
+            raise RuntimeError(
+                f"{baseline_dir} has no manifest.json; the baseline is not a run directory."
+            )
+        baseline_manifest = json.loads(baseline_manifest_path.read_text(encoding="utf-8"))
+        if "rebookend" in baseline_manifest:
+            raise RuntimeError(
+                f"{baseline_dir} is itself a rebookend, and a bookend has no before-side to "
+                "pair against; name the run that measured the baseline."
+            )
+        if baseline_manifest["cell"]["name"] != source_manifest["cell"]["name"]:
+            raise RuntimeError(
+                f"the baseline {baseline_dir} measured cell "
+                f"{baseline_manifest['cell']['name']!r}, not the source's "
+                f"{source_manifest['cell']['name']!r}; a pairing across cells is not a "
+                "measurement."
+            )
+        source_digest = source_manifest.get("split", {}).get("id_digest")
+        baseline_digest = baseline_manifest.get("split", {}).get("id_digest")
+        if source_digest != baseline_digest:
+            raise RuntimeError(
+                f"the baseline {baseline_dir} ran split id digest {baseline_digest!r} and "
+                f"the source ran {source_digest!r}: the before rows would not measure the "
+                "same held-out ids, so the pairing would be task numbers, not tasks."
+            )
+        if not _has_eval_before(baseline_dir):
+            raise RuntimeError(
+                f"the baseline {baseline_dir} has no eval_before provenance of its own, so "
+                "it holds no before rows to pair with."
+            )
+        baseline_run_id = str(baseline_manifest.get("run_id", ""))
+        baseline_dir_resolved = baseline_dir
+    elif _has_eval_before(source_run_dir):
+        baseline_run_id = str(source_manifest.get("run_id", ""))
+        baseline_dir_resolved = source_run_dir
+    else:
+        raise RuntimeError(
+            f"{source_run_dir} has no eval_before of its own (a rollout-only or after-only "
+            "run), so the bookend would have nothing to pair with. Name the run that "
+            "measured this cell's baseline with --baseline."
+        )
+    # The recorded arm wins over the checkout's default, exactly as a resume recovers it: the
+    # new measurement inherits the SOURCE's axes and changes exactly one of them, so a never-arm
+    # source publishes honestly as never + resumed.
+    recorded_regime = recorded_rollout_feedback(source_manifest)
+    cell = replace(cell, rollout_feedback=recorded_regime, eval_context="resumed")
+    split = load_split_by_name(cell.split)
+    instruction = load_instruction(cell.instruction_arm)
+    drift = experiment_drift(source_manifest, cell=cell, split=split, instruction=instruction)
+    if drift:
+        raise RuntimeError(
+            "the checkout no longer matches the run being rebookended: "
+            + "; ".join(drift)
+            + ". Restore the recorded definition; a bookend under an edited definition would "
+            "not pair with the run it claims to follow."
+        )
+    stopping_path = source_run_dir / ROLLOUT_STOPPING_FILE
+    if not stopping_path.is_file():
+        raise RuntimeError(
+            f"{source_run_dir} has no rollout terminus, so there is no conversation end to "
+            "resume from: a rebookend belongs on the far side of a real rollout ending, the "
+            "same rule eval_after always follows."
+        )
+    if terminal_session_in(source_run_dir) is None:
+        raise RuntimeError(
+            f"{source_run_dir}'s rollout record names no terminal session, so its conversation "
+            "cannot be resumed. Running the bookend cold instead would publish a mislabeled "
+            "measurement; there is no fallback."
+        )
+    # A fresh id even for two rebookends of one source in the same second: the timestamped stem
+    # has one-second resolution, and a collision would hand the second caller the first one's
+    # lock refusal instead of its own new run. The suffix is what makes the destination
+    # genuinely fresh rather than fresh-if-nobody-else-was-quick.
+    run_id = f"{_run_id(cell)}-rb{uuid.uuid4().hex[:8]}"
+    run_dir = Path(runs_dir) / run_id
+    # The concrete artifacts too, not only their directories. The bookend publishes under its
+    # OWN run id, never the cell name: the cell-name artifact is the SOURCE's measurement, the
+    # one this bookend exists to pair with, and sharing the stem destroyed it (write_results
+    # keeps one artifact per stem by design). The run-id stem keeps every bookend of every
+    # source coexisting beside the source result, and it makes the leaf unpredictable before
+    # this moment, so nothing can pre-occupy it; these checks still bound the minted names
+    # and the run path before the lock creates anything through them.
+    for target in (
+        run_dir,
+        Path(results_dir) / f"{run_id}.json",
+        Path(results_dir) / f"{run_id}{INCOMPLETE_SUFFIX}",
+    ):
+        resolved_target = target.resolve()
+        if resolved_target == source_run_dir or resolved_target.is_relative_to(source_run_dir):
+            raise RuntimeError(
+                f"{target} resolves into the source run directory, and a rebookend never "
+                "writes into the archive it bookends."
+            )
+    lock_fd = _acquire_run_lock(run_dir)
+    try:
+        return await _rebookend_owned(
+            source_run_dir,
+            source_manifest,
+            cell=cell,
+            split=split,
+            instruction=instruction,
+            baseline_run_id=baseline_run_id,
+            baseline_dir=baseline_dir_resolved,
+            run_id=run_id,
+            run_dir=run_dir,
+            results_dir=results_dir,
+            agent_image=agent_image,
+            credentials=credentials,
+            capture_egress=capture_egress,
+        )
+    finally:
+        _release_run_lock(lock_fd)
+
+
+async def _rebookend_owned(
+    source_run_dir: Path,
+    source_manifest: dict[str, Any],
+    *,
+    cell: Cell,
+    split: Split,
+    instruction: Instruction,
+    baseline_run_id: str,
+    baseline_dir: Path,
+    run_id: str,
+    run_dir: Path,
+    results_dir: Path,
+    agent_image: str,
+    credentials: dict[str, str] | None,
+    capture_egress: bool,
+) -> Path:
+    """The rebookend's own run, under an already-held lock on the NEW directory.
+
+    Three copies make it work, and each has a reason to be a copy rather than a reference.
+    The source's accumulated HOME is copied whole, transcripts included, because the resumed
+    forks reopen the terminal session out of it and the source must stay the archived artifact
+    it is; nothing here ever writes back. The source's stopping record is copied in, because
+    the resumed preflight reads the terminus off the run it is part of, and because it makes
+    the new run self-contained: a usage limit that suspends this bookend resumes through the
+    ordinary `shobench resume`, which re-reads the same copied record. And the manifest is
+    built fresh from the recovered cell rather than copied, so its digests describe the home
+    this run actually starts from, with a provenance block naming the source it bookends.
+
+    What is deliberately NOT copied: the source's provenance rows and legs. This run measures
+    one thing, the after-bookend, and publishes as itself; it pairs with the source post-hoc,
+    the way the deferred baselines pair. Its artifact carries the incomplete name, because a
+    run with no eval_before cannot account for the before side, and that name is the honest
+    one.
+    """
+    sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
+    ctx = RunContext(
+        cell=cell,
+        split=split,
+        instruction=instruction,
+        harness=harness_for(cell.harness),
+        run_id=run_id,
+        run_dir=run_dir,
+        sandbox=sandbox,
+        agent_image=agent_image,
+        credentials=dict(credentials or {}),
+    )
+    # The post-rollout self, whole: durable channels AND session state, because the fork
+    # machinery resolves the terminal transcript inside this copy before any fan-out. Copied
+    # before the sandbox comes up so a failure here leaves nothing running.
+    #
+    # MATERIALIZED, never linked: a symlink in the snapshot is a hole in the untouched
+    # guarantee, because everything that runs afterwards writes into this tree (the credential
+    # seeding, the runner files, the RW container mount), and a preserved link pointing back
+    # into the source turns any of those writes into a write THROUGH the copy into the
+    # archive; a credential reseed did exactly that in review. Every link becomes the bytes it
+    # names, resolved from the link's own parent (see ``_materialize_home`` for the whole
+    # policy: valid links materialize, dangling ones drop, escaping ones and cycles refuse
+    # loudly), and the snapshot references nothing beyond itself.
+    source_home = source_run_dir / "home"
+    if not source_home.is_dir():
+        raise RuntimeError(f"{source_run_dir} has no home directory to bookend.")
+    # Held STILL for the whole snapshot, not merely probed: a probe released before the copy
+    # left the copy racing any mutator that acquired in between, and a concurrent rerun's
+    # mid-copy write landed in the published snapshot. The shared hold refuses a live owner
+    # and blocks a would-be one until the copy is whole, and it is released here, before any
+    # spend, so the archive is never held during the eval itself.
+    with _holding_source_still(source_run_dir):
+        # Everything the plan relied on is re-proven under the hold, because a mutator that
+        # ran WHOLE between the early checks and this hold left no live lock to refuse. A
+        # suspension is the record such a mutator writes WITHOUT touching the manifest
+        # (reproduced: an owner took the lock, wrote suspended.json, released, and the old
+        # recheck saw an unchanged manifest and copied anyway), so it is rechecked first;
+        # the terminus and its terminal session are rechecked the same way; and the manifest
+        # compare catches every definitional rewrite, since a snapshot of new bytes under
+        # the old cell would be two runs wearing one name.
+        if (source_run_dir / SUSPENSION_FILE).is_file():
+            raise RuntimeError(
+                f"{source_run_dir} was suspended between the plan and the snapshot: the run "
+                "is not finished, and its ending belongs to `shobench resume`."
+            )
+        if terminal_session_in(source_run_dir) is None:
+            raise RuntimeError(
+                f"{source_run_dir}'s rollout terminus changed between the plan and the "
+                "snapshot and no longer names a terminal session. Re-run against the "
+                "settled archive."
+            )
+        if json.loads((source_run_dir / "manifest.json").read_text(encoding="utf-8")) != (
+            source_manifest
+        ):
+            raise RuntimeError(
+                f"{source_run_dir}'s manifest changed between the plan and the snapshot; "
+                "the source was mutated. Re-run the rebookend against the settled archive."
+            )
+        _materialize_home(source_home, sandbox.home)
+        shutil.copy2(source_run_dir / ROLLOUT_STOPPING_FILE, run_dir / ROLLOUT_STOPPING_FILE)
+        source_stopping = json.loads(
+            (source_run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
+        )
+
+    # The baseline's before rows, carried in at creation and published later as this
+    # artifact's own before block. Read PRE-SPEND, so a baseline whose provenance cannot be
+    # read refuses before anything is paid for, and persisted into the new run directory, so
+    # every publication of this run (the first, a resumed one, a repaired one) reads the same
+    # carried rows. Held still when the baseline carries a lock file; the pre-lock-era
+    # baselines have none, and their row files are append-only JSONL written by archived
+    # runs, so a plain read is honest there.
+    heldout_ids = [int(t) for t in side_for_phase(split, "eval_before").task_ids]
+    baseline_hold = (
+        _holding_source_still(baseline_dir)
+        if (baseline_dir / RUN_LOCK_FILE).is_file()
+        else contextlib.nullcontext()
+    )
+    with baseline_hold:
+        baseline_rows = read_eval_phase(baseline_dir / "eval_before", heldout_ids)
+    if not any(row.scored for row in baseline_rows):
+        raise RuntimeError(
+            f"the baseline {baseline_dir} holds no readable scored eval_before rows, so the "
+            "bookend would have nothing to pair with. Nothing has been spent."
+        )
+    ctx.publish_json(
+        run_dir / BASELINE_BEFORE_FILE,
+        {"source_run_id": baseline_run_id, "rows": [asdict(row) for row in baseline_rows]},
+    )
+
+    sandbox.up()
+    spec = spec_for(cell.harness, cell.credential_mode)
+    seeded = seed_home(spec, sandbox.home)
+    _watch_cell_credential(ctx, spec)
+    observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
+    try:
+        probes = {
+            "version": ctx.redactor.text(
+                _probe(ctx.harness.version_probe(), image=agent_image, sandbox=sandbox, env={})
+            )
+        }
+        seeds = _place_runner_files(ctx)
+        manifest = build_manifest(ctx, probes=probes)
+        manifest["credential_seed"] = seeded
+        manifest["home"]["seeded"] = seeds
+        manifest["axes"]["credential_mode"] = credential_effective_mode(
+            spec, sandbox.home, env_names=sorted(ctx.credentials)
+        )
+        # What this run is a bookend OF, by run id rather than by path: a durable artifact
+        # carries no operator layout, and the id is what pairs it with the source post-hoc.
+        manifest["rebookend"] = {
+            "rebookend_of": str(source_manifest.get("run_id", "")),
+            # Two identities, deliberately: the source is the terminal-state lineage (whose
+            # conversation this run resumes), and the baseline is the pairing identity (whose
+            # eval_before rows the report joins this run's after rows with). They coincide
+            # only when the source measured its own before-side.
+            "baseline_run_id": baseline_run_id,
+            "source_rollout_feedback": cell.rollout_feedback,
+            "source_stop_reason": str(source_stopping.get("stop_reason", "")),
+        }
+        ctx.publish_json(run_dir / "manifest.json", manifest)
+        return await _run_phases(
+            ctx,
+            manifest=manifest,
+            phases=("eval_after",),
+            results_dir=results_dir,
+            observer=observer,
+            # Under the bookend's own name: the cell-name artifact is the source's
+            # measurement, and this run pairs with it rather than replacing it.
+            artifact=run_id,
         )
     finally:
         with contextlib.suppress(Exception):
@@ -2351,8 +2944,10 @@ __all__ = [
     "durable_filter",
     "cleanup",
     "read_eval_phase",
+    "rebookend_run",
     "resume_cell",
     "run_cell",
+    "terminal_session_in",
     "run_eval_phase",
     "run_leg",
     "run_rollout_phase",

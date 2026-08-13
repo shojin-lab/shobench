@@ -20,6 +20,10 @@ a finished measurement.
 from __future__ import annotations
 
 import json
+import os
+import stat
+import tempfile
+import uuid
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -311,6 +315,24 @@ def pair_evals(
     return paired, unpaired
 
 
+def _creation_mode(directory: Path) -> int:
+    """The mode an ordinarily created file receives in this directory: 0666 under the umask.
+
+    Read by creating one rather than by flipping ``os.umask``, because the flip is a
+    process-global write and two concurrent publishers interleaving it could corrupt the
+    umask for everything else in the process; publication is exactly the boundary that runs
+    concurrently. The probe is exclusive-created, read, and removed, all inside the leaf's
+    own directory.
+    """
+    probe = directory / f".mode-probe.{uuid.uuid4().hex}.tmp"
+    fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    try:
+        return stat.S_IMODE(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+        probe.unlink(missing_ok=True)
+
+
 def write_results(
     path: Path,
     *,
@@ -320,6 +342,7 @@ def write_results(
     heldout_ids: Sequence[int],
     egress: dict[str, Any] | None = None,
     redact: Callable[[Any], Any] | None = None,
+    before_source_run_id: str | None = None,
 ) -> Path:
     """Write the cell's results JSON: the manifest, the per-task scores, and the summaries.
 
@@ -378,6 +401,10 @@ def write_results(
         "eval_before": {
             "summary": eval_summary(before, task_ids=ids),
             "tasks": [asdict(r) for r in before],
+            # Present only when the rows were measured by ANOTHER run and carried in (a
+            # rebookend publishing its baseline's before block): the label is what keeps a
+            # reader from taking them for rows this run measured.
+            **({"source_run_id": before_source_run_id} if before_source_run_id else {}),
         },
         "eval_after": {
             "summary": eval_summary(after, task_ids=ids),
@@ -398,7 +425,44 @@ def write_results(
     finished, partial = path, path.with_name(path.stem + INCOMPLETE_SUFFIX)
     path = finished if complete else partial
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    # Written beside the leaf and swapped in atomically, so publication REPLACES whatever
+    # holds the name: a stale file, a hard link, or a symlink someone left at the
+    # deterministic leaf. A plain write follows an existing symlink, which turned a link
+    # planted at the leaf name into a write through the results directory into wherever it
+    # pointed (an archived source run, in review); ``os.replace`` swaps the directory entry
+    # itself and follows nothing. Owned here rather than by each caller, so every publisher
+    # (a fresh cell, a resume, a rerun, a rebookend) inherits the same guarantee.
+    #
+    # The scratch entry is per CALL, minted exclusively by mkstemp, in the same directory so
+    # the swap can never cross devices. A per-process name was not enough: two publishers in
+    # one process shared it, and the pre-unlink one needed to reuse the name let publisher B
+    # unlink A's scratch mid-write, so A swapped B's half-written inode into the leaf and
+    # reported success (reproduced). Exclusive creation of a fresh name has no such window,
+    # and the ``finally`` keeps a failed publication from leaving the scratch behind.
+    scratch_fd, scratch_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    scratch = Path(scratch_name)
+    try:
+        with os.fdopen(scratch_fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(body, indent=2) + "\n")
+        # The swap carries the scratch's mode onto the leaf, and mkstemp minted it 0600: left
+        # alone, a fresh artifact landed owner-only and a republish DOWNGRADED an existing
+        # 0644 or 0664 result to 0600. So the scratch takes the destination's intended mode
+        # first: a regular file already at the leaf keeps its mode (an operator who opened a
+        # result up, or locked one down, keeps that choice across republication), and
+        # anything else gets what an ordinary creation would have gotten here, 0666 under the
+        # process umask. lstat, because the entry being replaced can be a planted symlink and
+        # its TARGET's mode means nothing for the regular file about to take the name.
+        try:
+            existing = os.lstat(path)
+            mode = stat.S_IMODE(existing.st_mode) if stat.S_ISREG(existing.st_mode) else None
+        except FileNotFoundError:
+            mode = None
+        os.chmod(scratch, _creation_mode(path.parent) if mode is None else mode)
+        os.replace(scratch, path)
+    finally:
+        scratch.unlink(missing_ok=True)
     # A results directory holds one artifact per cell, and a rerun already replaces what the
     # last run wrote. Leaving the other name in place would leave two files describing one cell
     # from two runs, which is how a reader ends up reporting the one that reads better.
