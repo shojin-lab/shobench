@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from shobench.runner import recorded_eval_context, recorded_rollout_feedback
+
 DEFAULT_RESAMPLES = 10000
 DEFAULT_SEED = 20260807
 
@@ -166,7 +168,21 @@ def assemble(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             assembled.append(doc)
             continue
         source = by_run_id.get(marker.get("rebookend_of"))
-        if source is None or source is doc:
+        if source is not None and (
+            source is doc or "rebookend" in source.get("manifest", {})
+        ):
+            # The named source is itself a bookend (a chain, a cycle, or a self-loop). Its
+            # eval_before is all missing by construction, so pairing against it would report
+            # an assembled measurement whose before-side never existed. The runner refuses to
+            # create such an artifact at the acceptance boundary; one that exists anyway (an
+            # older branch, a hand-made file) is labeled for what it is, never "assembled".
+            invalid = dict(doc)
+            invalid["assembly"] = {
+                "invalid_provenance": str(marker.get("rebookend_of") or "")
+            }
+            assembled.append(invalid)
+            continue
+        if source is None:
             assembled.append(doc)
             continue
         task_ids = [int(t) for t in doc.get("heldout", {}).get("task_ids", [])]
@@ -219,10 +235,13 @@ def report_cell(
         }
     )
     marker = manifest.get("rebookend")
+    assembly = doc.get("assembly", {})
     if not marker:
         pairing = "self"
-    elif doc.get("assembly", {}).get("paired_with"):
+    elif assembly.get("paired_with"):
         pairing = "assembled"
+    elif "invalid_provenance" in assembly:
+        pairing = "invalid_provenance"
     else:
         pairing = "source_missing"
     return CellReport(
@@ -231,8 +250,12 @@ def report_cell(
         harness=cell.get("harness", "?"),
         model=cell.get("model", "?"),
         run_id=str(manifest.get("run_id", "?")),
-        rollout_feedback=str(cell.get("rollout_feedback", "?")),
-        eval_context=str(cell.get("eval_context", "?")),
+        # The recorded-axis semantics, not a guess: a manifest written before an axis existed
+        # could only have run that axis's one pre-axis posture, which is exactly what
+        # ``recorded_rollout_feedback`` and ``recorded_eval_context`` define (never, cold),
+        # so a legacy artifact renders its real arm rather than a question mark.
+        rollout_feedback=recorded_rollout_feedback(manifest),
+        eval_context=recorded_eval_context(manifest),
         rebookend_of=(str(marker.get("rebookend_of")) if marker else None),
         pairing=pairing,
         n_paired=len(paired),
@@ -297,6 +320,8 @@ def render_table(reports: Sequence[CellReport]) -> str:
                 if r.pairing == "self"
                 else f"of {_run_suffix(r, r.rebookend_of)}"
                 if r.pairing == "assembled"
+                else "INVALID PROVENANCE"
+                if r.pairing == "invalid_provenance"
                 else "SOURCE MISSING"
             ),
             r.env,
@@ -325,6 +350,13 @@ def render_table(reports: Sequence[CellReport]) -> str:
         "  ".join(str(cell).ljust(width) for cell, width in zip(row, widths, strict=True))
         for row in rows
     ]
+    if any(r.pairing == "invalid_provenance" for r in reports):
+        lines += [
+            "",
+            "INVALID PROVENANCE: this row is a rebookend whose named source is itself a "
+            "rebookend (a chain or a cycle). A bookend's before-side never exists, so no "
+            "assembled measurement can be built from it; rebookend the original run instead.",
+        ]
     if any(r.pairing == "source_missing" for r in reports):
         lines += [
             "",

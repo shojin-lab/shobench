@@ -858,6 +858,146 @@ def test_two_bookends_of_one_source_both_assemble(tmp_path: Path) -> None:
     assert reports[second_manifest["run_id"]].mean_delta == pytest.approx(0.25)
 
 
+def test_rebookend_refuses_a_bookend_as_its_source(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A bookend of a bookend re-measures the same terminal state as rebookending the
+    original directly: the bookend's home IS the source's terminal home, copied, and its own
+    eval_after advanced no rollout. Chaining adds provenance to unwind and no information, so
+    the runner refuses at acceptance, naming the original, and the plan surfaces the state."""
+    from shobench.cli import main as cli_main
+
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["rebookend"] = {
+        "rebookend_of": "the-original-run",
+        "source_rollout_feedback": "never",
+        "source_stop_reason": "agent_stopped_early",
+    }
+    runner.write_json(source_dir / "manifest.json", manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="the-original-run"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+    cli_source = _real_cell_source(tmp_path / "cli")
+    cli_manifest = json.loads((cli_source / "manifest.json").read_text(encoding="utf-8"))
+    cli_manifest["rebookend"] = {"rebookend_of": "the-original-run"}
+    runner.write_json(cli_source / "manifest.json", cli_manifest)
+    assert cli_main(["rebookend", "--run", str(cli_source)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["refusals"]["source_is_bookend"] is True
+    assert cli_main(["rebookend", "--run", str(cli_source), "--go"]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "the-original-run" in err
+
+
+def test_the_assembler_labels_chains_and_cycles_invalid_never_assembled(
+    tmp_path: Path,
+) -> None:
+    """The reporter's independent defense: an artifact whose named source is itself a bookend
+    can never assemble, because a bookend's before-side does not exist. A chain's second hop
+    and both halves of a cycle are labeled invalid provenance, explicitly, in the table and
+    the JSON; the first hop still assembles against the real source."""
+    from shobench.report import assemble, load_results, render_table, report_cell
+    from shobench.results import TaskResult, write_results
+
+    results, source_id, first_id = _published_pair(tmp_path)
+    chained_manifest = {
+        "run_id": "cell-a-20260104T000000Z-rbfeedfeed",
+        "cell": {
+            "name": "cell-a", "env": "wordle_v1", "harness": "claude_code", "model": "m",
+            "rollout_feedback": "never", "eval_context": "resumed",
+        },
+        "rebookend": {"rebookend_of": first_id},
+    }
+    write_results(
+        results / f"{chained_manifest['run_id']}.json",
+        manifest=chained_manifest,
+        phases={
+            "eval_before": [],
+            "eval_after": [
+                TaskResult(seq=1, position=1, task_idx=1, closure="sealed", reward=0.6,
+                           success=False),
+            ],
+            "rollout": [],
+        },
+        stopping={},
+        heldout_ids=[1, 2],
+    )
+    docs = assemble(load_results(results))
+    reports = {r.run_id: r for r in (report_cell(d, resamples=100, seed=1) for d in docs)}
+    assert reports[first_id].pairing == "assembled"
+    chained = reports[chained_manifest["run_id"]]
+    assert chained.pairing == "invalid_provenance"
+    assert chained.n_paired == 0
+    table = render_table(sorted(reports.values(), key=lambda r: r.run_id))
+    assert "INVALID PROVENANCE" in table
+    assert chained.to_json()["pairing"] == "invalid_provenance"
+
+    # A cycle among bookends is the same refusal on both halves.
+    def bookend_doc(run_id: str, of: str) -> dict:
+        return {
+            "schema": "shobench.results/1",
+            "manifest": {
+                "run_id": run_id,
+                "cell": {"name": "c"},
+                "rebookend": {"rebookend_of": of},
+            },
+            "heldout": {"task_ids": [1]},
+            "eval_before": {"tasks": [], "summary": {}},
+            "eval_after": {"tasks": [], "summary": {}},
+            "rollout": {"summary": {}, "stopping": {}, "tasks": []},
+            "paired": [],
+            "unpaired": [],
+        }
+
+    cycle = assemble([bookend_doc("x", "y"), bookend_doc("y", "x")])
+    assert [report_cell(d, resamples=50, seed=1).pairing for d in cycle] == [
+        "invalid_provenance",
+        "invalid_provenance",
+    ]
+
+
+def test_legacy_artifacts_render_their_recorded_arms(tmp_path: Path) -> None:
+    """The pre-axis backfill semantics reach the report: absence means never and cold, the
+    way recorded_rollout_feedback, recorded_eval_context, and write_results already define
+    it, so the real legacy artifacts render never+cold and immediate+cold rather than
+    question marks. Pinned against the checked-in artifact shape and a synthetic pre-axis
+    manifest."""
+    from shobench.config import repo_root
+    from shobench.report import load_results, report_cell
+
+    legacy = {
+        "schema": "shobench.results/1",
+        "manifest": {"run_id": "r", "cell": {"name": "c"}},
+        "heldout": {"task_ids": []},
+        "eval_before": {"tasks": [], "summary": {}},
+        "eval_after": {"tasks": [], "summary": {}},
+        "rollout": {"summary": {}, "stopping": {}, "tasks": []},
+        "paired": [],
+        "unpaired": [],
+    }
+    report = report_cell(legacy, resamples=50, seed=1)
+    assert report.rollout_feedback == "never"
+    assert report.eval_context == "cold"
+
+    for doc in load_results(repo_root() / "results"):
+        report = report_cell(doc, resamples=50, seed=1)
+        assert report.rollout_feedback in ("never", "immediate"), report.cell
+        assert report.eval_context in ("cold", "resumed"), report.cell
+        assert "?" not in f"{report.rollout_feedback}{report.eval_context}"
+
+
 def test_the_source_is_held_still_for_the_whole_snapshot(tmp_path: Path, monkeypatch) -> None:
     """A probe released before the copy left the copy racing any mutator that acquired in
     between (a concurrent rerun's write landed in the published snapshot, in review). The

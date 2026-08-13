@@ -372,6 +372,10 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         print(f"no manifest at {manifest_path}; this is not a run directory.", file=sys.stderr)
         return 1
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source_is_bookend = "rebookend" in manifest
+    bookend_original = (
+        manifest.get("rebookend", {}).get("rebookend_of") if source_is_bookend else None
+    )
     cell = load_cell_by_name(manifest["cell"]["name"])
     recorded_arm = runner.recorded_rollout_feedback(manifest)
     split = load_split_by_name(cell.split)
@@ -418,6 +422,7 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             source_live = True
     refusals = {
         "suspension_present": (source_dir / SUSPENSION_FILE).is_file(),
+        "source_is_bookend": source_is_bookend,
         "source_lock_present": source_lock_present,
         "source_live": source_live,
         "outputs_inside_source": outputs_inside_source,
@@ -470,6 +475,11 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         )
         return 0
     blockers = []
+    if source_is_bookend:
+        blockers.append(
+            f"the source is itself a rebookend; rebookend the original run "
+            f"({bookend_original}) instead"
+        )
     if refusals["suspension_present"]:
         blockers.append("the source holds a suspension record; finish it with `shobench resume`")
     if not refusals["source_lock_present"]:

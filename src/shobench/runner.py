@@ -2522,6 +2522,19 @@ async def rebookend_run(
         )
     _refuse_live_source(source_run_dir)
     source_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if "rebookend" in source_manifest:
+        # A bookend of a bookend expresses nothing a direct rebookend does not express
+        # better. The bookend's home IS the source's terminal home, copied; its own
+        # eval_after advanced no rollout and left no new terminus, so chaining re-measures
+        # the same terminal state with an extra hop of provenance for a reader to unwind,
+        # and the reporter would have to walk chains to find the one real before-side.
+        # Refused, with the original named, because the original is the run to bookend.
+        original = source_manifest["rebookend"].get("rebookend_of", "unknown")
+        raise RuntimeError(
+            f"{source_run_dir} is itself a rebookend (of {original}), and a bookend of a "
+            "bookend re-measures the same terminal state as rebookending the original "
+            f"directly. Rebookend the original run ({original}) instead."
+        )
     cell = load_cell_by_name(source_manifest["cell"]["name"])
     # The recorded arm wins over the checkout's default, exactly as a resume recovers it: the
     # new measurement inherits the SOURCE's axes and changes exactly one of them, so a never-arm

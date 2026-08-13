@@ -490,8 +490,16 @@ resumed or repaired bookend republishes under its own run id, never the cell nam
 report is where the halves meet: `shobench report` assembles each bookend with the source
 its provenance names, pairing the SOURCE's eval_before rows with the BOOKEND's eval_after
 rows through the same pairing every publisher uses, and every reported row carries its run
-id, its arm axes, and its pairing, with a bookend whose source is not among the loaded files
-surfaced explicitly as SOURCE MISSING rather than reported as an unpaired zero. The source's lock file is held SHARED for
+id, its arm axes (pre-axis artifacts render their recorded arms, never plus cold, exactly as
+the recorded-axis helpers define absence), and its pairing, with a bookend whose source is
+not among the loaded files surfaced explicitly as SOURCE MISSING rather than reported as an
+unpaired zero. Chains are refused, not walked: a bookend of a bookend re-measures the same
+terminal state as rebookending the original directly (the bookend's home is the source's
+terminal home, copied, and its own eval_after advanced no rollout), so the runner and the
+plan refuse a source that is itself a rebookend, naming the original to bookend instead, and
+the reporter independently labels any artifact whose named source is a bookend (a chain or a
+cycle) INVALID PROVENANCE rather than assembled, because a bookend's before-side does not
+exist to pair against. The source's lock file is held SHARED for
 exactly the duration of the snapshot: shared refuses a live mutator and blocks a would-be
 one (every mutating owner takes the lock exclusive) without writing a byte, and it is
 released before any spend. A source WITHOUT a lock file is refused as unholdable rather than
