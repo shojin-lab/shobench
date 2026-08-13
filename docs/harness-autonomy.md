@@ -460,6 +460,17 @@ the recorded session id or its transcript is missing, because a phase that quiet
 would publish a mislabeled measurement; `eval_context = "cold"` on the cell is the recorded
 ablation, and eval_before is always cold since no conversation exists yet.
 
+The standing instruction follows the mode. A resumed fork launches with the ROLLOUT
+instruction (`rollout.system.txt`), not the eval one: the rule that the eval instruction
+never carries the improvement objective was designed for cold measurement, and a resumed
+conversation already carries the objective in its history and its compaction summaries, so
+swapping the standing instruction mid-conversation would measure an agent that never
+existed. The resumed after measures the agent as it lived, objective included. Every cold
+session (eval_before always, cold afters) keeps the blind `eval.system.txt`, and the
+manifest's instruction block records which one eval_after launched with
+(`instruction.eval_prompt_used`), so the artifact says it rather than leaving a reader to
+derive it from the axis.
+
 The preflight validates rather than globs, because existence is not resumability. Each
 harness's `session_transcript` resolves the file the way that CLI's own resume lookup does
 (exact naming, never a substring) and then requires the floor that CLI was observed to
@@ -475,13 +486,21 @@ refuse, and where a decoder checks nothing (codex's payload values) the predicat
 nothing, so the predicate sits as close to the decoder it fronts as probing can place it.
 The decoding dialect itself is part of the discipline, because the preflight parses in
 Python and the CLIs do not: Python's json accepts NaN-family constants that JSON.parse
-refuses and escaped lone surrogates that serde refuses, so the preflight reads a strict
-dialect (`_strict_json_object`: constants raise, every decoded string must survive a strict
-UTF-8 encode), and each side of that has its observation (a NaN-carrying prime header is
-"No session found matching"; a surrogate-carrying codex meta is unreadable session
-metadata). Anchoring is per CLI too: codex parses the literal first record and refuses the
-file when that fails, while prime's scanner skips lines its parser refuses, both observed
-with a valid record on line two. The refusals all this preempts would otherwise arrive per
+refuses, escaped lone surrogates that serde refuses, and nesting far past serde's recursion
+boundary, so the preflight reads a strict dialect (`_strict_json_object`: constants raise,
+every decoded string must survive a strict UTF-8 encode, and no container may sit deeper
+than the bracketed serde boundary), and each of those has its observation (a NaN-carrying
+prime header is "No session found matching"; a surrogate-carrying codex meta is unreadable
+session metadata; 126 nested arrays resumed and 127 were refused). The byte layer below the
+dialect is mirrored per reader rather than shared: codex reads strict UTF-8 and one raw
+`0xFF` before a valid record is "stream did not contain valid UTF-8" (a UTF-8 BOM, valid
+bytes and invalid JSON, is refused too), while the Node-family CLIs decode invalid bytes to
+U+FFFD and carry on (a replaced byte inside a prime header string and inside a claude
+transcript string both resumed), so the codex reader treats a decode failure as the fatal
+first-record refusal and the other two decode with replacement, never with erasure, which
+could stitch refuse-worthy bytes into acceptable JSON. Anchoring is per CLI too: codex
+parses the literal first record and refuses the file when that fails, while prime's scanner
+skips lines its parser refuses, both observed with a valid record on line two. The refusals all this preempts would otherwise arrive per
 task, after the fan-out's copies, streams, and containers were already paid for. What no
 line-level predicate can promise is a file that carries the floor plus additional records
 the CLI cannot replay (a poisoned line elsewhere in a crashed file); that residue stays a
@@ -517,10 +536,15 @@ names the id is not a conversation, and the preflight requires the whole floor.
 
 The value domains are part of the floor, not only the fields (all observed, rest of the line
 held at the verified minimum). The timestamp must be the complete, calendar-valid,
-timezone-carrying ISO instant the CLI itself writes: an object, an epoch number, a non-date
-string, and an ISO-shaped but calendar-invalid string (`2026-99-99T99:99:99Z`) were each
-refused as `No conversation found`, which is why the preflight parses the value as a
-datetime, end-anchored, rather than pattern-matching a prefix. The content must be a string
+timezone-carrying ISO instant in the GRAMMAR the CLI accepts, which is narrower than ISO
+8601: the extended form, the space-separated form, and the numeric HH:MM offset each
+resumed, while a week date (`2026-W33-3T00:00:00Z`) and the basic form (`20260812T000000Z`)
+were refused as `No conversation found` alongside an object, an epoch number, a non-date
+string, and an ISO-shaped but calendar-invalid string (`2026-99-99T99:99:99Z`); comma
+fractions, arbitrary separators, and offsets carrying seconds are also refused per the
+review's probes. So the preflight pairs an end-anchored grammar for the accepted profile
+with a real datetime parse: the grammar cannot see that 2026-99-99 is not a date, and the
+parse alone certified every profile above that `fromisoformat` accepts and the CLI does not. The content must be a string
 or a list: an object resolves the session and then crashes the resume with
 `TypeError: e.map is not a function`, whose own text names the CLI's domain (a string is
 handled apart; everything else is mapped as an array), and a list of non-block elements
@@ -551,9 +575,13 @@ refused as `failed to read session metadata` or `rollout ... is empty`; an empty
 same; a parseable non-meta first line is refused as `does not start with session metadata`;
 and an UNPARSEABLE first line is refused as `failed to parse first rollout record` even with
 a fully valid meta on line two, so the preflight anchors on the literal first record the way
-the reader does, skipping nothing. Decoding is serde-strict: an escaped lone surrogate in
-any meta value is refused as unreadable session metadata (observed, with and without the
-envelope timestamp beside it), which is the dialect the preflight's strict reader enforces.
+the reader does, skipping nothing. Decoding is serde-strict at every layer: an escaped lone
+surrogate in any meta value is refused as unreadable session metadata (observed, with and
+without the envelope timestamp beside it); the raw bytes must be valid UTF-8 (one `0xFF`
+before the verified minimum is `stream did not contain valid UTF-8`, and a UTF-8 BOM, valid
+bytes and invalid JSON, is refused too); and nesting stops at serde's recursion boundary,
+bracketed exactly (an extra field wrapped in 126 arrays resumed, 127 was refused). The
+preflight's strict reader enforces all three.
 
 Beyond presence and decodability the VALUES are not domain-checked at 0.147.0. A bogus
 originator, a bogus cli_version, a non-date payload timestamp, a non-date envelope
@@ -587,7 +615,10 @@ scanner's parser is JSON.parse, so a header line carrying a NaN-family constant 
 unparseable to it and the session is `No session found matching`; the skipping cuts the
 other way too, since a NaN-poisoned junk line ABOVE a valid header is skipped and the
 session resumed (both observed), which is exactly the skip-then-anchor the preflight
-mirrors. And the cwd, which is a value domain of the resume: a header without one, or
+mirrors. Bytes are decoded with replacement rather than refused: an invalid raw byte inside
+a header string arrived as U+FFFD and the session resumed, and an invalid-byte junk line
+above the header was skipped like any other unparseable line (both observed), so the
+preflight decodes the same way and never erases. And the cwd, which is a value domain of the resume: a header without one, or
 recorded at another directory, resolves as `Session found in different project` and stalls
 on an interactive `Fork this session into current directory?` prompt, which under the
 runner's closed stdin is exit 13 and no resume (observed for both). Every leg runs at

@@ -104,9 +104,12 @@ def load_instruction(arm: str, *, root: Path | None = None) -> Instruction:
     """Read an instruction arm from ``instructions/<arm>/``.
 
     Every arm supplies four files. ``rollout.system.txt`` is the standing instruction for the
-    improvement rollout, ``eval.system.txt`` the one for both eval phases (never carrying the
-    improvement objective, because an eval is a measurement), ``kickoff.txt`` the minimal user
-    turn, and ``continue.txt`` the cue the runner sends to resume a rollout.
+    improvement rollout, and also for a RESUMED eval_after: that conversation already carries
+    the objective in its history and its compaction summaries, so swapping the standing
+    instruction mid-conversation would measure an agent that never existed. ``eval.system.txt``
+    is the one for every cold eval session (eval_before always, cold afters), never carrying
+    the improvement objective, because a cold eval is a blind measurement. ``kickoff.txt`` is
+    the minimal user turn, and ``continue.txt`` the cue the runner sends to resume a rollout.
     """
     base = (root or repo_root()) / "instructions" / arm
     if not base.is_dir():

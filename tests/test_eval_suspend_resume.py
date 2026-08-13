@@ -851,6 +851,9 @@ def test_rerun_eval_reopens_only_eval_after_and_records_itself(tmp_path, monkeyp
     # read and not only in the republished record.
     assert rewritten["cell"]["eval_context"] == "cold"
     assert captured["cell"].eval_context == "cold"
+    # The instruction record follows the recovered axis: a cold eval_after ran under the
+    # blind eval instruction, and the republished artifact says so explicitly.
+    assert rewritten["instruction"]["eval_prompt_used"] == "eval_system"
     assert rewritten["eval_reruns"] and rewritten["eval_reruns"][0]["phase"] == "eval_after"
 
     run_dir = _reopenable_run(tmp_path / "second", with_before=True)

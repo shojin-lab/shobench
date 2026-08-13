@@ -34,9 +34,12 @@ power; the full matrix is the target it grows back toward.
    home copies carry the rollout transcript, so the forks never see each other, only the
    rollout's end). The after-bookend therefore measures the agent WITH its lived rollout
    state: what is still in context and in the compaction summaries, plus whatever the rollout
-   wrote to the home. This is the recorded `eval_context = "resumed"` default; the
-   `"cold"` arm (fresh sessions, durable channel only) is the ablation, and it is what the
-   pre-axis cells measured.
+   wrote to the home. A resumed task launches with the ROLLOUT standing instruction rather
+   than the blind eval one: the conversation already carries the objective in its history
+   and summaries, and swapping the instruction mid-conversation would measure an agent that
+   never existed. This is the recorded `eval_context = "resumed"` default; the `"cold"` arm
+   (fresh sessions, blind eval instruction, durable channel only) is the ablation, and it is
+   what the pre-axis cells measured.
 5. **Report.** Per-task paired deltas; mean before, mean after; 95% CI on the mean delta by
    paired bootstrap; full-solve rate before and after; N. Secondary: when the agent chose to
    stop during the rollout (tasks attempted before stopping, whether it self-checkpointed),

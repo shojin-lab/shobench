@@ -360,7 +360,18 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
         "started_at": time.time(),
         "cell": ctx.cell.to_manifest(),
         "split": ctx.split.to_manifest(),
-        "instruction": ctx.instruction.to_manifest(),
+        "instruction": {
+            **ctx.instruction.to_manifest(),
+            # Which standing instruction eval_after launches with, so the artifact says it
+            # rather than leaving a reader to derive it from the eval_context axis: a resumed
+            # after carries the rollout instruction (the conversation already holds the
+            # objective; swapping it mid-conversation would measure an agent that never
+            # existed), a cold one the blind eval instruction. eval_before is always the
+            # eval instruction regardless.
+            "eval_prompt_used": (
+                "rollout_system" if ctx.cell.eval_context == "resumed" else "eval_system"
+            ),
+        },
         "substrate": {
             "shogym_repo": SHOGYM_REPO,
             "shogym_rev": SHOGYM_REV,
@@ -943,7 +954,20 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                         ctx,
                         phase=phase,
                         leg=idx,
-                        system_prompt=ctx.instruction.eval_system,
+                        # A resumed fork carries the ROLLOUT's standing instruction, not the
+                        # eval one. The rule that the eval instruction never carries the
+                        # improvement objective was designed for cold measurement; a resumed
+                        # conversation already carries the objective in its history and its
+                        # compaction summaries, and swapping the standing instruction
+                        # mid-conversation would measure an agent that never existed. The
+                        # resumed after measures the agent as it lived, objective included;
+                        # every cold session (eval_before always) keeps the blind eval
+                        # instruction.
+                        system_prompt=(
+                            ctx.instruction.rollout_system
+                            if resume_session
+                            else ctx.instruction.eval_system
+                        ),
                         user_prompt=ctx.instruction.kickoff,
                         # A resumed fork names the rollout's terminal session; every task names
                         # the same one, and the per-task home copies are what keep the forks
@@ -1995,6 +2019,12 @@ async def _resume_cell_owned(
         # run's remaining eval tasks run cold, the way the finished ones were measured.
         cell = replace(cell, eval_context=recorded_context)
     manifest["cell"]["eval_context"] = recorded_context
+    # The instruction record stays consistent with the recovered axis, so the artifact keeps
+    # naming the prompt its eval_after actually launches with; a pre-axis manifest recovers
+    # cold and so names the blind eval instruction.
+    manifest.setdefault("instruction", {})["eval_prompt_used"] = (
+        "rollout_system" if recorded_context == "resumed" else "eval_system"
+    )
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
     drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)
@@ -2187,6 +2217,10 @@ async def _rerun_eval_owned(
         # under the posture the finished ids were measured under, never today's default.
         cell = replace(cell, eval_context=recorded_context)
     manifest["cell"]["eval_context"] = recorded_context
+    # Same consistency rule as a resume: the record names the prompt its eval_after runs with.
+    manifest.setdefault("instruction", {})["eval_prompt_used"] = (
+        "rollout_system" if recorded_context == "resumed" else "eval_system"
+    )
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
     drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)

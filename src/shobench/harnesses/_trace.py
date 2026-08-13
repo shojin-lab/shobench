@@ -26,14 +26,25 @@ def _refuse_nonstandard_constant(constant: str) -> float:
     raise ValueError(f"nonstandard JSON constant {constant!r}")
 
 
-def _strings_utf8_clean(node: object) -> bool:
-    """Does every string in this decoded tree survive a strict UTF-8 encode?
+# The deepest container nesting the strict dialect admits, counting the record itself as level
+# one. The boundary is serde's and was bracketed against the pinned codex, one variant at a
+# time over the verified minimum meta: an extra field wrapped in 126 nested arrays (deepest
+# container at level 127 under this counting) resumed to the transport boundary, and 127
+# arrays (level 128) was refused as unreadable session metadata. Python's own decoder parses
+# far deeper, which is exactly the gap: a structurally unreadable record must not pass the
+# preflight because the preflight's parser happens to have more stack.
+_MAX_NESTING = 127
 
+
+def _within_dialect(node: object, containers_above: int = 0) -> bool:
+    """Is this decoded tree inside the strict dialect: clean strings, bounded nesting?
+
+    Two checks ride one walk. Every string must survive a strict UTF-8 encode, because
     Python's json willingly decodes an escaped lone surrogate into a string no strict UTF-8
-    decoder could have produced. serde refuses that escape outright, so a preflight that let
-    it through would certify a record the codex reader cannot decode (observed: a meta whose
-    timestamp is ``\\ud800`` is refused as unreadable session metadata). Keys are checked
-    with the values, since a surrogate is no more decodable for being a key.
+    decoder could have produced, and serde refuses that escape outright (observed: a meta
+    whose timestamp is ``\\ud800`` is refused as unreadable session metadata); keys are
+    checked with the values, since a surrogate is no more decodable for being a key. And no
+    container may sit deeper than :data:`_MAX_NESTING`, serde's observed recursion boundary.
     """
     if isinstance(node, str):
         try:
@@ -42,9 +53,17 @@ def _strings_utf8_clean(node: object) -> bool:
             return False
         return True
     if isinstance(node, dict):
-        return all(_strings_utf8_clean(k) and _strings_utf8_clean(v) for k, v in node.items())
+        level = containers_above + 1
+        if level > _MAX_NESTING:
+            return False
+        return all(
+            _within_dialect(k, level) and _within_dialect(v, level) for k, v in node.items()
+        )
     if isinstance(node, list):
-        return all(_strings_utf8_clean(item) for item in node)
+        level = containers_above + 1
+        if level > _MAX_NESTING:
+            return False
+        return all(_within_dialect(item, level) for item in node)
     return True
 
 
@@ -52,20 +71,22 @@ def _strict_json_object(line: str) -> dict | None:
     """One JSONL line decoded in the dialect the pinned session readers share, or ``None``.
 
     Python's json is more permissive than the parsers on the other side of the preflight in
-    two ways that matter. It accepts the extension constants (NaN, Infinity, -Infinity),
+    three ways that matter. It accepts the extension constants (NaN, Infinity, -Infinity),
     which JSON.parse refuses: a prime header line carrying one is unparseable to the scanner
-    and the session is "No session found matching" (observed). And it decodes escaped lone
-    surrogates, which serde refuses: see :func:`_strings_utf8_clean`. A preflight reading the
-    lenient dialect would certify exactly those files, so this reader refuses both. The
-    intersection is deliberately the STRICTEST of the three CLIs' dialects: JS parsers do
-    accept a lone-surrogate escape, but no real session file carries one (their strings are
-    cwds, ids, and model text), so the narrowing refuses only fabrications.
+    and the session is "No session found matching" (observed). It decodes escaped lone
+    surrogates, which serde refuses. And it parses nesting far past serde's recursion
+    boundary (see :func:`_within_dialect` for both). A preflight reading the lenient dialect
+    would certify exactly those files, so this reader refuses all three. The intersection is
+    deliberately the STRICTEST of the three CLIs' dialects: JS parsers do accept a
+    lone-surrogate escape and deeper nesting, but no real session file carries either (their
+    strings are cwds, ids, and model text; their nesting is a few levels), so the narrowing
+    refuses only fabrications.
     """
     try:
         event = json.loads(line, parse_constant=_refuse_nonstandard_constant)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
-    if not isinstance(event, dict) or not _strings_utf8_clean(event):
+    if not isinstance(event, dict) or not _within_dialect(event):
         return None
     return event
 
@@ -76,37 +97,58 @@ def _first_parseable_event(path: Path) -> dict | None:
     This is prime-agent's own anchor, mirrored: its scanner walks lines, skips one its parser
     refuses, and reads the first that decodes; a session header below a NaN-poisoned junk
     line resumed, while a header below a PARSEABLE message line did not (both observed). So
-    unparseable lines are skipped here and parseable ones anchor. codex anchors harder, on
-    the literal first record, which is :func:`_first_record_strict`.
+    unparseable lines are skipped here and parseable ones anchor. Bytes are decoded the way
+    the Node runtime decodes them, with replacement rather than erasure: an invalid raw byte
+    inside a header string arrived as U+FFFD and the session resumed, and an invalid-byte
+    junk line above a valid header was skipped (both observed), while ``errors="ignore"``
+    would delete the bytes and could stitch refuse-worthy text into acceptable JSON. codex
+    anchors harder and refuses invalid bytes outright, which is
+    :func:`_first_record_strict`.
     """
     if not path.exists():
         return None
-    with path.open(encoding="utf-8", errors="ignore") as lines:
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            event = _strict_json_object(line)
-            if event is not None:
-                return event
+    try:
+        with path.open(encoding="utf-8", errors="replace") as lines:
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                event = _strict_json_object(line)
+                if event is not None:
+                    return event
+    except OSError:
+        # The layer below bytes: a file the preflight cannot read is a file it cannot vouch
+        # for, and "no transcript" is the refusal that already says so loudly.
+        return None
     return None
 
 
 def _first_record_strict(path: Path) -> dict | None:
-    """The FIRST non-empty line, strictly decoded as an object, or ``None`` when it is not one.
+    """The FIRST non-empty line, byte-strictly decoded as an object, or ``None``.
 
-    codex's reader mirror: it parses the first rollout record and refuses the whole file when
-    that parse fails ("failed to parse first rollout record", observed with a fully valid
-    meta sitting on line two), so nothing is skipped here either.
+    codex's reader mirror, at both layers it enforces. It parses the first rollout record and
+    refuses the whole file when that parse fails ("failed to parse first rollout record",
+    observed with a fully valid meta sitting on line two), so nothing is skipped here either.
+    And it reads the bytes as strict UTF-8: one raw ``0xFF`` prefixed to the verified minimum
+    record was refused as "stream did not contain valid UTF-8" (observed), so the line is
+    decoded from bytes with a decode failure as the same fatal refusal, never erased or
+    replaced into something readable.
     """
     if not path.exists():
         return None
-    with path.open(encoding="utf-8", errors="ignore") as lines:
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            return _strict_json_object(line)
+    try:
+        with path.open("rb") as lines:
+            for raw in lines:
+                if not raw.strip():
+                    continue
+                try:
+                    line = raw.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    return None
+                return _strict_json_object(line) if line else None
+    except OSError:
+        # As above: unreadable means unvouchable, refused before the fan-out.
+        return None
     return None
 
 

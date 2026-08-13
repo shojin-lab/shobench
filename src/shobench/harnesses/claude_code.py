@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -235,24 +236,38 @@ def _last_result_event(path: Path) -> dict | None:
     return _last_event_of_type(path, ("result",))
 
 
-def _is_zoned_instant(value: object) -> bool:
-    """Is this the complete, calendar-valid, timezone-carrying instant the CLI writes?
+# The timestamp grammar the pinned CLI accepts, end-anchored: extended calendar date, a T or
+# single-space separator, whole seconds, an optional dot fraction, and Z or an HH:MM offset.
+# Established by probing the CLI at the verified minimum: the extended form, the
+# space-separated form, and the +00:00 offset each resumed, while ISO profiles that
+# ``fromisoformat`` also accepts were each refused as "No conversation found": a week date
+# (2026-W33-3T...), the basic form (20260812T000000Z), a comma fraction, an arbitrary
+# separator, and an offset carrying seconds. Grammar and calendar are separate checks on
+# purpose: this pattern cannot see that 2026-99-99 is not a date, and the parse cannot see
+# that a week date is not this CLI's grammar.
+_CLI_INSTANT = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+)
 
-    A prefix pattern is not this check: it certified "2026-99-99T99:99:99Z", which the pinned
-    CLI refuses as "No conversation found" (observed), exactly like an object, an epoch
-    number, and a non-date string in the field. So the value is parsed as a datetime,
-    end-anchored (a trailing remainder fails the parse), calendar-checked by the parse
-    itself, and required to carry a timezone the way every CLI-written stamp does. The
-    timezone requirement is a deliberate narrowing: a naive stamp was not probed, and no real
-    transcript carries one, so refusing it costs nothing and claims nothing.
+
+def _is_zoned_instant(value: object) -> bool:
+    """Is this the complete, calendar-valid, timezone-carrying instant the CLI accepts?
+
+    Two checks, both observed to be load-bearing. The grammar (``_CLI_INSTANT``) pins the
+    accepted CLI profile, because ``fromisoformat`` alone certified week dates, the basic
+    form, comma fractions, and arbitrary separators the CLI refuses. The parse pins the
+    calendar, because a pattern alone certified "2026-99-99T99:99:99Z", which the CLI also
+    refuses. The timezone requirement rides in the grammar and is a deliberate narrowing: a
+    naive stamp was not probed, and no real transcript carries one, so refusing it costs
+    nothing and claims nothing.
     """
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not _CLI_INSTANT.match(value):
         return False
     try:
-        parsed = datetime.fromisoformat(value)
+        datetime.fromisoformat(value)
     except ValueError:
         return False
-    return parsed.tzinfo is not None
+    return True
 
 
 def _carries_resumable_conversation(path: Path, session_id: str) -> bool:
@@ -269,14 +284,17 @@ def _carries_resumable_conversation(path: Path, session_id: str) -> bool:
     here because the CLI constrains none: a list of non-blocks was observed to resume, its
     entries contributing empty text. Lines are decoded in the shared strict dialect
     (``_strict_json_object``), because the CLI's own JSON.parse never yields a line carrying
-    a NaN-family constant, so a qualifying line that needs one does not exist for it.
+    a NaN-family constant, so a qualifying line that needs one does not exist for it. Bytes
+    are decoded with replacement, the way the CLI's Node-family runtime decodes them: a raw
+    invalid byte inside a transcript string arrived as U+FFFD and the session resumed
+    (observed), while erasure could stitch refuse-worthy text into acceptable JSON.
 
     Streamed and stopped at the first match, tolerant of a malformed line, because the file
     was written by another process and a crash can cut it anywhere; a transcript cut after
     its kickoff line is still one the CLI resumes.
     """
     try:
-        with path.open(encoding="utf-8", errors="ignore") as lines:
+        with path.open(encoding="utf-8", errors="replace") as lines:
             for line in lines:
                 line = line.strip()
                 if not line:

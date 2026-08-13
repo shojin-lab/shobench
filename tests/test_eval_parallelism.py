@@ -460,6 +460,7 @@ def _capture_launches(monkeypatch, launches: dict[int, dict]) -> None:
         launches[idx] = {
             "session_id": kw["session_id"],
             "resume": kw["resume"],
+            "system_prompt": kw["system_prompt"],
             "transcript_in_copy": (
                 home / ".claude/projects/-work" / f"{_ROLLOUT_SID}.jsonl"
             ).exists(),
@@ -499,7 +500,9 @@ def test_a_resumed_eval_after_forks_the_rollout_session_into_every_task(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Every task resumes the rollout's terminal session, independently: same id in every
-    launch, and each fork's own home copy carries the transcript the resume reopens."""
+    launch, each fork's own home copy carries the transcript the resume reopens, and the
+    standing instruction is the ROLLOUT's: the conversation already holds the objective, and
+    swapping the instruction mid-conversation would measure an agent that never existed."""
     ctx = _ctx(tmp_path, ("1", "2", "3"))
     assert ctx.cell.eval_context == "resumed"
     _rollout_terminus(ctx)
@@ -514,6 +517,7 @@ def test_a_resumed_eval_after_forks_the_rollout_session_into_every_task(
         assert record["session_id"] == _ROLLOUT_SID
         assert record["resume"] is True
         assert record["transcript_in_copy"] is True
+        assert record["system_prompt"] == ctx.instruction.rollout_system
 
 
 def test_eval_before_never_resumes_whatever_the_axis_says(tmp_path: Path, monkeypatch) -> None:
@@ -531,6 +535,7 @@ def test_eval_before_never_resumes_whatever_the_axis_says(tmp_path: Path, monkey
         assert record["resume"] is False
         assert record["session_id"] != _ROLLOUT_SID  # a fresh pinned id, never the rollout's
         assert record["transcript_in_copy"] is False
+        assert record["system_prompt"] == ctx.instruction.eval_system  # blind, as always
 
 
 def test_a_cold_cell_runs_eval_after_cold(tmp_path: Path, monkeypatch) -> None:
@@ -549,6 +554,7 @@ def test_a_cold_cell_runs_eval_after_cold(tmp_path: Path, monkeypatch) -> None:
         assert record["resume"] is False
         assert record["session_id"] != _ROLLOUT_SID
         assert record["transcript_in_copy"] is False
+        assert record["system_prompt"] == ctx.instruction.eval_system  # cold stays blind
 
 
 def test_a_resumed_eval_after_with_no_rollout_session_fails_before_spending(

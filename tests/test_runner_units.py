@@ -934,6 +934,17 @@ def test_claude_value_domains_follow_the_pinned_cli(tmp_path: Path) -> None:
         # A deliberate narrowing rather than an observed refusal: a naive stamp was not
         # probed, and no CLI-written stamp lacks its timezone, so refusing it costs nothing.
         "timestamp_naive": _claude_line(timestamp="2026-08-12T00:00:00"),
+        # ISO profiles fromisoformat accepts and the CLI's grammar refuses (week date and
+        # basic form observed refused; comma fraction, arbitrary separator, and an offset
+        # carrying seconds reported refused and grammar-excluded): the calendar parse alone
+        # certified every one of these.
+        "timestamp_week_date": _claude_line(timestamp="2026-W33-3T00:00:00Z"),
+        "timestamp_basic_form": _claude_line(timestamp="20260812T000000Z"),
+        "timestamp_comma_fraction": _claude_line(timestamp="2026-08-12T00:00:00,5Z"),
+        "timestamp_arbitrary_separator": _claude_line(timestamp="2026-08-12x00:00:00Z"),
+        "timestamp_offset_with_seconds": _claude_line(
+            timestamp="2026-08-12T00:00:00+01:00:30"
+        ),
         "content_object": _claude_line(message={"role": "user", "content": {"x": 1}}),
     }
     for label, body in refused.items():
@@ -948,6 +959,10 @@ def test_claude_value_domains_follow_the_pinned_cli(tmp_path: Path) -> None:
         "content_list_of_non_blocks": _claude_line(
             message={"role": "user", "content": [1, 2]}
         ),
+        # The rest of the accepted grammar, each observed to resume: the space-separated
+        # extended form and the numeric HH:MM offset.
+        "timestamp_space_separator": _claude_line(timestamp="2026-08-12 00:00:00Z"),
+        "timestamp_numeric_offset": _claude_line(timestamp="2026-08-12T00:00:00+00:00"),
     }
     for label, body in accepted.items():
         home = _home_with(tmp_path / label, rel, body)
@@ -1113,6 +1128,117 @@ def test_the_preflight_reads_the_decoders_json_dialect_not_pythons(tmp_path: Pat
         + '","extra":NaN}\n',
     )
     assert claude.session_transcript(nan_line, _SID) is None
+
+
+def _home_with_bytes(tmp_path: Path, rel: str, body: bytes) -> Path:
+    home = tmp_path
+    target = home / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(body)
+    return home
+
+
+def test_the_preflight_reads_bytes_the_way_each_cli_does(tmp_path: Path) -> None:
+    """The byte layer below the JSON dialect, mirrored per reader (all observed).
+
+    codex reads strict UTF-8 and refuses invalid bytes outright: one raw 0xFF before the
+    verified minimum record is "stream did not contain valid UTF-8", and a UTF-8 BOM (valid
+    bytes, invalid JSON start) is refused too. The Node-family CLIs decode with replacement
+    and carry on: an invalid raw byte inside a prime header string arrived as U+FFFD and the
+    session resumed, an invalid-byte junk line above the header was skipped, and the same
+    replacement inside a claude transcript string resumed. Erasure is neither reader, which
+    is why the preflight never reads with errors="ignore": deleting bytes could stitch
+    refuse-worthy text into acceptable JSON.
+    """
+    codex = harness_for("codex")
+    codex_rel = f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl"
+    codex_meta = json.dumps(
+        {
+            "timestamp": _TS,
+            "type": "session_meta",
+            "payload": {
+                "id": _SID,
+                "timestamp": _TS,
+                "cwd": "/work",
+                "originator": "codex_exec",
+                "cli_version": "0.147.0",
+            },
+        }
+    ).encode("utf-8")
+    raw_byte = _home_with_bytes(tmp_path / "raw-byte", codex_rel, b"\xff" + codex_meta + b"\n")
+    assert codex.session_transcript(raw_byte, _SID) is None
+    bom = _home_with_bytes(tmp_path / "bom", codex_rel, b"\xef\xbb\xbf" + codex_meta + b"\n")
+    assert codex.session_transcript(bom, _SID) is None
+
+    prime = harness_for("prime_agent")
+    prime_rel = f".prime/agent/sessions/{_SID}.jsonl"
+    header = (
+        b'{"type":"session","version":3,"id":"' + _SID.encode() + b'","cwd":"/work"'
+    )
+    junk_above = _home_with_bytes(
+        tmp_path / "junk-above", prime_rel, b"\xff\xfe junk\n" + header + b"}\n"
+    )
+    assert prime.session_transcript(junk_above, _SID) == junk_above / prime_rel
+    byte_in_string = _home_with_bytes(
+        tmp_path / "byte-in-string", prime_rel, header + b',"note":"\xff"}\n'
+    )
+    assert prime.session_transcript(byte_in_string, _SID) == byte_in_string / prime_rel
+
+    claude = harness_for("claude_code")
+    claude_rel = f".claude/projects/-work/{_SID}.jsonl"
+    line = (
+        b'{"type":"user","message":{"role":"user","content":"hello"},"timestamp":"'
+        + _TS.encode()
+        + b'","sessionId":"'
+        + _SID.encode()
+        + b'","note":"\xff"}\n'
+    )
+    replaced = _home_with_bytes(tmp_path / "replaced", claude_rel, line)
+    assert claude.session_transcript(replaced, _SID) == replaced / claude_rel
+
+
+def _nested_arrays(levels: int) -> object:
+    value: object = 0
+    for _ in range(levels):
+        value = [value]
+    return value
+
+
+def test_the_preflight_stops_at_serdes_nesting_boundary(tmp_path: Path) -> None:
+    """The structural layer: serde parses only so deep, and Python parses much deeper.
+
+    The boundary was bracketed against the pinned codex, one variant at a time over the
+    verified minimum: an extra field wrapped in 126 nested arrays resumed to the transport
+    boundary and 127 was refused as unreadable session metadata. Both sides are pinned so the
+    cap can neither loosen back into certifying unreadable records nor quietly harden into
+    refusing rollouts the CLI accepts.
+    """
+    codex = harness_for("codex")
+    rel = f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl"
+
+    def meta(levels: int) -> str:
+        return (
+            json.dumps(
+                {
+                    "timestamp": _TS,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": _SID,
+                        "timestamp": _TS,
+                        "cwd": "/work",
+                        "originator": "codex_exec",
+                        "cli_version": "0.147.0",
+                    },
+                    "extra": _nested_arrays(levels),
+                }
+            )
+            + "\n"
+        )
+
+    accepted = _home_with(tmp_path / "accepted", rel, meta(126))
+    assert codex.session_transcript(accepted, _SID) == accepted / rel
+    refused = _home_with(tmp_path / "refused", rel, meta(127))
+    assert codex.session_transcript(refused, _SID) is None
 
 
 # ----- what counts as the agent's durable self ------------------------------------------------
