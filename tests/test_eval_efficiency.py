@@ -866,6 +866,31 @@ def test_a_drained_leg_carries_its_own_verdict_and_never_the_harness_classificat
     assert ctx.leg_records()[0]["verdict"]["kind"] == "stream_drained"
 
 
+def test_a_leg_that_was_given_no_grace_says_so_in_the_record(tmp_path: Path, monkeypatch) -> None:
+    """A leg ended on sight and a leg ended after two minutes are different endings, and the
+    record is where the difference survives.
+
+    It matters most for a phase that ran both, which the interrupted bookend will have: the only
+    thing that separates a row's leg from the rows sealed before the rule changed is this field.
+    A ``null`` says the leg was ended by the first reading that found it finished; any number
+    there would say it was given time it was not given, and a missing field would say nothing.
+    """
+    ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
+    monkeypatch.setattr(runner, "_supervise", lambda *a, **kw: (-1, False, True))
+
+    record = _leg(ctx, watchdog=DrainWatchdog(threading.Event(), None))
+
+    assert record.verdict.kind is StopKind.DRAINED
+    assert record.verdict.evidence["grace_s"] is None
+    # Through the same publish that writes legs.json, so what is asserted is the durable bytes:
+    # the field is there, and it is JSON null rather than a number or a dropped key.
+    path = ctx.publish_json(ctx.run_dir / "legs.json", ctx.leg_records())
+    evidence = json.loads(path.read_text(encoding="utf-8"))[0]["verdict"]["evidence"]
+    assert "grace_s" in evidence
+    assert evidence["grace_s"] is None
+    assert '"grace_s": null' in path.read_text(encoding="utf-8")
+
+
 def test_a_leg_the_watchdog_did_not_end_is_classified_by_its_harness(
     tmp_path: Path, monkeypatch
 ) -> None:
