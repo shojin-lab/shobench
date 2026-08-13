@@ -30,7 +30,6 @@ run reporting absent data the machine is holding is worse than a red one.
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
@@ -79,63 +78,58 @@ def _hle_cache_root(cache: Path) -> Path:
     return cache / "___".join(parts)
 
 
-def _hle_build_datasets_will_load(cache: Path) -> Path:
-    """The one build ``datasets`` will read out of ``cache``, chosen the way it chooses.
+def _hle_builder(cache: Path):
+    """The builder object the loader will read through, built the way the loader builds it.
 
-    Which builds under the root look prepared is the wrong question, because the loader does not
-    ask it. It globs the candidates, keeps the ones whose recorded config matches the directory
-    they sit in, and takes whichever was modified last. A finished build beside a newer broken one
-    therefore loses to the broken one, and a check that reads any prepared build it can find has
-    checked something the loader will not open.
+    Predicting where the loader ends up is the mistake this function exists to stop making. The
+    selection is only the first move: after it picks a directory, the builder may replace that
+    directory with a legacy-layout one it finds beside it, and on that branch it reads the files
+    under a different name as well. Any copy of that reasoning kept here is a divergence waiting
+    to be found, so nothing is copied. ``load_dataset`` builds this object and then reads through
+    it, so this builds the same object from the same arguments and asks it what it resolved to.
 
-    So the choice is made by the loader's own function rather than by a copy of it here. It is
-    private, and the day it moves this raises at import rather than quietly going back to
-    inspecting one build while the loader reads another. It raises on a cache it cannot choose
-    from, which is a failure and not a skip: by the time this is called, something under the root
-    has been prepared, so absence is not what is wrong.
+    Cheap, and it opens nothing: constructing a builder settles paths and metadata. The read comes
+    later, in the test, through the env the runner would use.
+
+    An error here is a failure rather than a skip. Nothing is cached is checked before this is
+    called, so a builder that cannot be constructed over a cache holding a prepared build is a
+    broken cache, and the exception says so.
     """
-    from datasets.packaged_modules.cache.cache import _find_hash_in_cache
+    from datasets import load_dataset_builder
 
     try:
-        config_name, version, build_hash = _find_hash_in_cache(
-            dataset_name=hle_data.HF_DATASET,
-            config_name=None,
-            cache_dir=str(cache),
-            config_kwargs={},
-            custom_features=None,
-        )
+        return load_dataset_builder(hle_data.HF_DATASET, cache_dir=str(cache))
     except Exception as exc:
         raise AssertionError(
-            f"datasets cannot choose which build to load out of {cache}, and the hle data is "
-            f"cached there: {type(exc).__name__}: {exc}"
+            f"datasets cannot open a builder over {cache}, and the hle data is cached there: "
+            f"{type(exc).__name__}: {exc}"
         ) from exc
-    return _hle_cache_root(cache) / config_name / version / build_hash
 
 
-def _hle_shards_datasets_will_read(build: Path, info: dict) -> list[Path]:
-    """The arrow files the requested split will be read from, named the way the reader names them.
+def _hle_files_datasets_will_read(builder) -> list[Path]:
+    """The exact files the reader is instructed to open for the requested split.
 
-    A build directory can hold arrow files this load never opens: another split's shards, residue
-    from an older prepare that the recorded split no longer refers to. The reader does not glob the
-    directory. It takes the split's recorded ``shard_lengths`` and builds the filenames from the
-    dataset name and the split name, so those files are the whole of what has to be there, and
-    what else sits beside them is not this test's business. Rejecting a build over a file the
-    loader will not touch would fail a cache that works, which is the same class of untrue report
-    as skipping over a cache that is present.
+    A build directory can hold arrow files this read never opens: another split's shards, residue
+    from an older prepare the recorded split no longer refers to. The reader does not glob the
+    directory, it is handed a file list, so that list is what has to be there and what else sits
+    beside it is not this test's business. Failing over a file the loader will not touch is the
+    same untrue report as skipping over a cache the machine is holding.
+
+    The list is built by the reader's own instruction builder, off the resolved directory, the
+    resolved split metadata, and the name the read path would use, which is the builder's name
+    rather than the dataset's on the legacy branch.
     """
-    from datasets.naming import filenames_for_dataset_split
+    from datasets.arrow_reader import make_file_instructions
 
-    split_info = info["splits"][hle_data.HF_SPLIT]
-    return [
-        Path(name)
-        for name in filenames_for_dataset_split(
-            build,
-            dataset_name=hle_data.HF_DATASET.split("/")[-1],
-            split=hle_data.HF_SPLIT,
-            filetype_suffix="arrow",
-            shard_lengths=split_info.get("shard_lengths"),
-        )
-    ]
+    name = builder.name if builder._check_legacy_cache() else builder.dataset_name
+    instructions = make_file_instructions(
+        name=name,
+        split_infos=list(builder.info.splits.values()),
+        instruction=hle_data.HF_SPLIT,
+        filetype_suffix="arrow",
+        prefix_path=str(builder.cache_dir),
+    )
+    return [Path(instruction["filename"]) for instruction in instructions.file_instructions]
 
 
 def _env(name: str, kwargs: dict):
@@ -184,20 +178,20 @@ def test_hle_manifest_ids_resolve_to_the_question_ids_it_records() -> None:
     # the branch every run takes.
     #
     # Nothing prepared under the root means nothing was ever cached, which is the only state that
-    # can honestly skip. Past that line the data is here, so the build the loader will select has
-    # to hold up, and if it does not, that is a failure with a true reason rather than a green run
+    # can honestly skip. Past that line the data is here, so what the loader resolves to has to
+    # hold up, and if it does not, that is a failure with a true reason rather than a green run
     # claiming data this machine has.
     cache = hle_data.cache_dir()
     root = _hle_cache_root(cache)
     if not any((c / "dataset_info.json").is_file() for c in root.glob("*/*/*")):
         pytest.skip(f"the gated hle dataset is not cached at {cache}, and a test will not fetch it")
-    build = _hle_build_datasets_will_load(cache)
-    info = json.loads((build / "dataset_info.json").read_text())
-    assert hle_data.HF_SPLIT in (info.get("splits") or {}), (
-        f"datasets will load {build}, which records no {hle_data.HF_SPLIT!r} split"
+    builder = _hle_builder(cache)
+    build = Path(builder.cache_dir)
+    assert hle_data.HF_SPLIT in (builder.info.splits or {}), (
+        f"datasets resolves to {build}, which records no {hle_data.HF_SPLIT!r} split"
     )
-    shards = _hle_shards_datasets_will_read(build, info)
-    unusable = [s.name for s in shards if not (s.is_file() and s.stat().st_size)]
+    files = _hle_files_datasets_will_read(builder)
+    unusable = [f.name for f in files if not (f.is_file() and f.stat().st_size)]
     assert not unusable, (
         f"datasets reads {hle_data.HF_SPLIT!r} out of {build}, and {unusable} is missing or empty"
     )
