@@ -1,15 +1,14 @@
 """What the suite has to settle before anything imports a client that would go out.
 
-Two libraries here read a setting once, at import, and act on it for the life of the process.
-``huggingface_hub`` reads ``HF_HUB_OFFLINE``, and ``datasets`` takes its own offline flag from that
-same constant. FastMCP reads ``FASTMCP_CHECK_FOR_UPDATES`` into its settings object, and with it
-left alone the first server this suite starts asks PyPI whether a newer FastMCP exists, which is a
-real request out of a suite that claims to make none. A test that sets either variable sets it too
-late. They are set here instead: pytest imports this file before it imports a test module, and
-before any of them import either library.
+Both libraries below read their setting once, at import, and act on it for the life of the
+process: ``huggingface_hub`` reads ``HF_HUB_OFFLINE`` and ``datasets`` takes its offline flag from
+that same constant, while FastMCP reads ``FASTMCP_CHECK_FOR_UPDATES`` into its settings object and
+without it asks PyPI about new releases the first time this suite starts a server. A test that
+sets either variable sets it too late, which is why they are set here: pytest imports this file
+before it imports a test module, and before any of them import either library.
 
-That is what makes this suite's verdict a property of the machine it runs on rather than of
-whether that machine has a network, and it is what the workflow's claim about the suite rests on.
+Here and nowhere else. Every way into this suite comes through this file, including a developer
+running pytest by hand, so a second copy of these pins in the workflow would only drift.
 """
 
 from __future__ import annotations

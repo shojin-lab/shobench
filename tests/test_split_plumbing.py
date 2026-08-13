@@ -16,16 +16,13 @@ would make the same test pass on a machine with a network and skip on one withou
 skip reason nobody can read. So the fetch is refused here and the absence is what gets
 reported. The tests themselves are unchanged: where the data is provisioned, they run in full.
 
-Two mechanisms hold that line, because the two downloads leave through different doors. The
-tarball fetch is shogym's own function, refused by the fixture below. The Hub fetch belongs to
-``datasets``, and it is stopped at the process level by ``conftest.py``, which pins the Hub
-client offline before anything imports it.
+Two doors, so two mechanisms: the tarball fetch is shogym's own function, refused by the fixture
+below, and the Hub fetch belongs to ``datasets``, stopped process-wide by ``conftest.py``.
 
-What is left here is naming the absence, and naming it only when it is real. A skip is a claim
-about the machine, so these tests skip on the two states that make the claim true, a refused
-fetch and a cache with nothing prepared in it, and on nothing else. Data that is present and
-then will not load is a failure. It reads as the harsher choice and is the honest one: a green
-run reporting absent data the machine is holding is worse than a red one.
+What is left here is naming the absence, and naming it only when it is real. These tests skip on
+a refused fetch and on a cache the loader would not reach for, and on nothing else. Data that is
+present and will not load fails instead, because a green run reporting absent data the machine is
+holding is worse than a red one.
 """
 
 from __future__ import annotations
@@ -68,11 +65,10 @@ def _no_upstream_fetch(monkeypatch):
 def _hle_is_cached(cache: Path) -> bool:
     """Whether ``datasets`` considers the hle dataset cached under ``cache``.
 
-    Put to the factory the offline load path falls back to, rather than to a copy of its glob. Its
-    answer is coarser than "loadable": a directory at the depth builds live at is enough, even one
-    holding an arrow file and no metadata beside it, even a half-written one. That coarseness is
-    the point. The factory reaching for a directory is what makes absence untrue, and everything
-    past this line is then free to fail rather than obliged to skip.
+    Put to the factory the offline load path falls back to rather than to a copy of its glob. Its
+    answer is coarser than "loadable" on purpose: a directory where builds live is enough, even a
+    half-written one. The factory reaching for a directory is what makes absence untrue, and
+    everything past this line is then free to fail rather than obliged to skip.
     """
     from datasets.load import CachedDatasetModuleFactory
 
@@ -86,19 +82,14 @@ def _hle_is_cached(cache: Path) -> bool:
 def _hle_builder(cache: Path):
     """The builder object the loader will read through, built the way the loader builds it.
 
-    Predicting where the loader ends up is the mistake this function exists to stop making. The
-    selection is only the first move: after it picks a directory, the builder may replace that
-    directory with a legacy-layout one it finds beside it, and on that branch it reads the files
-    under a different name as well. Any copy of that reasoning kept here is a divergence waiting
-    to be found, so nothing is copied. ``load_dataset`` builds this object and then reads through
-    it, so this builds the same object from the same arguments and asks it what it resolved to.
+    Predicting where the loader ends up is the mistake this exists to stop making: selection is
+    only its first move, and the builder can then replace the selected directory with a
+    legacy-layout one beside it and read the files under a different name. ``load_dataset`` builds
+    this object and reads through it, so this builds the same object from the same arguments and
+    asks it what it resolved to. Constructing a builder settles paths and metadata and opens
+    nothing; the read comes later, through the env the runner would use.
 
-    Cheap, and it opens nothing: constructing a builder settles paths and metadata. The read comes
-    later, in the test, through the env the runner would use.
-
-    An error here is a failure rather than a skip. Nothing is cached is checked before this is
-    called, so a builder that cannot be constructed over a cache holding a prepared build is a
-    broken cache, and the exception says so.
+    An error here fails rather than skips, absence having been settled before it was called.
     """
     from datasets import load_dataset_builder
 
@@ -114,15 +105,11 @@ def _hle_builder(cache: Path):
 def _hle_files_datasets_will_read(builder) -> list[Path]:
     """The exact files the reader is instructed to open for the requested split.
 
-    A build directory can hold arrow files this read never opens: another split's shards, residue
-    from an older prepare the recorded split no longer refers to. The reader does not glob the
-    directory, it is handed a file list, so that list is what has to be there and what else sits
-    beside it is not this test's business. Failing over a file the loader will not touch is the
-    same untrue report as skipping over a cache the machine is holding.
-
-    The list is built by the reader's own instruction builder, off the resolved directory, the
-    resolved split metadata, and the name the read path would use, which is the builder's name
-    rather than the dataset's on the legacy branch.
+    The reader is handed a file list rather than globbing the directory, so that list is what has
+    to be there, and the arrow files that can sit beside it (another split's shards, residue from
+    an older prepare) are not this test's business. The list comes from the reader's own
+    instruction builder, off the resolved directory and split metadata, under the name the read
+    path would use, which on the legacy branch is the builder's rather than the dataset's.
     """
     from datasets.arrow_reader import make_file_instructions
 
@@ -140,11 +127,9 @@ def _hle_files_datasets_will_read(builder) -> list[Path]:
 def _env(name: str, kwargs: dict):
     """Construct the env the way the runner does.
 
-    One failure is a skip here, and it is the one this file arranges: the refused fetch, which
-    says the source is not on this machine. Every other failure fails. A test only reaches this
-    line once it has established that the data it needs is present, and printing "not provisioned"
-    over a machine holding the data would be a false reason for a green run, which is the exact
-    report these tests exist to make impossible.
+    One failure skips here, the refused fetch, which says the source is not on this machine. Every
+    other failure fails: a test reaches this line having established that its data is present, so
+    "not provisioned" over a machine holding the data would be a false reason for a green run.
     """
     try:
         return env_factory(name, kwargs)(name)
@@ -176,16 +161,11 @@ def test_automationbench_manifest_covers_the_env_exactly() -> None:
 
 
 def test_hle_manifest_ids_resolve_to_the_question_ids_it_records() -> None:
-    # hle's tasks come off the Hub through ``datasets``, which the fixture above cannot cover:
-    # the download is not shogym's function. conftest.py pins the Hub client offline for the whole
-    # process, so the loader below reads this cache or raises, and reading this cache is what the
-    # pin also makes checkable: offline is the branch that selects a build from disk, and it is
-    # the branch every run takes.
-    #
-    # Nothing the loader would reach for means nothing was ever cached, which is the only state
-    # that can honestly skip, and the loader's own factory is what decides it. Past that line the
-    # data is here, so what the loader resolves to has to hold up, and if it does not, that is a
-    # failure with a true reason rather than a green run claiming data this machine has.
+    # hle's tasks come off the Hub through ``datasets``, which the fixture above cannot cover: the
+    # download is not shogym's function. conftest.py pins that client offline for the whole
+    # process, so the loader below reads this cache or raises, and every check between here and it
+    # is about that cache. Whether anything is cached at all decides the skip; past that, every
+    # disagreement with what the loader resolved to is a failure.
     cache = hle_data.cache_dir()
     if not _hle_is_cached(cache):
         pytest.skip(f"the gated hle dataset is not cached at {cache}, and a test will not fetch it")
