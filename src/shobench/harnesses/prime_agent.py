@@ -105,6 +105,15 @@ class PrimeAgent(Harness):
     the scope forbids. The runner raises all of them and reads a limit that was still reached
     as a cutoff.
 
+    Raising every budget has a consequence the flags do not show, and it is a finding rather than
+    a setting. Autonomy's continuation check consults the quality gates it was given, and this
+    launch passes none, so at 0.7.1 the check has nothing to evaluate and answers "keep going"
+    unconditionally: with the four budgets raised out of reach, a prime leg has no terminal
+    condition of its own. On the rollout that is exactly right, and is the thing being measured.
+    On an eval task it is pure waste, since the held-out row seals at the task's completion call
+    and everything after it is a session talking to itself, so the runner ends a drained eval leg
+    and records that ending as its own kind (see ``shobench.runner`` and ``StopKind.DRAINED``).
+
     Value-taking autonomous flags take a separate argument; ``--flag=value`` is rejected.
     stdin is closed, because print mode reads piped stdin and merges it into the prompt.
     """

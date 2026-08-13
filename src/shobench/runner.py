@@ -547,8 +547,9 @@ def _feed_stdin(proc: subprocess.Popen, data: str) -> None:
     a budget. A harness that exits before it drains the pipe closes it under this write, which is
     that harness's own ending and not an error here.
     """
+    if proc.stdin is None:
+        return
     with contextlib.suppress(OSError, ValueError):
-        assert proc.stdin is not None
         proc.stdin.write(data)
         proc.stdin.close()
 
@@ -573,7 +574,7 @@ def _supervise(
     client alone leaves the container running, and a container that outlives its leg keeps
     spending and keeps holding the task it was handed.
     """
-    proc = subprocess.Popen(  # noqa: S603 (argv is built here, never a shell string)
+    proc = subprocess.Popen(
         argv,
         stdout=out,
         stderr=err,
@@ -979,7 +980,16 @@ async def _watch_for_drain(
     finished_since: float | None = None
     while True:
         await asyncio.sleep(poll_s)
-        if not _eval_task_is_finished(stream, prov_dir, idx):
+        try:
+            finished = _eval_task_is_finished(stream, prov_dir, idx)
+        except Exception:
+            # A watcher that cannot read the state fails safe and never fails the task. It is
+            # reading a stream and a file that another party is writing, and the cost of guessing
+            # wrong in this direction is a leg that ends at its budget exactly as it did before
+            # this existed; the cost in the other direction would be a raise landing in the task's
+            # cleanup and turning a finished measurement into an unscored one.
+            finished = False
+        if not finished:
             finished_since = None
             continue
         if finished_since is None:
@@ -1077,6 +1087,9 @@ def _preflight_eval_credential(ctx: RunContext) -> None:
     spec = spec_for(ctx.harness.name, ctx.cell.credential_mode)
     note = refresh_seeded_credential(spec, ctx.sandbox.home)
     if note:
+        # A credential this runner just placed is one it can name, and naming it here rather than
+        # waiting for the first leg's watcher keeps the window at zero.
+        ctx.watch_credentials(ctx.sandbox.home)
         print(f"[shobench] {ctx.cell.name}: {note}", file=sys.stderr)
     ok, why_not = preflight_seeded_credential(spec, ctx.sandbox.home)
     if ok:
