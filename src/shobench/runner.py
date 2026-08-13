@@ -1527,26 +1527,28 @@ def recorded_eval_context(manifest: dict[str, Any]) -> str:
 # A BOOKEND is a new run. ``rebookend`` reuses only the source's finished home and its terminal
 # session, runs eval_after alone, and publishes under an id of its own; the source's rollout is
 # complete and immutable, so an edit made after it ended cannot reach it and cannot turn the
-# bookend into a second description of it. What the bookend MEASURES still has to be the source's
-# arm, so those fields refuse. The fields that only say how the bookend's own eval legs are run
-# are allowed to be today's, and the artifact records both values rather than quietly using one.
+# bookend into a second description of it. What it must not do is measure its after side by a
+# different rule than the before side it will be paired against, so nothing is allowed to drift:
+# the arm and the eval runtime are RECOVERED from the record and run under, and every field the
+# comparison covers refuses. What the bookend does not inherit is the cell file's digest, which
+# moves for a comment as readily as for a swapped model and so answers the wrong question.
 DRIFT_CONTINUATION = "continuation"
 DRIFT_BOOKEND = "bookend"
 DRIFT_SCOPES = (DRIFT_CONTINUATION, DRIFT_BOOKEND)
 
-# The cell fields a bookend may run under a changed value of.
+# The eval runtime a bookend takes from the record rather than from the cell file, because both
+# sides of a paired measurement have to be scored under one stopping rule.
 #
-# eval_task_timeout_s bounds one held-out leg, behind the harness watchdog that ordinarily ends
-# it. This is the allowance with a cost worth naming: a shorter bound can cut a leg the recorded
-# one would have let finish. It is allowed anyway. The legs it bounds are this run's own, the
-# artifact publishes the value that ran beside the value the source recorded, and refusing it
-# would mean no already-run cell can ever be bookended once the timeout is tuned, which is the
-# whole population this entry exists for.
+# eval_task_timeout_s is the deadline the held-out task stream is built with AND the leg's hard
+# timeout, so a task that seals between the recorded bound and a shorter current one is scoreable
+# on the before side and force-stopped on the after side. The paired delta would then be two
+# measurements under different rules, which no amount of recording in the artifact repairs.
 #
-# eval_concurrency buys host resources and nothing else: every held-out task runs in its own
-# fresh session against its own copy of the phase's home whatever this says, so it cannot reach
-# a score.
-BOOKEND_RUNTIME_CELL_FIELDS = ("budget.eval_task_timeout_s", "budget.eval_concurrency")
+# eval_concurrency is not score-neutral either. Per-task homes and sessions isolate task STATE,
+# not the resources a timed leg needs: concurrent legs share the host, the network and the
+# provider account while their per-task clocks run, so contention and throttling turn into
+# timeouts and unscored rows. It comes from the record for the same reason.
+BOOKEND_EVAL_RUNTIME_FIELDS = ("eval_task_timeout_s", "eval_concurrency")
 
 # The cell fields a bookend does not compare at all, each for its own reason.
 #
@@ -1575,18 +1577,18 @@ BOOKEND_UNCOMPARED_CELL_FIELDS = (
     "note",
 )
 
-# Everything else in the recorded cell block refuses, including a field added after these lists
-# were written: an unjudged axis counts as measurement-defining until someone decides here that
-# it is not. Named in full, because a field nobody judged is a field nobody can rely on.
+# Every other field in the block refuses on any difference, including a field added after this
+# comment was written. Named in full, because a field nobody judged is a field nobody can rely on.
 #
 # env, harness, model, effort, credential_mode and env_kwargs are what the bookend's own eval
 # sessions are made of: the environment, the CLI, the model behind it, the effort it thinks at,
 # the account that serves it, and how the environment is constructed (tau2's task split, hle's
 # judge).
 #
-# rollout_feedback is the source's arm. The runner recovers the recorded value onto the cell
-# before this comparison runs, so the checkout's default cannot leak into the bookend; the
-# comparison holds that recovery to its word.
+# rollout_feedback is the source's arm and eval_task_timeout_s and eval_concurrency are the eval
+# runtime. All three are recovered from the record onto the cell before the comparison runs, so
+# the checkout's values cannot leak into the bookend; the comparison holds those recoveries to
+# their word, and refuses where the record carried no value to recover.
 #
 # max_in_flight, rollout_wall_clock_s and pool_ceiling define the rollout the bookend inherits a
 # home from. The bookend runs none of it, so they cannot change its eval, but a bookend that
@@ -1598,6 +1600,17 @@ BOOKEND_UNCOMPARED_CELL_FIELDS = (
 #
 # name cannot differ, since the cell is loaded by the name the record carries. It refuses rather
 # than resting on that.
+
+# What a comparison finds where a manifest has no such field at all. A string rather than None,
+# because None is a legitimate recorded value (a cell with no pool_ceiling records null) and a
+# sentinel that collides with a real value would read as agreement.
+CELL_FIELD_ABSENT = "<absent>"
+
+# The only absences read as values rather than as differences, because each is a versioned axis
+# whose pre-axis meaning is known: never was the only rollout posture before the feedback arm
+# existed, and cold the only eval posture before the eval context did. Nothing else is
+# normalized. A field this list does not name is missing, not defaulted, and missing refuses.
+LEGACY_AXIS_DEFAULTS = {"rollout_feedback": "never", "eval_context": "cold"}
 
 
 def _flat_cell(cell_manifest: dict[str, Any]) -> dict[str, Any]:
@@ -1613,29 +1626,76 @@ def _flat_cell(cell_manifest: dict[str, Any]) -> dict[str, Any]:
             flat.update({f"budget.{name}": item for name, item in value.items()})
         else:
             flat[key] = value
-    return flat
+    return {**LEGACY_AXIS_DEFAULTS, **flat}
 
 
 def cell_field_drift(
     recorded_cell: dict[str, Any], current_cell: dict[str, Any]
 ) -> dict[str, dict[str, Any]]:
-    """Every field of the recorded cell block the checkout now states differently.
+    """Every field the two cell blocks state differently, over the UNION of their fields.
 
     Field by field rather than by the file's digest, because the digest answers only whether the
     bytes moved: a caller that has to decide whether the difference matters, or that has to tell
     a reader which value ran, gets nothing from it. Returned as a mapping from the dotted field
     name to both values, so the refusal and the record are one computation read twice.
 
-    A field the record does not carry is not a difference. That absence is what a manifest
-    written before the field looks like, and the axis helpers above are what turn it into the
-    value the run actually served.
+    The union is what makes it fail closed, and the intersection was the bug: a field added to
+    the cell after a run was recorded exists on one side only, so comparing only the recorded
+    keys let every historical manifest through no matter how the new axis was classified, and a
+    field REMOVED from the cell went the same way. Both sides get the absence sentinel instead,
+    so an axis that appears or disappears is a difference an operator is told about. The two
+    legacy axes are the exception, and only because their pre-axis meaning is known.
     """
+    recorded = _flat_cell(recorded_cell)
     current = _flat_cell(current_cell)
     return {
-        name: {"recorded": was, "now": current[name]}
-        for name, was in _flat_cell(recorded_cell).items()
-        if name in current and current[name] != was
+        name: {
+            "recorded": recorded.get(name, CELL_FIELD_ABSENT),
+            "checkout": current.get(name, CELL_FIELD_ABSENT),
+        }
+        for name in sorted(set(recorded) | set(current))
+        if recorded.get(name, CELL_FIELD_ABSENT) != current.get(name, CELL_FIELD_ABSENT)
     }
+
+
+def bookend_cell(cell: Cell, source_manifest: dict[str, Any]) -> Cell:
+    """The cell a rebookend actually runs: the source's recorded arm and eval runtime, resumed.
+
+    Three fields come from the record rather than from the checkout, each for its own reason. The
+    feedback arm is what the source's rollout served, so a never-arm source publishes honestly as
+    never plus resumed. The eval runtime is the stopping rule the before side was scored under,
+    and a paired delta whose two sides ran under different rules is two measurements rather than
+    one. The eval context is the single axis a rebookend exists to change, so it is pinned rather
+    than inherited.
+
+    The runner and the plan both build the cell here, so the plan's verdict is the runner's
+    verdict rather than a second opinion about it. Where the record carries no eval runtime to
+    inherit, the checkout's value stands and the drift check refuses it: an absence is not a
+    value, and only the operator can say what a run recorded before the field existed was
+    measured under.
+    """
+    recorded_budget = source_manifest.get("cell", {}).get("budget", {})
+    inherited = {
+        field: recorded_budget[field]
+        for field in BOOKEND_EVAL_RUNTIME_FIELDS
+        if recorded_budget.get(field) is not None
+    }
+    return replace(
+        cell,
+        rollout_feedback=recorded_rollout_feedback(source_manifest),
+        eval_context="resumed",
+        budget=replace(cell.budget, **inherited),
+    )
+
+
+def recorded_eval_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The eval runtime a run recorded: what a bookend inherits, and what its baseline is held to.
+
+    Absences stay the sentinel rather than being filled in, because two runs that both recorded
+    nothing are not thereby known to have been measured under the same rule.
+    """
+    budget = manifest.get("cell", {}).get("budget", {})
+    return {field: budget.get(field, CELL_FIELD_ABSENT) for field in BOOKEND_EVAL_RUNTIME_FIELDS}
 
 
 def experiment_drift(
@@ -1655,14 +1715,15 @@ def experiment_drift(
     half of the rollout would be run under. The digests to compare are already in the manifest,
     written before anything spent, so this is a comparison rather than a new mechanism.
 
-    ``scope`` names which comparison applies, and the difference is what the caller produces
-    rather than how strict it feels like being. A continuation refuses on the cell file's digest,
-    the strongest statement available: nothing about that run may change. A bookend compares the
-    cell field by field instead, because it publishes a new run over a finished rollout, so the
-    fields that only govern its own eval legs may be today's while the ones that would make it
-    measure something other than the source's arm still refuse. The split and instruction digests
-    are compared under both scopes: they are the held-out ids and the prompts, and neither scope
-    permits those to move.
+    ``scope`` names which comparison applies, and the difference is which question each caller
+    can answer, not how strict it feels like being. A continuation refuses on the cell file's
+    digest, the strongest statement available: nothing about that run may change. A bookend
+    compares the cell field by field instead, because it publishes a NEW run and the digest
+    cannot tell a rewritten comment from a swapped model; every field the comparison covers
+    still refuses, and the fields the bookend inherits rather than reads (the arm, the eval
+    runtime) are recovered onto the cell before this runs, so the comparison is what proves the
+    inheritance happened. The split and instruction digests are compared under both scopes: they
+    are the held-out ids and the prompts, and neither scope permits those to move.
 
     Returned rather than raised, so a caller can report every difference at once. An operator
     told about the budget, only to be told about the split on the next attempt, learns to stop
@@ -1697,12 +1758,11 @@ def experiment_drift(
         )
         cell_lines: list[str] = []
     else:
-        excused = set(BOOKEND_RUNTIME_CELL_FIELDS) | set(BOOKEND_UNCOMPARED_CELL_FIELDS)
         cell_lines = [
             f"cell {field} changed since the run started "
-            f"(recorded {values['recorded']!r}, now {values['now']!r})"
+            f"(recorded {values['recorded']!r}, checkout {values['checkout']!r})"
             for field, values in cell_field_drift(recorded_cell, cell.to_manifest()).items()
-            if field not in excused
+            if field not in BOOKEND_UNCOMPARED_CELL_FIELDS
         ]
     return cell_lines + [
         f"{what} changed since the run started (recorded {was}, now {now})"
@@ -3088,6 +3148,21 @@ async def rebookend_run(
                 f"the baseline {baseline_dir} has no eval_before provenance of its own, so "
                 "it holds no before rows to pair with."
             )
+        # The stopping rule, checked as strictly as the held-out ids and for the same reason.
+        # The bookend runs under the SOURCE's recorded eval runtime, so a baseline measured
+        # under a different one would put the pair's two sides under two rules: a task that
+        # seals between the two bounds is scoreable on one side and force-stopped on the other,
+        # and the delta would be an artifact of the bounds. Refused rather than reconciled,
+        # because nothing here can say which rule the pair should have had.
+        source_runtime = recorded_eval_runtime(source_manifest)
+        baseline_runtime = recorded_eval_runtime(baseline_manifest)
+        if source_runtime != baseline_runtime:
+            raise RuntimeError(
+                f"the baseline {baseline_dir} recorded eval runtime {baseline_runtime} and the "
+                f"source recorded {source_runtime}: the before side and the after side would be "
+                "scored under different stopping rules, so the paired delta would measure the "
+                "bounds as much as the agent."
+            )
         baseline_run_id = str(baseline_manifest.get("run_id", ""))
         baseline_dir_resolved = baseline_dir
     elif _has_eval_before(source_run_dir):
@@ -3099,17 +3174,20 @@ async def rebookend_run(
             "run), so the bookend would have nothing to pair with. Name the run that "
             "measured this cell's baseline with --baseline."
         )
-    # The recorded arm wins over the checkout's default, exactly as a resume recovers it: the
-    # new measurement inherits the SOURCE's axes and changes exactly one of them, so a never-arm
-    # source publishes honestly as never + resumed.
-    recorded_regime = recorded_rollout_feedback(source_manifest)
-    cell = replace(cell, rollout_feedback=recorded_regime, eval_context="resumed")
+    # What the checkout's cell file states differently from the record, taken against the FILE
+    # rather than against the cell this run will build from it. It is the reader's answer to
+    # "the file changed, so what governed this run?", and it goes into the manifest beside both
+    # blocks; the refusal below is a different comparison, against the cell that actually runs.
+    checkout_drift = cell_field_drift(source_manifest.get("cell", {}), cell.to_manifest())
+    # The record wins over the checkout for everything the new measurement inherits: the arm the
+    # source's rollout served, and the eval runtime its before side was scored under.
+    cell = bookend_cell(cell, source_manifest)
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
-    # Scoped to what the bookend will measure, not to the cell file's bytes. The bookend runs
-    # one eval over a rollout that already ended, so an edit to how long its own legs are given
-    # cannot reach the source, while an edit to the environment, the model, the held-out ids or
-    # the prompts would make it a measurement of something else entirely.
+    # Compared field by field rather than by the cell file's bytes, which move for a rewritten
+    # comment as readily as for a swapped model. Nothing is permitted to drift: the fields this
+    # run inherits were just recovered onto the cell, so the comparison holds that recovery to
+    # its word, and every other field refuses.
     drift = experiment_drift(
         source_manifest,
         cell=cell,
@@ -3171,6 +3249,7 @@ async def rebookend_run(
             instruction=instruction,
             baseline_run_id=baseline_run_id,
             baseline_dir=baseline_dir_resolved,
+            checkout_drift=checkout_drift,
             run_id=run_id,
             run_dir=run_dir,
             results_dir=results_dir,
@@ -3191,6 +3270,7 @@ async def _rebookend_owned(
     instruction: Instruction,
     baseline_run_id: str,
     baseline_dir: Path,
+    checkout_drift: dict[str, dict[str, Any]],
     run_id: str,
     run_dir: Path,
     results_dir: Path,
@@ -3335,15 +3415,22 @@ async def _rebookend_owned(
             "baseline_run_id": baseline_run_id,
             "source_rollout_feedback": cell.rollout_feedback,
             "source_stop_reason": str(source_stopping.get("stop_reason", "")),
-            # The source's cell block verbatim, beside the block this run actually ran under
-            # (``manifest["cell"]``, built from the checkout), and every field that differs
-            # named with both values. A bookend may run under a retuned eval budget, so the
-            # artifact has to SAY it ran under one: a reader comparing this run's numbers with
-            # the source's sees the difference here rather than by finding two checkouts and
-            # diffing them, and a field that could change the measurement never appears,
-            # because the drift check above refused before anything spent.
+            # The eval runtime this run took from the source's RECORD rather than from the cell
+            # file, with the values that actually bounded its legs. It is the fact a reader
+            # needs before comparing any number here with the baseline's: both sides of the
+            # pair stopped by the same rule.
+            "eval_runtime_from_record": {
+                field: getattr(cell.budget, field) for field in BOOKEND_EVAL_RUNTIME_FIELDS
+            },
+            # The source's cell block verbatim, beside the block this run ran under
+            # (``manifest["cell"]``), and every field the checkout's cell file states
+            # differently from the record, with both values. The file having moved is neither
+            # hidden nor load-bearing: anything that could change the measurement refused
+            # before this run spent, and the runtime fields above were inherited rather than
+            # read, so a reader sees what the file would have run and what did run without
+            # finding two checkouts to diff.
             "source_cell": dict(source_manifest.get("cell", {})),
-            "cell_drift": cell_field_drift(source_manifest.get("cell", {}), manifest["cell"]),
+            "cell_drift": checkout_drift,
         }
         ctx.publish_json(run_dir / "manifest.json", manifest)
         return await _run_phases(

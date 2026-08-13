@@ -536,37 +536,52 @@ source home, a cycle, or a special file refuses loudly. Publication is atomic ev
 (``write_results`` swaps the leaf entry in with ``os.replace``), and a rebookend additionally
 refuses up front any output directory, result leaf, or new run path that resolves into the
 source, so a link planted at a deterministic name is refused or replaced, never followed.
-The drift check a bookend applies is scoped to what its eval will measure, and it is the one
-place a rebookend is deliberately laxer than a resume. A resume and a rerun-eval write more of
-a measurement that already exists, under the run id that already names it, so they refuse on
-the cell file's digest: nothing about that run may change. A rebookend publishes a NEW run over
-a rollout that is finished and immutable, so an edit made after that rollout ended cannot reach
-it, and the file digest is the wrong question anyway, since it moves for a comment and for a
-swapped model alike (the real case: an eval timeout retuned after two rollouts finished refused
-both of their bookends). The bookend compares the recorded cell block field by field instead.
-Refusing: `env`, `harness`, `model`, `effort`, `credential_mode` and `env_kwargs`, which are
-what its own eval sessions are made of; `rollout_feedback`, the arm it inherits, compared
-against the recorded value the runner recovers onto the cell, so the comparison holds that
-recovery to its word; `max_in_flight`, `rollout_wall_clock_s` and `pool_ceiling`, which define
-the rollout it inherits a home from and would otherwise be published as numbers nobody ran;
-`required_env`, a precondition rather than a measurement, refused because a cell that needs a
-key it did not need before is a cell whose legs are produced differently; and the split's id
-digest and both system-prompt digests, which are the held-out ids and the prompts and are
-compared under either scope. Allowed: `eval_task_timeout_s` and `eval_concurrency`, which say
-only how this run's own eval legs are run. `eval_context` is not compared at all, being the one
-axis a rebookend changes by definition, and neither are the lookup keys (`split`,
-`instruction_arm`) whose identities are the digests, nor `config_path`, `note` and
-`config_sha256`. A field added to a cell later refuses by default: the excused fields are
-listed and everything else is measurement-defining until someone judges otherwise. The
-allowance is recorded rather than absorbed: the bookend's manifest carries the source's
-recorded cell block (`rebookend.source_cell`) beside the block it actually ran under (`cell`),
-plus `rebookend.cell_drift` naming every field the two state differently with both values, and
-the plan prints the same thing before anything spends, so a reader of the numbers sees that the
-eval ran under a retuned budget without finding two checkouts to diff. A repaired bookend keeps
-the strict comparison, deliberately: `rerun-eval` splices rows beside rows this run already
-measured, so a definitional edit would put two runtimes inside one artifact with nothing in a
-row to say which produced it, and the operator refused there can rebookend the source again,
-which measures the whole held-out set under one definition.
+The drift check a bookend applies compares the recorded cell block FIELD BY FIELD rather than
+by the cell file's digest, and it permits no drift at all. A resume and a rerun-eval write more
+of a measurement that already exists, under the run id that already names it, so they refuse on
+the digest: nothing about that run may change. A rebookend publishes a NEW run over a rollout
+that is finished and immutable, so an edit made after that rollout ended cannot reach it, and
+the digest is the wrong question anyway, since it moves for a comment as readily as for a
+swapped model (the real case: an eval timeout retuned after two rollouts finished refused both
+of their bookends). What replaces the digest is not permission but INHERITANCE. Three fields
+come from the record rather than from the checkout: `rollout_feedback`, the arm the source's
+rollout served; and `eval_task_timeout_s` and `eval_concurrency`, the eval runtime its before
+side was scored under. The runtime pair matters as much as the arm, because the timeout is both
+the held-out task stream's deadline and the leg's hard stop, so a bookend run under a shorter
+bound would force-stop a task that the before side had time to seal, and the paired delta would
+measure the bounds as much as the agent; concurrency is not score-neutral either, since
+concurrent legs share the host, the network and the provider account while their per-task clocks
+run, so contention and throttling become timeouts and unscored rows. Per-task homes isolate task
+STATE, not resources. `eval_context` is pinned to resumed, being the one axis a rebookend exists
+to change. Everything else refuses on any difference: `env`, `harness`, `model`, `effort`,
+`credential_mode` and `env_kwargs`, which are what its eval sessions are made of; `max_in_flight`,
+`rollout_wall_clock_s` and `pool_ceiling`, which define the rollout it inherits a home from and
+would otherwise be published as numbers nobody ran; `required_env`, a precondition rather than a
+measurement, refused because a cell that needs a key it did not need before is a cell whose legs
+are produced differently; `name`; and the split's id digest and both system-prompt digests, which
+are compared under either scope. The inherited fields refuse too, because the comparison runs
+against the cell the bookend will actually run: it is what holds the inheritance to its word, and
+a record with no runtime to inherit refuses rather than lending the file's, since an absence is
+not a value. The comparison walks the UNION of the recorded and current field sets with an
+explicit absence sentinel, so an axis added to the cell after a run was recorded surfaces instead
+of passing (comparing only recorded fields let every historical manifest through no matter how a
+new axis was classified), and a field the cell has since dropped surfaces the same way; only the
+two versioned legacy axes read absence as a value, absent `rollout_feedback` as never and absent
+`eval_context` as cold. The uncompared remainder is the bookkeeping that never reaches a session:
+the lookup keys `split` and `instruction_arm`, whose identities are the digests, plus
+`config_path`, `note` and `config_sha256`. The pairing gets the same rule as the ids: a named
+`--baseline` whose recorded eval runtime differs from the source's is refused, because the before
+and after sides would be scored under two stopping rules. None of this is absorbed silently. The
+bookend's manifest carries `rebookend.eval_runtime_from_record` (the values that bounded its
+legs), the source's recorded cell block (`rebookend.source_cell`) beside the block it ran under
+(`cell`), and `rebookend.cell_drift` naming every field the checkout's file states differently
+with both values, and the plan prints the same before anything spends, so a reader of the numbers
+sees which rule scored them and what the file would have run instead without finding two
+checkouts to diff. A repaired bookend keeps the whole-digest comparison, deliberately:
+`rerun-eval` splices rows beside rows this run already measured, so a definitional edit would put
+two runtimes inside one artifact with nothing in a row to say which produced it, and the operator
+refused there can rebookend the source again, which measures the whole held-out set under one
+definition.
 
 Refused before anything is copied or spent: a source without a terminus, without a
 resolvable terminal session, holding a suspension record, or still owned by a live process,

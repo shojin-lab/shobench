@@ -22,7 +22,6 @@ import json
 import os
 import sys
 from collections.abc import Sequence
-from dataclasses import replace
 from pathlib import Path
 
 from shobench import credentials, report, runner, tau2_data
@@ -379,21 +378,22 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     cell = load_cell_by_name(manifest["cell"]["name"])
     recorded_arm = runner.recorded_rollout_feedback(manifest)
     split = load_split_by_name(cell.split)
-    # The plan's verdict has to be the runner's verdict, so the plan applies the runner's own
-    # recovery before comparing: the bookend inherits the source's recorded feedback arm and
-    # pins the eval context to resumed, whatever the checkout's defaults are today. Compared
-    # without it, a moved default would read as drift here and pass there.
-    bookend_cell = replace(cell, rollout_feedback=recorded_arm, eval_context="resumed")
+    # Built by the runner's own recovery rather than by a second copy of the rule, so the plan's
+    # verdict is the runner's verdict: the bookend inherits the source's recorded arm and its
+    # recorded eval runtime, and pins the eval context to resumed.
+    will_run = runner.bookend_cell(cell, manifest)
     drift = runner.experiment_drift(
         manifest,
-        cell=bookend_cell,
+        cell=will_run,
         split=split,
         instruction=load_instruction(cell.instruction_arm),
         scope=runner.DRIFT_BOOKEND,
     )
-    # What the bookend WILL run under where the source recorded something else. Empty for a
-    # settled checkout; a refusing field never reaches it, since drift above blocks the --go.
-    cell_drift = runner.cell_field_drift(manifest.get("cell", {}), bookend_cell.to_manifest())
+    # What the checkout's cell file says where the record says otherwise, against the FILE, so
+    # the operator sees what the bookend is declining to read from it. The two eval-runtime
+    # fields come from the record instead, and the plan states the values that will bound the
+    # legs; everything else refuses, so nothing in here is silently in force.
+    cell_drift = runner.cell_field_drift(manifest.get("cell", {}), cell.to_manifest())
     terminal_session = runner.terminal_session_in(source_dir)
     # The id alone proves only that the stopping record names something; the plan promises the
     # session it will fork, so the transcript is resolved in the SOURCE home with the same
@@ -446,6 +446,13 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
                     )
                     == manifest.get("split", {}).get("id_digest"),
                     "baseline_has_eval_before": runner._has_eval_before(baseline_dir),
+                    # The before side's stopping rule and the after side's must be one rule,
+                    # so the runner refuses a baseline whose recorded eval runtime differs
+                    # from the source's, and the plan says so before anything spends.
+                    "baseline_eval_runtime_matches": (
+                        runner.recorded_eval_runtime(baseline_manifest)
+                        == runner.recorded_eval_runtime(manifest)
+                    ),
                 }
             )
         else:
@@ -480,8 +487,13 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             "eval_context": "resumed",
             "eval_prompt_used": "rollout_system",
         },
-        # The fields the bookend's eval will run under a different value of than the source
-        # recorded, named before anything spends and recorded again in the bookend's manifest.
+        # The stopping rule the legs will run under, taken from the record rather than from
+        # the cell file, and the fields where the file now says something else. Both are
+        # written into the bookend's manifest too, so the plan and the artifact agree.
+        "eval_runtime_from_record": {
+            field: getattr(will_run.budget, field)
+            for field in runner.BOOKEND_EVAL_RUNTIME_FIELDS
+        },
         "cell_drift": cell_drift,
         "source_stop_reason": source_stopping.get("stop_reason"),
         "terminal_session_id": terminal_session,
@@ -532,6 +544,11 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         ("baseline_cell_matches", "the named baseline measured a different cell"),
         ("baseline_split_matches", "the named baseline ran a different held-out split"),
         ("baseline_has_eval_before", "the named baseline has no eval_before provenance"),
+        (
+            "baseline_eval_runtime_matches",
+            "the named baseline recorded a different eval runtime, so the before and after "
+            "sides would be scored under different stopping rules",
+        ),
     ):
         value = refusals.get(state)
         if state == "baseline_is_bookend":
