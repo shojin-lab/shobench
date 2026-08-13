@@ -134,6 +134,18 @@ class PrimeAgent(Harness):
     # daemon-workers/) and stay behind with the rest of the noise.
     session_state_dirs = (".prime/agent/sessions", ".prime/agent/session-artifacts")
 
+    # Seconds, and short because prime is the harness the grace cannot help. With no quality gate
+    # it has no terminal condition of its own, and no archived phase holds a prime eval leg that
+    # ended by its own choosing, so every second of the wait is billed post-seal turns rather than
+    # room for a voluntary stop. On a resumed fork those turns are the expensive kind: the refine
+    # cycle that follows the seal rebuilds the system prompt, and the next turn writes the whole
+    # inherited prefix again as a fresh cache entry, measured at about $4.56 a leg against a
+    # 447K-token context and two thirds of the leg's total spend. Fifteen seconds covers the seal
+    # write and a drain poll with margin, and ends the leg before the rebuild turn, which follows
+    # the seal by tens of seconds, can finish a rewrite. No score moves either way: the row is
+    # sealed and the stream drained before the grace starts, and the per-task home is discarded.
+    eval_drain_grace_s = 15.0
+
     # The structured signal, which is the cleanest of the three harnesses: a stream failure is
     # classified into a kind, and rate_limit is one of them.
     usage_limit_rules = (

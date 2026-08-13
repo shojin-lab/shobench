@@ -224,6 +224,18 @@ class Harness:
     # terminal session inside the copy, where its own resume lookup goes searching for it.
     session_state_dirs: tuple[str, ...] = ()
 
+    # How long an eval leg of this harness may keep running after its held-out task is sealed and
+    # its stream has nothing left to give.
+    #
+    # Every harness needs a little of this. A leg does not end the instant the row seals: it
+    # writes its last message, closes its session, and exits. Claude Code and codex take 8 to 25
+    # seconds over that, so at two minutes the watchdog never fires for them and their legs still
+    # end on their own terms, which is what keeps the stopping record comparable across harnesses.
+    # The number is per harness because the wrap-up it covers is per harness, and because a
+    # harness that never ends a leg by choosing to is billed for every second of a wait it was
+    # never going to use.
+    eval_drain_grace_s: float = 120.0
+
     # Does this harness's trace say which model answered? Declared rather than inferred from an
     # empty list, because the two mean opposite things: a harness that reports models and
     # returned none had none answer, while a harness that reports none has told us nothing. The

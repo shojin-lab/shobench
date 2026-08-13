@@ -979,22 +979,15 @@ def _eval_pending_ids(phase_dir: Path, task_ids: Sequence[str]) -> list[str]:
     ]
 
 
-# How long an eval leg may keep running after its held-out task is sealed and its stream has
-# nothing left to give.
+# prime_agent is why the watchdog exists. Launched autonomous with no quality gate, its
+# continuation check has nothing to evaluate and returns "keep going" unconditionally, so the leg
+# has no terminal condition of its own and runs until the task timeout kills it: a median
+# time-to-terminal of about two minutes stretched into 25 to 30 minutes of wall clock, roughly 90%
+# of it after the measurement was already complete. The score is unaffected either way (the row
+# seals at the task's completion call and the per-task home is discarded), so what this recovers
+# is time and spend, and the ending is recorded as its own kind so the finding stays visible. How
+# long a leg is given after its task is finished is the harness's own ``eval_drain_grace_s``.
 #
-# Every harness needs a little of this. A leg does not end the instant the row seals: it writes
-# its last message, closes its session, and exits. Claude Code and codex do that in 8 to 25
-# seconds, so at two minutes this never fires for them and their legs still end on their own
-# terms, which is what keeps the stopping record comparable across harnesses.
-#
-# prime_agent is why it exists. Launched autonomous with no quality gate, its continuation check
-# has nothing to evaluate and returns "keep going" unconditionally, so the leg has no terminal
-# condition of its own and runs until the task timeout kills it: a median time-to-terminal of
-# about two minutes stretched into 25 to 30 minutes of wall clock, roughly 90% of it after the
-# measurement was already complete. The score is unaffected either way (the row seals at the
-# task's completion call and the per-task home is discarded), so what this recovers is time and
-# spend, and the ending is recorded as its own kind so the finding stays visible.
-EVAL_DRAIN_GRACE_S = 120.0
 # How often the condition is re-read. The condition is monotone in practice, so this only decides
 # how promptly the grace timer starts; it costs one queue read and one small file read.
 EVAL_DRAIN_POLL_S = 5.0
@@ -1317,8 +1310,9 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                 # The watchdog and the leg run side by side: the leg holds a worker thread, and
                 # the loop is free to keep reading this task's stream while it does. Cancelled in
                 # the `finally` so a leg that ended on its own leaves nothing watching a stream
-                # that is about to close.
-                watchdog = DrainWatchdog(threading.Event(), EVAL_DRAIN_GRACE_S)
+                # that is about to close. The grace it waits out belongs to the harness, since
+                # what the grace covers is that harness's own wrap-up after the seal.
+                watchdog = DrainWatchdog(threading.Event(), ctx.harness.eval_drain_grace_s)
                 async with stream, _served(stream, port):
                     watching = asyncio.create_task(
                         _watch_for_drain(stream, prov_dir, idx, watchdog)

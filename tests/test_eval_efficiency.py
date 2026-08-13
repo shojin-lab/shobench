@@ -40,7 +40,7 @@ from shobench.credentials import (
     refresh_seeded_credential,
     spec_for,
 )
-from shobench.harness import StopKind, StopVerdict
+from shobench.harness import Harness, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.results import TaskResult
 from shobench.runner import DrainWatchdog, LegRecord, RunContext, run_leg
@@ -624,6 +624,86 @@ def test_the_watchdog_fires_only_after_the_grace_and_only_when_finished(tmp_path
         assert time.monotonic() - started >= grace
 
     _against_a_real_stream(prov, 0, body)
+
+
+class _PollClock:
+    """A monotonic clock that hands out one poll interval per reading.
+
+    The watchdog reads a clock once per poll, so this runs the real loop at test speed over the
+    arithmetic a real phase does. Only the clock is stood in for: the stream, the sealed row and
+    the loop reading them are the run's own, and waiting the real graces out would spend two and a
+    quarter minutes of suite time on a subtraction.
+    """
+
+    def __init__(self) -> None:
+        self.readings: list[float] = []
+        self._next = 0.0
+
+    def monotonic(self) -> float:
+        self.readings.append(self._next)
+        self._next += runner.EVAL_DRAIN_POLL_S
+        return self.readings[-1]
+
+
+def test_each_harness_waits_the_grace_it_declares_and_no_other(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The wait belongs to the harness because what it covers is the harness's own wrap-up.
+
+    Claude Code and codex end their legs 8 to 25 seconds after the seal, so two minutes is a wait
+    they never reach the end of and their voluntary stops stay reachable. prime ends no eval leg
+    by choosing to, so every second past the seal is billed turns and nothing else.
+    """
+    prov = tmp_path / "task-00000"
+    prov.mkdir(parents=True)
+    fired_after: dict[str, float] = {}
+
+    async def body(stream, client):
+        await client.call_tool("get_task", {})
+        await client.call_tool("terminate", {})
+        for name in ("prime_agent", "claude_code", "codex"):
+            clock = _PollClock()
+            monkeypatch.setattr(runner, "time", clock)
+            watchdog = DrainWatchdog(threading.Event(), harness_for(name).eval_drain_grace_s)
+            assert await runner._watch_for_drain(stream, prov, 0, watchdog, poll_s=0.001) is True
+            # From the first reading that saw the task finished to the one that fired.
+            fired_after[name] = clock.readings[-1] - clock.readings[0]
+
+    _against_a_real_stream(prov, 0, body)
+
+    assert fired_after == {"prime_agent": 15.0, "claude_code": 120.0, "codex": 120.0}
+    # A harness that declares nothing waits the long one, so the shortening is prime's alone.
+    assert Harness.eval_drain_grace_s == 120.0
+
+
+def test_the_phase_bounds_every_leg_by_its_own_harness_grace(tmp_path: Path, monkeypatch) -> None:
+    """The declared number reaches the leg: the watchdog a phase builds carries the grace of the
+    harness that phase runs, which is the one place the runner reads it."""
+    monkeypatch.setattr(runner, "EVAL_LAUNCH_STAGGER_S", 0.0)
+
+    def graces_of(cell_name: str, *, at: Path) -> list[float]:
+        launched: list[int] = []
+        _capture_launches(monkeypatch, launched)
+        captured = runner.run_leg
+        seen: list[float] = []
+
+        def record(ctx_arg: RunContext, **kw: object) -> LegRecord:
+            watchdog = kw["watchdog"]
+            assert isinstance(watchdog, DrainWatchdog)
+            seen.append(watchdog.grace_s)
+            return captured(ctx_arg, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(runner, "run_leg", record)
+        ctx = _ctx(at, cell_name=cell_name, heldout=("1", "2"))
+        if ctx.harness.name == "prime_agent":
+            _seed_prime_auth(
+                ctx, lifetime_s=PREFLIGHT_MIN_LIFETIME_S + 7200, monkeypatch=monkeypatch
+            )
+        asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
+        return seen
+
+    assert graces_of(_PRIME_CELL, at=tmp_path / "prime") == [15.0, 15.0]
+    assert graces_of(_SMOKE_CELL, at=tmp_path / "claude") == [120.0, 120.0]
 
 
 # ----- the drain watchdog: what it does to the leg --------------------------------------------
