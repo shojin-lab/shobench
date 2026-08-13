@@ -1,0 +1,48 @@
+# The checks that cost nothing but runner minutes: ruff and the offline test suite.
+#
+# This workflow must never be able to spend money. It reads no secret, sets no provider key, and
+# runs no cell, no eval, and no harness. The suite it runs holds to the same line: every test that
+# would reach a network or a paid API skips itself instead, and the skip list is printed so a
+# green run that skipped everything is visible rather than silent. If a step here ever needs a
+# credential, it does not belong in this workflow.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+          # uv's download cache, keyed on the lock. shogym is a git dependency, so a cold cache
+          # is a clone rather than a wheel pull.
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # --frozen so a lock that drifted from pyproject.toml is a failure here rather than a
+      # silent re-resolve that tests something other than what a developer runs.
+      - run: uv sync --frozen
+
+      - run: uv run --frozen ruff check .
+
+      # -rs names every skip. Nothing in the suite needs a provider, a docker daemon, or a
+      # dataset; what is absent on a runner skips with a reason, and that reason is in the log.
+      # The docker marker is what pyproject.toml already says it is, a test needing a live
+      # daemon, and a runner has none. No test carries it today, so this deselects nothing and
+      # says so in the summary line the day one does.
+      - run: uv run --frozen pytest -q -rs -m "not docker"

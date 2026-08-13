@@ -32,3 +32,11 @@ rollout_wall_clock_s = 28800
 # The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
 pool_ceiling = 300
 eval_task_timeout_s = 900
+
+[env_kwargs]
+# The judge is a cell axis, so the cell names it rather than inheriting it. gpt-5.6-luna
+# replaces shogym's DEFAULT_JUDGE_MODEL (gpt-5.4-nano) because it grades measurably better,
+# and the choice was made before any hle cell ran, so no measurement is disturbed and all four
+# hle cells carry the identical judge. Effort is not settable through the pinned shogym judge,
+# which passes only model and messages, so this judge runs at the model default.
+judge_model = "gpt-5.6-luna"
