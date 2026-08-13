@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
+import uuid
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -313,6 +315,24 @@ def pair_evals(
     return paired, unpaired
 
 
+def _creation_mode(directory: Path) -> int:
+    """The mode an ordinarily created file receives in this directory: 0666 under the umask.
+
+    Read by creating one rather than by flipping ``os.umask``, because the flip is a
+    process-global write and two concurrent publishers interleaving it could corrupt the
+    umask for everything else in the process; publication is exactly the boundary that runs
+    concurrently. The probe is exclusive-created, read, and removed, all inside the leaf's
+    own directory.
+    """
+    probe = directory / f".mode-probe.{uuid.uuid4().hex}.tmp"
+    fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    try:
+        return stat.S_IMODE(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+        probe.unlink(missing_ok=True)
+
+
 def write_results(
     path: Path,
     *,
@@ -421,6 +441,20 @@ def write_results(
     try:
         with os.fdopen(scratch_fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(body, indent=2) + "\n")
+        # The swap carries the scratch's mode onto the leaf, and mkstemp minted it 0600: left
+        # alone, a fresh artifact landed owner-only and a republish DOWNGRADED an existing
+        # 0644 or 0664 result to 0600. So the scratch takes the destination's intended mode
+        # first: a regular file already at the leaf keeps its mode (an operator who opened a
+        # result up, or locked one down, keeps that choice across republication), and
+        # anything else gets what an ordinary creation would have gotten here, 0666 under the
+        # process umask. lstat, because the entry being replaced can be a planted symlink and
+        # its TARGET's mode means nothing for the regular file about to take the name.
+        try:
+            existing = os.lstat(path)
+            mode = stat.S_IMODE(existing.st_mode) if stat.S_ISREG(existing.st_mode) else None
+        except FileNotFoundError:
+            mode = None
+        os.chmod(scratch, _creation_mode(path.parent) if mode is None else mode)
         os.replace(scratch, path)
     finally:
         scratch.unlink(missing_ok=True)

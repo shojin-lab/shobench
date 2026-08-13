@@ -1488,6 +1488,46 @@ def test_concurrent_publications_of_one_leaf_each_land_whole(tmp_path: Path) -> 
     assert list(results.glob(".*tmp")) == []
 
 
+def test_publication_lands_with_ordinary_modes_not_the_scratch_mode(tmp_path: Path) -> None:
+    """The swap carries the scratch's mode onto the leaf, and mkstemp mints 0600: unfixed, a
+    fresh artifact landed owner-only and a republish downgraded an existing shared-readable
+    result (both reproduced). A fresh leaf gets what an ordinary creation would get under the
+    process umask, and an existing regular leaf keeps its own mode across republication."""
+    import stat as stat_module
+
+    old_umask = os.umask(0o022)
+    try:
+        fresh_dir = tmp_path / "fresh"
+        fresh_dir.mkdir()
+        fresh = write_results(
+            fresh_dir / "cell.json",
+            manifest={},
+            phases={"eval_before": [], "eval_after": [], "rollout": []},
+            stopping={},
+            heldout_ids=(),
+        )
+        assert stat_module.S_IMODE(fresh.stat().st_mode) == 0o644
+
+        re_dir = tmp_path / "re"
+        re_dir.mkdir()
+        existing = re_dir / "cell.json"
+        existing.write_text("{}", encoding="utf-8")
+        os.chmod(existing, 0o664)
+        republished = write_results(
+            re_dir / "cell.json",
+            manifest={},
+            phases={"eval_before": [], "eval_after": [], "rollout": []},
+            stopping={},
+            heldout_ids=(),
+        )
+        assert stat_module.S_IMODE(republished.stat().st_mode) == 0o664
+        # No probe or scratch survives either publication.
+        assert sorted(p.name for p in fresh_dir.iterdir()) == ["cell.json"]
+        assert sorted(p.name for p in re_dir.iterdir()) == ["cell.json"]
+    finally:
+        os.umask(old_umask)
+
+
 def test_a_failed_publication_leaves_no_scratch_behind(tmp_path: Path, monkeypatch) -> None:
     """A publication that dies mid-flight must not leave its scratch entry in the results
     directory: an orphan there is a file a reader can find and believe."""
