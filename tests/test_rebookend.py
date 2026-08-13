@@ -351,6 +351,218 @@ def test_rebookend_preflight_validates_the_transcript_in_the_copied_home(
     assert _fingerprint(source_dir) == before
 
 
+def test_rebookend_refuses_outputs_inside_the_source(tmp_path: Path, monkeypatch) -> None:
+    """The untouched guarantee is over the tree, so no output may land at or under the source,
+    whatever the operator typed: the new lock alone would already be a write into the archive."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    before = _fingerprint(source_dir)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    for runs_dir, results_dir in (
+        (source_dir, tmp_path / "results"),
+        (source_dir / "nested" / "runs", tmp_path / "results"),
+        (tmp_path / "runs", source_dir),
+        (tmp_path / "runs", source_dir / "results"),
+    ):
+        with pytest.raises(RuntimeError, match="inside the source"):
+            asyncio.run(
+                runner.rebookend_run(
+                    source_dir,
+                    runs_dir=runs_dir,
+                    results_dir=results_dir,
+                    capture_egress=False,
+                )
+            )
+    assert launches == {}
+    assert _fingerprint(source_dir) == before
+
+
+def test_the_snapshot_materializes_symlinks_so_no_writer_reaches_the_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The reviewed write-through, closed: a source home whose ``.codex`` is a symlink used to
+    be copied AS a link, and the first writer into the new home (the credential reseed, in the
+    reproduction) wrote through it into the archive. The snapshot is now materialized: every
+    link becomes the bytes it pointed at, nothing in the new tree references the source, and a
+    writer can do its worst."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    secrets = source_dir / "secrets"
+    secrets.mkdir()
+    (secrets / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+    (source_dir / "home" / ".codex").symlink_to(secrets)
+    before = _fingerprint(source_dir)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    new_home = new_run / "home"
+    # The snapshot is self-contained: the link became a real directory with the real bytes,
+    # and no link anywhere in the tree can reach outside it.
+    assert not (new_home / ".codex").is_symlink()
+    assert (new_home / ".codex" / "auth.json").read_text() == '{"auth_mode": "chatgpt"}'
+    assert not any(p.is_symlink() for p in new_home.rglob("*"))
+    # The reproduction's write, thrown at the copy: it stays in the copy.
+    (new_home / ".codex" / "auth.json").write_text('{"auth_mode": "OVERWRITTEN"}')
+    assert (secrets / "auth.json").read_text() == '{"auth_mode": "chatgpt"}'
+    assert _fingerprint(source_dir) == before
+
+
+def test_rebookend_refuses_a_source_a_live_process_owns(tmp_path: Path, monkeypatch) -> None:
+    """A settled-looking terminus under a live owner is not an archived state: the source lock
+    is probed non-mutatingly, and a held lock refuses before anything is copied."""
+    import fcntl
+
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    lock_path = source_dir / runner.RUN_LOCK_FILE
+    lock_path.write_text("{}", encoding="utf-8")
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    holder = open(lock_path)
+    try:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match="live process"):
+            asyncio.run(
+                runner.rebookend_run(
+                    source_dir,
+                    runs_dir=tmp_path / "runs",
+                    results_dir=tmp_path / "results",
+                    capture_egress=False,
+                )
+            )
+        assert launches == {}
+        assert not (tmp_path / "runs").exists()
+    finally:
+        holder.close()
+
+    # Every hard ending releases the lock in the kernel, so a lock file with no holder is a
+    # finished run and the probe passes without writing anything.
+    stat_before = lock_path.stat()
+    runner._refuse_live_source(source_dir)
+    assert lock_path.stat().st_mtime == stat_before.st_mtime
+    assert lock_path.read_text(encoding="utf-8") == "{}"
+
+
+def test_two_rebookends_of_one_source_in_one_second_get_distinct_runs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The timestamped stem has one-second resolution, so uniqueness cannot ride on the clock:
+    both calls in the same second must each get a fresh run rather than one stealing the
+    other's lock refusal."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    monkeypatch.setattr(runner, "_run_id", lambda c: f"{c.name}-20260101T000000Z")
+    first: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, first)
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+    second: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, second)
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    run_dirs = [p for p in (tmp_path / "runs").iterdir() if p.is_dir()]
+    assert len(run_dirs) == 2
+    assert len({p.name for p in run_dirs}) == 2
+    assert set(first) == set(second) == {0, 1, 2}
+
+
+def test_a_suspended_bookend_resumes_with_nothing_recorded(tmp_path: Path, monkeypatch) -> None:
+    """A bookend that hits a usage limit must publish the same shape an uninterrupted bookend
+    publishes. Its stopping file is the SOURCE's terminus, kept for the resumed preflight, and
+    an ordinary eval_after resume would republish it as this run's rollout; the rebookend
+    marker narrows the recorded set to nothing instead."""
+    cell, split = _synthetic_definitions(tmp_path)
+    run_dir = tmp_path / "bookend-run"
+    home = run_dir / "home"
+    home.mkdir(parents=True)
+    ctx = RunContext(
+        cell=replace(cell, eval_context="resumed"),
+        split=split,
+        instruction=load_instruction(cell.instruction_arm),
+        harness=runner.harness_for(cell.harness),
+        run_id="bookend-run-1",
+        run_dir=run_dir,
+        sandbox=CellSandbox(run_id="b", home=home, workdir=run_dir / "work"),
+    )
+    manifest = build_manifest(ctx, probes={"version": "t"})
+    manifest["rebookend"] = {
+        "rebookend_of": "source-run-20260101T000000Z",
+        "source_rollout_feedback": "never",
+        "source_stop_reason": "agent_stopped_early",
+    }
+    runner.write_json(run_dir / "manifest.json", manifest)
+    runner.write_json(
+        run_dir / ROLLOUT_STOPPING_FILE,
+        {"stop_reason": "agent_stopped_early", "session_id": _SID},
+    )
+    runner.write_json(
+        run_dir / SUSPENSION_FILE,
+        {
+            "schema": "shobench.suspension/1",
+            "run_id": "bookend-run-1",
+            "cell": cell.name,
+            "harness": cell.harness,
+            "phase": "eval_after",
+            "legs_before": 0,
+            "completed_task_ids": [0],
+            "pending_task_ids": [1, 2],
+            "stop_evidence": {"kind": "usage_limit", "reason": "t", "resumable": True},
+            "suspended_at": 1.0,
+            "resume_with": "uv run shobench resume",
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_phases(ctx_arg, *, manifest, phases, results_dir, observer, **kwargs):
+        captured["phases"] = phases
+        captured["recorded_phases"] = kwargs.get("recorded_phases")
+        return results_dir / "x.json"
+
+    monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
+    monkeypatch.setattr(runner, "load_cell_by_name", lambda name, **kw: cell)
+    monkeypatch.setattr(runner, "load_split_by_name", lambda name, **kw: split)
+    monkeypatch.setattr(
+        CellSandbox, "up", lambda self, **kw: self.home.mkdir(parents=True, exist_ok=True)
+    )
+    monkeypatch.setattr(CellSandbox, "down", lambda self: None)
+    monkeypatch.setattr(runner, "seed_home", lambda spec, home_arg: {})
+    monkeypatch.setattr(runner, "_start_egress", lambda sandbox, rd: None)
+
+    asyncio.run(
+        runner.resume_cell(run_dir, results_dir=tmp_path / "results", capture_egress=False)
+    )
+
+    assert captured["phases"] == ("eval_after",)
+    assert captured["recorded_phases"] == ()
+
+
 def _real_cell_source(tmp_path: Path) -> Path:
     """A source built from the committed smoke cell, so the CLI's checkout loaders and drift
     check run for real."""
@@ -402,6 +614,8 @@ def test_cli_rebookend_plans_without_spending(tmp_path: Path, capsys) -> None:
     assert plan["source_home"]["files"] >= 1
     assert plan["source_home"]["bytes"] > 0
     assert plan["refusals"]["suspension_present"] is False
+    assert plan["refusals"]["source_live"] is False
+    assert plan["refusals"]["outputs_inside_source"] == []
     assert plan["refusals"]["rollout_terminus_present"] is True
     assert plan["refusals"]["terminal_session_resolvable"] is True
     assert plan["refusals"]["experiment_drift"] == []

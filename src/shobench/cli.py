@@ -388,8 +388,21 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     )
     home_files = [p for p in (source_dir / "home").rglob("*") if p.is_file()]
     missing_required = [name for name in cell.required_env if not os.environ.get(name)]
+    source_resolved = source_dir.resolve()
+    outputs_inside_source = [
+        str(out)
+        for out in (Path(args.runs), Path(args.results))
+        if out.resolve() == source_resolved or out.resolve().is_relative_to(source_resolved)
+    ]
+    try:
+        runner._refuse_live_source(source_resolved)
+        source_live = False
+    except RuntimeError:
+        source_live = True
     refusals = {
         "suspension_present": (source_dir / SUSPENSION_FILE).is_file(),
+        "source_live": source_live,
+        "outputs_inside_source": outputs_inside_source,
         "rollout_terminus_present": source_stopping_path.is_file(),
         "terminal_session_resolvable": terminal_session is not None,
         "experiment_drift": drift,
@@ -431,6 +444,12 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     blockers = []
     if refusals["suspension_present"]:
         blockers.append("the source holds a suspension record; finish it with `shobench resume`")
+    if refusals["source_live"]:
+        blockers.append("the source is owned by a live process; wait for it to finish")
+    if outputs_inside_source:
+        blockers.append(
+            f"outputs {outputs_inside_source} are inside the source run directory"
+        )
     if not refusals["rollout_terminus_present"]:
         blockers.append("the source has no rollout terminus, so there is nothing to resume from")
     elif not refusals["terminal_session_resolvable"]:

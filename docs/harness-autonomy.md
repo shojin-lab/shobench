@@ -472,17 +472,24 @@ manifest's instruction block records which one eval_after launched with
 derive it from the axis.
 
 Runs measured before the resumed default get their bookend through `shobench rebookend`: a
-NEW run that copies the source's accumulated home (transcripts included), inherits the
-source's recorded axes with `eval_context` forced to resumed, and runs exactly the resumed
-eval_after against the source's terminal session, resolved from the source's own stopping
-record and validated by the same preflight inside the copied home. The source run is read and
-never written or locked: it is an archived artifact, and the new run names it in a
-`rebookend` provenance block and publishes under the incomplete name, since a run with no
-eval_before cannot account for the before side; pairing with the source happens post-hoc. A
-source without a terminus, without a resolvable terminal session, or holding a suspension
-record is refused before anything is copied or spent. The terminus is taken exactly where the
-rollout ended, whatever its stop reason: a harness_error ending mid-task resumes from that
-mid-task end, deliberately, because stepping back to a tidier point would resume a
+NEW run (fresh unique id, its own lock) that copies the source's accumulated home, inherits
+the source's recorded axes with `eval_context` forced to resumed, and runs exactly the
+resumed eval_after against the source's terminal session, resolved from the source's own
+stopping record and validated by the same preflight inside the copied home. The source run
+is read and never written or locked: it is an archived artifact, and the new run names it in
+a `rebookend` provenance block and publishes under the incomplete name, since a run with no
+eval_before cannot account for the before side; pairing with the source happens post-hoc.
+The snapshot is MATERIALIZED, transcripts included: every symlink becomes the bytes it
+pointed at, so nothing in the new tree references the source and no later writer (the
+credential reseed was the demonstrated case) can reach the archive through a preserved link.
+Refused before anything is copied or spent: a source without a terminus, without a
+resolvable terminal session, holding a suspension record, or still owned by a live process
+(the source lock is probed non-mutatingly), and any output path at or under the source. A
+bookend that a usage limit suspends resumes through the ordinary machinery and publishes the
+same shape an uninterrupted bookend does: its copied stopping record serves the preflight
+only and is never republished as the new run's rollout. The terminus is taken exactly where
+the rollout ended, whatever its stop reason: a harness_error ending mid-task resumes from
+that mid-task end, deliberately, because stepping back to a tidier point would resume a
 conversation the rollout never had.
 
 The preflight validates rather than globs, because existence is not resumability. Each
@@ -624,7 +631,15 @@ all, resumed to the auth boundary in a pristine home. Three things the CLI refus
 that. Anchoring: its scanner gives up on a file whose first parseable entry is not the
 header (source: `scanSessionInfo`), and a message line above a fully valid header is
 `No session found matching` for that id, the same answer a mismatched header id gets,
-because the scanner indexes by the header id and never the filename. The dialect: the
+because the scanner indexes by the header id and never the filename. The filename is in
+fact a DIFFERENT identifier space, and requiring it refused real runs: the daemon mints the
+session file under one id and the print run's header carries another, rewritten into that
+same file (observed on a session the pinned CLI itself wrote, and the shape of both real
+prime rollouts, whose recorded terminal id sits inside a file named for a different id).
+The CLI resolves the header id out of the differently named file and appends to it
+(observed, network off), so the preflight scans the flat sessions directory for exact
+header matches instead of trusting a name, and refuses two files carrying the same header
+id, because the resolver refuses an ambiguous selector (source: `resolveUniqueMatch`). The dialect: the
 scanner's parser is JSON.parse, so a header line carrying a NaN-family constant is
 unparseable to it and the session is `No session found matching`; the skipping cuts the
 other way too, since a NaN-poisoned junk line ABOVE a valid header is skipped and the

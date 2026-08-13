@@ -2089,6 +2089,14 @@ async def _resume_cell_owned(
     elif interrupted_phase == "eval_after":
         phases = ("eval_after",)
         recorded_phases = ("eval_before", "rollout")
+        if "rebookend" in manifest:
+            # A bookend never ran an eval_before or a rollout of its own: its stopping file
+            # is the SOURCE's terminus, copied in for the resumed preflight, and carrying it
+            # as a recorded phase would publish it as this run's rollout. The identical
+            # after-measurement must not change artifact shape just because it hit a usage
+            # limit, so a resumed bookend records nothing and publishes the same empty
+            # rollout an uninterrupted one does.
+            recorded_phases = ()
     else:
         raise RuntimeError(f"suspension names an unknown phase {interrupted_phase!r}")
     # Written before anything can suspend again, because a manifest that lives only in memory
@@ -2270,7 +2278,10 @@ async def _rerun_eval_owned(
     recorded: list[str] = []
     if phase != "eval_before" and (run_dir / "eval_before").is_dir():
         recorded.append("eval_before")
-    if (run_dir / "rollout_stopping.json").is_file():
+    # A bookend's stopping file is the SOURCE's terminus, copied in for the resumed preflight
+    # and never this run's own rollout, so a rerun must not republish it as one: the same
+    # narrowing the resume applies, or a repaired bookend would change artifact shape.
+    if (run_dir / "rollout_stopping.json").is_file() and "rebookend" not in manifest:
         recorded.append("rollout")
     recorded_phases = tuple(recorded)
     manifest.setdefault("eval_reruns", []).append({"at": time.time(), "phase": phase})
@@ -2292,6 +2303,36 @@ async def _rerun_eval_owned(
         sandbox.down()
 
 
+def _refuse_live_source(source_run_dir: Path) -> None:
+    """Refuse a source whose run lock a live process still holds, without mutating the source.
+
+    A source can hold a settled-looking terminus while its own eval_after or a later rerun
+    still owns the directory, and a snapshot taken under a live writer is not an archived
+    state. The probe is a non-mutating flock attempt on the EXISTING lock file: opened
+    read-only, never created, tried non-blocking, and released the moment it answers. A
+    missing lock file means no owner was ever possible, and an acquired lock means every
+    prior owner is gone, since any hard ending releases it in the kernel.
+    """
+    import fcntl
+
+    lock_path = source_run_dir / RUN_LOCK_FILE
+    if not lock_path.is_file():
+        return
+    fd = os.open(lock_path, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise RuntimeError(
+                f"{source_run_dir} is owned by a live process, so its state is still moving: "
+                "a snapshot taken now would not be the archived run. Wait for it to finish, "
+                "or stop it first."
+            ) from None
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 async def rebookend_run(
     source_run_dir: Path,
     *,
@@ -2307,16 +2348,27 @@ async def rebookend_run(
     never written. Everything this creates lives in a fresh run directory whose lock is taken
     before anything else, exactly as a fresh cell takes its own.
     """
-    source_run_dir = Path(source_run_dir)
+    source_run_dir = Path(source_run_dir).resolve()
     manifest_path = source_run_dir / "manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError(f"{source_run_dir} has no manifest.json; this is not a run directory.")
+    # No output may land at or under the source, whatever the operator typed: the untouched
+    # guarantee is over the tree, and `--runs <source>` or `--results <source>` would write the
+    # new lock, the run directory, or the published JSON straight into the archive.
+    for label, out_dir in (("runs_dir", Path(runs_dir)), ("results_dir", Path(results_dir))):
+        resolved = out_dir.resolve()
+        if resolved == source_run_dir or resolved.is_relative_to(source_run_dir):
+            raise RuntimeError(
+                f"{label} {out_dir} is inside the source run directory, and a rebookend never "
+                "writes into the archive it bookends. Point it elsewhere."
+            )
     if (source_run_dir / SUSPENSION_FILE).is_file():
         raise RuntimeError(
             f"{source_run_dir} holds a suspension record, so the run is not finished: use "
             "`shobench resume`, which knows what the interruption was waiting for. A rebookend "
             "measures the far side of a settled terminus."
         )
+    _refuse_live_source(source_run_dir)
     source_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     cell = load_cell_by_name(source_manifest["cell"]["name"])
     # The recorded arm wins over the checkout's default, exactly as a resume recovers it: the
@@ -2347,7 +2399,11 @@ async def rebookend_run(
             "cannot be resumed. Running the bookend cold instead would publish a mislabeled "
             "measurement; there is no fallback."
         )
-    run_id = _run_id(cell)
+    # A fresh id even for two rebookends of one source in the same second: the timestamped stem
+    # has one-second resolution, and a collision would hand the second caller the first one's
+    # lock refusal instead of its own new run. The suffix is what makes the destination
+    # genuinely fresh rather than fresh-if-nobody-else-was-quick.
+    run_id = f"{_run_id(cell)}-rb{uuid.uuid4().hex[:8]}"
     run_dir = Path(runs_dir) / run_id
     lock_fd = _acquire_run_lock(run_dir)
     try:
@@ -2415,10 +2471,20 @@ async def _rebookend_owned(
     # The post-rollout self, whole: durable channels AND session state, because the fork
     # machinery resolves the terminal transcript inside this copy before any fan-out. Copied
     # before the sandbox comes up so a failure here leaves nothing running.
+    #
+    # MATERIALIZED, never linked: a symlink in the snapshot is a hole in the untouched
+    # guarantee, because everything that runs afterwards writes into this tree (the credential
+    # seeding, the runner files, the RW container mount), and a preserved link pointing back
+    # into the source turns any of those writes into a write THROUGH the copy into the
+    # archive; a credential reseed did exactly that in review. So every link is resolved to
+    # the bytes it pointed at and copied as a real file, links inside and outside the source
+    # alike, and the snapshot references nothing beyond itself. A dangling link is dropped (it
+    # carries no bytes to materialize); a link cycle fails the copy loudly before anything is
+    # measured.
     source_home = source_run_dir / "home"
     if not source_home.is_dir():
         raise RuntimeError(f"{source_run_dir} has no home directory to bookend.")
-    shutil.copytree(source_home, sandbox.home, symlinks=True)
+    shutil.copytree(source_home, sandbox.home, symlinks=False, ignore_dangling_symlinks=True)
     shutil.copy2(source_run_dir / ROLLOUT_STOPPING_FILE, run_dir / ROLLOUT_STOPPING_FILE)
     source_stopping = json.loads(
         (source_run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
