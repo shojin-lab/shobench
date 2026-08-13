@@ -65,17 +65,22 @@ def _no_upstream_fetch(monkeypatch):
     monkeypatch.setattr(_upstream, "_download_package", refuse)
 
 
-def _hle_cache_root(cache: Path) -> Path:
-    """Where ``datasets`` keeps its builds of the hle dataset under ``cache``, named its way.
+def _hle_is_cached(cache: Path) -> bool:
+    """Whether ``datasets`` considers the hle dataset cached under ``cache``.
 
-    The dataset's own id is the input, so a rename upstream moves this with it. Builds land in
-    ``<root>/<config>/<version>/<hash>/``.
+    Put to the factory the offline load path falls back to, rather than to a copy of its glob. Its
+    answer is coarser than "loadable": a directory at the depth builds live at is enough, even one
+    holding an arrow file and no metadata beside it, even a half-written one. That coarseness is
+    the point. The factory reaching for a directory is what makes absence untrue, and everything
+    past this line is then free to fail rather than obliged to skip.
     """
-    from datasets.naming import camelcase_to_snakecase
+    from datasets.load import CachedDatasetModuleFactory
 
-    parts = hle_data.HF_DATASET.split("/")
-    parts[-1] = camelcase_to_snakecase(parts[-1])
-    return cache / "___".join(parts)
+    try:
+        CachedDatasetModuleFactory(hle_data.HF_DATASET, cache_dir=str(cache)).get_module()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _hle_builder(cache: Path):
@@ -177,13 +182,12 @@ def test_hle_manifest_ids_resolve_to_the_question_ids_it_records() -> None:
     # pin also makes checkable: offline is the branch that selects a build from disk, and it is
     # the branch every run takes.
     #
-    # Nothing prepared under the root means nothing was ever cached, which is the only state that
-    # can honestly skip. Past that line the data is here, so what the loader resolves to has to
-    # hold up, and if it does not, that is a failure with a true reason rather than a green run
-    # claiming data this machine has.
+    # Nothing the loader would reach for means nothing was ever cached, which is the only state
+    # that can honestly skip, and the loader's own factory is what decides it. Past that line the
+    # data is here, so what the loader resolves to has to hold up, and if it does not, that is a
+    # failure with a true reason rather than a green run claiming data this machine has.
     cache = hle_data.cache_dir()
-    root = _hle_cache_root(cache)
-    if not any((c / "dataset_info.json").is_file() for c in root.glob("*/*/*")):
+    if not _hle_is_cached(cache):
         pytest.skip(f"the gated hle dataset is not cached at {cache}, and a test will not fetch it")
     builder = _hle_builder(cache)
     build = Path(builder.cache_dir)
