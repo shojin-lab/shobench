@@ -138,10 +138,11 @@ class PrimeAgent(Harness):
     # it has no terminal condition of its own, and voluntary eval-leg stops are vanishingly rare
     # in the archives (a handful across hundreds of legs, the inspected one 1163s after its seal,
     # far beyond any plausible grace), so every second of the wait is billed post-seal turns
-    # rather than room for a voluntary stop. On a resumed fork those turns are the expensive kind: the refine
-    # cycle that follows the seal rebuilds the system prompt, and the next turn writes the whole
-    # inherited prefix again as a fresh cache entry, measured at about $4.56 a leg against a
-    # 447K-token context and two thirds of the leg's total spend. Fifteen seconds covers the seal
+    # rather than room for a voluntary stop. On a resumed fork those turns are the expensive
+    # kind: the refine cycle that follows the seal rebuilds the system prompt, and the next turn
+    # writes the whole inherited prefix again as a fresh cache entry, measured at about $4.56
+    # a leg against a 447K-token context and two thirds of the leg's total spend. Fifteen
+    # seconds covers the seal
     # write and a drain poll with margin, and ends the leg before the rebuild turn, which follows
     # the seal by tens of seconds, can finish a rewrite. No score moves either way: the row is
     # sealed and the stream drained before the grace starts, and the per-task home is discarded.
