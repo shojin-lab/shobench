@@ -74,4 +74,20 @@ jobs:
       # The docker marker is what pyproject.toml already says it is, a test needing a live
       # daemon, and a runner has none. No test carries it today, so this deselects nothing and
       # says so in the summary line the day one does.
-      - run: uv run --frozen pytest -q -rs -m "not docker"
+      - run: uv run --frozen pytest -q -rs -m "not docker" --junitxml=$RUNNER_TEMP/pytest.xml
+
+      # pytest exits 0 for a selection that skipped or deselected everything, so green can mean
+      # nothing ran. The floor is a tripwire and not a target: it sits far below the suite's real
+      # count and does not want raising as that count grows.
+      - run: |
+          uv run --frozen python - "$RUNNER_TEMP/pytest.xml" <<'PY'
+          import sys
+          from xml.etree import ElementTree
+
+          root = ElementTree.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          executed = int(suite.get("tests")) - int(suite.get("skipped"))
+          print(f"{executed} tests executed")
+          if executed < 250:
+              sys.exit(f"the suite executed {executed} tests, which is too few to call this a run")
+          PY
