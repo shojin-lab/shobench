@@ -42,4 +42,7 @@ jobs:
 
       # -rs names every skip. Nothing in the suite needs a provider, a docker daemon, or a
       # dataset; what is absent on a runner skips with a reason, and that reason is in the log.
-      - run: uv run --frozen pytest -q -rs
+      # The docker marker is what pyproject.toml already says it is, a test needing a live
+      # daemon, and a runner has none. No test carries it today, so this deselects nothing and
+      # says so in the summary line the day one does.
+      - run: uv run --frozen pytest -q -rs -m "not docker"
