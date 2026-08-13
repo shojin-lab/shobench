@@ -473,11 +473,19 @@ presence: where a decoder checks a value's shape (claude's timestamp and content
 cwd) the predicate checks that shape and each rejected shape is one the CLI was observed to
 refuse, and where a decoder checks nothing (codex's payload values) the predicate adds
 nothing, so the predicate sits as close to the decoder it fronts as probing can place it.
-The refusals this preempts would otherwise arrive per task, after the fan-out's copies,
-streams, and containers were already paid for. What no line-level predicate can promise is a
-file that carries the floor plus additional records the CLI cannot replay (a poisoned line
-elsewhere in a crashed file); that residue stays a per-task failure, and only a credentialed
-dry run could squeeze it further.
+The decoding dialect itself is part of the discipline, because the preflight parses in
+Python and the CLIs do not: Python's json accepts NaN-family constants that JSON.parse
+refuses and escaped lone surrogates that serde refuses, so the preflight reads a strict
+dialect (`_strict_json_object`: constants raise, every decoded string must survive a strict
+UTF-8 encode), and each side of that has its observation (a NaN-carrying prime header is
+"No session found matching"; a surrogate-carrying codex meta is unreadable session
+metadata). Anchoring is per CLI too: codex parses the literal first record and refuses the
+file when that fails, while prime's scanner skips lines its parser refuses, both observed
+with a valid record on line two. The refusals all this preempts would otherwise arrive per
+task, after the fan-out's copies, streams, and containers were already paid for. What no
+line-level predicate can promise is a file that carries the floor plus additional records
+the CLI cannot replay (a poisoned line elsewhere in a crashed file); that residue stays a
+per-task failure, and only a credentialed dry run could squeeze it further.
 
 Every claim below was produced against the pinned image (Claude Code 2.1.226, codex-cli
 0.147.0, prime-agent 0.7.1) with the network disabled and no credential present, so each probe
@@ -508,13 +516,16 @@ object`). The `uuid` field, present in every real line, is not required. A line 
 names the id is not a conversation, and the preflight requires the whole floor.
 
 The value domains are part of the floor, not only the fields (all observed, rest of the line
-held at the verified minimum). The timestamp must be the ISO-instant string the CLI itself
-writes: an object, an epoch number, and a non-date string were each refused as
-`No conversation found`. The content must be a string or a list: an object resolves the
-session and then crashes the resume with `TypeError: e.map is not a function`, whose own text
-names the CLI's domain (a string is handled apart; everything else is mapped as an array),
-and a list of non-block elements resumed, its entries contributing empty text, so the
-preflight constrains a list's elements no further than the CLI does.
+held at the verified minimum). The timestamp must be the complete, calendar-valid,
+timezone-carrying ISO instant the CLI itself writes: an object, an epoch number, a non-date
+string, and an ISO-shaped but calendar-invalid string (`2026-99-99T99:99:99Z`) were each
+refused as `No conversation found`, which is why the preflight parses the value as a
+datetime, end-anchored, rather than pattern-matching a prefix. The content must be a string
+or a list: an object resolves the session and then crashes the resume with
+`TypeError: e.map is not a function`, whose own text names the CLI's domain (a string is
+handled apart; everything else is mapped as an array), and a list of non-block elements
+resumed, its entries contributing empty text, so the preflight constrains a list's elements
+no further than the CLI does.
 
 ### codex (observed for the resume mechanics, source elsewhere)
 
@@ -532,19 +543,23 @@ thread-name selection are cwd-filtered and `--all` disables the filter (help tex
 explicit UUID, with rollout and eval both running at `/work`, does not touch that path.
 
 The floor a rollout must carry, minimized from a rollout the CLI itself wrote and re-resumed
-after every cut (all observed): the file must START with the session metadata, and the meta
-must decode whole. A `session_meta` first line whose payload holds `id`, `timestamp`, `cwd`,
-`originator`, and `cli_version`, with no items after it, resumes to the transport boundary.
-Dropping payload fields is refused as `failed to read session metadata`; an empty file as
-`rollout ... is empty`; and a parseable non-meta first line is refused as `does not start
-with session metadata` even when a fully valid meta sits on line two, so the preflight
-anchors on the first parseable line the way the CLI does.
+after every cut (all observed): the FIRST record must be the session metadata, decoded
+whole. A first line carrying the envelope `timestamp` and a `session_meta` payload holding
+`id`, `timestamp`, `cwd`, `originator`, and `cli_version`, with no items after it, resumes
+to the transport boundary. Dropping payload fields, or the envelope timestamp itself, is
+refused as `failed to read session metadata` or `rollout ... is empty`; an empty file the
+same; a parseable non-meta first line is refused as `does not start with session metadata`;
+and an UNPARSEABLE first line is refused as `failed to parse first rollout record` even with
+a fully valid meta on line two, so the preflight anchors on the literal first record the way
+the reader does, skipping nothing. Decoding is serde-strict: an escaped lone surrogate in
+any meta value is refused as unreadable session metadata (observed, with and without the
+envelope timestamp beside it), which is the dialect the preflight's strict reader enforces.
 
-Presence is the whole floor: the VALUES of those payload fields are not domain-checked at
-0.147.0. A bogus originator, a bogus cli_version, a non-date payload timestamp, a non-date
-envelope timestamp, and a relative cwd each resumed to the transport boundary (all observed,
-one variant at a time against the verified minimum), so the preflight constrains none of
-them; stricter would refuse rollouts the CLI accepts.
+Beyond presence and decodability the VALUES are not domain-checked at 0.147.0. A bogus
+originator, a bogus cli_version, a non-date payload timestamp, a non-date envelope
+timestamp, and a relative cwd each resumed to the transport boundary (all observed, one
+variant at a time against the verified minimum), so the preflight constrains none of them;
+stricter would refuse rollouts the CLI accepts.
 
 ### prime_agent (observed for the resume mechanics, source for the layout)
 
@@ -563,16 +578,20 @@ the runner does not use it, since the per-task copy is the fork.
 The floor a session file must carry (all observed): a header naming the id and the resuming
 cwd, and it must be the FIRST parseable line. A one-line
 `{"type": "session", "version": 3, "id": ..., "cwd": "/work"}` file, timestamp absent and
-all, resumed to the auth boundary in a pristine home. Two things the CLI refuses around
+all, resumed to the auth boundary in a pristine home. Three things the CLI refuses around
 that. Anchoring: its scanner gives up on a file whose first parseable entry is not the
 header (source: `scanSessionInfo`), and a message line above a fully valid header is
 `No session found matching` for that id, the same answer a mismatched header id gets,
-because the scanner indexes by the header id and never the filename. And the cwd, which is a
-value domain of the resume: a header without one, or recorded at another directory, resolves
-as `Session found in different project` and stalls on an interactive
-`Fork this session into current directory?` prompt, which under the runner's closed stdin is
-exit 13 and no resume (observed for both). Every leg runs at `/work`, so that is the cwd a
-forkable header must carry.
+because the scanner indexes by the header id and never the filename. The dialect: the
+scanner's parser is JSON.parse, so a header line carrying a NaN-family constant is
+unparseable to it and the session is `No session found matching`; the skipping cuts the
+other way too, since a NaN-poisoned junk line ABOVE a valid header is skipped and the
+session resumed (both observed), which is exactly the skip-then-anchor the preflight
+mirrors. And the cwd, which is a value domain of the resume: a header without one, or
+recorded at another directory, resolves as `Session found in different project` and stalls
+on an interactive `Fork this session into current directory?` prompt, which under the
+runner's closed stdin is exit 13 and no resume (observed for both). Every leg runs at
+`/work`, so that is the cwd a forkable header must carry.
 
 The transcript is not the whole persisted session. Its artifact tree at
 `<agent-dir>/session-artifacts/<id>/` is part of it (source, in the installed bundle): the

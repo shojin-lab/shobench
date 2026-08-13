@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import json
-import re
+from datetime import datetime
 from pathlib import Path
 
 from shobench.harness import (
@@ -17,7 +17,7 @@ from shobench.harness import (
     jsonl_events,
     stderr_evidence,
 )
-from shobench.harnesses._trace import _last_event_of_type
+from shobench.harnesses._trace import _last_event_of_type, _strict_json_object
 
 
 class ClaudeCode(Harness):
@@ -235,11 +235,24 @@ def _last_result_event(path: Path) -> dict | None:
     return _last_event_of_type(path, ("result",))
 
 
-# The timestamp shape the CLI itself writes (an ISO instant), required as a value domain and
-# not merely a present field: with the rest of the line held at the verified floor, an object,
-# an epoch number, and a non-date string in this field were each refused by the pinned CLI as
-# "No conversation found", while this shape resumes.
-_ISO_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+def _is_zoned_instant(value: object) -> bool:
+    """Is this the complete, calendar-valid, timezone-carrying instant the CLI writes?
+
+    A prefix pattern is not this check: it certified "2026-99-99T99:99:99Z", which the pinned
+    CLI refuses as "No conversation found" (observed), exactly like an object, an epoch
+    number, and a non-date string in the field. So the value is parsed as a datetime,
+    end-anchored (a trailing remainder fails the parse), calendar-checked by the parse
+    itself, and required to carry a timezone the way every CLI-written stamp does. The
+    timezone requirement is a deliberate narrowing: a naive stamp was not probed, and no real
+    transcript carries one, so refusing it costs nothing and claims nothing.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 def _carries_resumable_conversation(path: Path, session_id: str) -> bool:
@@ -247,13 +260,16 @@ def _carries_resumable_conversation(path: Path, session_id: str) -> bool:
 
     The qualifying line is the shape a real transcript's kickoff turn always has and the
     minimum the CLI was observed to accept: a ``user`` entry naming this ``sessionId``, with
-    an ISO-instant ``timestamp`` and a ``message`` carrying a role and non-empty content that
-    is a string or a list. The value domains matter as much as the fields: a truthy timestamp
-    of the wrong shape is refused as "No conversation found", and a truthy content of the
-    wrong shape resolves and then crashes the resume ("e.map is not a function", whose own
-    text shows the CLI's domain: a string is handled apart and anything else is mapped as an
-    array). A list's elements are not constrained here because the CLI constrains none: a
-    list of non-blocks was observed to resume, its entries contributing empty text.
+    an ISO-instant ``timestamp`` (see :func:`_is_zoned_instant`) and a ``message`` carrying a
+    role and non-empty content that is a string or a list. The value domains matter as much
+    as the fields: a truthy timestamp of the wrong shape is refused as "No conversation
+    found", and a truthy content of the wrong shape resolves and then crashes the resume
+    ("e.map is not a function", whose own text shows the CLI's domain: a string is handled
+    apart and anything else is mapped as an array). A list's elements are not constrained
+    here because the CLI constrains none: a list of non-blocks was observed to resume, its
+    entries contributing empty text. Lines are decoded in the shared strict dialect
+    (``_strict_json_object``), because the CLI's own JSON.parse never yields a line carrying
+    a NaN-family constant, so a qualifying line that needs one does not exist for it.
 
     Streamed and stopped at the first match, tolerant of a malformed line, because the file
     was written by another process and a crash can cut it anywhere; a transcript cut after
@@ -265,16 +281,12 @@ def _carries_resumable_conversation(path: Path, session_id: str) -> bool:
                 line = line.strip()
                 if not line:
                     continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, dict) or event.get("sessionId") != session_id:
+                event = _strict_json_object(line)
+                if event is None or event.get("sessionId") != session_id:
                     continue
                 if event.get("type") != "user":
                     continue
-                stamp = event.get("timestamp")
-                if not isinstance(stamp, str) or not _ISO_STAMP.match(stamp):
+                if not _is_zoned_instant(event.get("timestamp")):
                     continue
                 message = event.get("message")
                 if not isinstance(message, dict) or not message.get("role"):

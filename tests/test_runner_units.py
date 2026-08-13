@@ -927,6 +927,13 @@ def test_claude_value_domains_follow_the_pinned_cli(tmp_path: Path) -> None:
         "timestamp_object": _claude_line(timestamp={"x": 1}),
         "timestamp_number": _claude_line(timestamp=1786579093000),
         "timestamp_not_a_date": _claude_line(timestamp="not-a-date"),
+        # ISO-shaped is not ISO: the CLI refuses a calendar-invalid instant (observed), which
+        # is exactly what a prefix pattern certified. The parse is end-anchored and
+        # calendar-checked, so this is a value-domain case and not a syntax one.
+        "timestamp_bad_calendar": _claude_line(timestamp="2026-99-99T99:99:99Z"),
+        # A deliberate narrowing rather than an observed refusal: a naive stamp was not
+        # probed, and no CLI-written stamp lacks its timezone, so refusing it costs nothing.
+        "timestamp_naive": _claude_line(timestamp="2026-08-12T00:00:00"),
         "content_object": _claude_line(message={"role": "user", "content": {"x": 1}}),
     }
     for label, body in refused.items():
@@ -1021,6 +1028,91 @@ def test_codex_meta_values_are_unconstrained_because_the_cli_constrains_none(
         + "\n",
     )
     assert harness.session_transcript(envelope, _SID) == envelope / rel
+
+
+def test_the_preflight_reads_the_decoders_json_dialect_not_pythons(tmp_path: Path) -> None:
+    """Python's json is not the dialect the session readers speak, and the gap certified
+    files the CLIs refuse.
+
+    Two lenient extensions matter: Python decodes NaN-family constants, which JSON.parse
+    refuses, and escaped lone surrogates, which serde refuses. Every refusal below is one the
+    pinned CLI was observed to make, and the acceptance is observed too: prime's scanner
+    SKIPS a line its parser refuses, so a NaN-poisoned junk line above a valid header still
+    resumes, and the preflight must not refuse it either. codex is the opposite: it parses
+    the literal first record and refuses the file when that fails, valid meta below or not.
+    """
+    codex = harness_for("codex")
+    codex_rel = f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl"
+    codex_meta = json.dumps(
+        {
+            "timestamp": _TS,
+            "type": "session_meta",
+            "payload": {
+                "id": _SID,
+                "timestamp": _TS,
+                "cwd": "/work",
+                "originator": "codex_exec",
+                "cli_version": "0.147.0",
+            },
+        }
+    )
+    # The review's verbatim counterexample: an escaped lone surrogate in the meta, no
+    # envelope timestamp. Refused by the CLI, and refused with the envelope restored (the
+    # encoding is fatal on its own), and refused with clean values but no envelope timestamp
+    # (that field is load-bearing on its own), and refused when the first line does not
+    # parse at all.
+    surrogate_payload = (
+        '{"id":"' + _SID + '","timestamp":"\\ud800","cwd":"/work",'
+        '"originator":"codex_exec","cli_version":"0.147.0"}'
+    )
+    codex_refused = {
+        "surrogate_verbatim": '{"type":"session_meta","payload":' + surrogate_payload + "}\n",
+        "surrogate_full_envelope": '{"timestamp":"'
+        + _TS
+        + '","type":"session_meta","payload":'
+        + surrogate_payload
+        + "}\n",
+        "no_envelope_timestamp": '{"type":"session_meta","payload":{"id":"'
+        + _SID
+        + '","timestamp":"'
+        + _TS
+        + '","cwd":"/work","originator":"codex_exec","cli_version":"0.147.0"}}\n',
+        "garbage_above_meta": "not json\n" + codex_meta + "\n",
+    }
+    for label, body in codex_refused.items():
+        home = _home_with(tmp_path / label, codex_rel, body)
+        assert codex.session_transcript(home, _SID) is None, label
+
+    prime = harness_for("prime_agent")
+    prime_rel = f".prime/agent/sessions/{_SID}.jsonl"
+    prime_header = json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/work"})
+    nan_header = _home_with(
+        tmp_path / "nan-header",
+        prime_rel,
+        '{"type":"session","version":3,"id":"' + _SID + '","cwd":"/work","extra":NaN}\n',
+    )
+    assert prime.session_transcript(nan_header, _SID) is None
+    nan_junk_above = _home_with(
+        tmp_path / "nan-junk-above",
+        prime_rel,
+        '{"junk":NaN}\n' + prime_header + "\n",
+    )
+    assert prime.session_transcript(nan_junk_above, _SID) == nan_junk_above / prime_rel
+
+    # The same constant in a claude qualifying line: JSON.parse refuses it, so the CLI's own
+    # loader never yields this line and the strict reader must not either.
+    claude = harness_for("claude_code")
+    claude_rel = f".claude/projects/-work/{_SID}.jsonl"
+    nan_line = _home_with(
+        tmp_path / "nan-line",
+        claude_rel,
+        '{"type":"user","message":{"role":"user","content":"hello"},"timestamp":"'
+        + _TS
+        + '","sessionId":"'
+        + _SID
+        + '","extra":NaN}\n',
+    )
+    assert claude.session_transcript(nan_line, _SID) is None
 
 
 # ----- what counts as the agent's durable self ------------------------------------------------

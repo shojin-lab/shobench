@@ -16,7 +16,7 @@ from shobench.harness import (
 )
 from shobench.harnesses._trace import (
     _first_event_of_type,
-    _first_parseable_event,
+    _first_record_strict,
     _last_event_of_type,
 )
 
@@ -90,24 +90,28 @@ class Codex(Harness):
         return None if started is None else str(started.get("thread_id") or "") or None
 
     def session_transcript(self, home: Path, session_id: str) -> Path | None:
-        """The rollout file whose name ends in this thread id, opening with a meta the CLI's
-        own parser decodes.
+        """The rollout file whose name ends in this thread id, whose FIRST record is a meta
+        the CLI's own parser decodes.
 
         The floor was established against the pinned CLI (network off, zero tokens). The
-        rollout must START with the session metadata: a parseable non-meta first line is
-        refused as "does not start with session metadata" even when a valid meta follows it.
-        And the meta must decode whole: its payload needs ``id``, ``timestamp``, ``cwd``,
-        ``originator``, and ``cli_version``, because dropping any of them is refused as
-        "failed to read session metadata" and an empty file as "rollout ... is empty". No
-        items after the meta are required; a meta-only rollout resumed to the transport
-        boundary. Presence is also the whole of it: the VALUES of those fields are not
-        domain-checked at 0.147.0. A bogus originator, a bogus cli_version, a non-date
-        payload or envelope timestamp, and a relative cwd each resumed to the transport
-        boundary (all observed), so this predicate constrains none of them; requiring more
-        than the CLI does would refuse files the CLI accepts and prove nothing. Requiring the
-        payload id to equal the thread id still rejects a rollout recorded for some other
-        thread, and the exact filename suffix keeps a longer id that merely contains this one
-        from standing in.
+        FIRST record must be the session metadata, with nothing skipped: a parseable non-meta
+        first line is refused as "does not start with session metadata", and an unparseable
+        first line is refused as "failed to parse first rollout record" even when a fully
+        valid meta sits on line two. The record must decode whole, in serde's strict dialect
+        (see ``_strict_json_object``: an escaped lone surrogate in any value is refused as
+        unreadable metadata). The line's own ``timestamp`` field is required beside the
+        payload, whose ``id``, ``timestamp``, ``cwd``, ``originator``, and ``cli_version``
+        must all be present: dropping any of them, the envelope timestamp included, is
+        refused as "failed to read session metadata" or "rollout ... is empty". No items
+        after the meta are required; a meta-only rollout resumed to the transport boundary.
+
+        Presence and decodability are the whole of it: the VALUES are not domain-checked at
+        0.147.0. A bogus originator, a bogus cli_version, a non-date payload or envelope
+        timestamp, and a relative cwd each resumed to the transport boundary (all observed),
+        so this predicate constrains none of them; requiring more than the CLI does would
+        refuse files the CLI accepts and prove nothing. Requiring the payload id to equal the
+        thread id still rejects a rollout recorded for some other thread, and the exact
+        filename suffix keeps a longer id that merely contains this one from standing in.
         """
         root = home / ".codex" / "sessions"
         if not root.is_dir():
@@ -116,8 +120,10 @@ class Codex(Harness):
         for path in sorted(root.rglob("*.jsonl")):
             if not path.is_file() or not path.name.endswith(suffix):
                 continue
-            meta = _first_parseable_event(path)
+            meta = _first_record_strict(path)
             if meta is None or meta.get("type") != "session_meta":
+                continue
+            if not (isinstance(meta.get("timestamp"), str) and meta.get("timestamp")):
                 continue
             payload = meta.get("payload") or {}
             if payload.get("id") != session_id:
