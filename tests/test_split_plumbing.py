@@ -112,6 +112,32 @@ def _hle_build_datasets_will_load(cache: Path) -> Path:
     return _hle_cache_root(cache) / config_name / version / build_hash
 
 
+def _hle_shards_datasets_will_read(build: Path, info: dict) -> list[Path]:
+    """The arrow files the requested split will be read from, named the way the reader names them.
+
+    A build directory can hold arrow files this load never opens: another split's shards, residue
+    from an older prepare that the recorded split no longer refers to. The reader does not glob the
+    directory. It takes the split's recorded ``shard_lengths`` and builds the filenames from the
+    dataset name and the split name, so those files are the whole of what has to be there, and
+    what else sits beside them is not this test's business. Rejecting a build over a file the
+    loader will not touch would fail a cache that works, which is the same class of untrue report
+    as skipping over a cache that is present.
+    """
+    from datasets.naming import filenames_for_dataset_split
+
+    split_info = info["splits"][hle_data.HF_SPLIT]
+    return [
+        Path(name)
+        for name in filenames_for_dataset_split(
+            build,
+            dataset_name=hle_data.HF_DATASET.split("/")[-1],
+            split=hle_data.HF_SPLIT,
+            filetype_suffix="arrow",
+            shard_lengths=split_info.get("shard_lengths"),
+        )
+    ]
+
+
 def _env(name: str, kwargs: dict):
     """Construct the env the way the runner does.
 
@@ -170,10 +196,11 @@ def test_hle_manifest_ids_resolve_to_the_question_ids_it_records() -> None:
     assert hle_data.HF_SPLIT in (info.get("splits") or {}), (
         f"datasets will load {build}, which records no {hle_data.HF_SPLIT!r} split"
     )
-    shards = sorted(build.glob("*.arrow"))
-    assert shards, f"datasets will load {build}, which holds no arrow shard"
-    empty = [s.name for s in shards if s.stat().st_size == 0]
-    assert not empty, f"datasets will load {build}, whose shards {empty} are empty files"
+    shards = _hle_shards_datasets_will_read(build, info)
+    unusable = [s.name for s in shards if not (s.is_file() and s.stat().st_size)]
+    assert not unusable, (
+        f"datasets reads {hle_data.HF_SPLIT!r} out of {build}, and {unusable} is missing or empty"
+    )
     split = load_split_by_name("hle")
     env = _env("hle", split.heldout.env_kwargs)
     assert env.num_tasks == split.total_tasks
