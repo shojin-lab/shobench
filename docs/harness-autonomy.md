@@ -581,10 +581,24 @@ them is refused rather than read as agreement (a continuation keeps the old rule
 digest being proof of its own). The PAIRING is held to the same standard as the run: a named
 `--baseline` is not equivalent because it answers to the same cell name, two archives of one name
 being able to sit either side of any edit to the file, so `pairing_drift` compares the two
-RECORDS across everything that shaped the before rows the bookend will carry (`name`, `env`,
-`harness`, `model`, `effort`, `credential_mode`, `env_kwargs`, `required_env`), plus three both
-sides must STATE rather than merely agree on: the split id digest, the blind-eval prompt digest,
-and the eval runtime. One group is deliberately not compared, and the reason is checkable rather
+RECORDS across everything that shaped the before rows the bookend will carry. From the cell block:
+`name`, `env`, `harness`, `model`, `effort`, `credential_mode`, `env_kwargs`, `required_env`. And
+the row's execution identity, which both sides must STATE rather than merely agree on, absence
+refusing exactly as a difference does: the split id digest and the blind-eval prompt digest, the
+`kickoff` every eval leg is actually sent (which no cell digest covers, the instructions living
+outside `cells/`), the `container.agent_image` and the `harness_probes` block probed inside it (an
+image tag is mutable, so the probe is the fact and both are compared), the effective credential
+mode from `axes` (which account served the legs, a thing the cell's REQUESTED mode does not
+settle), the whole `substrate` block (the shogym revision that serves and scores every task, its
+repo, and the MCP server name the agent's tools appear under), and the eval runtime. The two
+blocks are compared key by key rather than field by named field, so a key added to either is
+eval-defining until someone judges otherwise. What is deliberately absent from that set is
+enumerated in the runner with a reason each: the continuation cue no eval leg is sent, the rollout
+prompt a deferred baseline never used, the lookup names whose identities are the digests, the
+observed models and other OUTCOMES (the real terra pair records `['gpt-5.6-terra']` on the source
+from its rollout and `[]` on the baseline from its before legs, so comparing them would refuse a
+pairing for having measured something), the axes that restate compared cell fields, the run-local
+bookkeeping, and the record's own schema version. One group is deliberately not compared, and the reason is checkable rather
 than stylistic: `rollout_feedback`, `max_in_flight`, `rollout_wall_clock_s` and `pool_ceiling`
 shape a rollout a deferred baseline never ran, `EvalStream` pins the blind feedback posture
 whatever the cell's arm says, and the eval fan-out is one session per task whatever

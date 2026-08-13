@@ -1628,14 +1628,50 @@ IDENTITY_DIGESTS = (
     ("eval instruction", "instruction", "eval_system_sha256"),
 )
 
-# The identity a PAIRING requires both archives to state: the held-out ids the before rows were
-# produced over, and the blind-eval prompt they were produced under. The rollout prompt is not
-# here on purpose, a deferred baseline having run no rollout; the bookend's own resumed after side
-# carries it, and it is checked against the SOURCE where it belongs.
-PAIRING_IDENTITY = (
-    ("split ids", "split", "id_digest"),
-    ("eval instruction", "instruction", "eval_system_sha256"),
+# The rest of a before row's EXECUTION IDENTITY: every recorded fact outside the cell block that
+# shaped the rows a pairing carries. Both archives must STATE each one and agree on it, absence
+# refusing exactly as it does for the digests, because a record that cannot say what produced its
+# rows cannot be shown to have produced them the same way.
+#
+# The held-out ids and the blind-eval prompt are what the row was measured over and under. The
+# kickoff is the user turn every eval leg actually sends, and the cell file's digest does not
+# cover it, the instructions living outside cells/. The agent image and the probed harness build
+# are the CLI that ran: an image tag is mutable, so the probe is the fact, and both are compared.
+# The effective credential mode is which account served the legs, which the cell's REQUESTED mode
+# does not settle.
+PAIRING_IDENTITY_FIELDS = (
+    ("split ids", "split.id_digest"),
+    ("eval instruction", "instruction.eval_system_sha256"),
+    ("eval kickoff", "instruction.kickoff"),
+    ("agent image", "container.agent_image"),
+    ("credential mode", "axes.credential_mode.effective"),
 )
+
+# Blocks compared whole, key by key, because pinning the execution substrate is their entire
+# purpose: the shogym revision that serves and scores every task, the repo it comes from, the MCP
+# server name the agent's tools appear under, and whatever the harness probe reported from inside
+# the image. A key added to either is eval-defining until someone judges otherwise, which is the
+# fail-closed direction and the reason these are not enumerated field by field.
+PAIRING_IDENTITY_BLOCKS = ("substrate", "harness_probes")
+
+# Deliberately NOT compared, each for a reason a reader can check.
+#
+# instruction.continuation is the cue that reopens a ROLLOUT; no eval leg is ever sent it.
+# instruction.rollout_system_sha256 is the standing prompt of a rollout a deferred baseline never
+# ran, and the bookend's own resumed after side carries it, where the source-to-checkout
+# comparison guards it.
+# instruction.arm and split.path are lookup keys whose identities are the digests above.
+# axes.model.observed and observed_models are OUTCOMES read off the traces, not definitions, and
+# the two sides' come from different phases: in the real terra pair the source recorded
+# ['gpt-5.6-terra'] from its rollout and the baseline [] from its before legs, so comparing them
+# would refuse a pairing for having measured something.
+# axes.model.requested and axes.effort restate cell fields already compared.
+# container.network, container.netns_container, container.home, home, work, redaction,
+# credential_seed, run_id, started_at, ended_at, resumptions and eval_reruns are run-local
+# bookkeeping: they name this run's resources and history, not what its rows were produced by.
+# schema names the record's shape rather than the measurement, and every field the pairing rests
+# on is compared by name, so a purely additive bump must not refuse every archive that predates
+# it.
 
 # What a pairing compares between the two RECORDED runs, as everything the cell block carries
 # except these. The bookend's uncompared bookkeeping is uncompared here for the same reasons; the
@@ -1721,8 +1757,14 @@ def _shown(value: Any) -> str:
     absence marker needs neither, and an operator reading the line has to be able to tell which
     they are looking at. The published record keeps one string for both, where the surrounding
     block says which fields each side carries.
+
+    Long values are cut, because a harness probe is a page of CLI output and a refusal nobody can
+    read is a refusal nobody reads. Both manifests carry the whole value either way.
     """
-    return "no such field" if value is _MISSING else repr(value)
+    if value is _MISSING:
+        return "no such field"
+    shown = repr(value)
+    return shown if len(shown) <= 120 else f"{shown[:117]}..."
 
 
 def cell_field_drift(
@@ -1821,6 +1863,34 @@ def _recorded_value(manifest: dict[str, Any], block: str, key: str) -> Any:
     return _MISSING if value is None else value
 
 
+def _recorded_path(manifest: dict[str, Any], path: str) -> Any:
+    """One recorded field named by its dotted path, absent or null reading as absence."""
+    value: Any = manifest
+    for step in path.split("."):
+        if not isinstance(value, dict) or step not in value:
+            return _MISSING
+        value = value[step]
+    return _MISSING if value is None else value
+
+
+def _pairing_identity_lines(label: str, source_value: Any, baseline_value: Any) -> list[str]:
+    """One identity compared between two archives: stated on both sides, and the same.
+
+    Absence refuses rather than passing, the whole point of an identity being that a record
+    ASSERTS what produced its rows; two silences agree about nothing.
+    """
+    if source_value is _MISSING or baseline_value is _MISSING:
+        return [
+            f"{label} is not recorded on both sides (source {_shown(source_value)}, baseline "
+            f"{_shown(baseline_value)}), so nothing proves the two archives measured the same way"
+        ]
+    if source_value != baseline_value:
+        return [
+            f"{label} differs (source {_shown(source_value)}, baseline {_shown(baseline_value)})"
+        ]
+    return []
+
+
 def pairing_drift(
     source_manifest: dict[str, Any], baseline_manifest: dict[str, Any]
 ) -> list[str]:
@@ -1856,18 +1926,30 @@ def pairing_drift(
         )
         if name not in PAIRING_UNCOMPARED_CELL_FIELDS
     ]
-    for label, block, key in PAIRING_IDENTITY:
-        source_value = _recorded_value(source_manifest, block, key)
-        baseline_value = _recorded_value(baseline_manifest, block, key)
-        if source_value is _MISSING or baseline_value is _MISSING:
+    for label, path in PAIRING_IDENTITY_FIELDS:
+        lines += _pairing_identity_lines(
+            f"{label} ({path})",
+            _recorded_path(source_manifest, path),
+            _recorded_path(baseline_manifest, path),
+        )
+    for block in PAIRING_IDENTITY_BLOCKS:
+        source_block = source_manifest.get(block) or {}
+        baseline_block = baseline_manifest.get(block) or {}
+        if not source_block or not baseline_block:
+            # An empty block is not an empty difference: it is a record that names none of the
+            # substrate its rows were produced on, and nothing left to compare.
             lines.append(
-                f"{label} is not recorded on both sides "
-                f"(source {_shown(source_value)}, baseline {_shown(baseline_value)}), so nothing "
-                "proves the two archives measured the same thing"
+                f"{block} is not recorded on both sides (source "
+                f"{'recorded' if source_block else 'no such block'}, baseline "
+                f"{'recorded' if baseline_block else 'no such block'}), so nothing proves the two "
+                "archives ran on one substrate"
             )
-        elif source_value != baseline_value:
-            lines.append(
-                f"{label} differs (source {source_value!r}, baseline {baseline_value!r})"
+            continue
+        for key in sorted(set(source_block) | set(baseline_block)):
+            lines += _pairing_identity_lines(
+                f"{block}.{key}",
+                _recorded_path(source_manifest, f"{block}.{key}"),
+                _recorded_path(baseline_manifest, f"{block}.{key}"),
             )
     source_runtime = _inheritable_eval_runtime(source_manifest)
     baseline_runtime = _inheritable_eval_runtime(baseline_manifest)

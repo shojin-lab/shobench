@@ -127,7 +127,7 @@ def _source_run(
         run_dir=source_dir,
         sandbox=CellSandbox(run_id="src", home=home, workdir=source_dir / "work"),
     )
-    runner.write_json(source_dir / "manifest.json", build_manifest(ctx, probes={"version": "t"}))
+    runner.write_json(source_dir / "manifest.json", _archived_manifest(ctx))
     if with_terminus:
         runner.write_json(
             source_dir / ROLLOUT_STOPPING_FILE,
@@ -144,6 +144,24 @@ def _source_run(
                 parents=True, exist_ok=True
             )
     return source_dir
+
+
+def _archived_manifest(ctx) -> dict:
+    """What a real run leaves on disk, which is more than ``build_manifest`` returns.
+
+    The runner fills the effective credential mode in after the probe, so a manifest built here
+    and written straight out would be missing a field every archived run carries, and the pairing
+    identity would refuse fixtures for a reason no real archive has.
+    """
+    manifest = build_manifest(ctx, probes={"version": "t"})
+    manifest["axes"]["credential_mode"] = {
+        "requested": ctx.cell.credential_mode,
+        "effective": ctx.cell.credential_mode,
+        "matches_requested": True,
+        "source": "seeded file",
+        "evidence": "",
+    }
+    return manifest
 
 
 def _fingerprint(root: Path) -> dict[str, str]:
@@ -1061,9 +1079,7 @@ def _baseline_run(tmp_path: Path, cell, split, *, name: str = "baseline-run") ->
         run_dir=baseline_dir,
         sandbox=CellSandbox(run_id="b", home=home, workdir=baseline_dir / "work"),
     )
-    runner.write_json(
-        baseline_dir / "manifest.json", build_manifest(ctx, probes={"version": "t"})
-    )
+    runner.write_json(baseline_dir / "manifest.json", _archived_manifest(ctx))
     for task_id in split.heldout.task_ids:
         (baseline_dir / "eval_before" / f"task-{int(task_id):05d}").mkdir(parents=True)
     return baseline_dir
@@ -1588,7 +1604,7 @@ def _real_cell_source(tmp_path: Path) -> Path:
         run_dir=source_dir,
         sandbox=CellSandbox(run_id="src", home=home, workdir=source_dir / "work"),
     )
-    runner.write_json(source_dir / "manifest.json", build_manifest(ctx, probes={"version": "t"}))
+    runner.write_json(source_dir / "manifest.json", _archived_manifest(ctx))
     runner.write_json(
         source_dir / ROLLOUT_STOPPING_FILE,
         {"stop_reason": "pool_exhausted", "session_id": _SID},
@@ -2574,3 +2590,134 @@ def test_every_cell_field_is_judged_for_a_pairing() -> None:
     for field in runner.BOOKEND_EVAL_RUNTIME_FIELDS:
         assert f"budget.{field}" in uncompared
     assert runner.pairing_drift({}, {}) != []
+
+
+# ----- the pairing identity covers every recorded eval input ------------------------------------
+#
+# The cell block is not the whole definition of a before row. The kickoff every eval leg is sent
+# lives outside cells/, the shogym revision serves and scores the task, and the image and its
+# probed harness build are the CLI that ran. A baseline differing on any of those contributed rows
+# produced another way, and the published artifact carries only the rows and a run id.
+
+
+def _set_path(manifest: dict, path: str, value) -> None:
+    block = manifest
+    *steps, leaf = path.split(".")
+    for step in steps:
+        block = block.setdefault(step, {})
+    block[leaf] = value
+
+
+def _drop_path(manifest: dict, path: str) -> None:
+    block = manifest
+    *steps, leaf = path.split(".")
+    for step in steps:
+        block = block.get(step, {})
+    block.pop(leaf, None)
+
+
+def _paired_manifests(tmp_path: Path):
+    """Two archives of one definition: a rollout-only source and its deferred baseline."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    read = lambda d: json.loads((d / "manifest.json").read_text(encoding="utf-8"))  # noqa: E731
+    return read(source_dir), read(baseline_dir)
+
+
+def test_two_archives_of_one_definition_pair(tmp_path: Path) -> None:
+    """The control the mutations below are measured against, and the shape the real v0 pairs
+    have: everything the pairing rests on is recorded and identical."""
+    source, baseline = _paired_manifests(tmp_path)
+    assert runner.pairing_drift(source, baseline) == []
+
+
+@pytest.mark.parametrize("path", [path for _, path in runner.PAIRING_IDENTITY_FIELDS])
+def test_a_pairing_identity_that_differs_refuses(tmp_path: Path, path: str) -> None:
+    """Generated from the identity set itself, so a field added to it is exercised the day it
+    is added rather than the day someone remembers to test it."""
+    source, baseline = _paired_manifests(tmp_path)
+    _set_path(baseline, path, "something-the-source-never-used")
+
+    drift = runner.pairing_drift(source, baseline)
+    assert drift and any(path in line for line in drift), drift
+
+
+@pytest.mark.parametrize("path", [path for _, path in runner.PAIRING_IDENTITY_FIELDS])
+def test_a_pairing_identity_that_is_unrecorded_refuses(tmp_path: Path, path: str) -> None:
+    """Absent on one side or on both. An identity is a record ASSERTING what produced its rows,
+    so silence proves nothing and two silences agree about nothing."""
+    source, baseline = _paired_manifests(tmp_path)
+    unrecorded = lambda: [  # noqa: E731
+        line for line in runner.pairing_drift(source, baseline) if "not recorded" in line
+    ]
+    _drop_path(baseline, path)
+    assert unrecorded(), path
+
+    _drop_path(source, path)
+    assert unrecorded(), path
+
+
+@pytest.mark.parametrize("block", runner.PAIRING_IDENTITY_BLOCKS)
+def test_a_pairing_identity_block_is_compared_key_by_key(tmp_path: Path, block: str) -> None:
+    """The substrate and the probe are compared whole rather than field by field, so a key added
+    to either is eval-defining until someone judges otherwise. A block missing altogether names
+    none of what its rows ran on, which is a refusal of its own."""
+    source, baseline = _paired_manifests(tmp_path)
+    assert baseline[block], "the fixture must model an archive that records this block"
+    for key in baseline[block]:
+        mutated = json.loads(json.dumps(baseline))
+        mutated[block][key] = "something-else"
+        drift = runner.pairing_drift(source, mutated)
+        assert drift and any(f"{block}.{key}" in line for line in drift), (key, drift)
+
+    without = json.loads(json.dumps(baseline))
+    del without[block]
+    drift = runner.pairing_drift(source, without)
+    assert drift and any("one substrate" in line or block in line for line in drift), drift
+
+
+def test_the_pairing_identity_set_is_the_decided_one() -> None:
+    """The decision, written where removing a field breaks a test rather than a measurement.
+
+    Every entry is a recorded fact a before row was produced by: the ids it ran over, the blind
+    prompt and the user turn it was sent, the image and harness build that ran it, the account
+    that served it, and the substrate that served and scored it. What is deliberately absent is
+    listed beside the constants in the runner, each with its reason.
+    """
+    assert runner.PAIRING_IDENTITY_FIELDS == (
+        ("split ids", "split.id_digest"),
+        ("eval instruction", "instruction.eval_system_sha256"),
+        ("eval kickoff", "instruction.kickoff"),
+        ("agent image", "container.agent_image"),
+        ("credential mode", "axes.credential_mode.effective"),
+    )
+    assert runner.PAIRING_IDENTITY_BLOCKS == ("substrate", "harness_probes")
+
+
+def test_a_baseline_with_another_kickoff_is_refused_through_the_entry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """One of the three the review mutated, driven through the real entry rather than the
+    helper, so the refusal is proven where the spend would have happened."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    baseline_manifest = json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8"))
+    baseline_manifest["instruction"]["kickoff"] = "A different eval opener.\n"
+    runner.write_json(baseline_dir / "manifest.json", baseline_manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="eval kickoff"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=baseline_dir,
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
