@@ -446,12 +446,12 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
                     )
                     == manifest.get("split", {}).get("id_digest"),
                     "baseline_has_eval_before": runner._has_eval_before(baseline_dir),
-                    # The before side's stopping rule and the after side's must be one rule,
-                    # so the runner refuses a baseline whose recorded eval runtime differs
-                    # from the source's, and the plan says so before anything spends.
-                    "baseline_eval_runtime_matches": (
-                        runner.recorded_eval_runtime(baseline_manifest)
-                        == runner.recorded_eval_runtime(manifest)
+                    # The before side's stopping rule and the after side's must be one KNOWN
+                    # rule, so the runner refuses a baseline whose recorded eval runtime
+                    # differs from the source's or is missing on either side, and the plan
+                    # says so before anything spends.
+                    "baseline_eval_runtime_matches": runner.eval_runtimes_agree(
+                        manifest, baseline_manifest
                     ),
                 }
             )
@@ -546,8 +546,8 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         ("baseline_has_eval_before", "the named baseline has no eval_before provenance"),
         (
             "baseline_eval_runtime_matches",
-            "the named baseline recorded a different eval runtime, so the before and after "
-            "sides would be scored under different stopping rules",
+            "the named baseline's recorded eval runtime does not pair with the source's, so "
+            "the before and after sides would not be scored under one stopping rule",
         ),
     ):
         value = refusals.get(state)

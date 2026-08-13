@@ -1901,7 +1901,8 @@ def test_an_unrecoverable_eval_runtime_refuses() -> None:
     assert will_run.budget.eval_task_timeout_s == cell.budget.eval_task_timeout_s
     drift = _bookend_drift(manifest, cell, split, instruction)
     assert drift and any("budget.eval_task_timeout_s" in line for line in drift), drift
-    assert any(runner.CELL_FIELD_ABSENT in line for line in drift), drift
+    # The line says the record has no such field, never a value that merely spells like one.
+    assert any("recorded no such field" in line for line in drift), drift
 
 
 @pytest.mark.parametrize(
@@ -2095,7 +2096,7 @@ def test_a_baseline_measured_under_another_bound_is_refused(
     launches: dict[int, dict] = {}
     _wire_fakes(monkeypatch, cell, split, launches)
 
-    with pytest.raises(RuntimeError, match="different stopping rules"):
+    with pytest.raises(RuntimeError, match="one stopping rule"):
         asyncio.run(
             runner.rebookend_run(
                 source_dir,
@@ -2241,5 +2242,171 @@ def test_cli_blocks_a_baseline_measured_under_another_bound(tmp_path: Path, caps
         == 1
     )
     err = capsys.readouterr().err
-    assert "BLOCKED" in err and "different stopping rules" in err
+    assert "BLOCKED" in err and "one stopping rule" in err
+    assert not (tmp_path / "runs").exists()
+
+
+# ----- a reopened bookend keeps the runtime it inherited ---------------------------------------
+#
+# The inheritance has to survive every path that reconstructs the run, not only the one that
+# creates it. A bookend's recorded config_sha256 is the CURRENT file's digest, since the file it
+# was built from never changed, so the continuation's whole-config check passes a reopening and
+# cannot notice that the checkout's budget is not the one the run was measured under.
+
+
+def _bookend_recording_another_runtime(tmp_path: Path, monkeypatch, launches: dict[int, dict]):
+    """A REAL bookend whose recorded eval runtime differs from the checkout's.
+
+    Produced by the entry itself rather than assembled by hand, so its manifest carries what a
+    real bookend carries: the inherited budget in ``cell``, and the unchanged cell file's own
+    digest, which is exactly why a reopening is not refused.
+    """
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    source_manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_manifest["cell"]["budget"]["eval_task_timeout_s"] = 300
+    source_manifest["cell"]["budget"]["eval_concurrency"] = 3
+    runner.write_json(source_dir / "manifest.json", source_manifest)
+    _wire_fakes(monkeypatch, cell, split, launches)
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+    run_dir = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cell"]["config_sha256"] == cell.to_manifest()["config_sha256"], (
+        "the fixture is only faithful if the digest is the checkout's own"
+    )
+    assert (cell.budget.eval_task_timeout_s, cell.budget.eval_concurrency) == (120, 1)
+    return run_dir, cell
+
+
+def _capture_reopened_cell(monkeypatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    async def fake_run_phases(ctx, *, manifest, phases, results_dir, observer, **kwargs):
+        captured["cell"] = ctx.cell
+        captured["manifest"] = manifest
+        return results_dir / "x.json"
+
+    monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
+    monkeypatch.setattr(runner, "_start_egress", lambda sandbox, run_dir: None)
+    monkeypatch.setattr(runner, "_watch_cell_credential", lambda ctx, spec: None)
+    return captured
+
+
+def test_a_repaired_bookend_keeps_the_runtime_it_inherited(tmp_path: Path, monkeypatch) -> None:
+    """A rerun-eval fills the ids infrastructure lost, beside rows already measured, so it must
+    bound them by the rule those rows were measured under. Read off the checkout instead, it
+    would splice two stopping rules into one artifact whose manifest names only one."""
+    launches: dict[int, dict] = {}
+    run_dir, cell = _bookend_recording_another_runtime(tmp_path, monkeypatch, launches)
+    captured = _capture_reopened_cell(monkeypatch)
+
+    asyncio.run(
+        runner.rerun_eval(run_dir, results_dir=tmp_path / "repair", capture_egress=False)
+    )
+
+    reopened = captured["cell"]
+    assert (reopened.budget.eval_task_timeout_s, reopened.budget.eval_concurrency) == (300, 3)
+    # And the record still says what it said: the reopening reads the runtime, never rewrites it.
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["rebookend"]["eval_runtime_from_record"] == {
+        "eval_task_timeout_s": 300,
+        "eval_concurrency": 3,
+    }
+    assert manifest["cell"]["budget"]["eval_task_timeout_s"] == 300
+
+
+def test_a_resumed_bookend_keeps_the_runtime_it_inherited(tmp_path: Path, monkeypatch) -> None:
+    """Same for the usage-limit path: a bookend that suspends mid-eval finishes its remaining
+    ids under the bound the finished ones were measured under, not the checkout's."""
+    launches: dict[int, dict] = {}
+    run_dir, cell = _bookend_recording_another_runtime(tmp_path, monkeypatch, launches)
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    runner.write_json(
+        run_dir / SUSPENSION_FILE,
+        {
+            "schema": "shobench.suspension/1",
+            "run_id": manifest["run_id"],
+            "cell": cell.name,
+            "harness": cell.harness,
+            "phase": "eval_after",
+            "completed_task_ids": [0],
+            "pending_task_ids": [1, 2],
+            "stop_evidence": StopVerdict(StopKind.USAGE_LIMIT, "the window closed").to_json(),
+            "suspended_at": 1.0,
+        },
+    )
+    captured = _capture_reopened_cell(monkeypatch)
+
+    asyncio.run(
+        runner.resume_cell(run_dir, results_dir=tmp_path / "resumed", capture_egress=False)
+    )
+
+    reopened = captured["cell"]
+    assert (reopened.budget.eval_task_timeout_s, reopened.budget.eval_concurrency) == (300, 3)
+
+
+def test_a_value_that_spells_like_absence_still_refuses() -> None:
+    """Absence is compared as an identity, not as a spelling.
+
+    While the missing-key default WAS the display string, a field whose legitimate value spelled
+    the same way compared equal to a missing one in either direction, which reopened the union's
+    fail-closed hole for that one value. model and effort accept arbitrary text and reach harness
+    session construction, so the hole was reachable rather than theoretical.
+    """
+    assert runner.cell_field_drift({}, {"model": runner.CELL_FIELD_ABSENT}) != {}
+    assert runner.cell_field_drift({"model": runner.CELL_FIELD_ABSENT}, {}) != {}
+
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    del manifest["cell"]["model"]
+    spelled = replace(cell, model=runner.CELL_FIELD_ABSENT)
+
+    drift = runner.experiment_drift(
+        manifest,
+        cell=runner.bookend_cell(spelled, manifest),
+        split=split,
+        instruction=instruction,
+        scope=runner.DRIFT_BOOKEND,
+    )
+    assert drift and any("cell model" in line for line in drift), drift
+    # And the line distinguishes the two sides, which the record's single string cannot.
+    assert any("recorded no such field" in line for line in drift), drift
+
+
+def test_two_unrecorded_runtimes_are_not_an_agreement(tmp_path: Path, monkeypatch) -> None:
+    """A pair whose stopping rule neither side recorded is unproven, not matched. Silence is
+    not a value, and the check exists to know that the before rows and the after rows stopped
+    by the same rule."""
+    assert runner.eval_runtimes_agree({}, {}) is False
+
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    for run_dir in (source_dir, baseline_dir):
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        for field in runner.BOOKEND_EVAL_RUNTIME_FIELDS:
+            del manifest["cell"]["budget"][field]
+        runner.write_json(run_dir / "manifest.json", manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="one stopping rule"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=baseline_dir,
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
     assert not (tmp_path / "runs").exists()

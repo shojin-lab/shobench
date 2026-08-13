@@ -562,26 +562,39 @@ are produced differently; `name`; and the split's id digest and both system-prom
 are compared under either scope. The inherited fields refuse too, because the comparison runs
 against the cell the bookend will actually run: it is what holds the inheritance to its word, and
 a record with no runtime to inherit refuses rather than lending the file's, since an absence is
-not a value. The comparison walks the UNION of the recorded and current field sets with an
-explicit absence sentinel, so an axis added to the cell after a run was recorded surfaces instead
-of passing (comparing only recorded fields let every historical manifest through no matter how a
-new axis was classified), and a field the cell has since dropped surfaces the same way; only the
-two versioned legacy axes read absence as a value, absent `rollout_feedback` as never and absent
-`eval_context` as cold. The uncompared remainder is the bookkeeping that never reaches a session:
+not a value. The comparison walks the UNION of the recorded and current field sets,
+comparing presence before values, so an axis added to the cell after a run was recorded surfaces
+instead of passing (comparing only recorded fields let every historical manifest through no matter
+how a new axis was classified), and a field the cell has since dropped surfaces the same way; only
+the two versioned legacy axes read absence as a value, absent `rollout_feedback` as never and
+absent `eval_context` as cold. Absence is compared as an identity rather than as a spelling,
+because `model` and `effort` accept arbitrary text and reach session construction, so a field
+whose value happened to spell like the absence marker would otherwise compare equal to a missing
+one; the marker becomes the published string only once the two sides are known to differ, and a
+refusal line says `no such field` where the record says `<absent>`. The uncompared remainder is
+the bookkeeping that never reaches a session:
 the lookup keys `split` and `instruction_arm`, whose identities are the digests, plus
 `config_path`, `note` and `config_sha256`. The pairing gets the same rule as the ids: a named
-`--baseline` whose recorded eval runtime differs from the source's is refused, because the before
-and after sides would be scored under two stopping rules. None of this is absorbed silently. The
+`--baseline` is refused unless both records state the same eval runtime, because the before and
+after sides would otherwise be scored under two stopping rules, and two silences are not an
+agreement about one. None of this is absorbed silently. The
 bookend's manifest carries `rebookend.eval_runtime_from_record` (the values that bounded its
 legs), the source's recorded cell block (`rebookend.source_cell`) beside the block it ran under
 (`cell`), and `rebookend.cell_drift` naming every field the checkout's file states differently
 with both values, and the plan prints the same before anything spends, so a reader of the numbers
 sees which rule scored them and what the file would have run instead without finding two
-checkouts to diff. A repaired bookend keeps the whole-digest comparison, deliberately:
-`rerun-eval` splices rows beside rows this run already measured, so a definitional edit would put
-two runtimes inside one artifact with nothing in a row to say which produced it, and the operator
-refused there can rebookend the source again, which measures the whole held-out set under one
-definition.
+checkouts to diff. Every path that REOPENS a bookend rebuilds it from its own record
+first: a resume after a usage limit and a `rerun-eval` repair both restore the recorded eval
+runtime along with the recorded axes, before the drift check and before the run context exists.
+The digest cannot stand in for that, and this is the one case where it silently would not, since
+a bookend's recorded `config_sha256` is its unchanged cell file's own digest: the reopening passes
+the whole-config check while the checkout's budget is not the one the finished rows were measured
+under, and reading it off the checkout would splice two stopping rules into one artifact and
+republish a manifest naming a runtime that was never in force. The whole-digest comparison itself
+stays for a repaired bookend, deliberately: `rerun-eval` fills ids beside ids this run already
+measured, so a definitional edit would put two definitions inside one artifact with nothing in a
+row to say which produced it, and the operator refused there can rebookend the source again,
+which measures the whole held-out set under one definition.
 
 Refused before anything is copied or spent: a source without a terminus, without a
 resolvable terminal session, holding a suspension record, or still owned by a live process,

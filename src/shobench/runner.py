@@ -1601,10 +1601,17 @@ BOOKEND_UNCOMPARED_CELL_FIELDS = (
 # name cannot differ, since the cell is loaded by the name the record carries. It refuses rather
 # than resting on that.
 
-# What a comparison finds where a manifest has no such field at all. A string rather than None,
-# because None is a legitimate recorded value (a cell with no pool_ceiling records null) and a
-# sentinel that collides with a real value would read as agreement.
+# How a missing field is SHOWN, in a refusal line and in the record a bookend publishes.
 CELL_FIELD_ABSENT = "<absent>"
+
+# How a missing field is COMPARED. Absence has to be an identity rather than a spelling: as a
+# string it was indistinguishable from a field whose legitimate value happens to spell the same
+# way, and model and effort take arbitrary text and reach harness session construction, so one
+# accepted value reopened the hole the union comparison exists to close. None cannot serve
+# either, being a legitimate recorded value (a cell with no pool_ceiling records null). This
+# object never leaves the comparison: it becomes the display form only once the two sides are
+# known to differ.
+_MISSING = object()
 
 # The only absences read as values rather than as differences, because each is a versioned axis
 # whose pre-axis meaning is known: never was the only rollout posture before the feedback arm
@@ -1629,32 +1636,63 @@ def _flat_cell(cell_manifest: dict[str, Any]) -> dict[str, Any]:
     return {**LEGACY_AXIS_DEFAULTS, **flat}
 
 
-def cell_field_drift(
+def _cell_differences(
     recorded_cell: dict[str, Any], current_cell: dict[str, Any]
-) -> dict[str, dict[str, Any]]:
+) -> list[tuple[str, Any, Any]]:
     """Every field the two cell blocks state differently, over the UNION of their fields.
 
     Field by field rather than by the file's digest, because the digest answers only whether the
     bytes moved: a caller that has to decide whether the difference matters, or that has to tell
-    a reader which value ran, gets nothing from it. Returned as a mapping from the dotted field
-    name to both values, so the refusal and the record are one computation read twice.
+    a reader which value ran, gets nothing from it.
 
     The union is what makes it fail closed, and the intersection was the bug: a field added to
     the cell after a run was recorded exists on one side only, so comparing only the recorded
     keys let every historical manifest through no matter how the new axis was classified, and a
-    field REMOVED from the cell went the same way. Both sides get the absence sentinel instead,
-    so an axis that appears or disappears is a difference an operator is told about. The two
-    legacy axes are the exception, and only because their pre-axis meaning is known.
+    field REMOVED from the cell went the same way. Presence is compared before values here, so a
+    field that is missing on one side differs from one that is present with any value at all.
+    The two legacy axes are the exception, and only because their pre-axis meaning is known.
+
+    ``_MISSING`` is kept in the result rather than rendered, so each caller can say absence its
+    own way: unambiguously in a refusal line, and as the published string in the record.
     """
     recorded = _flat_cell(recorded_cell)
     current = _flat_cell(current_cell)
+    differences = []
+    for name in sorted(set(recorded) | set(current)):
+        was = recorded.get(name, _MISSING)
+        now = current.get(name, _MISSING)
+        present = (was is not _MISSING, now is not _MISSING)
+        if present[0] != present[1] or (all(present) and was != now):
+            differences.append((name, was, now))
+    return differences
+
+
+def _shown(value: Any) -> str:
+    """A side of a difference as a refusal line says it: no such field, or the value itself.
+
+    The two forms are deliberately not interchangeable. A field missing from the record needs a
+    value added to the checkout or a record repaired; a field whose value merely SPELLS like the
+    absence marker needs neither, and an operator reading the line has to be able to tell which
+    they are looking at. The published record keeps one string for both, where the surrounding
+    block says which fields each side carries.
+    """
+    return "no such field" if value is _MISSING else repr(value)
+
+
+def cell_field_drift(
+    recorded_cell: dict[str, Any], current_cell: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """The differences as a record carries them: dotted field name to both values.
+
+    The same computation the refusal reads, so what an operator is refused for and what an
+    artifact reports can never be two different answers.
+    """
     return {
         name: {
-            "recorded": recorded.get(name, CELL_FIELD_ABSENT),
-            "checkout": current.get(name, CELL_FIELD_ABSENT),
+            "recorded": CELL_FIELD_ABSENT if was is _MISSING else was,
+            "checkout": CELL_FIELD_ABSENT if now is _MISSING else now,
         }
-        for name in sorted(set(recorded) | set(current))
-        if recorded.get(name, CELL_FIELD_ABSENT) != current.get(name, CELL_FIELD_ABSENT)
+        for name, was, now in _cell_differences(recorded_cell, current_cell)
     }
 
 
@@ -1674,28 +1712,75 @@ def bookend_cell(cell: Cell, source_manifest: dict[str, Any]) -> Cell:
     value, and only the operator can say what a run recorded before the field existed was
     measured under.
     """
-    recorded_budget = source_manifest.get("cell", {}).get("budget", {})
-    inherited = {
-        field: recorded_budget[field]
-        for field in BOOKEND_EVAL_RUNTIME_FIELDS
-        if recorded_budget.get(field) is not None
-    }
     return replace(
         cell,
         rollout_feedback=recorded_rollout_feedback(source_manifest),
         eval_context="resumed",
-        budget=replace(cell.budget, **inherited),
+        budget=replace(cell.budget, **_inheritable_eval_runtime(source_manifest)),
     )
 
 
-def recorded_eval_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
-    """The eval runtime a run recorded: what a bookend inherits, and what its baseline is held to.
+def reopened_cell(cell: Cell, manifest: dict[str, Any]) -> Cell:
+    """The cell a reopening runs, rebuilt from the run's own record rather than off the checkout.
 
-    Absences stay the sentinel rather than being filled in, because two runs that both recorded
-    nothing are not thereby known to have been measured under the same rule.
+    Two recoveries apply to every run. The feedback arm and the eval context are the axes the run
+    was measured under, and the checkout's defaults may have moved since; shogym would refuse to
+    reopen the provenance directory under the other regime anyway, so recovering them makes this
+    an explicit reconstruction rather than a refusal an operator has to decode.
+
+    The third applies to a BOOKEND, and it is the one the whole-config check cannot catch. A
+    bookend's eval runtime came from the run it bookends, so its record legitimately differs from
+    its cell file while its recorded config_sha256 IS that unchanged file's digest: the digest
+    check passes the reopening, and a reopening that read the budget off the checkout would
+    finish the remaining ids under a rule the finished ids never saw, splicing two stopping rules
+    into one artifact whose manifest names one of them. The recorded cell block is the authority,
+    so a bookend published before the runtime was inherited also reconstructs to what it ran.
     """
-    budget = manifest.get("cell", {}).get("budget", {})
+    cell = replace(
+        cell,
+        rollout_feedback=recorded_rollout_feedback(manifest),
+        eval_context=recorded_eval_context(manifest),
+    )
+    if "rebookend" not in manifest:
+        # Every other run recorded the checkout's own budget, and the digest check that follows
+        # refuses if the file moved since, so there is nothing here to reconstruct.
+        return cell
+    return replace(cell, budget=replace(cell.budget, **_inheritable_eval_runtime(manifest)))
+
+
+def _inheritable_eval_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The eval runtime fields a record can hand over, absences left out.
+
+    A field the record does not carry is not inherited and not defaulted: the caller keeps what
+    it had and the drift check refuses the difference, because only an operator can say what a
+    run recorded before the field existed was measured under.
+    """
+    budget = manifest.get("cell", {}).get("budget", {}) or {}
+    return {
+        field: budget[field]
+        for field in BOOKEND_EVAL_RUNTIME_FIELDS
+        if budget.get(field) is not None
+    }
+
+
+def recorded_eval_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The eval runtime a run recorded, as a reader is shown it, absences included."""
+    budget = manifest.get("cell", {}).get("budget", {}) or {}
     return {field: budget.get(field, CELL_FIELD_ABSENT) for field in BOOKEND_EVAL_RUNTIME_FIELDS}
+
+
+def eval_runtimes_agree(manifest: dict[str, Any], other: dict[str, Any]) -> bool:
+    """Whether two runs are KNOWN to have been measured under one eval stopping rule.
+
+    Two absences are not an agreement. A run that recorded no bound is one nobody can say what
+    bounded it, so a pair with a missing side is unproven rather than matched, and unproven is
+    what this refuses: the point of the check is that the before rows and the after rows stopped
+    by the same rule, which is a fact about records rather than about their silence.
+    """
+    known = _inheritable_eval_runtime(manifest)
+    return len(known) == len(BOOKEND_EVAL_RUNTIME_FIELDS) and known == _inheritable_eval_runtime(
+        other
+    )
 
 
 def experiment_drift(
@@ -1760,8 +1845,8 @@ def experiment_drift(
     else:
         cell_lines = [
             f"cell {field} changed since the run started "
-            f"(recorded {values['recorded']!r}, checkout {values['checkout']!r})"
-            for field, values in cell_field_drift(recorded_cell, cell.to_manifest()).items()
+            f"(recorded {_shown(was)}, checkout {_shown(now)})"
+            for field, was, now in _cell_differences(recorded_cell, cell.to_manifest())
             if field not in BOOKEND_UNCOMPARED_CELL_FIELDS
         ]
     return cell_lines + [
@@ -2571,27 +2656,17 @@ async def _resume_cell_owned(
     record = json.loads((run_dir / SUSPENSION_FILE).read_text(encoding="utf-8"))
     interrupted_phase = record.get("phase", "rollout")
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    cell = load_cell_by_name(manifest["cell"]["name"])
-    recorded_regime = recorded_rollout_feedback(manifest)
-    if cell.rollout_feedback != recorded_regime:
-        # The continuation finishes the experiment the record started, so the run's recorded
-        # feedback arm wins over the checkout's default. shogym would refuse to reopen the
-        # provenance directory under the other regime anyway; this makes the recovery explicit
-        # instead of a refusal the operator has to decode. Backfilled into the manifest below,
-        # so later resumptions read an explicit value.
-        cell = replace(cell, rollout_feedback=recorded_regime)
-    manifest["cell"]["rollout_feedback"] = recorded_regime
-    recorded_context = recorded_eval_context(manifest)
-    if cell.eval_context != recorded_context:
-        # Same recovery for the eval context: the run's recorded posture wins, so a pre-axis
-        # run's remaining eval tasks run cold, the way the finished ones were measured.
-        cell = replace(cell, eval_context=recorded_context)
-    manifest["cell"]["eval_context"] = recorded_context
+    # The continuation finishes the experiment the record started, so the run's own record wins
+    # over the checkout: its axes, and a bookend's inherited eval runtime.
+    cell = reopened_cell(load_cell_by_name(manifest["cell"]["name"]), manifest)
+    # Backfilled so a later resumption reads explicit values where this one read absence.
+    manifest["cell"]["rollout_feedback"] = cell.rollout_feedback
+    manifest["cell"]["eval_context"] = cell.eval_context
     # The instruction record stays consistent with the recovered axis, so the artifact keeps
     # naming the prompt its eval_after actually launches with; a pre-axis manifest recovers
     # cold and so names the blind eval instruction.
     manifest.setdefault("instruction", {})["eval_prompt_used"] = (
-        "rollout_system" if recorded_context == "resumed" else "eval_system"
+        "rollout_system" if cell.eval_context == "resumed" else "eval_system"
     )
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
@@ -2784,23 +2859,15 @@ async def _rerun_eval_owned(
             "phase with `shobench run --phases eval_before` instead."
         )
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    cell = load_cell_by_name(manifest["cell"]["name"])
-    recorded_regime = recorded_rollout_feedback(manifest)
-    if cell.rollout_feedback != recorded_regime:
-        # Same recovery as a resume: the run's recorded arm wins over the checkout's default,
-        # even though an eval re-run never constructs a rollout stream, so the manifest this
-        # process republishes keeps describing the experiment that actually ran.
-        cell = replace(cell, rollout_feedback=recorded_regime)
-    manifest["cell"]["rollout_feedback"] = recorded_regime
-    recorded_context = recorded_eval_context(manifest)
-    if cell.eval_context != recorded_context:
-        # And for the eval context, which a re-run acts on directly: the holes are re-run
-        # under the posture the finished ids were measured under, never today's default.
-        cell = replace(cell, eval_context=recorded_context)
-    manifest["cell"]["eval_context"] = recorded_context
+    # Same reconstruction as a resume, and a repair needs it for the same reason a resume does:
+    # the holes are re-run under the posture and the stopping rule the finished ids were
+    # measured under, never today's, or one artifact would carry rows scored two ways.
+    cell = reopened_cell(load_cell_by_name(manifest["cell"]["name"]), manifest)
+    manifest["cell"]["rollout_feedback"] = cell.rollout_feedback
+    manifest["cell"]["eval_context"] = cell.eval_context
     # Same consistency rule as a resume: the record names the prompt its eval_after runs with.
     manifest.setdefault("instruction", {})["eval_prompt_used"] = (
-        "rollout_system" if recorded_context == "resumed" else "eval_system"
+        "rollout_system" if cell.eval_context == "resumed" else "eval_system"
     )
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
@@ -3154,14 +3221,13 @@ async def rebookend_run(
         # seals between the two bounds is scoreable on one side and force-stopped on the other,
         # and the delta would be an artifact of the bounds. Refused rather than reconciled,
         # because nothing here can say which rule the pair should have had.
-        source_runtime = recorded_eval_runtime(source_manifest)
-        baseline_runtime = recorded_eval_runtime(baseline_manifest)
-        if source_runtime != baseline_runtime:
+        if not eval_runtimes_agree(source_manifest, baseline_manifest):
             raise RuntimeError(
-                f"the baseline {baseline_dir} recorded eval runtime {baseline_runtime} and the "
-                f"source recorded {source_runtime}: the before side and the after side would be "
-                "scored under different stopping rules, so the paired delta would measure the "
-                "bounds as much as the agent."
+                f"the baseline {baseline_dir} recorded eval runtime "
+                f"{recorded_eval_runtime(baseline_manifest)} and the source recorded "
+                f"{recorded_eval_runtime(source_manifest)}: the before side and the after side "
+                "would not be scored under one stopping rule, so the paired delta would measure "
+                "the bounds as much as the agent."
             )
         baseline_run_id = str(baseline_manifest.get("run_id", ""))
         baseline_dir_resolved = baseline_dir
