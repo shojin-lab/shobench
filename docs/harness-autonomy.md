@@ -536,6 +536,139 @@ source home, a cycle, or a special file refuses loudly. Publication is atomic ev
 (``write_results`` swaps the leaf entry in with ``os.replace``), and a rebookend additionally
 refuses up front any output directory, result leaf, or new run path that resolves into the
 source, so a link planted at a deterministic name is refused or replaced, never followed.
+The drift check a bookend applies compares the recorded cell block FIELD BY FIELD rather than
+by the cell file's digest, and it permits no drift at all. A resume and a rerun-eval write more
+of a measurement that already exists, under the run id that already names it, so they refuse on
+the digest: nothing about that run may change. A rebookend publishes a NEW run over a rollout
+that is finished and immutable, so an edit made after that rollout ended cannot reach it, and
+the digest is the wrong question anyway, since it moves for a comment as readily as for a
+swapped model (the real case: an eval timeout retuned after two rollouts finished refused both
+of their bookends). What replaces the digest is not permission but INHERITANCE. Three fields
+come from the record rather than from the checkout: `rollout_feedback`, the arm the source's
+rollout served; and `eval_task_timeout_s` and `eval_concurrency`, the eval runtime its before
+side was scored under. The runtime pair matters as much as the arm, because the timeout is both
+the held-out task stream's deadline and the leg's hard stop, so a bookend run under a shorter
+bound would force-stop a task that the before side had time to seal, and the paired delta would
+measure the bounds as much as the agent; concurrency is not score-neutral either, since
+concurrent legs share the host, the network and the provider account while their per-task clocks
+run, so contention and throttling become timeouts and unscored rows. Per-task homes isolate task
+STATE, not resources. `eval_context` is pinned to resumed, being the one axis a rebookend exists
+to change. Everything else refuses on any difference: `env`, `harness`, `model`, `effort`,
+`credential_mode` and `env_kwargs`, which are what its eval sessions are made of; `max_in_flight`,
+`rollout_wall_clock_s` and `pool_ceiling`, which define the rollout it inherits a home from and
+would otherwise be published as numbers nobody ran; `required_env`, a precondition rather than a
+measurement, refused because a cell that needs a key it did not need before is a cell whose legs
+are produced differently; `name`; and the split's id digest and both system-prompt digests, which
+are compared under either scope. The inherited fields refuse too, because the comparison runs
+against the cell the bookend will actually run: it is what holds the inheritance to its word, and
+a record with no runtime to inherit refuses rather than lending the file's, since an absence is
+not a value. The comparison walks the UNION of the recorded and current field sets,
+comparing presence before values, so an axis added to the cell after a run was recorded surfaces
+instead of passing (comparing only recorded fields let every historical manifest through no matter
+how a new axis was classified), and a field the cell has since dropped surfaces the same way; only
+the two versioned legacy axes read absence as a value, absent `rollout_feedback` as never and
+absent `eval_context` as cold. Absence is compared as an identity rather than as a spelling,
+because `model` and `effort` accept arbitrary text and reach session construction, so a field
+whose value happened to spell like the absence marker would otherwise compare equal to a missing
+one; the marker becomes the published string only once the two sides are known to differ, and a
+refusal line says `no such field` where the record says `<absent>`. The uncompared remainder is
+the bookkeeping that never reaches a session:
+the lookup keys `split` and `instruction_arm`, whose identities are the digests, plus
+`config_path`, `note` and `config_sha256`. The identity digests fail closed in this scope too: a bookend has given up the whole-cell
+digest, so the split's id digest and the two prompt digests are the only proof left that its eval
+measures the source's held-out ids under the source's prompts, and a record that states none of
+them is refused rather than read as agreement (a continuation keeps the old rule, its whole-cell
+digest being proof of its own). The PAIRING is held to the same standard as the run: a named
+`--baseline` is not equivalent because it answers to the same cell name, two archives of one name
+being able to sit either side of any edit to the file, so `pairing_drift` compares the two
+RECORDS across everything that shaped the before rows the bookend will carry. From the cell block:
+`name`, `env`, `harness`, `model`, `effort`, `credential_mode`, `env_kwargs`, `required_env`. And
+the row's execution identity, which both sides must STATE rather than merely agree on, absence
+refusing exactly as a difference does: the split id digest and the blind-eval prompt digest, the
+`kickoff` every eval leg is actually sent (which no cell digest covers, the instructions living
+outside `cells/`), the `container.agent_image` tag and the `harness_probes` block probed inside
+it, the effective credential mode from `axes`, the whole `substrate` block (the shogym revision
+that serves and scores every task, its repo, and the MCP server name the agent's tools appear
+under), the `axes.effort` block, the `split.provenance` block, and the eval runtime. Those four
+blocks are compared key by key rather than field by named field, so a key added to any of them is
+eval-defining until someone judges otherwise. The effort block is not a restatement of the cell's
+effort: `requested` is the ask, and `applied` and `how` are whether it reached the harness at all.
+The split provenance is not a restatement of `id_digest` either, which hashes the env name, the
+ids and the env kwargs, meaning POSITIONS rather than content: tau2 resolves those positions
+against a byte-verified upstream tree whose sha lives in the provenance, so two archives can share
+every id and score different task bytes. That check is only as good as what an env records, and
+hle carries no immutable dataset revision today, so for hle it proves the split file and not the
+dataset behind it. What the credential mode establishes is narrow and stated as such:
+`subscription`, `api_key` or `unknown`, never WHICH account, since the auth files carry rotating
+tokens (a hash of one fingerprints a credential rather than an account and would refuse a pairing
+across an ordinary refresh) and their only stable identifiers are the account email and id, which
+must never enter a published artifact.
+
+The identity is checked THREE ways, not two, and they are one enumerated fact set with one
+absence discipline. Archive to archive is the pairing above. Archive to checkout is
+`experiment_drift`, which guards the cell definition and the prompts. Archive to EFFECTIVE
+EXECUTION is the third: the run about to happen has an identity of its own (the image it resolved,
+the substrate it imports, the split provenance and prompts it will send, the effort the harness
+will apply, the probe the image prints, the credential mode the seeded home reports), and
+recording that in the new manifest documents a mismatch rather than preventing one. So the
+spending path builds the current identity and compares it against the record before
+`_run_phases`, on every path that adds rows to an existing measurement: a rebookend, a resume and
+a rerun-eval alike. Where each fact is checked follows from when it can be known. Everything
+derivable from the checkout and docker is compared before a byte is copied. The harness probe
+exists only once a container has printed it and the effective credential mode only once a
+credential is placed, so those two are compared at that moment, after setup and before the first
+leg, which is the last point at which no row exists yet. A reopen path takes no probe, so it
+compares the image content id instead, a stricter statement about the same image, and names the
+probe unproven rather than inventing one. Absence on either side is named rather than refused
+here, because the current side may be unable to answer (no docker for a digest, no probe on this
+path) and the archive may predate the field; a stated disagreement refuses. The image is resolved
+to its content id ONCE per run and that id is what every probe and every leg is given, so a
+concurrent rebuild or retag cannot slide different bytes under a run whose manifest names the tag.
+
+Two identities also get a THREE-WAY rule against fail-closed absence, because fail-closed absence
+refuses history: no archive written before this change records the agent image's content id or the
+runner's own revision, and requiring them would refuse the pairings this entry exists for. Every
+run records both from now on (`container.image_digest` from `docker image inspect`, and
+`substrate.shobench_rev` with a `shobench_dirty` flag beside it, since shogym serves and scores a
+task while this package decides how it is launched and supervised). The pairing compares them when
+both archives state them, refuses when exactly one does, and passes when neither does while NAMING
+them in the plan (`baseline_pairing_unproven`) and in the bookend's manifest
+(`rebookend.pairing_identity_unproven`), so the artifact says what it could not establish instead
+of implying it established everything. It is the same versioned-absence idea as `rollout_feedback`
+and `eval_context` with the opposite reading: those two have a known pre-axis meaning, these have
+none, so they get visibility rather than a default. A dirty runner tree reads as an absence too,
+its commit not identifying the code that ran. What is deliberately absent from that set is
+enumerated in the runner with a reason each: the continuation cue no eval leg is sent, the rollout
+prompt a deferred baseline never used, the lookup names whose identities are the digests, the
+observed models and other OUTCOMES (the real terra pair records `['gpt-5.6-terra']` on the source
+from its rollout and `[]` on the baseline from its before legs, so comparing them would refuse a
+pairing for having measured something), `axes.model.requested`, which restates a compared cell field, the run-local
+bookkeeping, and the record's own schema version. One group is deliberately not compared, and the reason is checkable rather
+than stylistic: `rollout_feedback`, `max_in_flight`, `rollout_wall_clock_s` and `pool_ceiling`
+shape a rollout a deferred baseline never ran, `EvalStream` pins the blind feedback posture
+whatever the cell's arm says, and the eval fan-out is one session per task whatever
+`max_in_flight` says. Both v0 pairs really do differ there, their sources having run the immediate
+arm and their baselines the never arm, so comparing the rollout knobs would refuse every pairing
+that exists over what provably cannot reach a before row. The plan and the spending path call the
+same helper, so a dry run cannot report a pairing the `--go` will refuse. None of this is absorbed silently. The
+bookend's manifest carries `rebookend.eval_runtime_from_record` (the values that bounded its
+legs), the source's recorded cell block (`rebookend.source_cell`) beside the block it ran under
+(`cell`), and `rebookend.cell_drift` naming every field the checkout's file states differently
+with both values, and the plan prints the same before anything spends, so a reader of the numbers
+sees which rule scored them and what the file would have run instead without finding two
+checkouts to diff. Every path that REOPENS a bookend rebuilds it from its own record
+first: a resume after a usage limit and a `rerun-eval` repair both restore the recorded eval
+runtime along with the recorded axes, before the drift check and before the run context exists.
+The digest cannot stand in for that, and this is the one case where it silently would not, since
+a bookend's recorded `config_sha256` is its unchanged cell file's own digest: the reopening passes
+the whole-config check while the checkout's budget is not the one the finished rows were measured
+under, and reading it off the checkout would splice two stopping rules into one artifact and
+republish a manifest naming a runtime that was never in force. The whole-digest comparison itself
+stays for a repaired bookend, deliberately: `rerun-eval` fills ids beside ids this run already
+measured, so a definitional edit would put two definitions inside one artifact with nothing in a
+row to say which produced it, and the operator refused there can rebookend the source again,
+which measures the whole held-out set under one definition.
+
 Refused before anything is copied or spent: a source without a terminus, without a
 resolvable terminal session, holding a suspension record, or still owned by a live process,
 and any output path, result leaf, or new run path at or under the source. A

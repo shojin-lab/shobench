@@ -54,6 +54,7 @@ from shobench.containers import (
     docker,
     home_digest,
     home_inventory,
+    image_digest,
     run_relative,
     run_stem,
     write_json,
@@ -68,7 +69,7 @@ from shobench.credentials import (
 from shobench.credentials import effective_mode as credential_effective_mode
 from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
-from shobench.pins import SHOGYM_REPO, SHOGYM_REV
+from shobench.pins import SHOGYM_REPO, SHOGYM_REV, shobench_revision
 from shobench.redact import MARKER as redact_marker
 from shobench.redact import Redactor, redactor_for, secrets_in_file
 from shobench.results import (
@@ -238,7 +239,12 @@ class RunContext:
     run_dir: Path
     sandbox: CellSandbox
     port: int = DEFAULT_PORT
+    # What docker is actually given: the image's content id once it resolves, so every probe and
+    # every leg of one run uses the same bytes even if the tag is moved under it mid-run. The tag
+    # it was asked for and the id it resolved to are carried beside it for the record.
     agent_image: str = AGENT_IMAGE
+    image_tag: str = ""
+    image_digest: str | None = None
     credentials: dict[str, str] = field(default_factory=dict)
     legs: list[LegRecord] = field(default_factory=list)
     # Legs this process did not run: the record a suspended run left behind. A continuation is
@@ -348,6 +354,56 @@ def _probe(
     return (result.stdout + result.stderr).strip()
 
 
+def substrate_block() -> dict[str, Any]:
+    """What a row is produced ON, in the shape the manifest records and a comparison reads.
+
+    shogym serves and scores the task; this package decides how it is launched and supervised,
+    which is the other half, so its revision sits beside shogym's. Built here rather than inline
+    because the same block is what a later run compares itself against: one function means the
+    recorded fact and the checked fact cannot drift apart.
+    """
+    revision, dirty = shobench_revision()
+    return {
+        "shogym_repo": SHOGYM_REPO,
+        "shogym_rev": SHOGYM_REV,
+        "mcp_server_name": SERVER_NAME,
+        "shobench_rev": revision,
+        "shobench_dirty": dirty,
+    }
+
+
+def effort_axis(cell: Cell, harness: Harness) -> dict[str, Any]:
+    """What the cell asked of the harness, and what the harness will do with it.
+
+    ``requested`` is the ask and ``applied``/``how`` are whether it reaches the CLI at all, which
+    is a property of the harness rather than of the cell: every prime_agent cell requests an
+    effort no prime_agent build can apply. Shared with the comparison for the same reason as the
+    substrate block.
+    """
+    return {
+        "requested": cell.effort,
+        "applied": bool(cell.effort and harness.effort_flag),
+        "how": (
+            harness.effort_flag
+            or f"{harness.name} exposes no reasoning-effort control; it is ignored"
+        ),
+    }
+
+
+def pinned_image(agent_image: str) -> tuple[str, str, str | None]:
+    """The image a run pins itself to: what to run, the tag asked for, and the content id.
+
+    A tag is mutable and a run is long. Resolving it once, here, and handing the ID to every
+    probe and every leg is what makes the recorded digest a statement about the bytes that ran
+    rather than about what the tag happened to point at when the manifest was written; a
+    concurrent rebuild or retag then cannot slide a different image under the run. Resolution
+    that fails leaves the tag in place and records no digest, which is the honest absence: a
+    host without docker is about to fail for better reasons anyway.
+    """
+    digest = image_digest(agent_image)
+    return digest or agent_image, agent_image, digest
+
+
 def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]:
     """The record of what this cell was, written before anything spends.
 
@@ -379,11 +435,12 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
                 "rollout_system" if ctx.cell.eval_context == "resumed" else "eval_system"
             ),
         },
-        "substrate": {
-            "shogym_repo": SHOGYM_REPO,
-            "shogym_rev": SHOGYM_REV,
-            "mcp_server_name": SERVER_NAME,
-        },
+        # What the row was produced ON. shogym serves and scores the task; this package decides
+        # how the task is launched and supervised, which is the other half, so its revision is
+        # recorded beside shogym's rather than left for a reader to infer from a timestamp. The
+        # dirty flag says whether that revision identifies the code: a modified tree's commit
+        # does not, and a comparison has to be able to tell.
+        "substrate": substrate_block(),
         "harness_probes": probes,
         # What the cell asked for, and what the harness will actually do with it. These used to
         # be one field each, copied out of the cell file, which made the manifest a restatement
@@ -402,17 +459,17 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
                     else f"{ctx.harness.name} names no model in its trace; nothing observes it"
                 ),
             },
-            "effort": {
-                "requested": ctx.cell.effort,
-                "applied": bool(ctx.cell.effort and ctx.harness.effort_flag),
-                "how": (
-                    ctx.harness.effort_flag
-                    or f"{ctx.harness.name} exposes no reasoning-effort control; it is ignored"
-                ),
-            },
+            "effort": effort_axis(ctx.cell, ctx.harness),
         },
         "container": {
-            "agent_image": ctx.agent_image,
+            "agent_image": ctx.image_tag or ctx.agent_image,
+            # The tag names the image; this identifies it. Rebuilding one tag on a newer base
+            # or a different runtime leaves the tag and the harness version probe unchanged
+            # while changing the agent, so the content id is what a later comparison rests on.
+            # Resolved ONCE, before the first container, and reused for every probe and leg, so
+            # what is recorded is what ran rather than what the tag pointed at when asked. Null
+            # where docker could not answer, which reads as the absence it is.
+            "image_digest": ctx.image_digest,
             "network": ctx.sandbox.network,
             "netns_container": ctx.sandbox.netns_container,
             "home": run_relative(ctx.sandbox.home, ctx.run_dir),
@@ -1516,8 +1573,714 @@ def recorded_eval_context(manifest: dict[str, Any]) -> str:
     return str(manifest.get("cell", {}).get("eval_context") or "cold")
 
 
+# Which definitional edits a reopening refuses, named by what the reopening produces.
+#
+# A CONTINUATION writes more of a measurement that already exists, under the run id that already
+# names it: ``resume`` finishes the phases a usage limit interrupted, and ``rerun-eval`` fills
+# rows infrastructure lost. Both refuse every definitional edit there is, because one run id must
+# not describe two experiments, and rows measured under a second definition spliced into one
+# artifact are exactly that.
+#
+# A BOOKEND is a new run. ``rebookend`` reuses only the source's finished home and its terminal
+# session, runs eval_after alone, and publishes under an id of its own; the source's rollout is
+# complete and immutable, so an edit made after it ended cannot reach it and cannot turn the
+# bookend into a second description of it. What it must not do is measure its after side by a
+# different rule than the before side it will be paired against, so nothing is allowed to drift:
+# the arm and the eval runtime are RECOVERED from the record and run under, and every field the
+# comparison covers refuses. What the bookend does not inherit is the cell file's digest, which
+# moves for a comment as readily as for a swapped model and so answers the wrong question.
+DRIFT_CONTINUATION = "continuation"
+DRIFT_BOOKEND = "bookend"
+DRIFT_SCOPES = (DRIFT_CONTINUATION, DRIFT_BOOKEND)
+
+# The eval runtime a bookend takes from the record rather than from the cell file, because both
+# sides of a paired measurement have to be scored under one stopping rule.
+#
+# eval_task_timeout_s is the deadline the held-out task stream is built with AND the leg's hard
+# timeout, so a task that seals between the recorded bound and a shorter current one is scoreable
+# on the before side and force-stopped on the after side. The paired delta would then be two
+# measurements under different rules, which no amount of recording in the artifact repairs.
+#
+# eval_concurrency is not score-neutral either. Per-task homes and sessions isolate task STATE,
+# not the resources a timed leg needs: concurrent legs share the host, the network and the
+# provider account while their per-task clocks run, so contention and throttling turn into
+# timeouts and unscored rows. It comes from the record for the same reason.
+BOOKEND_EVAL_RUNTIME_FIELDS = ("eval_task_timeout_s", "eval_concurrency")
+
+# The cell fields a bookend does not compare at all, each for its own reason.
+#
+# eval_context is the one axis a rebookend changes by definition: the runner pins resumed
+# whatever the file says, and every source this entry exists for measured its after cold, so
+# comparing it would refuse every bookend there is. The bookend's axes block states what it ran.
+#
+# split and instruction_arm are lookup keys rather than identities. The held-out ids are
+# identified by the split's id digest and the prompts by their system-prompt digests, and both
+# are compared against the record separately below; a file renamed with its content unchanged is
+# not a different measurement, and one edited in place is caught by the digest.
+#
+# config_sha256 is the check this scope exists to replace. It covers every byte of the file,
+# comments and runtime fields alike, so it cannot tell a retuned timeout from a swapped model.
+# It is still reported into the bookend's record, where "the file itself changed" is worth a
+# reader knowing.
+#
+# config_path is where the file sits in the checkout and note is free text carried to a reader.
+# Neither reaches a session.
+BOOKEND_UNCOMPARED_CELL_FIELDS = (
+    "eval_context",
+    "split",
+    "instruction_arm",
+    "config_sha256",
+    "config_path",
+    "note",
+)
+
+# Every other field in the block refuses on any difference, including a field added after this
+# comment was written. Named in full, because a field nobody judged is a field nobody can rely on.
+#
+# env, harness, model, effort, credential_mode and env_kwargs are what the bookend's own eval
+# sessions are made of: the environment, the CLI, the model behind it, the effort it thinks at,
+# the account that serves it, and how the environment is constructed (tau2's task split, hle's
+# judge).
+#
+# rollout_feedback is the source's arm and eval_task_timeout_s and eval_concurrency are the eval
+# runtime. All three are recovered from the record onto the cell before the comparison runs, so
+# the checkout's values cannot leak into the bookend; the comparison holds those recoveries to
+# their word, and refuses where the record carried no value to recover.
+#
+# max_in_flight, rollout_wall_clock_s and pool_ceiling define the rollout the bookend inherits a
+# home from. The bookend runs none of it, so they cannot change its eval, but a bookend that
+# published them as today's numbers would label the source's arm with a rollout nobody ran.
+#
+# required_env is a precondition rather than a measurement, and it refuses anyway: a cell that
+# needs a key it did not need before is a cell whose legs are produced differently, and the
+# operator is the one who can say whether the edit was meant for this bookend.
+#
+# name cannot differ, since the cell is loaded by the name the record carries. It refuses rather
+# than resting on that.
+
+# The cell fields that shape the ROLLOUT and reach nothing else, which is what makes them the one
+# group a PAIRING does not compare. A deferred baseline runs eval_before alone: ``EvalStream``
+# pins the blind feedback posture whatever the cell's arm says and refuses a provenance directory
+# recorded under any other, the eval fan-out is one session per task whatever max_in_flight says,
+# and neither the rollout's wall clock nor its serving ceiling is read by an eval phase. Both v0
+# pairs really do differ here, their sources having run the immediate arm and their deferred
+# baselines the never arm, so comparing these would refuse every pairing there is over what
+# provably cannot reach a before row. The source-to-checkout comparison still refuses them, for a
+# different reason: there they would relabel the arm the bookend publishes.
+ROLLOUT_ONLY_CELL_FIELDS = (
+    "rollout_feedback",
+    "max_in_flight",
+    "budget.rollout_wall_clock_s",
+    "budget.pool_ceiling",
+)
+
+# The digests a bookend rests on once it has given up the whole-cell one: the only remaining proof
+# that its eval measures the run's held-out ids under the run's prompts.
+IDENTITY_DIGESTS = (
+    ("split ids", "split", "id_digest"),
+    ("rollout instruction", "instruction", "rollout_system_sha256"),
+    ("eval instruction", "instruction", "eval_system_sha256"),
+)
+
+# WHEN each fact can be compared, which is a property of the fact rather than of the caller. Most
+# are knowable from the checkout and docker before anything runs. Two are not: a harness probe
+# exists only once a container has run one, and the effective credential mode only once a
+# credential has been seeded, so those are checked at the point they become known, before any row
+# is filled, rather than being dropped for being awkward.
+IDENTITY_PRE_SPEND = "pre_spend"
+IDENTITY_AFTER_SETUP = "after_setup"
+
+# A row's EXECUTION IDENTITY outside the cell block: what it was measured over and under, and
+# what ran it. The kickoff is here because no cell digest covers it, the instructions living
+# outside cells/, and the image tag because it names the CLI that ran, with its content id below.
+#
+# The effective credential mode says which KIND of account served the legs (subscription, api_key
+# or unknown) and no more: two different subscription accounts record the same value and compare
+# equal, so account identity is NOT established here. It is not recorded either, deliberately.
+# The auth files carry rotating tokens, so hashing one fingerprints a credential rather than an
+# account and would refuse a pairing across an ordinary refresh, and their only stable
+# identifiers are the account email and id, which must never enter a published artifact.
+PAIRING_IDENTITY_FIELDS = (
+    ("split ids", "split.id_digest", IDENTITY_PRE_SPEND),
+    ("eval instruction", "instruction.eval_system_sha256", IDENTITY_PRE_SPEND),
+    ("eval kickoff", "instruction.kickoff", IDENTITY_PRE_SPEND),
+    ("agent image tag", "container.agent_image", IDENTITY_PRE_SPEND),
+    ("credential mode", "axes.credential_mode.effective", IDENTITY_AFTER_SETUP),
+)
+
+# Blocks compared whole, key by key, because pinning what produced a row is their entire purpose.
+#
+# substrate is the code the row ran on: the shogym revision that serves and scores every task, the
+# repo it comes from, the MCP server name the agent's tools appear under, and this runner's own
+# revision, whose absence is handled below.
+# harness_probes is what the harness reported from inside the image.
+# axes.effort is not a restatement of the cell's effort: ``requested`` is the cell's ask, and
+# ``applied`` and ``how`` are whether that ask reached the harness at all. A before side that
+# applied an effort the source's did not is a different measurement, and only this block records
+# the difference.
+# split.provenance is what the held-out POSITIONS resolve against. id_digest hashes the env name,
+# the ids and the env kwargs, which is positions rather than content: tau2 resolves those
+# positions against a byte-verified upstream tree whose sha lives here, so two archives can share
+# every id and score different task bytes. Recording is what makes this checkable, and it is only
+# as good as what an env records: hle carries no immutable dataset revision today, so for hle this
+# proves the split file and not the dataset behind it. That gap is real and is not closed here.
+#
+# A key added to any of these is eval-defining until someone judges otherwise, which is the
+# fail-closed direction and the reason they are compared whole rather than field by named field.
+PAIRING_IDENTITY_BLOCKS = (
+    ("substrate", IDENTITY_PRE_SPEND),
+    ("split.provenance", IDENTITY_PRE_SPEND),
+    ("axes.effort", IDENTITY_PRE_SPEND),
+    ("harness_probes", IDENTITY_AFTER_SETUP),
+)
+
+# The identities no archive carries yet, and so the only ones whose absence is tolerated rather
+# than refused: every other fact here is in every real archive, and requiring these would refuse
+# every pairing that exists. Recording them starts now; ``_identity_agreement`` holds the rule.
+# A dirty runner tree reads as an absence too, its commit not identifying the code that ran.
+PAIRING_VERSIONED_IDENTITY = (
+    ("agent image digest", "container.image_digest", IDENTITY_PRE_SPEND),
+    ("runner revision", "substrate.shobench_rev", IDENTITY_PRE_SPEND),
+)
+
+# Keys inside the compared blocks that identify nothing on their own. ``shobench_dirty`` says
+# whether the revision beside it identifies anything, and it is read exactly there; comparing it
+# separately would refuse a pair of edited checkouts for agreeing that they were edited.
+PAIRING_UNCOMPARED_IDENTITY_PATHS = ("substrate.shobench_dirty",)
+
+# Deliberately NOT compared, each for a reason a reader can check.
+#
+# instruction.continuation is the cue that reopens a ROLLOUT; no eval leg is ever sent it.
+# instruction.rollout_system_sha256 is the standing prompt of a rollout a deferred baseline never
+# ran, and the bookend's own resumed after side carries it, where the source-to-checkout
+# comparison guards it.
+# instruction.arm and split.path are lookup keys whose identities are the digests above.
+# axes.model.observed and observed_models are OUTCOMES read off the traces, not definitions, and
+# the two sides' come from different phases: in the real terra pair the source recorded
+# ['gpt-5.6-terra'] from its rollout and the baseline [] from its before legs, so comparing them
+# would refuse a pairing for having measured something.
+# axes.model.requested restates a cell field already compared. axes.effort does NOT, and is
+# compared as a block above.
+# substrate.shobench_dirty is not compared for its own sake: it says whether the revision beside
+# it identifies anything, and that is read where the revision is compared.
+# container.network, container.netns_container, container.home, home, work, redaction,
+# credential_seed, run_id, started_at, ended_at, resumptions and eval_reruns are run-local
+# bookkeeping: they name this run's resources and history, not what its rows were produced by.
+# schema names the record's shape rather than the measurement, and every field the pairing rests
+# on is compared by name, so a purely additive bump must not refuse every archive that predates
+# it.
+
+# What a pairing compares between the two RECORDED runs, as everything the cell block carries
+# except these. The bookend's uncompared bookkeeping is uncompared here for the same reasons; the
+# rollout-only fields for the reason above; and the eval runtime because it is compared under the
+# stricter rule below, where both sides must state it rather than merely agree.
+PAIRING_UNCOMPARED_CELL_FIELDS = (
+    *BOOKEND_UNCOMPARED_CELL_FIELDS,
+    *ROLLOUT_ONLY_CELL_FIELDS,
+    *(f"budget.{field}" for field in BOOKEND_EVAL_RUNTIME_FIELDS),
+)
+
+# How a missing field is SHOWN, in a refusal line and in the record a bookend publishes.
+CELL_FIELD_ABSENT = "<absent>"
+
+# How a missing field is COMPARED. Absence has to be an identity rather than a spelling, since
+# model and effort take arbitrary text and reach harness session construction, so a field whose
+# value spells like the marker must not compare equal to a missing one. None cannot serve either,
+# being a legitimate recorded value (a cell with no pool_ceiling records null). This object never
+# leaves the comparison: it becomes the display form only once the two sides are known to differ.
+_MISSING = object()
+
+# The only absences read as values rather than as differences, because each is a versioned axis
+# whose pre-axis meaning is known: never was the only rollout posture before the feedback arm
+# existed, and cold the only eval posture before the eval context did. Nothing else is
+# normalized. A field this list does not name is missing, not defaulted, and missing refuses.
+LEGACY_AXIS_DEFAULTS = {"rollout_feedback": "never", "eval_context": "cold"}
+
+
+def _flat_cell(cell_manifest: dict[str, Any]) -> dict[str, Any]:
+    """The cell manifest block as one level of dotted names, so a field is comparable by name.
+
+    Only the budget table nests, and its fields are judged one at a time rather than as a block,
+    so it is the only thing flattened. ``env_kwargs`` stays whole deliberately: it is one
+    statement of how the environment is constructed, and half of it agreeing means nothing.
+    """
+    flat: dict[str, Any] = {}
+    for key, value in cell_manifest.items():
+        if key == "budget" and isinstance(value, dict):
+            flat.update({f"budget.{name}": item for name, item in value.items()})
+        else:
+            flat[key] = value
+    return {**LEGACY_AXIS_DEFAULTS, **flat}
+
+
+def _cell_differences(
+    recorded_cell: dict[str, Any], current_cell: dict[str, Any]
+) -> list[tuple[str, Any, Any]]:
+    """Every field the two cell blocks state differently, over the UNION of their fields.
+
+    Field by field rather than by the file's digest, because the digest answers only whether the
+    bytes moved: a caller that has to decide whether the difference matters, or that has to tell
+    a reader which value ran, gets nothing from it.
+
+    The union is what makes it fail closed. A field added to the cell after a run was recorded
+    exists on one side only, and so does one since removed, so presence is compared before values
+    and a field missing on one side differs from one present with any value at all. The two
+    legacy axes are the exception, and only because their pre-axis meaning is known.
+
+    ``_MISSING`` is kept in the result rather than rendered, so each caller can say absence its
+    own way: unambiguously in a refusal line, and as the published string in the record.
+    """
+    recorded = _flat_cell(recorded_cell)
+    current = _flat_cell(current_cell)
+    differences = []
+    for name in sorted(set(recorded) | set(current)):
+        was = recorded.get(name, _MISSING)
+        now = current.get(name, _MISSING)
+        present = (was is not _MISSING, now is not _MISSING)
+        if present[0] != present[1] or (all(present) and was != now):
+            differences.append((name, was, now))
+    return differences
+
+
+def _shown(value: Any) -> str:
+    """A side of a difference as a refusal line says it: no such field, or the value itself.
+
+    The two forms are deliberately not interchangeable: a field missing from the record needs a
+    value added or a record repaired, and a field whose value merely SPELLS like the absence
+    marker needs neither. The published record keeps one string for both.
+
+    Long values are cut, because a harness probe is a page of CLI output and a refusal nobody can
+    read is a refusal nobody reads. Both manifests carry the whole value either way.
+    """
+    if value is _MISSING:
+        return "no such field"
+    shown = repr(value)
+    return shown if len(shown) <= 120 else f"{shown[:117]}..."
+
+
+def cell_field_drift(
+    recorded_cell: dict[str, Any], current_cell: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """The differences as a record carries them: dotted field name to both values.
+
+    The same computation the refusal reads, so what an operator is refused for and what an
+    artifact reports can never be two different answers.
+    """
+    return {
+        name: {
+            "recorded": CELL_FIELD_ABSENT if was is _MISSING else was,
+            "checkout": CELL_FIELD_ABSENT if now is _MISSING else now,
+        }
+        for name, was, now in _cell_differences(recorded_cell, current_cell)
+    }
+
+
+def bookend_cell(cell: Cell, source_manifest: dict[str, Any]) -> Cell:
+    """The cell a rebookend actually runs: the source's recorded arm and eval runtime, resumed.
+
+    Three fields come from the record rather than from the checkout, each for its own reason. The
+    feedback arm is what the source's rollout served, so a never-arm source publishes honestly as
+    never plus resumed. The eval runtime is the stopping rule the before side was scored under,
+    and a paired delta whose two sides ran under different rules is two measurements rather than
+    one. The eval context is the single axis a rebookend exists to change, so it is pinned rather
+    than inherited.
+
+    The runner and the plan both build the cell here, so the plan's verdict is the runner's.
+    Where the record carries no eval runtime to inherit, the checkout's value stands and the
+    drift check refuses it: an absence is not a value, and only the operator can say what a run
+    recorded before the field existed was measured under.
+    """
+    return replace(
+        cell,
+        rollout_feedback=recorded_rollout_feedback(source_manifest),
+        eval_context="resumed",
+        budget=replace(cell.budget, **_inheritable_eval_runtime(source_manifest)),
+    )
+
+
+def reopened_cell(cell: Cell, manifest: dict[str, Any]) -> Cell:
+    """The cell a reopening runs, rebuilt from the run's own record rather than off the checkout.
+
+    Two recoveries apply to every run. The feedback arm and the eval context are the axes the run
+    was measured under, and the checkout's defaults may have moved since; shogym would refuse to
+    reopen the provenance directory under the other regime anyway, so recovering them makes this
+    an explicit reconstruction rather than a refusal an operator has to decode.
+
+    The third applies to a BOOKEND, and it is the one the whole-config check cannot catch: a
+    bookend's eval runtime came from the run it bookends, so its record legitimately differs from
+    its cell file while its recorded config_sha256 IS that unchanged file's digest. The digest
+    check therefore passes the reopening, and a reopening that read the budget off the checkout
+    would finish the remaining ids under a rule the finished ones never saw. The recorded cell
+    block is the authority, so a bookend published before the runtime was inherited also
+    reconstructs to what it ran.
+    """
+    cell = replace(
+        cell,
+        rollout_feedback=recorded_rollout_feedback(manifest),
+        eval_context=recorded_eval_context(manifest),
+    )
+    if "rebookend" not in manifest:
+        # Every other run recorded the checkout's own budget, and the digest check that follows
+        # refuses if the file moved since, so there is nothing here to reconstruct.
+        return cell
+    return replace(cell, budget=replace(cell.budget, **_inheritable_eval_runtime(manifest)))
+
+
+def _inheritable_eval_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The eval runtime fields a record can hand over, absences left out.
+
+    A field the record does not carry is not inherited and not defaulted: the caller keeps what
+    it had and the drift check refuses the difference, because only an operator can say what a
+    run recorded before the field existed was measured under.
+    """
+    budget = manifest.get("cell", {}).get("budget", {}) or {}
+    return {
+        field: budget[field]
+        for field in BOOKEND_EVAL_RUNTIME_FIELDS
+        if budget.get(field) is not None
+    }
+
+
+def recorded_eval_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The eval runtime a run recorded, as a reader is shown it, absences included."""
+    budget = manifest.get("cell", {}).get("budget", {}) or {}
+    return {field: budget.get(field, CELL_FIELD_ABSENT) for field in BOOKEND_EVAL_RUNTIME_FIELDS}
+
+
+def _recorded_value(manifest: dict[str, Any], block: str, key: str) -> Any:
+    """One recorded field, with a null read as the absence it is rather than as a value."""
+    value = (manifest.get(block) or {}).get(key)
+    return _MISSING if value is None else value
+
+
+def _recorded_path(manifest: dict[str, Any], path: str) -> Any:
+    """One recorded field named by its dotted path, absent or null reading as absence."""
+    value: Any = manifest
+    for step in path.split("."):
+        if not isinstance(value, dict) or step not in value:
+            return _MISSING
+        value = value[step]
+    return _MISSING if value is None else value
+
+
+def _pairing_identity_lines(label: str, source_value: Any, baseline_value: Any) -> list[str]:
+    """One identity compared between two archives: stated on both sides, and the same.
+
+    Absence refuses rather than passing, the whole point of an identity being that a record
+    ASSERTS what produced its rows; two silences agree about nothing.
+    """
+    if source_value is _MISSING or baseline_value is _MISSING:
+        return [
+            f"{label} is not recorded on both sides (source {_shown(source_value)}, baseline "
+            f"{_shown(baseline_value)}), so nothing proves the two archives measured the same way"
+        ]
+    if source_value != baseline_value:
+        return [
+            f"{label} differs (source {_shown(source_value)}, baseline {_shown(baseline_value)})"
+        ]
+    return []
+
+
+def _versioned_identity(manifest: dict[str, Any], path: str) -> Any:
+    """A versioned identity as recorded, with a runner revision from a dirty tree read as absent.
+
+    A commit is an identity only when the tree that ran was that commit. A modified one shares
+    the sha and not the code, so two edited checkouts must not prove anything about each other.
+    """
+    value = _recorded_path(manifest, path)
+    if path == "substrate.shobench_rev" and _recorded_path(manifest, "substrate.shobench_dirty"):
+        return _MISSING
+    return value
+
+
+def identity_facts(stage: str | None = None) -> tuple[tuple[str, str, bool], ...]:
+    """The enumerated identity as (label, path, versioned) triples, optionally for one stage.
+
+    One list, read by all three comparisons, so archive-to-archive, archive-to-checkout and
+    archive-to-execution can never be checking different things. Block members expand to their
+    keys at comparison time, since a block's keys are whatever the two records carry.
+    """
+    facts: list[tuple[str, str, bool]] = []
+    for label, path, fact_stage in PAIRING_IDENTITY_FIELDS:
+        if stage in (None, fact_stage):
+            facts.append((f"{label} ({path})", path, False))
+    for label, path, fact_stage in PAIRING_VERSIONED_IDENTITY:
+        if stage in (None, fact_stage):
+            facts.append((f"{label} ({path})", path, True))
+    return tuple(facts)
+
+
+def identity_blocks(stage: str | None = None) -> tuple[str, ...]:
+    """The blocks compared key by key, optionally for one stage."""
+    return tuple(
+        block for block, fact_stage in PAIRING_IDENTITY_BLOCKS if stage in (None, fact_stage)
+    )
+
+
+def _identity_agreement(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    left_name: str,
+    right_name: str,
+    stage: str | None,
+    archives: bool,
+) -> tuple[list[str], list[str]]:
+    """Two identities compared fact by fact: what disagrees, and what neither could state.
+
+    THE absence discipline, stated once here because every comparison in this module routes
+    through it. ``archives`` picks which of the two applies, and they differ because the sides
+    differ.
+
+    Between two ARCHIVES, both are finished records of finished runs, so:
+
+        both state it   -> compared, and a difference refuses;
+        one states it   -> refuses, one record proving what the other cannot;
+        neither         -> refuses, unless the fact is versioned (no archive written before it
+                           can carry it), in which case it is named as unproven instead.
+
+    Against a CURRENT identity, which is not a finished record (docker may not answer for a
+    digest, a path may take no probe, and the archive may predate the field):
+
+        both state it   -> compared, and a difference refuses;
+        either silent   -> named as unproven.
+
+    Both disciplines put the same fact in the same list, which is what makes one published
+    unproven list mean one thing.
+    """
+    lines: list[str] = []
+    unproven: list[str] = []
+    for label, path, versioned in identity_facts(stage):
+        left_value = _versioned_identity(left, path) if versioned else _recorded_path(left, path)
+        right_value = (
+            _versioned_identity(right, path) if versioned else _recorded_path(right, path)
+        )
+        missing = left_value is _MISSING or right_value is _MISSING
+        if missing and (not archives or (versioned and left_value is right_value)):
+            unproven.append(path)
+            continue
+        lines += _identity_lines(label, left_value, right_value, left_name, right_name)
+    versioned_paths = {path for _, path, _stage in PAIRING_VERSIONED_IDENTITY}
+    for block in identity_blocks(stage):
+        left_block = _recorded_path(left, block)
+        right_block = _recorded_path(right, block)
+        left_keys = set(left_block) if isinstance(left_block, dict) else set()
+        right_keys = set(right_block) if isinstance(right_block, dict) else set()
+        if archives and not (left_keys and right_keys):
+            # An absent block in an archive is not an empty difference: it is a record that names
+            # none of what its rows were produced by, leaving nothing to compare.
+            lines.append(
+                f"{block} is not recorded on both sides ({left_name} "
+                f"{'recorded' if left_keys else 'no such block'}, {right_name} "
+                f"{'recorded' if right_keys else 'no such block'}), so nothing proves the two "
+                "were produced the same way"
+            )
+            continue
+        for key in sorted(left_keys | right_keys):
+            path = f"{block}.{key}"
+            if path in versioned_paths or path in PAIRING_UNCOMPARED_IDENTITY_PATHS:
+                # Owned by the versioned rule, or judged to identify nothing on its own.
+                continue
+            left_value = _recorded_path(left, path)
+            right_value = _recorded_path(right, path)
+            if left_value is _MISSING or right_value is _MISSING:
+                if not archives:
+                    unproven.append(path)
+                    continue
+            lines += _identity_lines(path, left_value, right_value, left_name, right_name)
+    return lines, sorted(set(unproven))
+
+
+def _identity_lines(
+    label: str, left_value: Any, right_value: Any, left_name: str, right_name: str
+) -> list[str]:
+    """One fact's verdict as a reader sees it, absence and difference worded differently."""
+    if left_value is _MISSING or right_value is _MISSING:
+        return [
+            f"{label} is not recorded on both sides ({left_name} {_shown(left_value)}, "
+            f"{right_name} {_shown(right_value)}), so nothing proves the two measured the same way"
+        ]
+    if left_value != right_value:
+        return [
+            f"{label} differs ({left_name} {_shown(left_value)}, "
+            f"{right_name} {_shown(right_value)})"
+        ]
+    return []
+
+
+def current_identity(
+    *,
+    cell: Cell,
+    split: Split,
+    instruction: Instruction,
+    harness: Harness,
+    image_tag: str,
+    image_digest_value: str | None,
+) -> dict[str, Any]:
+    """The identity of the run about to happen, in manifest shape, for what is knowable pre-spend.
+
+    Manifest shape rather than a bespoke structure, so the same paths name the same facts on both
+    sides of the comparison and a field added to the manifest is a field the comparison can be
+    taught in one place. Everything here is knowable before a container exists: the checkout's
+    split and prompts, the resolved image, the substrate, and the effort the harness will or will
+    not apply. What is not knowable yet is in ``after_setup_identity``.
+    """
+    return {
+        "split": {
+            "id_digest": split.to_manifest().get("id_digest"),
+            "provenance": dict(split.provenance),
+        },
+        "instruction": {
+            "eval_system_sha256": instruction.eval_system_sha256,
+            "kickoff": instruction.kickoff,
+        },
+        "container": {"agent_image": image_tag, "image_digest": image_digest_value},
+        "substrate": substrate_block(),
+        "axes": {"effort": effort_axis(cell, harness)},
+    }
+
+
+def after_setup_identity(
+    *, probes: dict[str, str] | None, credential_mode: dict[str, Any] | None
+) -> dict[str, Any]:
+    """The identity facts that exist only once a container has run and a credential is placed.
+
+    A harness probe is output from inside the image and the effective credential mode is read off
+    the seeded home, so neither can be compared before setup. A path that takes no probe passes
+    none, and the facts it cannot state are named as unproven rather than assumed: the reopen
+    paths are that case, and the image content id, compared pre-spend, is a stricter statement
+    about the same image than a version string would be.
+    """
+    identity: dict[str, Any] = {"harness_probes": dict(probes or {})}
+    if credential_mode is not None:
+        identity["axes"] = {"credential_mode": credential_mode}
+    return identity
+
+
+def execution_drift(
+    recorded: dict[str, Any], current: dict[str, Any], *, stage: str
+) -> tuple[list[str], list[str]]:
+    """The third side: what the run ABOUT TO HAPPEN does not share with the record it continues.
+
+    A pairing proves two archives agree with each other and a drift check proves the cell file
+    has not moved, and neither says anything about the image, the substrate, the prompts as sent
+    or the effort as applied that the new rows will actually be produced under. Recording those
+    in the new manifest documents a mismatch rather than preventing it, so they are compared
+    here, before ``_run_phases``, and a stated disagreement refuses.
+
+    ``stage`` says which facts are knowable yet: see ``IDENTITY_AFTER_SETUP``. The caller
+    publishes the returned unproven names, so the artifact says what it could not establish.
+    """
+    return _identity_agreement(
+        recorded,
+        current,
+        left_name="recorded",
+        right_name="current",
+        stage=stage,
+        archives=False,
+    )
+
+
+def _refuse_execution_drift(
+    recorded: dict[str, Any], current: dict[str, Any], *, stage: str, what: str
+) -> list[str]:
+    """Refuse a stated disagreement with the record, and hand back what could not be stated.
+
+    Raised rather than returned, unlike the plan-facing checks, because by the time a caller has
+    a current identity in hand it has decided to spend: the only useful thing to do with a
+    disagreement here is to stop before a row exists.
+    """
+    lines, unproven = execution_drift(recorded, current, stage=stage)
+    if lines:
+        raise RuntimeError(
+            f"the execution identity no longer matches the run {what}: "
+            + "; ".join(lines)
+            + ". Rows produced here would not belong to the measurement they would be published "
+            "as."
+        )
+    return unproven
+
+
+def pairing_unproven(
+    source_manifest: dict[str, Any], baseline_manifest: dict[str, Any]
+) -> list[str]:
+    """The identities NEITHER archive states, named so the artifact can say what it did not prove.
+
+    Published rather than swallowed, so a reader of the delta sees exactly which facts about the
+    two sides were never established. ``_identity_agreement`` decides what silence means.
+    """
+    return _identity_agreement(
+        source_manifest,
+        baseline_manifest,
+        left_name="source",
+        right_name="baseline",
+        stage=None,
+        archives=True,
+    )[1]
+
+
+def pairing_drift(
+    source_manifest: dict[str, Any], baseline_manifest: dict[str, Any]
+) -> list[str]:
+    """What the baseline's before rows were measured by that the source's after rows are not.
+
+    A rebookend publishes ONE measurement out of two archives: the after rows it runs against the
+    source's definition, and the before rows it carries from the baseline's. The delta is only a
+    measurement if both sides were produced the same way, and matching the cell NAME is no
+    evidence of that: two archived runs of one name can sit either side of any edit to the file.
+    So the comparison is over what the two RECORDS state, field by field, and everything refuses
+    except what provably cannot reach a before row (``PAIRING_UNCOMPARED_CELL_FIELDS``).
+
+    The ROLLOUT instruction is deliberately not compared. A deferred baseline ran no rollout, and
+    its before rows were produced under the eval prompt; the rollout prompt the bookend's own
+    resumed after side carries is checked against the source instead, where it belongs.
+
+    Returned as lines rather than a bool so the refusal can name every difference at once, and
+    shared by the plan and the spending path so a dry run cannot say something the ``--go`` will
+    not. Empty means the two archives are the same measurement seen twice.
+    """
+    lines = [
+        f"cell {name} differs (source {_shown(was)}, baseline {_shown(now)})"
+        for name, was, now in _cell_differences(
+            source_manifest.get("cell", {}), baseline_manifest.get("cell", {})
+        )
+        if name not in PAIRING_UNCOMPARED_CELL_FIELDS
+    ]
+    # Every stage, because both sides are finished records: a probe and a credential mode are as
+    # available in an archive as a split digest is. The stages only matter to the third
+    # comparison, where the current side is still becoming knowable.
+    lines += _identity_agreement(
+        source_manifest,
+        baseline_manifest,
+        left_name="source",
+        right_name="baseline",
+        stage=None,
+        archives=True,
+    )[0]
+    source_runtime = _inheritable_eval_runtime(source_manifest)
+    baseline_runtime = _inheritable_eval_runtime(baseline_manifest)
+    for bound in BOOKEND_EVAL_RUNTIME_FIELDS:
+        was, now = source_runtime.get(bound, _MISSING), baseline_runtime.get(bound, _MISSING)
+        if was is _MISSING or now is _MISSING:
+            lines.append(
+                f"eval runtime {bound} is not recorded on both sides (source {_shown(was)}, "
+                f"baseline {_shown(now)}), so the two sides are not known to stop by one rule"
+            )
+        elif was != now:
+            lines.append(
+                f"eval runtime {bound} differs (source {was!r}, baseline {now!r}): the before "
+                "side and the after side would not be scored under one stopping rule"
+            )
+    return lines
+
+
 def experiment_drift(
-    manifest: dict[str, Any], *, cell: Cell, split: Split, instruction: Instruction
+    manifest: dict[str, Any],
+    *,
+    cell: Cell,
+    split: Split,
+    instruction: Instruction,
+    scope: str = DRIFT_CONTINUATION,
 ) -> list[str]:
     """What the checkout now says that the recorded run does not, as human-readable lines.
 
@@ -1528,36 +2291,65 @@ def experiment_drift(
     half of the rollout would be run under. The digests to compare are already in the manifest,
     written before anything spent, so this is a comparison rather than a new mechanism.
 
+    ``scope`` names which comparison applies. A continuation refuses on the cell file's digest,
+    the strongest statement available: nothing about that run may change. A bookend compares the
+    cell field by field instead, because the digest cannot tell a rewritten comment from a
+    swapped model; every field it covers still refuses, and the fields a bookend inherits rather
+    than reads are recovered onto the cell before this runs, so the comparison is what proves the
+    inheritance happened. The split and instruction digests are compared under both scopes.
+
     Returned rather than raised, so a caller can report every difference at once. An operator
     told about the budget, only to be told about the split on the next attempt, learns to stop
     reading.
     """
+    if scope not in DRIFT_SCOPES:
+        raise ValueError(f"unknown drift scope {scope!r}; expected one of {DRIFT_SCOPES}")
     recorded_cell = manifest.get("cell", {})
-    recorded_split = manifest.get("split", {})
-    recorded_instruction = manifest.get("instruction", {})
-    checks = (
-        (
-            "cell config",
-            recorded_cell.get("config_sha256"),
-            cell.to_manifest().get("config_sha256"),
-        ),
-        ("split ids", recorded_split.get("id_digest"), split.to_manifest().get("id_digest")),
-        (
-            "rollout instruction",
-            recorded_instruction.get("rollout_system_sha256"),
-            instruction.rollout_system_sha256,
-        ),
-        (
-            "eval instruction",
-            recorded_instruction.get("eval_system_sha256"),
-            instruction.eval_system_sha256,
-        ),
-    )
-    return [
-        f"{what} changed since the run started (recorded {was}, now {now})"
-        for what, was, now in checks
-        if was is not None and now is not None and was != now
+    now_by_label = {
+        "split ids": split.to_manifest().get("id_digest"),
+        "rollout instruction": instruction.rollout_system_sha256,
+        "eval instruction": instruction.eval_system_sha256,
+    }
+    checks = [
+        (label, _recorded_value(manifest, block, key), now_by_label[label])
+        for label, block, key in IDENTITY_DIGESTS
     ]
+    if scope == DRIFT_CONTINUATION:
+        # The whole-cell digest is this scope's proof, and it is stronger than the three below,
+        # so a record that predates one of them is not refused for lacking it: the file it
+        # hashed is the file this process reads. Absence keeps its old meaning here.
+        checks.insert(
+            0,
+            (
+                "cell config",
+                _recorded_value(manifest, "cell", "config_sha256"),
+                cell.to_manifest().get("config_sha256"),
+            ),
+        )
+        return [
+            f"{what} changed since the run started (recorded {was}, now {now})"
+            for what, was, now in checks
+            if was is not _MISSING and now is not None and was != now
+        ]
+    # A bookend gives up the whole-cell digest, so these three are the only proof left that its
+    # eval measures the source's held-out ids under the source's prompts. An absent one is not
+    # agreement, it is a record that cannot say what it measured, and it fails closed the way an
+    # absent eval runtime does. Every archived run states all three.
+    lines = [
+        f"cell {field} changed since the run started "
+        f"(recorded {_shown(was)}, checkout {_shown(now)})"
+        for field, was, now in _cell_differences(recorded_cell, cell.to_manifest())
+        if field not in BOOKEND_UNCOMPARED_CELL_FIELDS
+    ]
+    for what, was, now in checks:
+        if was is _MISSING or now is None:
+            lines.append(
+                f"{what} is not recorded (recorded {_shown(was)}), so nothing proves this "
+                "bookend measures what the run it follows measured"
+            )
+        elif was != now:
+            lines.append(f"{what} changed since the run started (recorded {was}, now {now})")
+    return lines
 
 
 def _fresh_session_id(ctx: RunContext) -> str | None:
@@ -2232,6 +3024,12 @@ async def _run_cell_owned(
 ) -> Path:
     instruction = load_instruction(cell.instruction_arm)
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
+    # A fresh run pins its image exactly as a reopening does, and for the same two reasons: its
+    # probes and its legs must be the same bytes, and the archive it becomes has to STATE which
+    # bytes those were. A fresh run that skipped this recorded no content id at all, so every
+    # pairing it ever took part in would have called the image unproven for the life of the
+    # archive, and the promise that recording starts now would have been empty.
+    image_ref, image_tag, image_id = pinned_image(agent_image)
     ctx = RunContext(
         cell=cell,
         split=split,
@@ -2241,7 +3039,9 @@ async def _run_cell_owned(
         run_dir=run_dir,
         sandbox=sandbox,
         port=port,
-        agent_image=agent_image,
+        agent_image=image_ref,
+        image_tag=image_tag,
+        image_digest=image_id,
         credentials=dict(credentials or {}),
     )
 
@@ -2259,7 +3059,16 @@ async def _run_cell_owned(
             # No credential: a version probe reports what the image installed, which no harness
             # needs to authenticate to answer. The model probe is the one that does.
             "version": ctx.redactor.text(
-                _probe(ctx.harness.version_probe(), image=agent_image, sandbox=sandbox, env={})
+                _probe(
+                    ctx.harness.version_probe(),
+                    # The pinned reference, never the tag: a probe from one image beside legs
+                    # from another describes a run that did not happen, and two builds printing
+                    # one version string is precisely the case the content id exists to tell
+                    # apart, so the version probe cannot be the thing that notices.
+                    image=ctx.agent_image,
+                    sandbox=sandbox,
+                    env={},
+                )
             )
         }
         model_probe = ctx.harness.model_probe()
@@ -2270,7 +3079,7 @@ async def _run_cell_owned(
             # twice would otherwise put the first of the two into the manifest it feeds.
             with _watching_credentials(ctx, sandbox.home):
                 output = _probe(
-                    model_probe, image=agent_image, sandbox=sandbox, env=ctx.credentials
+                    model_probe, image=ctx.agent_image, sandbox=sandbox, env=ctx.credentials
                 )
             ctx.watch_credentials(sandbox.home)
             probes["model"] = ctx.redactor.text(output)
@@ -2360,27 +3169,17 @@ async def _resume_cell_owned(
     record = json.loads((run_dir / SUSPENSION_FILE).read_text(encoding="utf-8"))
     interrupted_phase = record.get("phase", "rollout")
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    cell = load_cell_by_name(manifest["cell"]["name"])
-    recorded_regime = recorded_rollout_feedback(manifest)
-    if cell.rollout_feedback != recorded_regime:
-        # The continuation finishes the experiment the record started, so the run's recorded
-        # feedback arm wins over the checkout's default. shogym would refuse to reopen the
-        # provenance directory under the other regime anyway; this makes the recovery explicit
-        # instead of a refusal the operator has to decode. Backfilled into the manifest below,
-        # so later resumptions read an explicit value.
-        cell = replace(cell, rollout_feedback=recorded_regime)
-    manifest["cell"]["rollout_feedback"] = recorded_regime
-    recorded_context = recorded_eval_context(manifest)
-    if cell.eval_context != recorded_context:
-        # Same recovery for the eval context: the run's recorded posture wins, so a pre-axis
-        # run's remaining eval tasks run cold, the way the finished ones were measured.
-        cell = replace(cell, eval_context=recorded_context)
-    manifest["cell"]["eval_context"] = recorded_context
+    # The continuation finishes the experiment the record started, so the run's own record wins
+    # over the checkout: its axes, and a bookend's inherited eval runtime.
+    cell = reopened_cell(load_cell_by_name(manifest["cell"]["name"]), manifest)
+    # Backfilled so a later resumption reads explicit values where this one read absence.
+    manifest["cell"]["rollout_feedback"] = cell.rollout_feedback
+    manifest["cell"]["eval_context"] = cell.eval_context
     # The instruction record stays consistent with the recovered axis, so the artifact keeps
     # naming the prompt its eval_after actually launches with; a pre-axis manifest recovers
     # cold and so names the blind eval instruction.
     manifest.setdefault("instruction", {})["eval_prompt_used"] = (
-        "rollout_system" if recorded_context == "resumed" else "eval_system"
+        "rollout_system" if cell.eval_context == "resumed" else "eval_system"
     )
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
@@ -2394,6 +3193,24 @@ async def _resume_cell_owned(
             + "; ".join(drift)
             + ". Restore the recorded definition, or start a fresh cell."
         )
+    harness = harness_for(cell.harness)
+    image_ref, image_tag, image_id = pinned_image(agent_image)
+    # This process writes rows into a run that already has some, so what produces them has to be
+    # what produced the others. Everything knowable without a container is checked here, before
+    # the sandbox exists; the rest below, still before any row.
+    unproven = _refuse_execution_drift(
+        manifest,
+        current_identity(
+            cell=cell,
+            split=split,
+            instruction=instruction,
+            harness=harness,
+            image_tag=image_tag,
+            image_digest_value=image_id,
+        ),
+        stage=IDENTITY_PRE_SPEND,
+        what="being continued",
+    )
     run_id = record["run_id"]
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
     _migrate_recorded_containers(manifest, sandbox)
@@ -2401,11 +3218,13 @@ async def _resume_cell_owned(
         cell=cell,
         split=split,
         instruction=instruction,
-        harness=harness_for(cell.harness),
+        harness=harness,
         run_id=run_id,
         run_dir=run_dir,
         sandbox=sandbox,
-        agent_image=agent_image,
+        agent_image=image_ref,
+        image_tag=image_tag,
+        image_digest=image_id,
         credentials=dict(credentials or {}),
     )
     # The credential is placed again because the sandbox is new even though the home is not;
@@ -2415,6 +3234,21 @@ async def _resume_cell_owned(
     spec = spec_for(cell.harness, cell.credential_mode)
     seed_home(spec, sandbox.home)
     _watch_cell_credential(ctx, spec)
+    # The effective credential mode exists only once a credential is placed, so it is compared
+    # here. No probe is taken on this path, so the harness probe is named unproven rather than
+    # invented; the image content id, compared above, is the stricter statement about that image.
+    unproven += _refuse_execution_drift(
+        manifest,
+        after_setup_identity(
+            probes=None,
+            credential_mode=credential_effective_mode(
+                spec, sandbox.home, env_names=sorted(ctx.credentials)
+            ),
+        ),
+        stage=IDENTITY_AFTER_SETUP,
+        what="being continued",
+    )
+    manifest["identity_unproven"] = sorted(set(unproven))
     legs_path = run_dir / "legs.json"
     if legs_path.is_file():
         # The legs the suspended run recorded. This process appends to that record rather than
@@ -2573,26 +3407,21 @@ async def _rerun_eval_owned(
             "phase with `shobench run --phases eval_before` instead."
         )
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    cell = load_cell_by_name(manifest["cell"]["name"])
-    recorded_regime = recorded_rollout_feedback(manifest)
-    if cell.rollout_feedback != recorded_regime:
-        # Same recovery as a resume: the run's recorded arm wins over the checkout's default,
-        # even though an eval re-run never constructs a rollout stream, so the manifest this
-        # process republishes keeps describing the experiment that actually ran.
-        cell = replace(cell, rollout_feedback=recorded_regime)
-    manifest["cell"]["rollout_feedback"] = recorded_regime
-    recorded_context = recorded_eval_context(manifest)
-    if cell.eval_context != recorded_context:
-        # And for the eval context, which a re-run acts on directly: the holes are re-run
-        # under the posture the finished ids were measured under, never today's default.
-        cell = replace(cell, eval_context=recorded_context)
-    manifest["cell"]["eval_context"] = recorded_context
+    # Same reconstruction as a resume: the holes are re-run under the posture and the stopping
+    # rule the finished ids were measured under, never today's.
+    cell = reopened_cell(load_cell_by_name(manifest["cell"]["name"]), manifest)
+    manifest["cell"]["rollout_feedback"] = cell.rollout_feedback
+    manifest["cell"]["eval_context"] = cell.eval_context
     # Same consistency rule as a resume: the record names the prompt its eval_after runs with.
     manifest.setdefault("instruction", {})["eval_prompt_used"] = (
-        "rollout_system" if recorded_context == "resumed" else "eval_system"
+        "rollout_system" if cell.eval_context == "resumed" else "eval_system"
     )
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
+    # The whole-file comparison, and a repaired BOOKEND gets it too, though a rebookend does
+    # not: a rebookend measures every held-out task under one definition, while a repair splices
+    # rows into an eval whose other rows are already measured, and nothing in a row would say
+    # which definition produced it. An operator refused here can rebookend the source instead.
     drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)
     if drift:
         raise RuntimeError(
@@ -2600,6 +3429,23 @@ async def _rerun_eval_owned(
             + "; ".join(drift)
             + ". Restore the recorded definition, or start a fresh cell."
         )
+    harness = harness_for(cell.harness)
+    image_ref, image_tag, image_id = pinned_image(agent_image)
+    # A repair splices rows in beside rows this run already has, so rows produced by another
+    # image or another runner would sit in one artifact with the ones they claim to complete.
+    unproven = _refuse_execution_drift(
+        manifest,
+        current_identity(
+            cell=cell,
+            split=split,
+            instruction=instruction,
+            harness=harness,
+            image_tag=image_tag,
+            image_digest_value=image_id,
+        ),
+        stage=IDENTITY_PRE_SPEND,
+        what="being reopened",
+    )
     run_id = str(manifest["run_id"])
     sandbox = CellSandbox(run_id=run_id, home=run_dir / "home", workdir=run_dir / "work")
     _migrate_recorded_containers(manifest, sandbox)
@@ -2607,11 +3453,13 @@ async def _rerun_eval_owned(
         cell=cell,
         split=split,
         instruction=instruction,
-        harness=harness_for(cell.harness),
+        harness=harness,
         run_id=run_id,
         run_dir=run_dir,
         sandbox=sandbox,
-        agent_image=agent_image,
+        agent_image=image_ref,
+        image_tag=image_tag,
+        image_digest=image_id,
         credentials=dict(credentials or {}),
     )
     # Re-seeded for the same reason a resume re-seeds: the sandbox is new even though the home
@@ -2620,6 +3468,18 @@ async def _rerun_eval_owned(
     spec = spec_for(cell.harness, cell.credential_mode)
     seed_home(spec, sandbox.home)
     _watch_cell_credential(ctx, spec)
+    unproven += _refuse_execution_drift(
+        manifest,
+        after_setup_identity(
+            probes=None,
+            credential_mode=credential_effective_mode(
+                spec, sandbox.home, env_names=sorted(ctx.credentials)
+            ),
+        ),
+        stage=IDENTITY_AFTER_SETUP,
+        what="being reopened",
+    )
+    manifest["identity_unproven"] = sorted(set(unproven))
     legs_path = run_dir / "legs.json"
     if legs_path.is_file():
         ctx.prior_legs = json.loads(legs_path.read_text(encoding="utf-8"))
@@ -2930,25 +3790,53 @@ async def rebookend_run(
                 f"the baseline {baseline_dir} has no eval_before provenance of its own, so "
                 "it holds no before rows to pair with."
             )
+        # The bookend runs its after side against the SOURCE's definition and carries THIS
+        # run's before rows, so the two definitions have to be one. Refused rather than
+        # reconciled, since nothing here can say which of them the pair should have had.
+        pairing = pairing_drift(source_manifest, baseline_manifest)
+        if pairing:
+            raise RuntimeError(
+                f"the baseline {baseline_dir} was not measured by the same definition as the "
+                f"source: {'; '.join(pairing)}. Name a baseline of this definition, or measure "
+                "one."
+            )
         baseline_run_id = str(baseline_manifest.get("run_id", ""))
         baseline_dir_resolved = baseline_dir
+        pairing_identity_manifest = baseline_manifest
     elif _has_eval_before(source_run_dir):
         baseline_run_id = str(source_manifest.get("run_id", ""))
         baseline_dir_resolved = source_run_dir
+        # Self-paired: the before rows are the source's own, so the two sides are one archive
+        # and every identity matches itself. What the source does not record about itself is
+        # still worth naming, since the bookend's after side runs on today's image and runner.
+        pairing_identity_manifest = source_manifest
     else:
         raise RuntimeError(
             f"{source_run_dir} has no eval_before of its own (a rollout-only or after-only "
             "run), so the bookend would have nothing to pair with. Name the run that "
             "measured this cell's baseline with --baseline."
         )
-    # The recorded arm wins over the checkout's default, exactly as a resume recovers it: the
-    # new measurement inherits the SOURCE's axes and changes exactly one of them, so a never-arm
-    # source publishes honestly as never + resumed.
-    recorded_regime = recorded_rollout_feedback(source_manifest)
-    cell = replace(cell, rollout_feedback=recorded_regime, eval_context="resumed")
+    # Taken against the cell FILE rather than against the cell this run will build from it: the
+    # reader's answer to "the file changed, so what governed this run?". The refusal below is a
+    # different comparison, against the cell that actually runs.
+    checkout_drift = cell_field_drift(source_manifest.get("cell", {}), cell.to_manifest())
+    # What the pairing could not establish, computed where both records are in hand and carried
+    # into the bookend's own manifest, so the artifact states it rather than a reader assuming.
+    unproven_identities = pairing_unproven(source_manifest, pairing_identity_manifest)
+    # The record wins over the checkout for everything the new measurement inherits: the arm the
+    # source's rollout served, and the eval runtime its before side was scored under.
+    cell = bookend_cell(cell, source_manifest)
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
-    drift = experiment_drift(source_manifest, cell=cell, split=split, instruction=instruction)
+    # Field by field rather than by the cell file's bytes. The fields this run inherits were
+    # just recovered onto the cell, so this holds that recovery to its word.
+    drift = experiment_drift(
+        source_manifest,
+        cell=cell,
+        split=split,
+        instruction=instruction,
+        scope=DRIFT_BOOKEND,
+    )
     if drift:
         raise RuntimeError(
             "the checkout no longer matches the run being rebookended: "
@@ -2956,6 +3844,22 @@ async def rebookend_run(
             + ". Restore the recorded definition; a bookend under an edited definition would "
             "not pair with the run it claims to follow."
         )
+    # The third side, compared here before a byte is copied, and again after setup for the two
+    # facts that do not exist yet.
+    image_ref, image_tag, image_id = pinned_image(agent_image)
+    unproven_execution = _refuse_execution_drift(
+        source_manifest,
+        current_identity(
+            cell=cell,
+            split=split,
+            instruction=instruction,
+            harness=harness_for(cell.harness),
+            image_tag=image_tag,
+            image_digest_value=image_id,
+        ),
+        stage=IDENTITY_PRE_SPEND,
+        what="being rebookended",
+    )
     stopping_path = source_run_dir / ROLLOUT_STOPPING_FILE
     if not stopping_path.is_file():
         raise RuntimeError(
@@ -3003,6 +3907,12 @@ async def rebookend_run(
             instruction=instruction,
             baseline_run_id=baseline_run_id,
             baseline_dir=baseline_dir_resolved,
+            checkout_drift=checkout_drift,
+            unproven_identities=unproven_identities,
+            unproven_execution=unproven_execution,
+            image_ref=image_ref,
+            image_tag=image_tag,
+            image_id=image_id,
             run_id=run_id,
             run_dir=run_dir,
             results_dir=results_dir,
@@ -3023,6 +3933,12 @@ async def _rebookend_owned(
     instruction: Instruction,
     baseline_run_id: str,
     baseline_dir: Path,
+    checkout_drift: dict[str, dict[str, Any]],
+    unproven_identities: list[str],
+    unproven_execution: list[str],
+    image_ref: str,
+    image_tag: str,
+    image_id: str | None,
     run_id: str,
     run_dir: Path,
     results_dir: Path,
@@ -3057,7 +3973,9 @@ async def _rebookend_owned(
         run_id=run_id,
         run_dir=run_dir,
         sandbox=sandbox,
-        agent_image=agent_image,
+        agent_image=image_ref,
+        image_tag=image_tag,
+        image_digest=image_id,
         credentials=dict(credentials or {}),
     )
     # The post-rollout self, whole: durable channels AND session state, because the fork
@@ -3146,7 +4064,16 @@ async def _rebookend_owned(
     try:
         probes = {
             "version": ctx.redactor.text(
-                _probe(ctx.harness.version_probe(), image=agent_image, sandbox=sandbox, env={})
+                _probe(
+                    ctx.harness.version_probe(),
+                    # The pinned reference, never the tag: a probe from one image beside legs
+                    # from another describes a run that did not happen, and two builds printing
+                    # one version string is precisely the case the content id exists to tell
+                    # apart, so the version probe cannot be the thing that notices.
+                    image=ctx.agent_image,
+                    sandbox=sandbox,
+                    env={},
+                )
             )
         }
         seeds = _place_runner_files(ctx)
@@ -3155,6 +4082,20 @@ async def _rebookend_owned(
         manifest["home"]["seeded"] = seeds
         manifest["axes"]["credential_mode"] = credential_effective_mode(
             spec, sandbox.home, env_names=sorted(ctx.credentials)
+        )
+        # The facts that did not exist until now: the probe came out of the image a moment ago
+        # and the credential mode off the home it was seeded into. Checked here, after the
+        # manifest is built and before ``_run_phases``, which is the last moment before a row
+        # can exist. The manifest this run publishes is its own; what it is checked against is
+        # the SOURCE's record, the run whose measurement these rows will be paired with.
+        unproven = unproven_execution + _refuse_execution_drift(
+            source_manifest,
+            after_setup_identity(
+                probes=manifest["harness_probes"],
+                credential_mode=manifest["axes"]["credential_mode"],
+            ),
+            stage=IDENTITY_AFTER_SETUP,
+            what="being rebookended",
         )
         # What this run is a bookend OF, by run id rather than by path: a durable artifact
         # carries no operator layout, and the id is what pairs it with the source post-hoc.
@@ -3167,6 +4108,32 @@ async def _rebookend_owned(
             "baseline_run_id": baseline_run_id,
             "source_rollout_feedback": cell.rollout_feedback,
             "source_stop_reason": str(source_stopping.get("stop_reason", "")),
+            # The eval runtime this run took from the source's RECORD rather than from the cell
+            # file, with the values that actually bounded its legs. It is the fact a reader
+            # needs before comparing any number here with the baseline's: both sides of the
+            # pair stopped by the same rule.
+            "eval_runtime_from_record": {
+                field: getattr(cell.budget, field) for field in BOOKEND_EVAL_RUNTIME_FIELDS
+            },
+            # The source's cell block verbatim, beside the block this run ran under
+            # (``manifest["cell"]``), and every field the checkout's cell file states
+            # differently from the record, with both values. The file having moved is neither
+            # hidden nor load-bearing: anything that could change the measurement refused
+            # before this run spent, and the runtime fields above were inherited rather than
+            # read, so a reader sees what the file would have run and what did run without
+            # finding two checkouts to diff.
+            "source_cell": dict(source_manifest.get("cell", {})),
+            "cell_drift": checkout_drift,
+            # What the pairing could NOT establish, named rather than left to a reader's
+            # assumption: the identities neither archive recorded, which is empty for any pair
+            # of runs made after the recording started and never empty for the v0 archives.
+            # Every other identity refused before this run spent, so this list is the whole of
+            # what the published delta rests on trust for.
+            "pairing_identity_unproven": unproven_identities,
+            # And what THIS run could not prove about itself against the source's record: the
+            # same discipline one comparison further out, so the artifact names every identity
+            # it rests on trust for rather than only the ones between the two archives.
+            "execution_identity_unproven": sorted(set(unproven)),
         }
         ctx.publish_json(run_dir / "manifest.json", manifest)
         return await _run_phases(

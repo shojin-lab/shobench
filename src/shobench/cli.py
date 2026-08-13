@@ -378,12 +378,21 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     cell = load_cell_by_name(manifest["cell"]["name"])
     recorded_arm = runner.recorded_rollout_feedback(manifest)
     split = load_split_by_name(cell.split)
+    # Built by the runner's own recovery rather than by a second copy of the rule, so the plan's
+    # verdict is the runner's verdict: the bookend inherits the source's recorded arm and its
+    # recorded eval runtime, and pins the eval context to resumed.
+    will_run = runner.bookend_cell(cell, manifest)
     drift = runner.experiment_drift(
         manifest,
-        cell=cell,
+        cell=will_run,
         split=split,
         instruction=load_instruction(cell.instruction_arm),
+        scope=runner.DRIFT_BOOKEND,
     )
+    # What the checkout's cell file says where the record says otherwise, so the operator sees
+    # what the bookend is declining to read from it. Nothing in here is silently in force: the
+    # eval runtime comes from the record, and everything else refuses.
+    cell_drift = runner.cell_field_drift(manifest.get("cell", {}), cell.to_manifest())
     terminal_session = runner.terminal_session_in(source_dir)
     # The id alone proves only that the stopping record names something; the plan promises the
     # session it will fork, so the transcript is resolved in the SOURCE home with the same
@@ -436,10 +445,44 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
                     )
                     == manifest.get("split", {}).get("id_digest"),
                     "baseline_has_eval_before": runner._has_eval_before(baseline_dir),
+                    # The whole pairing verdict, from the same helper the spending path
+                    # raises on, so a dry plan cannot say something a --go will not. Empty is
+                    # the passing shape.
+                    "baseline_pairing_drift": runner.pairing_drift(
+                        manifest, baseline_manifest
+                    ),
+                    # Not a refusal and not nothing: the identities NEITHER archive records,
+                    # named before the spend. The bookend's manifest carries the same list.
+                    "baseline_pairing_unproven": runner.pairing_unproven(
+                        manifest, baseline_manifest
+                    ),
                 }
             )
         else:
             baseline_states["baseline_is_run_dir"] = False
+    elif source_has_before:
+        # Self-paired: the before rows are the source's own, so the pairing is a record against
+        # itself and every fact it states matches. What it does NOT state is still evidence the
+        # plan owes an operator, and the manifest carries it either way.
+        baseline_states["baseline_pairing_drift"] = runner.pairing_drift(manifest, manifest)
+        baseline_states["baseline_pairing_unproven"] = runner.pairing_unproven(
+            manifest, manifest
+        )
+    # The third comparison, at the only stage a plan can make it. The facts that exist only
+    # after a container and a credential are checked by the runner at the moment they become
+    # knowable, still before any row.
+    execution_lines, execution_unproven = runner.execution_drift(
+        manifest,
+        runner.current_identity(
+            cell=will_run,
+            split=split,
+            instruction=load_instruction(cell.instruction_arm),
+            harness=harness_for(cell.harness),
+            image_tag=args.image,
+            image_digest_value=runner.image_digest(args.image),
+        ),
+        stage=runner.IDENTITY_PRE_SPEND,
+    )
     source_lock_present = (source_dir / runner.RUN_LOCK_FILE).is_file()
     source_live = False
     if source_lock_present:
@@ -457,6 +500,8 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         "terminal_session_resolvable": terminal_session is not None,
         "terminal_transcript_resolvable": terminal_transcript is not None,
         "experiment_drift": drift,
+        "execution_identity_drift": execution_lines,
+        "execution_identity_unproven": execution_unproven,
         "missing_required_env": missing_required,
         **baseline_states,
     }
@@ -470,6 +515,14 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             "eval_context": "resumed",
             "eval_prompt_used": "rollout_system",
         },
+        # The stopping rule the legs will run under, taken from the record rather than from
+        # the cell file, and the fields where the file now says something else. Both are
+        # written into the bookend's manifest too, so the plan and the artifact agree.
+        "eval_runtime_from_record": {
+            field: getattr(will_run.budget, field)
+            for field in runner.BOOKEND_EVAL_RUNTIME_FIELDS
+        },
+        "cell_drift": cell_drift,
         "source_stop_reason": source_stopping.get("stop_reason"),
         "terminal_session_id": terminal_session,
         "baseline_run_id": baseline_run_id,
@@ -526,6 +579,16 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
                 blockers.append("the named baseline is itself a rebookend")
         elif value is False:
             blockers.append(why)
+    if refusals["execution_identity_drift"]:
+        blockers.append(
+            "the execution identity of this checkout does not match the source's record: "
+            + "; ".join(refusals["execution_identity_drift"])
+        )
+    if refusals.get("baseline_pairing_drift"):
+        blockers.append(
+            "the named baseline was not measured by the same definition as the source: "
+            + "; ".join(refusals["baseline_pairing_drift"])
+        )
     if refusals["suspension_present"]:
         blockers.append("the source holds a suspension record; finish it with `shobench resume`")
     if not refusals["source_lock_present"]:

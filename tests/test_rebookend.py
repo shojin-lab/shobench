@@ -20,6 +20,7 @@ import contextlib
 import hashlib
 import json
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -40,6 +41,17 @@ from shobench.runner import (
 from shobench.splits import Side, Split, load_split_by_name
 
 _SID = "cccccccc-4444-4444-4444-cccccccccccc"
+
+
+@pytest.fixture(autouse=True)
+def _pinned_execution_identity(monkeypatch):
+    """Docker and git answer for real inside these functions, so both sides of every identity
+    check would otherwise move with the machine: a host without docker records no image id, and
+    a dirty checkout records no usable revision. Pinned at the source rather than in the
+    fixtures, so the archives these tests write and the current identity they are checked
+    against come from the same values, which is what a real run on one machine looks like."""
+    monkeypatch.setattr(runner, "image_digest", lambda image: "sha256:" + "a" * 64)
+    monkeypatch.setattr(runner, "shobench_revision", lambda: ("b" * 40, False))
 
 
 class _FakeStream:
@@ -126,7 +138,7 @@ def _source_run(
         run_dir=source_dir,
         sandbox=CellSandbox(run_id="src", home=home, workdir=source_dir / "work"),
     )
-    runner.write_json(source_dir / "manifest.json", build_manifest(ctx, probes={"version": "t"}))
+    runner.write_json(source_dir / "manifest.json", _archived_manifest(ctx))
     if with_terminus:
         runner.write_json(
             source_dir / ROLLOUT_STOPPING_FILE,
@@ -145,6 +157,31 @@ def _source_run(
     return source_dir
 
 
+def _archived_manifest(ctx) -> dict:
+    """What a real run leaves on disk, which is more than ``build_manifest`` returns.
+
+    The runner fills the effective credential mode in after the probe, so a manifest built here
+    and written straight out would be missing a field every archived run carries, and the pairing
+    identity would refuse fixtures for a reason no real archive has.
+    """
+    # The probe value the stubbed ``_probe`` returns and the credential mode an unseeded home
+    # computes, because that is what a run in this test environment records. A fixture that
+    # recorded something prettier would model an archive no run here could have produced, and
+    # the execution-identity check compares exactly these.
+    manifest = build_manifest(ctx, probes={"version": "probe"})
+    manifest["axes"]["credential_mode"] = {
+        "requested": ctx.cell.credential_mode,
+        "effective": "unknown",
+        "matches_requested": False,
+        "source": "nothing found",
+        "evidence": "",
+    }
+    # The fixture builds its context by hand, so the image the run pinned is set here from the
+    # same function the runner resolves it with rather than from a literal.
+    manifest["container"]["image_digest"] = runner.image_digest(ctx.agent_image)
+    return manifest
+
+
 def _fingerprint(root: Path) -> dict[str, str]:
     return {
         p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -153,10 +190,16 @@ def _fingerprint(root: Path) -> dict[str, str]:
     }
 
 
-def _wire_fakes(monkeypatch, cell, split, launches: dict[int, dict]) -> None:
+def _wire_fakes(
+    monkeypatch, cell, split, launches: dict[int, dict], probes: list | None = None
+) -> None:
     """The same provider-free fan-out the resumed eval_after tests drive, plus the loaders:
     the cell under test is synthetic, so the checkout loaders hand back the recorded
-    definitions the drift check verifies, exactly as they would for a committed cell."""
+    definitions the drift check verifies, exactly as they would for a committed cell.
+
+    ``probes`` collects the image reference each probe was run against, which is how a test
+    proves the probe and the legs saw the same bytes."""
+    probes = [] if probes is None else probes
 
     def fake_run_leg(ctx_arg: RunContext, **kw: object) -> LegRecord:
         idx = int(kw["task_idx"])  # type: ignore[arg-type]
@@ -165,6 +208,9 @@ def _wire_fakes(monkeypatch, cell, split, launches: dict[int, dict]) -> None:
             "session_id": kw["session_id"],
             "resume": kw["resume"],
             "system_prompt": kw["system_prompt"],
+            # The bound the leg ran under, which is the stopping rule whatever row it
+            # produces was scored by.
+            "timeout_s": kw["timeout_s"],
             "transcript_in_copy": (
                 home / ".claude/projects/-work" / f"{_SID}.jsonl"
             ).is_file(),
@@ -215,7 +261,9 @@ def _wire_fakes(monkeypatch, cell, split, launches: dict[int, dict]) -> None:
     )
     monkeypatch.setattr(CellSandbox, "down", lambda self: None)
     monkeypatch.setattr(runner, "seed_home", lambda spec, home: {})
-    monkeypatch.setattr(runner, "_probe", lambda *a, **kw: "probe")
+    monkeypatch.setattr(
+        runner, "_probe", lambda *a, **kw: probes.append(kw.get("image")) or "probe"
+    )
     monkeypatch.setattr(runner, "warm_env", lambda cell_arg: None)
     monkeypatch.setattr(runner, "build_stream", lambda *a, **kw: _FakeStream())
     monkeypatch.setattr(runner, "_served", _fake_served)
@@ -273,13 +321,35 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
     assert manifest["cell"]["rollout_feedback"] == "never"
     assert manifest["cell"]["eval_context"] == "resumed"
     assert manifest["instruction"]["eval_prompt_used"] == "rollout_system"
-    assert manifest["rebookend"] == {
+    marker = manifest["rebookend"]
+    assert {key: marker[key] for key in marker if key not in ("source_cell", "cell_drift")} == {
         "rebookend_of": "source-run-20260101T000000Z",
         # The source measured its own eval_before, so the baseline defaults to it: the
         # self-paired case, stated in the marker rather than assumed by the reader.
         "baseline_run_id": "source-run-20260101T000000Z",
         "source_rollout_feedback": "never",
         "source_stop_reason": "agent_stopped_early",
+        # The stopping rule the legs ran under, taken from the record so the pair's two sides
+        # share one. A settled checkout states the same values, and the marker says them
+        # anyway, because a reader must not have to infer which side the rule came from.
+        "eval_runtime_from_record": {
+            "eval_task_timeout_s": cell.budget.eval_task_timeout_s,
+            "eval_concurrency": cell.budget.eval_concurrency,
+        },
+        # Both archives record the image id and the runner revision, so the pairing proved
+        # every identity it names and the list of what it could not prove is empty.
+        "pairing_identity_unproven": [],
+        # And the run that produced these after rows was checked against the source's record
+        # too, image and substrate and probe and credential mode, with nothing left unproven.
+        "execution_identity_unproven": [],
+    }
+    # The source's recorded cell block is kept whole beside the block this run ran under, and
+    # every field the checkout's file states differently is named with both values. Nothing but
+    # the axis a rebookend exists to change moved here, and that is what the record says.
+    source_manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert marker["source_cell"] == source_manifest["cell"]
+    assert marker["cell_drift"] == {
+        "eval_context": {"recorded": "cold", "checkout": "resumed"}
     }
 
     # Published honestly, under its OWN name, and SELF-CONTAINED: the before block is the
@@ -1041,9 +1111,7 @@ def _baseline_run(tmp_path: Path, cell, split, *, name: str = "baseline-run") ->
         run_dir=baseline_dir,
         sandbox=CellSandbox(run_id="b", home=home, workdir=baseline_dir / "work"),
     )
-    runner.write_json(
-        baseline_dir / "manifest.json", build_manifest(ctx, probes={"version": "t"})
-    )
+    runner.write_json(baseline_dir / "manifest.json", _archived_manifest(ctx))
     for task_id in split.heldout.task_ids:
         (baseline_dir / "eval_before" / f"task-{int(task_id):05d}").mkdir(parents=True)
     return baseline_dir
@@ -1568,7 +1636,7 @@ def _real_cell_source(tmp_path: Path) -> Path:
         run_dir=source_dir,
         sandbox=CellSandbox(run_id="src", home=home, workdir=source_dir / "work"),
     )
-    runner.write_json(source_dir / "manifest.json", build_manifest(ctx, probes={"version": "t"}))
+    runner.write_json(source_dir / "manifest.json", _archived_manifest(ctx))
     runner.write_json(
         source_dir / ROLLOUT_STOPPING_FILE,
         {"stop_reason": "pool_exhausted", "session_id": _SID},
@@ -1758,3 +1826,1299 @@ def test_a_suspension_written_between_probe_and_hold_refuses(
             )
         )
     assert launches == {}
+
+
+# ----- the drift comparison a bookend applies -------------------------------------------------
+#
+# A rebookend is a NEW run over a rollout that already ended, so the cell file's digest is the
+# wrong question: it moves for a comment and for a swapped model alike, and it refused the real
+# planned bookends after their cells' eval timeout was retuned. What the bookend measures has to
+# be the source's arm, and the rule its rows are scored by has to be the rule the before side was
+# scored by, so the arm and the eval runtime are taken from the RECORD and everything refuses on
+# drift.
+
+# The two planned bookends recorded this bound, and their cells now carry a shorter one. Every
+# other field of those cells is untouched, which is exactly the shape modeled here.
+_RECORDED_EVAL_TIMEOUT_S = 1800
+
+
+def _retuned_timeout_source(cell_name: str):
+    """The recorded definitions of a run whose cell has since had only its eval timeout retuned.
+
+    Built from the COMMITTED cell rather than a synthetic one, so the comparison runs against
+    the real field set: same cell name, the bound the run recorded, and the digest of the file
+    as it read then.
+    """
+    cell = load_cell_by_name(cell_name)
+    current_text = cell.source.read_text(encoding="utf-8")
+    recorded_text = current_text.replace(
+        f"eval_task_timeout_s = {cell.budget.eval_task_timeout_s}",
+        f"eval_task_timeout_s = {_RECORDED_EVAL_TIMEOUT_S}",
+    )
+    assert recorded_text != current_text, "the fixture models a cell whose timeout moved"
+    split = load_split_by_name(cell.split)
+    instruction = load_instruction(cell.instruction_arm)
+    recorded_cell = cell.to_manifest()
+    recorded_cell["budget"] = {
+        **recorded_cell["budget"],
+        "eval_task_timeout_s": _RECORDED_EVAL_TIMEOUT_S,
+    }
+    recorded_cell["config_sha256"] = hashlib.sha256(recorded_text.encode("utf-8")).hexdigest()
+    manifest = {
+        "run_id": f"{cell_name}-20260813T003200Z",
+        "cell": recorded_cell,
+        "split": split.to_manifest(),
+        "instruction": instruction.to_manifest(),
+    }
+    return manifest, cell, split, instruction
+
+
+def _bookend_drift(manifest, cell, split, instruction, *, recover: bool = True):
+    """The refusal lines a rebookend would raise, over the cell it would actually run."""
+    return runner.experiment_drift(
+        manifest,
+        cell=runner.bookend_cell(cell, manifest) if recover else cell,
+        split=split,
+        instruction=instruction,
+        scope=runner.DRIFT_BOOKEND,
+    )
+
+
+@pytest.mark.parametrize(
+    "cell_name",
+    [
+        "automationbench-prime_agent-claude-opus-5",
+        "automationbench-prime_agent-gpt-56-terra",
+    ],
+)
+def test_a_bookend_of_a_retuned_cell_runs_under_the_recorded_bound(cell_name: str) -> None:
+    """The two real refusals, and the reason the fix is inheritance rather than permission.
+
+    Both sources finished their rollouts before the timeout moved, so the edit cannot reach
+    them and the bookend is measurable. It runs under the RECORDED bound, not the file's: the
+    before side it will be paired against was scored by that bound, and a task that seals
+    between the two would otherwise be scoreable before and force-stopped after.
+    """
+    manifest, cell, split, instruction = _retuned_timeout_source(cell_name)
+
+    assert _bookend_drift(manifest, cell, split, instruction) == []
+    will_run = runner.bookend_cell(cell, manifest)
+    assert will_run.budget.eval_task_timeout_s == _RECORDED_EVAL_TIMEOUT_S
+    assert will_run.budget.eval_task_timeout_s != cell.budget.eval_task_timeout_s
+    assert will_run.budget.eval_concurrency == manifest["cell"]["budget"]["eval_concurrency"]
+
+    # The same edit still stops a continuation dead: resume and rerun-eval write more of a
+    # measurement that already exists, and nothing about that one may move.
+    continuation = runner.experiment_drift(
+        manifest, cell=cell, split=split, instruction=instruction
+    )
+    assert continuation and "cell config changed" in continuation[0]
+
+    # Inherited, never hidden: the record names what the checkout would have run instead.
+    drift = runner.cell_field_drift(manifest["cell"], cell.to_manifest())
+    assert drift["budget.eval_task_timeout_s"] == {
+        "recorded": _RECORDED_EVAL_TIMEOUT_S,
+        "checkout": cell.budget.eval_task_timeout_s,
+    }
+    assert "config_sha256" in drift, "the reader is told the file itself moved"
+
+
+def test_the_bookend_inherits_the_recorded_eval_concurrency() -> None:
+    """Concurrency is not score-neutral: concurrent legs share the host, the network and the
+    provider account while their per-task clocks run, so contention and throttling become
+    timeouts and unscored rows. It comes from the record for the same reason the bound does."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest["cell"]["budget"]["eval_concurrency"] = cell.budget.eval_concurrency + 3
+
+    will_run = runner.bookend_cell(cell, manifest)
+    assert will_run.budget.eval_concurrency == cell.budget.eval_concurrency + 3
+    assert _bookend_drift(manifest, cell, split, instruction) == []
+
+
+def test_an_unrecoverable_eval_runtime_refuses() -> None:
+    """A record with no bound to inherit is an absence, not a value. Nothing here can say what
+    a run measured before the field existed, so it refuses rather than lending the file's."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    del manifest["cell"]["budget"]["eval_task_timeout_s"]
+
+    will_run = runner.bookend_cell(cell, manifest)
+    assert will_run.budget.eval_task_timeout_s == cell.budget.eval_task_timeout_s
+    drift = _bookend_drift(manifest, cell, split, instruction)
+    assert drift and any("budget.eval_task_timeout_s" in line for line in drift), drift
+    # The line says the record has no such field, never a value that merely spells like one.
+    assert any("recorded no such field" in line for line in drift), drift
+
+
+@pytest.mark.parametrize(
+    ("field", "recorded_value", "names"),
+    [
+        ("model", "claude-opus-4", "cell model"),
+        ("env", "wordle_v1", "cell env"),
+        ("harness", "claude_code", "cell harness"),
+        ("effort", "low", "cell effort"),
+        ("credential_mode", "api_key", "cell credential_mode"),
+        ("env_kwargs", {"judge_model": "a-different-judge"}, "cell env_kwargs"),
+        ("required_env", ["OPENAI_API_KEY"], "cell required_env"),
+        ("max_in_flight", 1, "cell max_in_flight"),
+    ],
+)
+def test_a_bookend_refuses_a_measurement_change(field, recorded_value, names) -> None:
+    """Everything the bookend's own eval sessions are made of: a bookend under any of these
+    measures something other than the run it claims to follow."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest["cell"][field] = recorded_value
+
+    drift = _bookend_drift(manifest, cell, split, instruction)
+    assert drift and any(names in line for line in drift), drift
+
+
+def test_a_bookend_holds_its_inheritances_to_their_word() -> None:
+    """The arm and the eval runtime are inherited rather than read, and the comparison is what
+    proves the inheritance happened: a cell handed in with the checkout's values instead is
+    refused, not published under a rule its before side never wore."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest["cell"]["rollout_feedback"] = "never"
+
+    assert _bookend_drift(manifest, cell, split, instruction) == []
+    drift = _bookend_drift(
+        manifest, replace(cell, eval_context="resumed"), split, instruction, recover=False
+    )
+    assert any("cell rollout_feedback" in line for line in drift), drift
+    assert any("cell budget.eval_task_timeout_s" in line for line in drift), drift
+
+
+@pytest.mark.parametrize("field", ["rollout_wall_clock_s", "pool_ceiling"])
+def test_a_bookend_refuses_a_changed_rollout_budget(field: str) -> None:
+    """The bookend runs no rollout, so these cannot change its eval; it inherits the home that
+    rollout built and labels the arm, so publishing today's numbers would name a rollout
+    nobody ran."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest["cell"]["budget"][field] = 7
+
+    drift = _bookend_drift(manifest, cell, split, instruction)
+    assert drift and any(f"cell budget.{field}" in line for line in drift), drift
+
+
+@pytest.mark.parametrize(
+    ("block", "key", "names"),
+    [
+        ("split", "id_digest", "split ids"),
+        ("instruction", "rollout_system_sha256", "rollout instruction"),
+        ("instruction", "eval_system_sha256", "eval instruction"),
+    ],
+)
+def test_a_bookend_refuses_a_changed_split_or_instruction(block, key, names) -> None:
+    """The held-out ids and the prompts are compared under both scopes: a bookend over other
+    ids pairs task numbers that are not the same tasks, and one under a reworded prompt
+    measures a different question."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest[block][key] = "0" * 64
+
+    drift = _bookend_drift(manifest, cell, split, instruction)
+    assert drift and any(names in line for line in drift), drift
+
+
+def test_an_axis_the_record_predates_refuses() -> None:
+    """The comparison walks the UNION of the two field sets, so a cell axis added after a run
+    was recorded surfaces instead of passing.
+
+    Comparing only the recorded fields would let every historical manifest through no matter how
+    a new axis was classified, which makes a fail-closed rule an enumeration nobody enforces.
+    """
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    del manifest["cell"]["effort"]
+
+    drift = _bookend_drift(manifest, cell, split, instruction)
+    assert drift and any("cell effort" in line for line in drift), drift
+    assert runner.cell_field_drift(manifest["cell"], cell.to_manifest())["effort"] == {
+        "recorded": runner.CELL_FIELD_ABSENT,
+        "checkout": cell.effort,
+    }
+
+
+def test_a_field_the_cell_no_longer_carries_refuses() -> None:
+    """The reverse direction, which the intersection also passed: a field the record carries
+    and the cell has since dropped is a definition the checkout can no longer state."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest["cell"]["budget"]["leg_wall_clock_s"] = 900
+
+    drift = _bookend_drift(manifest, cell, split, instruction)
+    assert drift and any("cell budget.leg_wall_clock_s" in line for line in drift), drift
+
+
+def test_only_the_versioned_legacy_axes_read_absence_as_a_value() -> None:
+    """A pre-axis manifest carries no rollout_feedback and no eval_context, and those two
+    absences have known meanings: never was the only rollout posture then, cold the only eval
+    posture. Nothing else is normalized, which is what keeps the union honest."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    # A wave-1 record: written before either axis existed, so both keys are simply absent.
+    del manifest["cell"]["rollout_feedback"]
+    del manifest["cell"]["eval_context"]
+
+    # The arm recovers to never and the comparison agrees; the eval context is the axis the
+    # bookend changes, so it is reported rather than refused.
+    assert runner.bookend_cell(cell, manifest).rollout_feedback == "never"
+    assert _bookend_drift(manifest, cell, split, instruction) == []
+    drift = runner.cell_field_drift(manifest["cell"], cell.to_manifest())
+    assert drift["rollout_feedback"] == {"recorded": "never", "checkout": cell.rollout_feedback}
+    assert drift["eval_context"] == {"recorded": "cold", "checkout": cell.eval_context}
+
+
+def test_every_cell_field_is_judged() -> None:
+    """A cell axis added later must not fall into the uncompared set by default.
+
+    The uncompared fields are listed in the runner and the refusing ones are everything else,
+    so this is where the second list is written down: a new field breaks it, and whoever adds
+    the field decides which side it belongs on rather than inheriting an answer.
+    """
+    fields = set(
+        runner._flat_cell(
+            load_cell_by_name("automationbench-prime_agent-claude-opus-5").to_manifest()
+        )
+    )
+    uncompared = set(runner.BOOKEND_UNCOMPARED_CELL_FIELDS)
+    assert uncompared <= fields, "an uncompared field no cell carries is a stale judgement"
+    assert fields - uncompared == {
+        "name",
+        "env",
+        "harness",
+        "model",
+        "effort",
+        "max_in_flight",
+        "rollout_feedback",
+        "credential_mode",
+        "env_kwargs",
+        "required_env",
+        "budget.rollout_wall_clock_s",
+        "budget.pool_ceiling",
+        "budget.eval_task_timeout_s",
+        "budget.eval_concurrency",
+    }
+
+
+def test_an_unknown_drift_scope_is_refused() -> None:
+    """The scope decides what may change, so a misspelled one must not quietly pick a default."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+
+    with pytest.raises(ValueError, match="unknown drift scope"):
+        runner.experiment_drift(
+            manifest, cell=cell, split=split, instruction=instruction, scope="whatever"
+        )
+
+
+def test_a_baseline_measured_under_another_bound_is_refused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The pairing check the stopping rule deserves. The bookend runs under the SOURCE's
+    recorded bound, so a baseline scored under a different one would put the two sides of the
+    pair under two rules, and the delta would measure the bounds as much as the agent."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    baseline_manifest = json.loads(
+        (baseline_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    baseline_manifest["cell"]["budget"]["eval_task_timeout_s"] = 999
+    runner.write_json(baseline_dir / "manifest.json", baseline_manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="would not be scored under one stopping rule"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=baseline_dir,
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+
+def test_the_bookend_runs_and_records_the_recorded_eval_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """End to end: the legs run under the source's recorded bound, the manifest says so, and
+    the checkout's differing values are named beside it, so a reader of the numbers sees which
+    rule scored them without finding two checkouts to diff."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    source_manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    # The source's before side was scored under a longer bound, and the file it hashed no
+    # longer exists.
+    source_manifest["cell"]["budget"]["eval_task_timeout_s"] = 300
+    source_manifest["cell"]["config_sha256"] = "0" * 64
+    runner.write_json(source_dir / "manifest.json", source_manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    results_path = asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    # Every leg ran under the RECORDED bound, not the cell file's.
+    assert set(launches) == {0, 1, 2}
+    assert {record["timeout_s"] for record in launches.values()} == {300}
+    assert cell.budget.eval_task_timeout_s != 300
+
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((new_run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cell"]["budget"]["eval_task_timeout_s"] == 300
+    assert manifest["rebookend"]["eval_runtime_from_record"] == {
+        "eval_task_timeout_s": 300,
+        "eval_concurrency": cell.budget.eval_concurrency,
+    }
+    assert manifest["rebookend"]["source_cell"] == source_manifest["cell"]
+    assert manifest["rebookend"]["cell_drift"]["budget.eval_task_timeout_s"] == {
+        "recorded": 300,
+        "checkout": cell.budget.eval_task_timeout_s,
+    }
+    assert "config_sha256" in manifest["rebookend"]["cell_drift"]
+    # And it reaches the published artifact, which is what anyone reading the numbers holds.
+    published = json.loads(results_path.read_text(encoding="utf-8"))
+    assert published["manifest"]["rebookend"]["eval_runtime_from_record"] == {
+        "eval_task_timeout_s": 300,
+        "eval_concurrency": cell.budget.eval_concurrency,
+    }
+
+
+def test_cli_plans_a_bookend_whose_cell_timeout_was_retuned(tmp_path: Path, capsys) -> None:
+    """The refusal an operator actually met, at the entry they met it in: the plan runs the
+    checkout's real loaders, reports no drift, names the bound the legs will run under, and
+    names what the file says instead."""
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    cell = load_cell_by_name("smoke-automationbench-claude-code")
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["cell"]["budget"]["eval_task_timeout_s"] = _RECORDED_EVAL_TIMEOUT_S
+    manifest["cell"]["config_sha256"] = "0" * 64
+    runner.write_json(source_dir / "manifest.json", manifest)
+
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+
+    assert plan["refusals"]["experiment_drift"] == []
+    assert plan["eval_runtime_from_record"] == {
+        "eval_task_timeout_s": _RECORDED_EVAL_TIMEOUT_S,
+        "eval_concurrency": cell.budget.eval_concurrency,
+    }
+    assert plan["cell_drift"]["budget.eval_task_timeout_s"] == {
+        "recorded": _RECORDED_EVAL_TIMEOUT_S,
+        "checkout": cell.budget.eval_task_timeout_s,
+    }
+    assert "config_sha256" in plan["cell_drift"]
+
+
+def test_cli_blocks_a_bookend_whose_cell_measures_something_else(
+    tmp_path: Path, capsys
+) -> None:
+    """A model swap is not a runtime detail, and the block lands before anything is minted."""
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["cell"]["model"] = "a-model-this-run-never-used"
+    runner.write_json(source_dir / "manifest.json", manifest)
+
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert any("cell model changed" in line for line in plan["refusals"]["experiment_drift"])
+
+    assert cli_main(["rebookend", "--run", str(source_dir), "--go"]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "cell model changed" in err
+    assert not (tmp_path / "runs").exists()
+
+
+def test_cli_blocks_a_baseline_measured_under_another_bound(tmp_path: Path, capsys) -> None:
+    """The plan states the pairing's stopping rule as a refusal state of its own, so the
+    operator sees it before the runner raises."""
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    baseline_dir = tmp_path / "baseline"
+    shutil.copytree(source_dir, baseline_dir)
+    baseline_manifest = json.loads(
+        (baseline_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    baseline_manifest["run_id"] = "baseline-run-20260101T000000Z"
+    baseline_manifest["cell"]["budget"]["eval_task_timeout_s"] = 999
+    runner.write_json(baseline_dir / "manifest.json", baseline_manifest)
+
+    assert (
+        cli_main(
+            ["rebookend", "--run", str(source_dir), "--baseline", str(baseline_dir)]
+        )
+        == 0
+    )
+    plan = json.loads(capsys.readouterr().out)
+    assert any(
+        "eval runtime eval_task_timeout_s differs" in line
+        for line in plan["refusals"]["baseline_pairing_drift"]
+    )
+
+    assert (
+        cli_main(
+            ["rebookend", "--run", str(source_dir), "--baseline", str(baseline_dir), "--go"]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "one stopping rule" in err
+    assert not (tmp_path / "runs").exists()
+
+
+# ----- a reopened bookend keeps the runtime it inherited ---------------------------------------
+#
+# The inheritance has to survive every path that reconstructs the run, not only the one that
+# creates it. A bookend's recorded config_sha256 is the CURRENT file's digest, since the file it
+# was built from never changed, so the continuation's whole-config check passes a reopening and
+# cannot notice that the checkout's budget is not the one the run was measured under.
+
+
+def _bookend_recording_another_runtime(tmp_path: Path, monkeypatch, launches: dict[int, dict]):
+    """A REAL bookend whose recorded eval runtime differs from the checkout's.
+
+    Produced by the entry itself rather than assembled by hand, so its manifest carries what a
+    real bookend carries: the inherited budget in ``cell``, and the unchanged cell file's own
+    digest, which is exactly why a reopening is not refused.
+    """
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    source_manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_manifest["cell"]["budget"]["eval_task_timeout_s"] = 300
+    source_manifest["cell"]["budget"]["eval_concurrency"] = 3
+    runner.write_json(source_dir / "manifest.json", source_manifest)
+    _wire_fakes(monkeypatch, cell, split, launches)
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+    run_dir = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cell"]["config_sha256"] == cell.to_manifest()["config_sha256"], (
+        "the fixture is only faithful if the digest is the checkout's own"
+    )
+    assert (cell.budget.eval_task_timeout_s, cell.budget.eval_concurrency) == (120, 1)
+    return run_dir, cell
+
+
+def _capture_reopened_cell(monkeypatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    async def fake_run_phases(ctx, *, manifest, phases, results_dir, observer, **kwargs):
+        captured["cell"] = ctx.cell
+        captured["manifest"] = manifest
+        return results_dir / "x.json"
+
+    monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
+    monkeypatch.setattr(runner, "_start_egress", lambda sandbox, run_dir: None)
+    monkeypatch.setattr(runner, "_watch_cell_credential", lambda ctx, spec: None)
+    return captured
+
+
+def test_a_repaired_bookend_keeps_the_runtime_it_inherited(tmp_path: Path, monkeypatch) -> None:
+    """A rerun-eval fills the ids infrastructure lost, beside rows already measured, so it must
+    bound them by the rule those rows were measured under. Read off the checkout instead, it
+    would splice two stopping rules into one artifact whose manifest names only one."""
+    launches: dict[int, dict] = {}
+    run_dir, cell = _bookend_recording_another_runtime(tmp_path, monkeypatch, launches)
+    captured = _capture_reopened_cell(monkeypatch)
+
+    asyncio.run(
+        runner.rerun_eval(run_dir, results_dir=tmp_path / "repair", capture_egress=False)
+    )
+
+    reopened = captured["cell"]
+    assert (reopened.budget.eval_task_timeout_s, reopened.budget.eval_concurrency) == (300, 3)
+    # And the record still says what it said: the reopening reads the runtime, never rewrites it.
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["rebookend"]["eval_runtime_from_record"] == {
+        "eval_task_timeout_s": 300,
+        "eval_concurrency": 3,
+    }
+    assert manifest["cell"]["budget"]["eval_task_timeout_s"] == 300
+
+
+def test_a_resumed_bookend_keeps_the_runtime_it_inherited(tmp_path: Path, monkeypatch) -> None:
+    """Same for the usage-limit path: a bookend that suspends mid-eval finishes its remaining
+    ids under the bound the finished ones were measured under, not the checkout's."""
+    launches: dict[int, dict] = {}
+    run_dir, cell = _bookend_recording_another_runtime(tmp_path, monkeypatch, launches)
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    runner.write_json(
+        run_dir / SUSPENSION_FILE,
+        {
+            "schema": "shobench.suspension/1",
+            "run_id": manifest["run_id"],
+            "cell": cell.name,
+            "harness": cell.harness,
+            "phase": "eval_after",
+            "completed_task_ids": [0],
+            "pending_task_ids": [1, 2],
+            "stop_evidence": StopVerdict(StopKind.USAGE_LIMIT, "the window closed").to_json(),
+            "suspended_at": 1.0,
+        },
+    )
+    captured = _capture_reopened_cell(monkeypatch)
+
+    asyncio.run(
+        runner.resume_cell(run_dir, results_dir=tmp_path / "resumed", capture_egress=False)
+    )
+
+    reopened = captured["cell"]
+    assert (reopened.budget.eval_task_timeout_s, reopened.budget.eval_concurrency) == (300, 3)
+
+
+def test_a_value_that_spells_like_absence_still_refuses() -> None:
+    """Absence is compared as an identity, not as a spelling.
+
+    A field whose legitimate value spells like the display marker must not compare equal to a
+    missing one in either direction: model and effort accept arbitrary text and reach harness
+    session construction, so that hole is reachable rather than theoretical.
+    """
+    assert runner.cell_field_drift({}, {"model": runner.CELL_FIELD_ABSENT}) != {}
+    assert runner.cell_field_drift({"model": runner.CELL_FIELD_ABSENT}, {}) != {}
+
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    del manifest["cell"]["model"]
+    spelled = replace(cell, model=runner.CELL_FIELD_ABSENT)
+
+    drift = runner.experiment_drift(
+        manifest,
+        cell=runner.bookend_cell(spelled, manifest),
+        split=split,
+        instruction=instruction,
+        scope=runner.DRIFT_BOOKEND,
+    )
+    assert drift and any("cell model" in line for line in drift), drift
+    # And the line distinguishes the two sides, which the record's single string cannot.
+    assert any("recorded no such field" in line for line in drift), drift
+
+
+def test_two_unrecorded_runtimes_are_not_an_agreement(tmp_path: Path, monkeypatch) -> None:
+    """A pair whose stopping rule neither side recorded is unproven, not matched. Silence is
+    not a value, and the check exists to know that the before rows and the after rows stopped
+    by the same rule."""
+    assert runner.pairing_drift({}, {}) != []
+
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    for run_dir in (source_dir, baseline_dir):
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        for field in runner.BOOKEND_EVAL_RUNTIME_FIELDS:
+            del manifest["cell"]["budget"][field]
+        runner.write_json(run_dir / "manifest.json", manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="not known to stop by one rule"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=baseline_dir,
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+
+# ----- the pairing is an equivalence, not a name match ------------------------------------------
+#
+# A bookend's after rows are guarded against the SOURCE's definition, and its before rows come
+# from the baseline's archive. Matching the cell name proves nothing about the version of that
+# cell the baseline ran, so everything that shaped its eval_before rows is compared too.
+
+
+def _divergent_baseline(tmp_path: Path, cell, split, **changes):
+    """A baseline archive whose recorded definition differs from the source's in one way."""
+    baseline_dir = _baseline_run(tmp_path, cell, split, name=f"baseline-{len(changes)}")
+    manifest = json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8"))
+    for dotted, value in changes.items():
+        block, _, key = dotted.partition(".")
+        manifest.setdefault(block, {})[key] = value
+    runner.write_json(baseline_dir / "manifest.json", manifest)
+    return baseline_dir
+
+
+@pytest.mark.parametrize(
+    ("change", "names"),
+    [
+        ({"cell.model": "a-model-the-source-never-ran"}, "model"),
+        ({"cell.env": "wordle_v2"}, "env"),
+        ({"cell.harness": "codex"}, "harness"),
+        ({"cell.effort": "low"}, "effort"),
+        ({"cell.credential_mode": "api_key"}, "credential_mode"),
+        ({"cell.env_kwargs": {"judge_model": "a-different-judge"}}, "env_kwargs"),
+        ({"instruction.eval_system_sha256": "0" * 64}, "eval instruction"),
+    ],
+)
+def test_a_baseline_measured_by_another_definition_is_refused(
+    tmp_path: Path, monkeypatch, change, names
+) -> None:
+    """Every field the baseline's before rows were produced by. A judge, a model, an effort or
+    a blind-eval prompt that differs makes the delta a comparison of two measurements, and the
+    cell name is not evidence that two archives ran the same version of that cell."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _divergent_baseline(tmp_path, cell, split, **change)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="was not measured by the same definition"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=baseline_dir,
+                capture_egress=False,
+            )
+        )
+    assert any(names in line for line in runner.pairing_drift(
+        json.loads((source_dir / "manifest.json").read_text(encoding="utf-8")),
+        json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8")),
+    ))
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+
+def test_a_baseline_that_only_rolled_out_differently_still_pairs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The fields a deferred baseline cannot have used. It runs eval_before alone, the eval
+    stream pins the blind feedback posture whatever the cell's arm says, and the eval fan-out
+    is one session per task whatever max_in_flight says. Both v0 pairs really do differ here,
+    their sources having run the immediate arm and their baselines the never arm, so comparing
+    the rollout knobs would refuse every pairing there is over what cannot reach a row."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _divergent_baseline(
+        tmp_path,
+        cell,
+        split,
+        **{
+            "cell.rollout_feedback": "immediate" if cell.rollout_feedback == "never" else "never",
+            "cell.max_in_flight": cell.max_in_flight + 7,
+        },
+    )
+    baseline_manifest = json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8"))
+    baseline_manifest["cell"]["budget"]["rollout_wall_clock_s"] = 1
+    baseline_manifest["cell"]["budget"]["pool_ceiling"] = 1
+    runner.write_json(baseline_dir / "manifest.json", baseline_manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            baseline_run_dir=baseline_dir,
+            capture_egress=False,
+        )
+    )
+    assert set(launches) == {0, 1, 2}
+
+
+@pytest.mark.parametrize(
+    ("block", "key", "names"),
+    [
+        ("split", "id_digest", "split ids"),
+        ("instruction", "rollout_system_sha256", "rollout instruction"),
+        ("instruction", "eval_system_sha256", "eval instruction"),
+    ],
+)
+def test_an_unrecorded_identity_digest_refuses_a_bookend(block, key, names) -> None:
+    """A bookend gives up the whole-cell digest, so the identity digests are the only proof
+    left that the held-out ids and the prompts are the ones the source used. An absent one is
+    not agreement: it is a record that cannot say what it measured, and it fails closed the
+    way an absent eval runtime does."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    del manifest[block][key]
+
+    drift = _bookend_drift(manifest, cell, split, instruction)
+    assert drift and any(names in line for line in drift), drift
+    assert any("not recorded" in line for line in drift), drift
+    # A continuation is unaffected by the absence: the whole-cell digest is proof of its own, so
+    # a record predating one of these is not refused for lacking it. The only continuation
+    # difference this fixture has is the retuned file it hashes.
+    continuation = runner.experiment_drift(
+        manifest, cell=cell, split=split, instruction=instruction
+    )
+    assert continuation and all("cell config changed" in line for line in continuation)
+
+
+def test_every_cell_field_is_judged_for_a_pairing() -> None:
+    """The pairing's field set, written down where a new cell axis breaks it.
+
+    The excluded groups are listed in the runner and everything else is eval-defining, so a
+    field added later refuses a pairing until someone decides otherwise. The one group excluded
+    for a reason other than bookkeeping is the rollout knobs, and the reason is checkable: a
+    deferred baseline runs eval_before alone, whose stream pins the blind posture and fans out
+    one session per task whatever those say.
+    """
+    fields = set(
+        runner._flat_cell(
+            load_cell_by_name("automationbench-prime_agent-claude-opus-5").to_manifest()
+        )
+    )
+    uncompared = set(runner.PAIRING_UNCOMPARED_CELL_FIELDS)
+    assert uncompared <= fields, "an uncompared field no cell carries is a stale judgement"
+    assert fields - uncompared == {
+        "name",
+        "env",
+        "harness",
+        "model",
+        "effort",
+        "credential_mode",
+        "env_kwargs",
+        "required_env",
+    }
+    # The eval runtime is not excused, only compared under the stricter rule: both archives
+    # must state it, so silence on either side refuses where mere equality would pass.
+    for field in runner.BOOKEND_EVAL_RUNTIME_FIELDS:
+        assert f"budget.{field}" in uncompared
+    assert runner.pairing_drift({}, {}) != []
+
+
+# ----- the pairing identity covers every recorded eval input ------------------------------------
+#
+# The cell block is not the whole definition of a before row. The kickoff every eval leg is sent
+# lives outside cells/, the shogym revision serves and scores the task, and the image and its
+# probed harness build are the CLI that ran. A baseline differing on any of those contributed rows
+# produced another way, and the published artifact carries only the rows and a run id.
+
+
+def _set_path(manifest: dict, path: str, value) -> None:
+    block = manifest
+    *steps, leaf = path.split(".")
+    for step in steps:
+        block = block.setdefault(step, {})
+    block[leaf] = value
+
+
+def _drop_path(manifest: dict, path: str) -> None:
+    block = manifest
+    *steps, leaf = path.split(".")
+    for step in steps:
+        block = block.get(step, {})
+    block.pop(leaf, None)
+
+
+def _paired_manifests(tmp_path: Path):
+    """Two archives of one definition: a rollout-only source and its deferred baseline."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    read = lambda d: json.loads((d / "manifest.json").read_text(encoding="utf-8"))  # noqa: E731
+    return read(source_dir), read(baseline_dir)
+
+
+def test_two_archives_of_one_definition_pair(tmp_path: Path) -> None:
+    """The control the mutations below are measured against, and the shape the real v0 pairs
+    have: everything the pairing rests on is recorded and identical."""
+    source, baseline = _paired_manifests(tmp_path)
+    assert runner.pairing_drift(source, baseline) == []
+
+
+@pytest.mark.parametrize("path", [path for _, path, _stage in runner.PAIRING_IDENTITY_FIELDS])
+def test_a_pairing_identity_that_differs_refuses(tmp_path: Path, path: str) -> None:
+    """Generated from the identity set itself, so a field added to it is exercised the day it
+    is added rather than the day someone remembers to test it."""
+    source, baseline = _paired_manifests(tmp_path)
+    _set_path(baseline, path, "something-the-source-never-used")
+
+    drift = runner.pairing_drift(source, baseline)
+    assert drift and any(path in line for line in drift), drift
+
+
+@pytest.mark.parametrize("path", [path for _, path, _stage in runner.PAIRING_IDENTITY_FIELDS])
+def test_a_pairing_identity_that_is_unrecorded_refuses(tmp_path: Path, path: str) -> None:
+    """Absent on one side or on both. An identity is a record ASSERTING what produced its rows,
+    so silence proves nothing and two silences agree about nothing."""
+    source, baseline = _paired_manifests(tmp_path)
+    unrecorded = lambda: [  # noqa: E731
+        line for line in runner.pairing_drift(source, baseline) if "not recorded" in line
+    ]
+    _drop_path(baseline, path)
+    assert unrecorded(), path
+
+    _drop_path(source, path)
+    assert unrecorded(), path
+
+
+@pytest.mark.parametrize("block", [block for block, _stage in runner.PAIRING_IDENTITY_BLOCKS])
+def test_a_pairing_identity_block_is_compared_key_by_key(tmp_path: Path, block: str) -> None:
+    """These blocks are compared whole rather than field by named field, so a key added to any of
+    them is eval-defining until someone judges otherwise. A block missing altogether names none
+    of what its rows were produced by, which is a refusal of its own."""
+    source, baseline = _paired_manifests(tmp_path)
+    owned_elsewhere = {path for _, path, _s in runner.PAIRING_VERSIONED_IDENTITY} | set(
+        runner.PAIRING_UNCOMPARED_IDENTITY_PATHS
+    )
+    recorded = runner._recorded_path(baseline, block)
+    assert isinstance(recorded, dict) and recorded, "the fixture must record this block"
+    compared = [key for key in recorded if f"{block}.{key}" not in owned_elsewhere]
+    assert compared, (block, "every key is owned elsewhere; the block comparison is dead")
+    for key in compared:
+        mutated = json.loads(json.dumps(baseline))
+        _set_path(mutated, f"{block}.{key}", "something-else")
+        drift = runner.pairing_drift(source, mutated)
+        assert drift and any(f"{block}.{key}" in line for line in drift), (key, drift)
+
+    without = json.loads(json.dumps(baseline))
+    _drop_path(without, block)
+    drift = runner.pairing_drift(source, without)
+    assert drift and any(block in line for line in drift), drift
+
+
+def test_the_pairing_identity_set_is_the_decided_one() -> None:
+    """The decision, written where removing a fact breaks a test rather than a measurement.
+
+    Every entry is a recorded fact a before row was produced by: the ids it ran over and the
+    data behind them, the blind prompt and the user turn it was sent, the image and harness build
+    that ran it, the kind of account that served it, the effort that did or did not reach the
+    harness, and the code that served, scored and supervised it. What is deliberately absent is
+    listed beside the constants in the runner, each with its reason.
+    """
+    assert runner.PAIRING_IDENTITY_FIELDS == (
+        ("split ids", "split.id_digest", runner.IDENTITY_PRE_SPEND),
+        ("eval instruction", "instruction.eval_system_sha256", runner.IDENTITY_PRE_SPEND),
+        ("eval kickoff", "instruction.kickoff", runner.IDENTITY_PRE_SPEND),
+        ("agent image tag", "container.agent_image", runner.IDENTITY_PRE_SPEND),
+        ("credential mode", "axes.credential_mode.effective", runner.IDENTITY_AFTER_SETUP),
+    )
+    assert runner.PAIRING_IDENTITY_BLOCKS == (
+        ("substrate", runner.IDENTITY_PRE_SPEND),
+        ("split.provenance", runner.IDENTITY_PRE_SPEND),
+        ("axes.effort", runner.IDENTITY_PRE_SPEND),
+        ("harness_probes", runner.IDENTITY_AFTER_SETUP),
+    )
+    # The two facts no archive written before this change carries, and the only place absence
+    # is tolerated rather than refused.
+    assert runner.PAIRING_VERSIONED_IDENTITY == (
+        ("agent image digest", "container.image_digest", runner.IDENTITY_PRE_SPEND),
+        ("runner revision", "substrate.shobench_rev", runner.IDENTITY_PRE_SPEND),
+    )
+
+
+def test_a_baseline_with_another_kickoff_is_refused_through_the_entry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Driven through the real entry rather than the helper, so the refusal is proven where the
+    spend would have happened."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    baseline_manifest = json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8"))
+    baseline_manifest["instruction"]["kickoff"] = "A different eval opener.\n"
+    runner.write_json(baseline_dir / "manifest.json", baseline_manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="eval kickoff"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=baseline_dir,
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+
+# ----- the identities no archive carries yet ----------------------------------------------------
+#
+# Fail-closed absence refuses history. The image content id and the runner revision are recorded
+# from now on and are in no archive written before, so requiring them would refuse the two pairings
+# this entry exists for. They get a three-way rule instead, and the silence is published.
+
+
+@pytest.mark.parametrize(
+    ("label", "path"),
+    [(label, path) for label, path, _stage in runner.PAIRING_VERSIONED_IDENTITY],
+)
+def test_a_versioned_identity_refuses_when_only_one_side_states_it(
+    tmp_path: Path, label: str, path: str
+) -> None:
+    """One archive proving what the other cannot is not a match. The pairing refuses rather
+    than reading the newer record's word for both."""
+    source, baseline = _paired_manifests(tmp_path)
+    _drop_path(baseline, path)
+
+    drift = runner.pairing_drift(source, baseline)
+    assert drift and any(path in line for line in drift), drift
+    assert runner.pairing_unproven(source, baseline) == [], "one side does state it"
+
+
+@pytest.mark.parametrize(
+    ("label", "path"),
+    [(label, path) for label, path, _stage in runner.PAIRING_VERSIONED_IDENTITY],
+)
+def test_a_versioned_identity_that_differs_refuses(tmp_path: Path, label: str, path: str) -> None:
+    """Stated on both sides, it is an identity like any other."""
+    source, baseline = _paired_manifests(tmp_path)
+    _set_path(baseline, path, "something-the-source-never-ran")
+
+    drift = runner.pairing_drift(source, baseline)
+    assert drift and any(path in line for line in drift), drift
+
+
+def test_two_silent_archives_pair_and_the_silence_is_published(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The v0 shape: neither archive records the image id or the runner revision, so the pairing
+    passes and the artifact says which identities it could not establish. Absence is visible
+    here, never silent, which is the whole difference between this category and the rest."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    for run_dir in (source_dir, baseline_dir):
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        for _, path, _stage in runner.PAIRING_VERSIONED_IDENTITY:
+            _drop_path(manifest, path)
+        runner.write_json(run_dir / "manifest.json", manifest)
+    source = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    baseline = json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert runner.pairing_drift(source, baseline) == []
+    assert runner.pairing_unproven(source, baseline) == sorted(
+        path for _, path, _stage in runner.PAIRING_VERSIONED_IDENTITY
+    )
+
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+    results_path = asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            baseline_run_dir=baseline_dir,
+            capture_egress=False,
+        )
+    )
+
+    assert set(launches) == {0, 1, 2}, "a pairing of two silent archives still runs"
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((new_run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["rebookend"]["pairing_identity_unproven"] == [
+        "container.image_digest",
+        "substrate.shobench_rev",
+    ]
+    # And it reaches the published artifact, which is what a reader of the delta holds.
+    published = json.loads(results_path.read_text(encoding="utf-8"))
+    assert published["manifest"]["rebookend"]["pairing_identity_unproven"] == [
+        "container.image_digest",
+        "substrate.shobench_rev",
+    ]
+
+
+def test_a_dirty_runner_tree_does_not_prove_a_revision(tmp_path: Path) -> None:
+    """A modified checkout shares its commit and not its code, so two edited trees at one sha
+    must not prove anything about each other: the revision reads as unrecorded and lands in the
+    published unproven list instead of passing as a match."""
+    source, baseline = _paired_manifests(tmp_path)
+    for manifest in (source, baseline):
+        _set_path(manifest, "substrate.shobench_dirty", True)
+
+    assert runner.pairing_drift(source, baseline) == []
+    assert "substrate.shobench_rev" in runner.pairing_unproven(source, baseline)
+
+    # One clean side and one dirty side is the one-sided case: the clean archive states an
+    # identity the dirty one cannot, and the pairing refuses.
+    _set_path(baseline, "substrate.shobench_dirty", False)
+    drift = runner.pairing_drift(source, baseline)
+    assert drift and any("substrate.shobench_rev" in line for line in drift), drift
+
+
+def test_the_recorded_effort_block_is_compared(tmp_path: Path) -> None:
+    """requested is the cell's ask; applied and how are whether it reached the harness at all.
+    A before side that applied an effort the source's did not is a different measurement, and
+    the cell block alone cannot say so."""
+    source, baseline = _paired_manifests(tmp_path / "applied")
+    _set_path(baseline, "axes.effort.applied", not source["axes"]["effort"]["applied"])
+    assert any("axes.effort.applied" in line for line in runner.pairing_drift(source, baseline))
+
+    source, baseline = _paired_manifests(tmp_path / "how")
+    _set_path(baseline, "axes.effort.how", "a flag the source never passed")
+    assert any("axes.effort.how" in line for line in runner.pairing_drift(source, baseline))
+
+
+def test_the_split_provenance_is_compared(tmp_path: Path) -> None:
+    """id_digest hashes the env name, the ids and the env kwargs: POSITIONS, not the bytes they
+    resolve against. tau2 resolves them against a byte-verified upstream tree whose sha the
+    split records here, so two archives can share every id and score different task content."""
+    source, baseline = _paired_manifests(tmp_path / "upstream")
+    _set_path(baseline, "split.provenance.upstream_sha", "0" * 40)
+    drift = runner.pairing_drift(source, baseline)
+    assert drift and any("split.provenance.upstream_sha" in line for line in drift), drift
+
+    source, baseline = _paired_manifests(tmp_path / "kind")
+    _set_path(baseline, "split.provenance.kind", "regenerated")
+    assert any("split.provenance.kind" in line for line in runner.pairing_drift(source, baseline))
+    assert source["split"]["id_digest"] == baseline["split"]["id_digest"], (
+        "the point of the check is that the positions still agree"
+    )
+
+
+# ----- the third side: what will actually produce the new rows ----------------------------------
+#
+# A pairing proves two archives agree with each other and the drift check proves the cell file has
+# not moved. Neither says anything about the image, the substrate, the prompt as sent or the effort
+# as applied that the NEW rows will be produced under, and recording those in the new manifest
+# documents a mismatch rather than preventing it.
+
+
+def _current_identity_for(cell, split, image_tag="shobench-agent:v0"):
+    return runner.current_identity(
+        cell=cell,
+        split=split,
+        instruction=load_instruction(cell.instruction_arm),
+        harness=runner.harness_for(cell.harness),
+        image_tag=image_tag,
+        image_digest_value=runner.image_digest(image_tag),
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("substrate.shogym_rev", "0" * 40),
+        ("substrate.shobench_rev", "c" * 40),
+        ("container.image_digest", "sha256:" + "d" * 64),
+        ("container.agent_image", "another-image:v9"),
+        ("instruction.kickoff", "A different opener.\n"),
+        # A key both records carry. A key only ONE side carries is an absence, which this
+        # comparison names rather than refuses, and the image-digest test covers that path.
+        ("split.provenance.kind", "regenerated"),
+        ("axes.effort.applied", True),
+    ],
+)
+def test_a_checkout_that_would_produce_rows_differently_refuses(
+    tmp_path: Path, monkeypatch, path: str, value
+) -> None:
+    """Every pre-spend fact, driven through the real entry. The archives agree with each other
+    and the cell file has not moved; what has moved is the thing about to produce the rows."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    _set_path(manifest, path, value)
+    runner.write_json(source_dir / "manifest.json", manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="execution identity no longer matches"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}, "the refusal lands before anything is copied or run"
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("harness_probes.version", "a version this image never printed"),
+        ("axes.credential_mode.effective", "api_key"),
+    ],
+)
+def test_an_after_setup_fact_refuses_before_any_row(
+    tmp_path: Path, monkeypatch, path: str, value
+) -> None:
+    """The two facts that do not exist until a container has run and a credential is placed.
+    They are checked at the moment they become knowable, which is still before the first leg."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    _set_path(manifest, path, value)
+    runner.write_json(source_dir / "manifest.json", manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="execution identity no longer matches"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}, "no leg ran, so no row exists to be wrong"
+
+
+def test_an_unstatable_current_fact_is_named_rather_than_refused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The current side can fail to answer: docker may not be there to resolve a digest, and no
+    reopen path takes a probe. That is not a disagreement and it is not nothing, so it lands in
+    the published unproven list rather than refusing or passing in silence."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    monkeypatch.setattr(runner, "image_digest", lambda image: None)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((new_run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["rebookend"]["execution_identity_unproven"] == ["container.image_digest"]
+    assert manifest["container"]["image_digest"] is None
+
+
+@pytest.mark.parametrize("reopen", ["resume", "rerun"])
+def test_a_reopening_refuses_a_changed_execution_identity(
+    tmp_path: Path, monkeypatch, reopen: str
+) -> None:
+    """Both reopen paths get the same check, and for the sharper reason: they fill rows beside
+    rows a run already has, so an image or a substrate that moved under them would put two
+    executions inside one artifact that names one."""
+    launches: dict[int, dict] = {}
+    run_dir, cell = _bookend_recording_another_runtime(tmp_path, monkeypatch, launches)
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    _set_path(manifest, "substrate.shogym_rev", "0" * 40)
+    if reopen == "resume":
+        manifest_extra = {
+            "schema": "shobench.suspension/1",
+            "run_id": manifest["run_id"],
+            "cell": cell.name,
+            "harness": cell.harness,
+            "phase": "eval_after",
+            "completed_task_ids": [0],
+            "pending_task_ids": [1, 2],
+            "stop_evidence": StopVerdict(StopKind.USAGE_LIMIT, "the window closed").to_json(),
+            "suspended_at": 1.0,
+        }
+        runner.write_json(run_dir / SUSPENSION_FILE, manifest_extra)
+    runner.write_json(run_dir / "manifest.json", manifest)
+    _capture_reopened_cell(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="execution identity no longer matches"):
+        if reopen == "resume":
+            asyncio.run(
+                runner.resume_cell(run_dir, results_dir=tmp_path / "out", capture_egress=False)
+            )
+        else:
+            asyncio.run(
+                runner.rerun_eval(run_dir, results_dir=tmp_path / "out", capture_egress=False)
+            )
+
+
+def test_the_plan_reports_the_execution_check_before_any_spend(
+    tmp_path: Path, capsys
+) -> None:
+    """The operator's view of the third comparison, and the self-paired plan publishing the same
+    evidence the manifest would: a plan that says less than the artifact is a plan nobody can
+    act on."""
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["refusals"]["source_has_own_eval_before"] is True
+    # Self-paired, so the pairing is a record against itself: nothing differs, and what the
+    # record cannot state is named rather than omitted.
+    assert plan["refusals"]["baseline_pairing_drift"] == []
+    assert "baseline_pairing_unproven" in plan["refusals"]
+    assert "execution_identity_drift" in plan["refusals"]
+
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    _set_path(manifest, "substrate.shogym_rev", "0" * 40)
+    runner.write_json(source_dir / "manifest.json", manifest)
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert any(
+        "substrate.shogym_rev" in line for line in plan["refusals"]["execution_identity_drift"]
+    )
+
+    assert cli_main(["rebookend", "--run", str(source_dir), "--go"]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "execution identity" in err
+    assert not (tmp_path / "runs").exists()
+
+
+def test_a_bookend_probes_the_image_its_legs_will_run(tmp_path: Path, monkeypatch) -> None:
+    """The probe and the legs are one image or the record describes a run that did not happen.
+
+    The probe took the mutable TAG while the legs took the pinned id, so a rebuild between the
+    two put image B in the probe and image A in the manifest and the rows; two builds printing
+    one version string is exactly the case the content id exists to tell apart, so the version
+    probe cannot be what notices.
+    """
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    launches: dict[int, dict] = {}
+    probes: list[str] = []
+    _wire_fakes(monkeypatch, cell, split, launches, probes)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    pinned = runner.image_digest("shobench-agent:v0")
+    assert probes == [pinned], probes
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((new_run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["container"]["image_digest"] == pinned
+    assert manifest["container"]["agent_image"] == "shobench-agent:v0"

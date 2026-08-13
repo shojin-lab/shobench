@@ -423,3 +423,113 @@ def test_the_rollout_stream_regime_follows_the_cell_axis(monkeypatch, tmp_path: 
         dataclasses.replace(cell, rollout_feedback="never"), split, "rollout", tmp_path
     )
     assert type(captured["feedback"]).__name__ == "Never"
+
+
+# ----- the image a run pinned itself to ---------------------------------------------------------
+#
+# A tag is a mutable name and a run is long, so one run has to resolve it once and then use the
+# same bytes for every probe and every leg. The fresh path skipped that entirely: it probed and ran
+# on the tag and recorded no content id, which left every future archive permanently unable to
+# state the identity the pairing checks for.
+
+
+def test_a_fresh_run_pins_its_image_and_records_both_names(tmp_path: Path, monkeypatch) -> None:
+    """Driven through the real ``run_cell`` with no phases, because what is under test is what
+    the call site resolves and hands on, not what a probe does with it."""
+    import asyncio
+
+    from shobench import runner
+
+    probed: list[str] = []
+
+    def fake_probe(argv, *, image, sandbox, env, redactor=None):
+        probed.append(image)
+        return "2.1.226 (Claude Code)"
+
+    monkeypatch.setattr(runner, "_probe", fake_probe)
+    monkeypatch.setattr(runner, "image_digest", lambda image: "sha256:" + "e" * 64)
+    monkeypatch.setattr(CellSandbox, "up", lambda self, **kw: None)
+    monkeypatch.setattr(CellSandbox, "down", lambda self: None)
+    cell = load_cell_by_name("smoke-automationbench-claude-code")
+
+    asyncio.run(
+        runner.run_cell(
+            cell,
+            load_split_by_name(cell.split),
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            agent_image="mutable-agent:latest",
+            phases=(),
+            capture_egress=False,
+        )
+    )
+
+    # Every probe ran the resolved id, so a rebuild mid-run cannot put one image in the probe
+    # and another in the legs.
+    assert probed == ["sha256:" + "e" * 64]
+    run_dir = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    # The tag says what was asked for and the digest says what answered. An archive that states
+    # only the tag can never prove its image to a later pairing.
+    assert manifest["container"]["agent_image"] == "mutable-agent:latest"
+    assert manifest["container"]["image_digest"] == "sha256:" + "e" * 64
+
+
+def test_an_unresolvable_image_leaves_the_tag_in_place(tmp_path: Path, monkeypatch) -> None:
+    """Docker not answering is an absence, not a failure: the run proceeds on the tag and the
+    record says it could not name the bytes, which is what the unproven list is for."""
+    import asyncio
+
+    from shobench import runner
+
+    probed: list[str] = []
+
+    def fake_probe(argv, *, image, sandbox, env, redactor=None):
+        probed.append(image)
+        return "2.1.226 (Claude Code)"
+
+    monkeypatch.setattr(runner, "_probe", fake_probe)
+    monkeypatch.setattr(runner, "image_digest", lambda image: None)
+    monkeypatch.setattr(CellSandbox, "up", lambda self, **kw: None)
+    monkeypatch.setattr(CellSandbox, "down", lambda self: None)
+    cell = load_cell_by_name("smoke-automationbench-claude-code")
+
+    asyncio.run(
+        runner.run_cell(
+            cell,
+            load_split_by_name(cell.split),
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            agent_image="mutable-agent:latest",
+            phases=(),
+            capture_egress=False,
+        )
+    )
+
+    assert probed == ["mutable-agent:latest"]
+    run_dir = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["container"]["agent_image"] == "mutable-agent:latest"
+    assert manifest["container"]["image_digest"] is None
+
+
+def test_resolving_an_image_asks_docker_every_time(monkeypatch) -> None:
+    """The resolution is scoped to a run, not to the process. A cache that outlived one run made
+    a second run in the same process pin the image the first one resolved, so a deliberate
+    rebuild between two calls of the exported API published the old id for the new run's rows."""
+    from shobench import containers
+
+    answers = iter(["sha256:first", "sha256:second"])
+
+    class _Result:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self) -> None:
+            self.stdout = next(answers) + "\n"
+
+    monkeypatch.setattr(containers, "docker", lambda *a, **kw: _Result())
+    monkeypatch.setattr(containers.shutil, "which", lambda name: "/usr/bin/docker")
+
+    assert containers.image_digest("mutable-agent:latest") == "sha256:first"
+    assert containers.image_digest("mutable-agent:latest") == "sha256:second"

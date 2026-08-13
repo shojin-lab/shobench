@@ -60,6 +60,30 @@ def daemon_available() -> bool:
     return shutil.which("docker") is not None and docker("info", check=False).returncode == 0
 
 
+def image_digest(image: str) -> str | None:
+    """The image's content id, which is exactly what a tag is not.
+
+    A tag is a mutable name: rebuilding ``shobench-agent:v0`` on a newer base, a different Node
+    or Python, another shell tool or another Prime kernel produces the same tag and the same
+    ``--version`` probe while producing a different agent. The image ID is the content, so it is
+    what a later comparison can rest on, and every run records it from here on.
+
+    Answers nothing when docker cannot (no daemon, no such image, no docker at all) rather than
+    raising or guessing: a manifest that records an honest absence is what lets a reader see the
+    identity was never established, and this is not worth failing a run over.
+
+    Deliberately uncached, unlike the runner revision: an image is re-read from the daemon at
+    container start, so a rebuild between two runs in one process is real. The runner asks once
+    per run and carries the answer in that run's context, which is the scope that means anything.
+    """
+    if shutil.which("docker") is None:
+        return None
+    result = docker("image", "inspect", "--format", "{{.Id}}", image, check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def build_image(dockerfile: Path, context: Path, tag: str) -> str:
     docker("build", "-q", "-f", str(dockerfile), "-t", tag, str(context))
     return tag
