@@ -135,9 +135,10 @@ class PrimeAgent(Harness):
     session_state_dirs = (".prime/agent/sessions", ".prime/agent/session-artifacts")
 
     # Seconds, and short because prime is the harness the grace cannot help. With no quality gate
-    # it has no terminal condition of its own, and no archived phase holds a prime eval leg that
-    # ended by its own choosing, so every second of the wait is billed post-seal turns rather than
-    # room for a voluntary stop. On a resumed fork those turns are the expensive kind: the refine
+    # it has no terminal condition of its own, and voluntary eval-leg stops are vanishingly rare
+    # in the archives (a handful across hundreds of legs, the inspected one 1163s after its seal,
+    # far beyond any plausible grace), so every second of the wait is billed post-seal turns
+    # rather than room for a voluntary stop. On a resumed fork those turns are the expensive kind: the refine
     # cycle that follows the seal rebuilds the system prompt, and the next turn writes the whole
     # inherited prefix again as a fresh cache entry, measured at about $4.56 a leg against a
     # 447K-token context and two thirds of the leg's total spend. Fifteen seconds covers the seal
