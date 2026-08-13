@@ -134,19 +134,23 @@ class PrimeAgent(Harness):
     # daemon-workers/) and stay behind with the rest of the noise.
     session_state_dirs = (".prime/agent/sessions", ".prime/agent/session-artifacts")
 
-    # Seconds, and short because prime is the harness the grace cannot help. With no quality gate
-    # it has no terminal condition of its own, and voluntary eval-leg stops are vanishingly rare
-    # in the archives (a handful across hundreds of legs, the inspected one 1163s after its seal,
-    # far beyond any plausible grace), so every second of the wait is billed post-seal turns
-    # rather than room for a voluntary stop. On a resumed fork those turns are the expensive
-    # kind: the refine cycle that follows the seal rebuilds the system prompt, and the next turn
-    # writes the whole inherited prefix again as a fresh cache entry, measured at about $4.56
-    # a leg against a 447K-token context and two thirds of the leg's total spend. Fifteen
-    # seconds covers the seal
-    # write and a drain poll with margin, and ends the leg before the rebuild turn, which follows
-    # the seal by tens of seconds, can finish a rewrite. No score moves either way: the row is
-    # sealed and the stream drained before the grace starts, and the per-task home is discarded.
-    eval_drain_grace_s = 15.0
+    # None, meaning the first drain poll that finds a finished eval leg ends it.
+    #
+    # With no quality gate prime has no terminal condition of its own, and voluntary eval-leg
+    # stops are vanishingly rare in the archives (a handful across hundreds of legs, the inspected
+    # one 1163s after its seal, far beyond any plausible grace), so a wait protects nothing here
+    # and buys only post-seal turns. What rules out a short wait as well as a long one is what a
+    # wait would be racing: the billable event is a request being DISPATCHED rather than a turn
+    # completing, and a dispatched request is charged whether or not anyone is still listening for
+    # its answer, while prime can begin planning its refinement at an assistant-message boundary
+    # with tools still running, so on a slow seal the distance from the seal to the next dispatch
+    # collapses toward nothing. Any fixed number is a clock racing a behavior this runner does not
+    # control, so prime is given no clock, and what is left is the poll interval, which is as
+    # close to the seal as an out-of-band watcher can read. The stake is measured: on a resumed
+    # fork the post-seal refine turn writes the whole inherited prefix again as a fresh cache
+    # entry, about $4.56 a leg against a 447K-token context and two thirds of the leg's spend. No
+    # score moves either way, since the row is sealed and the stream drained before any of it.
+    eval_drain_grace_s = None
 
     # The structured signal, which is the cleanest of the three harnesses: a stream failure is
     # classified into a kind, and rate_limit is one of them.

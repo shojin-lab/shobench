@@ -584,11 +584,13 @@ class DrainWatchdog:
     thread supervising the container, so the two halves of the decision (watching the stream,
     ending the process) stay where each belongs. ``grace_s`` rides along because the verdict has
     to say how long the leg was given after there was nothing left for it to do; a reader of the
-    record should not have to go looking up a constant to know what the ending means.
+    record should not have to go looking up a constant to know what the ending means. ``None`` is
+    that answer for a harness that is given nothing: the first reading that finds the leg
+    finished ends it.
     """
 
     fired: threading.Event
-    grace_s: float
+    grace_s: float | None
 
 
 # How often the leg supervisor looks up from waiting on the container. It only matters for a leg
@@ -986,10 +988,13 @@ def _eval_pending_ids(phase_dir: Path, task_ids: Sequence[str]) -> list[str]:
 # of it after the measurement was already complete. The score is unaffected either way (the row
 # seals at the task's completion call and the per-task home is discarded), so what this recovers
 # is time and spend, and the ending is recorded as its own kind so the finding stays visible. How
-# long a leg is given after its task is finished is the harness's own ``eval_drain_grace_s``.
+# long a leg is given after its task is finished, if anything at all, is the harness's own
+# ``eval_drain_grace_s``.
 #
 # How often the condition is re-read. The condition is monotone in practice, so this only decides
-# how promptly the grace timer starts; it costs one queue read and one small file read.
+# how promptly the grace timer starts; it costs one queue read and one small file read. For a
+# harness given no grace it is the whole of the delay, so the ending lands within one interval of
+# the seal.
 EVAL_DRAIN_POLL_S = 5.0
 
 
@@ -1017,7 +1022,8 @@ async def _watch_for_drain(
     *,
     poll_s: float = EVAL_DRAIN_POLL_S,
 ) -> bool:
-    """Set the watchdog once this task has been finished for the whole grace period.
+    """Set the watchdog once this task has been finished for the harness's whole grace period, or
+    on the first reading that finds it finished when the harness declares no grace.
 
     Runs on the phase's event loop, which is where the stream mutates, so reading the queue here
     cannot catch it mid-change. The leg itself is on a worker thread and is told through the
@@ -1042,6 +1048,12 @@ async def _watch_for_drain(
         if not finished:
             finished_since = None
             continue
+        if watchdog.grace_s is None:
+            # No grace: this reading is the ending. Written as its own branch rather than as a
+            # zero-length timer, because a zero would still be compared on the NEXT poll and the
+            # leg would live a poll interval longer, which is the whole of what this is for.
+            watchdog.fired.set()
+            return True
         if finished_since is None:
             finished_since = time.monotonic()
         elif time.monotonic() - finished_since >= watchdog.grace_s:

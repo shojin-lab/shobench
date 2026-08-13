@@ -645,47 +645,70 @@ class _PollClock:
         return self.readings[-1]
 
 
-def test_each_harness_waits_the_grace_it_declares_and_no_other(
+def test_prime_ends_a_finished_leg_on_sight_and_the_others_wait_their_grace(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The wait belongs to the harness because what it covers is the harness's own wrap-up.
+    """Two endings, and which one a leg gets is the harness's own declaration.
 
     Claude Code and codex end their legs 8 to 25 seconds after the seal, so two minutes is a wait
-    they never reach the end of and their voluntary stops stay reachable. prime ends no eval leg
-    by choosing to, so every second past the seal is billed turns and nothing else.
+    they never reach the end of and their voluntary stops stay reachable. prime is not waiting for
+    an ending it makes, and a wait for it is a clock racing the next billable dispatch, so the
+    first reading that finds its leg finished is the ending. A zero would not do this: it would
+    still be compared on the following poll.
     """
     prov = tmp_path / "task-00000"
     prov.mkdir(parents=True)
-    fired_after: dict[str, float] = {}
+    real_finished = runner._eval_task_is_finished
+    seen: dict[str, tuple[int, float]] = {}
+
+    async def watch_out(stream, name: str) -> tuple[int, float]:
+        """One harness's watchdog against an already finished leg: how many readings found it
+        finished before the watchdog fired, and how many simulated seconds passed over them."""
+        clock = _PollClock()
+        polls = 0
+
+        def counted(*args: object, **kw: object) -> bool:
+            nonlocal polls
+            finished = real_finished(*args, **kw)
+            polls += 1 if finished else 0
+            return finished
+
+        monkeypatch.setattr(runner, "_eval_task_is_finished", counted)
+        monkeypatch.setattr(runner, "time", clock)
+        watchdog = DrainWatchdog(threading.Event(), harness_for(name).eval_drain_grace_s)
+        assert await runner._watch_for_drain(stream, prov, 0, watchdog, poll_s=0.001) is True
+        assert watchdog.fired.is_set()
+        waited = clock.readings[-1] - clock.readings[0] if clock.readings else 0.0
+        return polls, waited
 
     async def body(stream, client):
         await client.call_tool("get_task", {})
         await client.call_tool("terminate", {})
         for name in ("prime_agent", "claude_code", "codex"):
-            clock = _PollClock()
-            monkeypatch.setattr(runner, "time", clock)
-            watchdog = DrainWatchdog(threading.Event(), harness_for(name).eval_drain_grace_s)
-            assert await runner._watch_for_drain(stream, prov, 0, watchdog, poll_s=0.001) is True
-            # From the first reading that saw the task finished to the one that fired.
-            fired_after[name] = clock.readings[-1] - clock.readings[0]
+            seen[name] = await watch_out(stream, name)
 
     _against_a_real_stream(prov, 0, body)
 
-    assert fired_after == {"prime_agent": 15.0, "claude_code": 120.0, "codex": 120.0}
-    # A harness that declares nothing waits the long one, so the shortening is prime's alone.
+    # prime: the reading that finds the leg finished is the one that ends it, nothing waited and
+    # no clock consulted, so the exposure is the poll interval and not a number racing a dispatch.
+    assert seen["prime_agent"] == (1, 0.0)
+    # claude_code and codex: unchanged, two minutes of polls before a leg is taken from them.
+    assert seen["claude_code"] == (25, 120.0)
+    assert seen["codex"] == (25, 120.0)
+    # A harness that declares nothing waits the long one, so the change is prime's alone.
     assert Harness.eval_drain_grace_s == 120.0
 
 
 def test_the_phase_bounds_every_leg_by_its_own_harness_grace(tmp_path: Path, monkeypatch) -> None:
-    """The declared number reaches the leg: the watchdog a phase builds carries the grace of the
-    harness that phase runs, which is the one place the runner reads it."""
+    """What the harness declares reaches the leg: the watchdog a phase builds carries its own
+    harness's grace, which is the one place the runner reads it."""
     monkeypatch.setattr(runner, "EVAL_LAUNCH_STAGGER_S", 0.0)
 
-    def graces_of(cell_name: str, *, at: Path) -> list[float]:
+    def graces_of(cell_name: str, *, at: Path) -> list[float | None]:
         launched: list[int] = []
         _capture_launches(monkeypatch, launched)
         captured = runner.run_leg
-        seen: list[float] = []
+        seen: list[float | None] = []
 
         def record(ctx_arg: RunContext, **kw: object) -> LegRecord:
             watchdog = kw["watchdog"]
@@ -702,7 +725,7 @@ def test_the_phase_bounds_every_leg_by_its_own_harness_grace(tmp_path: Path, mon
         asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
         return seen
 
-    assert graces_of(_PRIME_CELL, at=tmp_path / "prime") == [15.0, 15.0]
+    assert graces_of(_PRIME_CELL, at=tmp_path / "prime") == [None, None]
     assert graces_of(_SMOKE_CELL, at=tmp_path / "claude") == [120.0, 120.0]
 
 
