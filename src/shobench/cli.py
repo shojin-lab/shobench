@@ -28,7 +28,9 @@ from shobench import credentials, report, runner, tau2_data
 from shobench.config import load_all_cells, load_cell_by_name, load_instruction, repo_root
 from shobench.containers import AGENT_IMAGE, NETNS_IMAGE, CellSandbox, build_image, daemon_available
 from shobench.egress import EGRESS_IMAGE
+from shobench.harnesses import harness_for
 from shobench.pins import SHOGYM_REV
+from shobench.results import INCOMPLETE_SUFFIX
 from shobench.runner import SUSPENSION_FILE, resume_cell, run_cell
 from shobench.serving import DEFAULT_PORT
 from shobench.splits import load_split_by_name
@@ -380,6 +382,14 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         instruction=load_instruction(cell.instruction_arm),
     )
     terminal_session = runner.terminal_session_in(source_dir)
+    # The id alone proves only that the stopping record names something; the plan promises the
+    # session it will fork, so the transcript is resolved in the SOURCE home with the same
+    # per-harness validation the runner preflight applies to the copy.
+    terminal_transcript = (
+        harness_for(cell.harness).session_transcript(source_dir / "home", terminal_session)
+        if terminal_session is not None
+        else None
+    )
     source_stopping_path = source_dir / runner.ROLLOUT_STOPPING_FILE
     source_stopping = (
         json.loads(source_stopping_path.read_text(encoding="utf-8"))
@@ -413,6 +423,7 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         "outputs_inside_source": outputs_inside_source,
         "rollout_terminus_present": source_stopping_path.is_file(),
         "terminal_session_resolvable": terminal_session is not None,
+        "terminal_transcript_resolvable": terminal_transcript is not None,
         "experiment_drift": drift,
         "missing_required_env": missing_required,
     }
@@ -431,8 +442,15 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         # Every held-out task, because a rebookend is a fresh bookend rather than a repair:
         # nothing is already complete in a run directory that does not exist yet.
         "heldout_tasks_to_run": len(split.heldout),
-        "result_artifact": f"<bookend-run-id>.json under {args.results} (the source's "
-        f"{cell.name}.json artifact is never touched)",
+        # The leaf a before-less bookend actually writes is the incomplete shape, always:
+        # with no eval_before it cannot account for the before side. The pairing partner is
+        # the source's own artifact, in whichever shape the source published (the report-set
+        # sources are the incomplete shape), and `shobench report` assembles the two by run
+        # id.
+        "result_artifact": f"<bookend-run-id>{INCOMPLETE_SUFFIX} under {args.results} "
+        f"(pairs post-hoc with the source's {cell.name}.json or "
+        f"{cell.name}{INCOMPLETE_SUFFIX}, which is never touched; `shobench report` "
+        "assembles them by run id)",
         "source_home": {
             "files": len(home_files),
             "bytes": sum(p.stat().st_size for p in home_files),
@@ -468,6 +486,10 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         blockers.append("the source has no rollout terminus, so there is nothing to resume from")
     elif not refusals["terminal_session_resolvable"]:
         blockers.append("the source's rollout record names no terminal session")
+    elif not refusals["terminal_transcript_resolvable"]:
+        blockers.append(
+            "the recorded terminal session has no resumable transcript in the source home"
+        )
     if drift:
         blockers.append("; ".join(drift))
     if missing_required:

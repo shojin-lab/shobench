@@ -607,13 +607,22 @@ def test_resume_cell_routes_an_eval_suspension_to_the_phases_that_remain(
     captured: dict[str, object] = {}
 
     async def fake_run_phases(
-        ctx, *, manifest, phases, results_dir, observer, suspended=None, recorded_phases=()
+        ctx,
+        *,
+        manifest,
+        phases,
+        results_dir,
+        observer,
+        suspended=None,
+        recorded_phases=(),
+        artifact=None,
     ):
         captured["phases"] = phases
         captured["recorded_phases"] = recorded_phases
         captured["suspended"] = suspended
         captured["resumptions"] = list(manifest.get("resumptions", []))
         captured["cell"] = ctx.cell
+        captured["artifact"] = artifact
         return results_dir / "x.json"
 
     monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
@@ -639,6 +648,8 @@ def test_resume_cell_routes_an_eval_suspension_to_the_phases_that_remain(
     # write time), and the continuation's cell must still say it: a resume that fell back to
     # the checkout's value would re-run the pending ids under whatever the default had become.
     assert captured["cell"].eval_context == "resumed"  # type: ignore[union-attr]
+    # An ordinary cell keeps the cell-name artifact; only a bookend overrides the stem.
+    assert captured["artifact"] is None
 
 
 # ----- the guaranteed hard exit, and publishing nothing --------------------------------------

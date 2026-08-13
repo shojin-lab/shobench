@@ -485,7 +485,13 @@ one-artifact-per-cell rule (`write_results` replaces the stem's other shape) wou
 destroyed it; the run-id stem keeps the source result and every bookend of every source
 coexisting, self-paired through the provenance block, and it makes the leaf unpredictable
 before the run mints its id, so nothing can pre-occupy it, with the minted names still
-bounded against the source before the lock. The source's lock file is held SHARED for
+bounded against the source before the lock; the stem rides through every reopening (a
+resumed or repaired bookend republishes under its own run id, never the cell name). The
+report is where the halves meet: `shobench report` assembles each bookend with the source
+its provenance names, pairing the SOURCE's eval_before rows with the BOOKEND's eval_after
+rows through the same pairing every publisher uses, and every reported row carries its run
+id, its arm axes, and its pairing, with a bookend whose source is not among the loaded files
+surfaced explicitly as SOURCE MISSING rather than reported as an unpaired zero. The source's lock file is held SHARED for
 exactly the duration of the snapshot: shared refuses a live mutator and blocks a would-be
 one (every mutating owner takes the lock exclusive) without writing a byte, and it is
 released before any spend. A source WITHOUT a lock file is refused as unholdable rather than

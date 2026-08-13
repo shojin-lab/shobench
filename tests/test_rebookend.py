@@ -677,6 +677,7 @@ def test_a_suspended_bookend_resumes_with_nothing_recorded(tmp_path: Path, monke
     async def fake_run_phases(ctx_arg, *, manifest, phases, results_dir, observer, **kwargs):
         captured["phases"] = phases
         captured["recorded_phases"] = kwargs.get("recorded_phases")
+        captured["artifact"] = kwargs.get("artifact")
         return results_dir / "x.json"
 
     monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
@@ -695,6 +696,166 @@ def test_a_suspended_bookend_resumes_with_nothing_recorded(tmp_path: Path, monke
 
     assert captured["phases"] == ("eval_after",)
     assert captured["recorded_phases"] == ()
+    # The reopened bookend keeps its own artifact stem: the cell-name fallback is the
+    # source's artifact, and republishing under it is the round-5 destruction resurrected.
+    assert captured["artifact"] == "bookend-run-1"
+
+
+def _published_pair(tmp_path: Path) -> tuple[Path, str, str]:
+    """A results directory holding a real source artifact and a real bookend artifact, both
+    written by the real publisher, joined only by the bookend's provenance block."""
+    from shobench.results import TaskResult, write_results
+
+    results = tmp_path / "results"
+    results.mkdir(exist_ok=True)
+
+    def row(idx: int, reward: float) -> TaskResult:
+        return TaskResult(
+            seq=idx, position=idx, task_idx=idx, closure="sealed", reward=reward,
+            success=reward >= 1.0,
+        )
+
+    source_manifest = {
+        "run_id": "cell-a-20260101T000000Z",
+        "cell": {
+            "name": "cell-a", "env": "wordle_v1", "harness": "claude_code", "model": "m",
+            "rollout_feedback": "never", "eval_context": "cold",
+        },
+    }
+    write_results(
+        results / "cell-a.json",
+        manifest=source_manifest,
+        phases={
+            "eval_before": [row(1, 0.2), row(2, 0.4)],
+            "eval_after": [row(1, 0.3), row(2, 0.4)],
+            "rollout": [],
+        },
+        stopping={"stop_reason": "agent_stopped_early"},
+        heldout_ids=[1, 2],
+    )
+    bookend_manifest = {
+        "run_id": "cell-a-20260102T000000Z-rb01234567",
+        "cell": {
+            "name": "cell-a", "env": "wordle_v1", "harness": "claude_code", "model": "m",
+            "rollout_feedback": "never", "eval_context": "resumed",
+        },
+        "rebookend": {
+            "rebookend_of": "cell-a-20260101T000000Z",
+            "source_rollout_feedback": "never",
+            "source_stop_reason": "agent_stopped_early",
+        },
+    }
+    write_results(
+        results / f"{bookend_manifest['run_id']}.json",
+        manifest=bookend_manifest,
+        phases={
+            "eval_before": [],
+            "eval_after": [row(1, 0.9), row(2, 0.8)],
+            "rollout": [],
+        },
+        stopping={},
+        heldout_ids=[1, 2],
+    )
+    return results, str(source_manifest["run_id"]), str(bookend_manifest["run_id"])
+
+
+def test_the_assembler_pairs_a_bookend_with_its_source(tmp_path: Path) -> None:
+    """The report's own machinery: a bookend artifact alone is n_paired 0 by construction,
+    because its before side lives in the SOURCE artifact its provenance names. Assembled, the
+    source's before rows pair with the bookend's after rows through the same pair_evals every
+    publisher uses, and both rows carry the identity that keeps duplicate cell names apart."""
+    from shobench.report import assemble, load_results, render_table, report_cell
+
+    results, source_id, bookend_id = _published_pair(tmp_path)
+    docs = assemble(load_results(results))
+    reports = {r.run_id: r for r in (report_cell(d, resamples=200, seed=1) for d in docs)}
+
+    source = reports[source_id]
+    assert source.pairing == "self"
+    assert source.n_paired == 2
+    assert source.mean_delta == pytest.approx(0.05)
+    assert source.eval_context == "cold"
+
+    bookend = reports[bookend_id]
+    assert bookend.pairing == "assembled"
+    assert bookend.rebookend_of == source_id
+    assert bookend.n_paired == 2
+    # The assembled delta is bookend-after minus SOURCE-before: (0.9-0.2, 0.8-0.4).
+    assert bookend.mean_before == pytest.approx(0.3)
+    assert bookend.mean_after == pytest.approx(0.85)
+    assert bookend.mean_delta == pytest.approx(0.55)
+    assert bookend.rollout_feedback == "never"
+    assert bookend.eval_context == "resumed"
+    assert bookend.complete is True
+
+    table = render_table(sorted(reports.values(), key=lambda r: r.run_id))
+    assert "20260102T000000Z-rb01234567" in table  # the run column disambiguates
+    assert "never+resumed" in table and "never+cold" in table
+    assert "of 20260101T000000Z" in table
+    as_json = [r.to_json() for r in reports.values()]
+    assert {j["run_id"] for j in as_json} == {source_id, bookend_id}
+    assert any(j["rebookend_of"] == source_id for j in as_json)
+
+
+def test_a_bookend_without_its_source_surfaces_explicitly(tmp_path: Path) -> None:
+    """A measurement that cannot find its other half is a fact the reader needs, never a
+    silent unpaired zero: the row says SOURCE MISSING in the table and in the JSON."""
+    from shobench.report import assemble, load_results, render_table, report_cell
+
+    results, source_id, bookend_id = _published_pair(tmp_path)
+    (results / "cell-a.json").unlink()
+    docs = assemble(load_results(results))
+    (report,) = [report_cell(d, resamples=100, seed=1) for d in docs]
+
+    assert report.run_id == bookend_id
+    assert report.pairing == "source_missing"
+    assert report.n_paired == 0
+    table = render_table([report])
+    assert "SOURCE MISSING" in table
+    assert report.to_json()["pairing"] == "source_missing"
+
+
+def test_two_bookends_of_one_source_both_assemble(tmp_path: Path) -> None:
+    from shobench.report import assemble, load_results, report_cell
+    from shobench.results import TaskResult, write_results
+
+    results, source_id, first_id = _published_pair(tmp_path)
+    second_manifest = {
+        "run_id": "cell-a-20260103T000000Z-rb89abcdef",
+        "cell": {
+            "name": "cell-a", "env": "wordle_v1", "harness": "claude_code", "model": "m",
+            "rollout_feedback": "never", "eval_context": "resumed",
+        },
+        "rebookend": {
+            "rebookend_of": source_id,
+            "source_rollout_feedback": "never",
+            "source_stop_reason": "agent_stopped_early",
+        },
+    }
+    write_results(
+        results / f"{second_manifest['run_id']}.json",
+        manifest=second_manifest,
+        phases={
+            "eval_before": [],
+            "eval_after": [
+                TaskResult(seq=1, position=1, task_idx=1, closure="sealed", reward=0.5,
+                           success=False),
+                TaskResult(seq=2, position=2, task_idx=2, closure="sealed", reward=0.6,
+                           success=False),
+            ],
+            "rollout": [],
+        },
+        stopping={},
+        heldout_ids=[1, 2],
+    )
+
+    docs = assemble(load_results(results))
+    reports = {r.run_id: r for r in (report_cell(d, resamples=100, seed=1) for d in docs)}
+    assert reports[first_id].pairing == "assembled"
+    assert reports[second_manifest["run_id"]].pairing == "assembled"
+    assert reports[first_id].n_paired == 2
+    assert reports[second_manifest["run_id"]].n_paired == 2
+    assert reports[second_manifest["run_id"]].mean_delta == pytest.approx(0.25)
 
 
 def test_the_source_is_held_still_for_the_whole_snapshot(tmp_path: Path, monkeypatch) -> None:
@@ -853,6 +1014,20 @@ def _real_cell_source(tmp_path: Path) -> Path:
     home = source_dir / "home"
     home.mkdir(parents=True)
     (home / "notes.md").write_text("post-rollout self\n", encoding="utf-8")
+    transcript = home / ".claude" / "projects" / "-work" / f"{_SID}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "kickoff"},
+                "timestamp": "2026-08-12T00:00:00.000Z",
+                "sessionId": _SID,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     ctx = RunContext(
         cell=cell,
         split=split,
@@ -900,10 +1075,14 @@ def test_cli_rebookend_plans_without_spending(tmp_path: Path, capsys) -> None:
     assert plan["refusals"]["source_live"] is False
     assert plan["refusals"]["outputs_inside_source"] == []
     assert "result_leaves_inside_source" not in plan["refusals"]
-    assert plan["result_artifact"].startswith("<bookend-run-id>.json")
+    assert plan["result_artifact"].startswith("<bookend-run-id>.incomplete.json")
     assert plan["refusals"]["rollout_terminus_present"] is True
     assert plan["refusals"]["terminal_session_resolvable"] is True
+    assert plan["refusals"]["terminal_transcript_resolvable"] is True
     assert plan["refusals"]["experiment_drift"] == []
+    # The leaf named is the one a before-less bookend actually writes.
+    assert plan["result_artifact"].startswith("<bookend-run-id>.incomplete.json")
+    assert "assembles them by run id" in plan["result_artifact"]
 
 
 def test_cli_rebookend_reports_and_blocks_on_a_refusal_state(tmp_path: Path, capsys) -> None:

@@ -29,12 +29,25 @@ DEFAULT_SEED = 20260807
 
 @dataclass(frozen=True)
 class CellReport:
-    """One cell's four numbers and an interval, plus what the rollout did to earn them."""
+    """One cell's four numbers and an interval, plus what the rollout did to earn them.
+
+    Identity is more than the cell name: rebookends put several runs of one cell beside each
+    other on purpose, so every row carries its ``run_id``, its arm axes, and its pairing. A
+    row whose ``pairing`` is "self" measured its own before and after; "assembled" is a
+    bookend whose after was paired with its SOURCE's before by the assembler; and
+    "source_missing" is a bookend whose source artifact was not among the loaded files, kept
+    visible rather than silently reported as an unpaired zero.
+    """
 
     cell: str
     env: str
     harness: str
     model: str
+    run_id: str
+    rollout_feedback: str
+    eval_context: str
+    rebookend_of: str | None
+    pairing: str
     n_paired: int
     n_unpaired: int
     # What the cell asked for, and whether the file can account for it. A paired mean over 118
@@ -61,6 +74,11 @@ class CellReport:
             "env": self.env,
             "harness": self.harness,
             "model": self.model,
+            "run_id": self.run_id,
+            "rollout_feedback": self.rollout_feedback,
+            "eval_context": self.eval_context,
+            "rebookend_of": self.rebookend_of,
+            "pairing": self.pairing,
             "n_paired": self.n_paired,
             "n_unpaired": self.n_unpaired,
             "n_requested": self.n_requested,
@@ -116,6 +134,63 @@ def _mean(values: Sequence[float | None]) -> float | None:
     return (sum(present) / len(present)) if present else None
 
 
+def assemble(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join every bookend artifact to its source before any reporting math runs.
+
+    A bookend artifact is honest but incomplete by construction: its eval_before is all
+    missing rows and its own pairing is empty, because the before side belongs to the SOURCE
+    run it names in ``manifest.rebookend.rebookend_of``. Fed to the reporter raw, it showed
+    ``n_paired 0`` beside a duplicate cell row, which is not the measurement the rebookend
+    exists to create. So the assembler runs first: each bookend is matched to the loaded
+    artifact whose ``manifest.run_id`` its marker names, the SOURCE's eval_before block
+    replaces the bookend's empty one, and the pairing is recomputed through the same
+    ``pair_evals`` every publisher uses, over the bookend's committed held-out ids.
+
+    A bookend whose source is not among the loaded files passes through UNASSEMBLED, with an
+    annotation the reporter surfaces as ``pairing: source_missing``: an explicit row, never a
+    silent unpaired zero, because a measurement that cannot find its other half is a fact the
+    reader needs. Non-bookend documents pass through untouched. Assembly is in-memory only;
+    no artifact is rewritten.
+    """
+    from shobench.results import TaskResult, heldout_accounting, pair_evals
+
+    by_run_id = {
+        doc.get("manifest", {}).get("run_id"): doc
+        for doc in docs
+        if doc.get("manifest", {}).get("run_id")
+    }
+    assembled: list[dict[str, Any]] = []
+    for doc in docs:
+        marker = doc.get("manifest", {}).get("rebookend")
+        if not marker:
+            assembled.append(doc)
+            continue
+        source = by_run_id.get(marker.get("rebookend_of"))
+        if source is None or source is doc:
+            assembled.append(doc)
+            continue
+        task_ids = [int(t) for t in doc.get("heldout", {}).get("task_ids", [])]
+        before = [TaskResult(**row) for row in source.get("eval_before", {}).get("tasks", [])]
+        after = [TaskResult(**row) for row in doc.get("eval_after", {}).get("tasks", [])]
+        paired, unpaired = pair_evals(before, after, task_ids=task_ids)
+        accounting = {
+            "eval_before": heldout_accounting(before, task_ids=task_ids),
+            "eval_after": heldout_accounting(after, task_ids=task_ids),
+        }
+        joined = dict(doc)
+        joined["eval_before"] = source.get("eval_before", {})
+        joined["paired"] = paired
+        joined["unpaired"] = unpaired
+        joined["heldout"] = {
+            **doc.get("heldout", {}),
+            **accounting,
+            "complete": all(entry["complete"] for entry in accounting.values()),
+        }
+        joined["assembly"] = {"paired_with": source.get("manifest", {}).get("run_id")}
+        assembled.append(joined)
+    return assembled
+
+
 def report_cell(
     doc: dict[str, Any], *, resamples: int = DEFAULT_RESAMPLES, seed: int = DEFAULT_SEED
 ) -> CellReport:
@@ -143,11 +218,23 @@ def report_cell(
             for idx in heldout.get(phase, {}).get("missing_task_ids", [])
         }
     )
+    marker = manifest.get("rebookend")
+    if not marker:
+        pairing = "self"
+    elif doc.get("assembly", {}).get("paired_with"):
+        pairing = "assembled"
+    else:
+        pairing = "source_missing"
     return CellReport(
         cell=cell.get("name", "?"),
         env=cell.get("env", "?"),
         harness=cell.get("harness", "?"),
         model=cell.get("model", "?"),
+        run_id=str(manifest.get("run_id", "?")),
+        rollout_feedback=str(cell.get("rollout_feedback", "?")),
+        eval_context=str(cell.get("eval_context", "?")),
+        rebookend_of=(str(marker.get("rebookend_of")) if marker else None),
+        pairing=pairing,
         n_paired=len(paired),
         n_unpaired=len(unpaired),
         n_requested=heldout.get("n_requested", len(paired) + len(unpaired)),
@@ -171,9 +258,20 @@ def _fmt(value: float | None, places: int = 3) -> str:
     return "-" if value is None else f"{value:.{places}f}"
 
 
+def _run_suffix(report: CellReport, run_id: str | None = None) -> str:
+    """The run id with its cell-name prefix stripped, which is what distinguishes duplicate
+    cell rows without tripling the table's width; the JSON output carries the full id."""
+    value = report.run_id if run_id is None else run_id
+    prefix = f"{report.cell}-"
+    return value[len(prefix):] if value.startswith(prefix) else value
+
+
 def render_table(reports: Sequence[CellReport]) -> str:
     header = (
         "cell",
+        "run",
+        "arm",
+        "pairing",
         "env",
         "harness",
         "model",
@@ -192,6 +290,15 @@ def render_table(reports: Sequence[CellReport]) -> str:
             # A cell that cannot account for every held-out task is marked where its name is,
             # because every other number on its line is a mean over a subset of what it asked for.
             r.cell if r.complete else f"{r.cell} *",
+            _run_suffix(r),
+            f"{r.rollout_feedback}+{r.eval_context}",
+            (
+                "self"
+                if r.pairing == "self"
+                else f"of {_run_suffix(r, r.rebookend_of)}"
+                if r.pairing == "assembled"
+                else "SOURCE MISSING"
+            ),
             r.env,
             r.harness,
             r.model,
@@ -218,6 +325,14 @@ def render_table(reports: Sequence[CellReport]) -> str:
         "  ".join(str(cell).ljust(width) for cell, width in zip(row, widths, strict=True))
         for row in rows
     ]
+    if any(r.pairing == "source_missing" for r in reports):
+        lines += [
+            "",
+            "SOURCE MISSING: this row is a rebookend whose source artifact (named in its "
+            "manifest.rebookend.rebookend_of) was not among the loaded results, so its after "
+            "side could not be paired with the source's before side. Load both files "
+            "together to assemble the measurement.",
+        ]
     if any(not r.complete for r in reports):
         lines += [
             "",
@@ -251,8 +366,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not docs:
         print(f"no shobench results JSON found under {args.results}")
         return 1
+    docs = assemble(docs)
     reports = [report_cell(d, resamples=args.resamples, seed=args.seed) for d in docs]
-    reports.sort(key=lambda r: (r.env, r.harness, r.model))
+    reports.sort(key=lambda r: (r.env, r.harness, r.model, r.run_id))
     if args.format == "json":
         print(
             json.dumps(
@@ -272,4 +388,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["CellReport", "paired_bootstrap", "render_table", "report_cell"]
+__all__ = ["CellReport", "assemble", "paired_bootstrap", "render_table", "report_cell"]

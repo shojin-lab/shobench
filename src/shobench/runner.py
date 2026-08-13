@@ -2133,6 +2133,11 @@ async def _resume_cell_owned(
             observer=observer,
             suspended=suspended,
             recorded_phases=recorded_phases,
+            # A bookend keeps its own artifact stem across every reopening: the cell-name
+            # fallback is the SOURCE's artifact, and a resumed bookend publishing under it
+            # would destroy the result it pairs with, exactly the destruction the run-id
+            # namespace exists to prevent.
+            artifact=run_id if "rebookend" in manifest else None,
         )
         # Only now is the record spent. It is this run's one retry handle, and everything
         # between here and the top of this function can fail: a stream that will not open, a
@@ -2304,6 +2309,8 @@ async def _rerun_eval_owned(
             results_dir=results_dir,
             observer=observer,
             recorded_phases=recorded_phases,
+            # Same rule as a resume: a reopened bookend republishes under its own run id.
+            artifact=run_id if "rebookend" in manifest else None,
         )
     finally:
         with contextlib.suppress(Exception):
