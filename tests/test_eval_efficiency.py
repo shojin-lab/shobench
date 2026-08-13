@@ -40,7 +40,7 @@ from shobench.credentials import (
     refresh_seeded_credential,
     spec_for,
 )
-from shobench.harness import StopKind, StopVerdict
+from shobench.harness import Harness, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.results import TaskResult
 from shobench.runner import DrainWatchdog, LegRecord, RunContext, run_leg
@@ -626,6 +626,109 @@ def test_the_watchdog_fires_only_after_the_grace_and_only_when_finished(tmp_path
     _against_a_real_stream(prov, 0, body)
 
 
+class _PollClock:
+    """A monotonic clock that hands out one poll interval per reading.
+
+    The watchdog reads a clock once per poll, so this runs the real loop at test speed over the
+    arithmetic a real phase does. Only the clock is stood in for: the stream, the sealed row and
+    the loop reading them are the run's own, and waiting the real graces out would spend two and a
+    quarter minutes of suite time on a subtraction.
+    """
+
+    def __init__(self) -> None:
+        self.readings: list[float] = []
+        self._next = 0.0
+
+    def monotonic(self) -> float:
+        self.readings.append(self._next)
+        self._next += runner.EVAL_DRAIN_POLL_S
+        return self.readings[-1]
+
+
+def test_prime_ends_a_finished_leg_on_sight_and_the_others_wait_their_grace(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two endings, and which one a leg gets is the harness's own declaration.
+
+    Claude Code and codex end their legs 8 to 25 seconds after the seal, so two minutes is a wait
+    they never reach the end of and their voluntary stops stay reachable. prime is not waiting for
+    an ending it makes, and a wait for it is a clock racing the next billable dispatch, so the
+    first reading that finds its leg finished is the ending. A zero would not do this: it would
+    still be compared on the following poll.
+    """
+    prov = tmp_path / "task-00000"
+    prov.mkdir(parents=True)
+    real_finished = runner._eval_task_is_finished
+    seen: dict[str, tuple[int, float]] = {}
+
+    async def watch_out(stream, name: str) -> tuple[int, float]:
+        """One harness's watchdog against an already finished leg: how many readings found it
+        finished before the watchdog fired, and how many simulated seconds passed over them."""
+        clock = _PollClock()
+        polls = 0
+
+        def counted(*args: object, **kw: object) -> bool:
+            nonlocal polls
+            finished = real_finished(*args, **kw)
+            polls += 1 if finished else 0
+            return finished
+
+        monkeypatch.setattr(runner, "_eval_task_is_finished", counted)
+        monkeypatch.setattr(runner, "time", clock)
+        watchdog = DrainWatchdog(threading.Event(), harness_for(name).eval_drain_grace_s)
+        assert await runner._watch_for_drain(stream, prov, 0, watchdog, poll_s=0.001) is True
+        assert watchdog.fired.is_set()
+        waited = clock.readings[-1] - clock.readings[0] if clock.readings else 0.0
+        return polls, waited
+
+    async def body(stream, client):
+        await client.call_tool("get_task", {})
+        await client.call_tool("terminate", {})
+        for name in ("prime_agent", "claude_code", "codex"):
+            seen[name] = await watch_out(stream, name)
+
+    _against_a_real_stream(prov, 0, body)
+
+    # prime: the reading that finds the leg finished is the one that ends it, nothing waited and
+    # no clock consulted, so the exposure is the poll interval and not a number racing a dispatch.
+    assert seen["prime_agent"] == (1, 0.0)
+    # claude_code and codex: unchanged, two minutes of polls before a leg is taken from them.
+    assert seen["claude_code"] == (25, 120.0)
+    assert seen["codex"] == (25, 120.0)
+    # A harness that declares nothing waits the long one, so the change is prime's alone.
+    assert Harness.eval_drain_grace_s == 120.0
+
+
+def test_the_phase_bounds_every_leg_by_its_own_harness_grace(tmp_path: Path, monkeypatch) -> None:
+    """What the harness declares reaches the leg: the watchdog a phase builds carries its own
+    harness's grace, which is the one place the runner reads it."""
+    monkeypatch.setattr(runner, "EVAL_LAUNCH_STAGGER_S", 0.0)
+
+    def graces_of(cell_name: str, *, at: Path) -> list[float | None]:
+        launched: list[int] = []
+        _capture_launches(monkeypatch, launched)
+        captured = runner.run_leg
+        seen: list[float | None] = []
+
+        def record(ctx_arg: RunContext, **kw: object) -> LegRecord:
+            watchdog = kw["watchdog"]
+            assert isinstance(watchdog, DrainWatchdog)
+            seen.append(watchdog.grace_s)
+            return captured(ctx_arg, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(runner, "run_leg", record)
+        ctx = _ctx(at, cell_name=cell_name, heldout=("1", "2"))
+        if ctx.harness.name == "prime_agent":
+            _seed_prime_auth(
+                ctx, lifetime_s=PREFLIGHT_MIN_LIFETIME_S + 7200, monkeypatch=monkeypatch
+            )
+        asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
+        return seen
+
+    assert graces_of(_PRIME_CELL, at=tmp_path / "prime") == [None, None]
+    assert graces_of(_SMOKE_CELL, at=tmp_path / "claude") == [120.0, 120.0]
+
+
 # ----- the drain watchdog: what it does to the leg --------------------------------------------
 
 
@@ -761,6 +864,31 @@ def test_a_drained_leg_carries_its_own_verdict_and_never_the_harness_classificat
     assert record.verdict.evidence["grace_s"] == 120.0
     # It reaches the durable record as itself, which is where the finding stays legible.
     assert ctx.leg_records()[0]["verdict"]["kind"] == "stream_drained"
+
+
+def test_a_leg_that_was_given_no_grace_says_so_in_the_record(tmp_path: Path, monkeypatch) -> None:
+    """A leg ended on sight and a leg ended after two minutes are different endings, and the
+    record is where the difference survives.
+
+    It matters most for a phase that ran both, which the interrupted bookend will have: the only
+    thing that separates a row's leg from the rows sealed before the rule changed is this field.
+    A ``null`` says the leg was ended by the first reading that found it finished; any number
+    there would say it was given time it was not given, and a missing field would say nothing.
+    """
+    ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
+    monkeypatch.setattr(runner, "_supervise", lambda *a, **kw: (-1, False, True))
+
+    record = _leg(ctx, watchdog=DrainWatchdog(threading.Event(), None))
+
+    assert record.verdict.kind is StopKind.DRAINED
+    assert record.verdict.evidence["grace_s"] is None
+    # Through the same publish that writes legs.json, so what is asserted is the durable bytes:
+    # the field is there, and it is JSON null rather than a number or a dropped key.
+    path = ctx.publish_json(ctx.run_dir / "legs.json", ctx.leg_records())
+    evidence = json.loads(path.read_text(encoding="utf-8"))[0]["verdict"]["evidence"]
+    assert "grace_s" in evidence
+    assert evidence["grace_s"] is None
+    assert '"grace_s": null' in path.read_text(encoding="utf-8")
 
 
 def test_a_leg_the_watchdog_did_not_end_is_classified_by_its_harness(

@@ -224,6 +224,18 @@ class Harness:
     # terminal session inside the copy, where its own resume lookup goes searching for it.
     session_state_dirs: tuple[str, ...] = ()
 
+    # How long an eval leg of this harness may keep running after its held-out task is sealed and
+    # its stream has nothing left to give, or ``None`` for a harness whose leg the first reading
+    # that finds it finished ends outright, with no wait at all.
+    #
+    # A harness that ends its own legs needs a little of this. A leg does not end the instant the
+    # row seals: it writes its last message, closes its session, and exits. Claude Code and codex
+    # take 8 to 25 seconds over that, so at two minutes the watchdog never fires for them and
+    # their legs still end on their own terms, which is what keeps the stopping record comparable
+    # across harnesses. A harness that never ends a leg by choosing to has no such wrap-up to
+    # protect, and every second it is given is spent on turns nobody will read.
+    eval_drain_grace_s: float | None = 120.0
+
     # Does this harness's trace say which model answered? Declared rather than inferred from an
     # empty list, because the two mean opposite things: a harness that reports models and
     # returned none had none answer, while a harness that reports none has told us nothing. The
@@ -284,13 +296,14 @@ class Harness:
         """
         return StopVerdict(StopKind.LEG_TIMEOUT, "the runner ended the leg at its budget")
 
-    def drained_verdict(self, *, grace_s: float) -> StopVerdict:
+    def drained_verdict(self, *, grace_s: float | None) -> StopVerdict:
         """The verdict for an eval leg the runner ended after its work was already finished.
 
         Identical for every harness, and never overridden, for the same reason the timeout
         verdict is: the decision was the runner's. What it records is that the held-out task was
         sealed, the stream had nothing remaining and nothing in flight, and the harness was still
-        running ``grace_s`` later.
+        running ``grace_s`` later, or was still running when it was first looked at where the
+        grace is ``None``.
 
         It is a third kind rather than either of the two it sits between, and both exclusions
         matter. It is not a chosen stop, because the agent chose nothing here. It is not a leg
