@@ -79,7 +79,13 @@ def _synthetic_definitions(tmp_path: Path):
 
 
 def _source_run(
-    tmp_path: Path, cell, split, *, session_id: str | None = _SID, with_terminus: bool = True
+    tmp_path: Path,
+    cell,
+    split,
+    *,
+    session_id: str | None = _SID,
+    with_terminus: bool = True,
+    with_before: bool = True,
 ) -> Path:
     """An archived source run: manifest, terminus, and the accumulated post-rollout home.
 
@@ -129,6 +135,13 @@ def _source_run(
     # Every real run writes its lock on the way in, and a lock-less source is refused as
     # unholdable, so the fixture is a lockable archive like the runs this entry exists for.
     (source_dir / runner.RUN_LOCK_FILE).write_text("{}", encoding="utf-8")
+    if with_before:
+        # A source that measured its own eval_before is the self-paired default; the v0
+        # shapes (rollout-only sources with a separate baseline run) set with_before=False.
+        for task_id in split.heldout.task_ids:
+            (source_dir / "eval_before" / f"task-{int(task_id):05d}").mkdir(
+                parents=True, exist_ok=True
+            )
     return source_dir
 
 
@@ -254,6 +267,9 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
     assert manifest["instruction"]["eval_prompt_used"] == "rollout_system"
     assert manifest["rebookend"] == {
         "rebookend_of": "source-run-20260101T000000Z",
+        # The source measured its own eval_before, so the baseline defaults to it: the
+        # self-paired case, stated in the marker rather than assumed by the reader.
+        "baseline_run_id": "source-run-20260101T000000Z",
         "source_rollout_feedback": "never",
         "source_stop_reason": "agent_stopped_early",
     }
@@ -797,9 +813,9 @@ def test_the_assembler_pairs_a_bookend_with_its_source(tmp_path: Path) -> None:
     assert any(j["rebookend_of"] == source_id for j in as_json)
 
 
-def test_a_bookend_without_its_source_surfaces_explicitly(tmp_path: Path) -> None:
+def test_a_bookend_without_its_baseline_surfaces_explicitly(tmp_path: Path) -> None:
     """A measurement that cannot find its other half is a fact the reader needs, never a
-    silent unpaired zero: the row says SOURCE MISSING in the table and in the JSON."""
+    silent unpaired zero: the row says BASELINE MISSING in the table and in the JSON."""
     from shobench.report import assemble, load_results, render_table, report_cell
 
     results, source_id, bookend_id = _published_pair(tmp_path)
@@ -808,11 +824,11 @@ def test_a_bookend_without_its_source_surfaces_explicitly(tmp_path: Path) -> Non
     (report,) = [report_cell(d, resamples=100, seed=1) for d in docs]
 
     assert report.run_id == bookend_id
-    assert report.pairing == "source_missing"
+    assert report.pairing == "baseline_missing"
     assert report.n_paired == 0
     table = render_table([report])
-    assert "SOURCE MISSING" in table
-    assert report.to_json()["pairing"] == "source_missing"
+    assert "BASELINE MISSING" in table
+    assert report.to_json()["pairing"] == "baseline_missing"
 
 
 def test_two_bookends_of_one_source_both_assemble(tmp_path: Path) -> None:
@@ -996,6 +1012,251 @@ def test_legacy_artifacts_render_their_recorded_arms(tmp_path: Path) -> None:
         assert report.rollout_feedback in ("never", "immediate"), report.cell
         assert report.eval_context in ("cold", "resumed"), report.cell
         assert "?" not in f"{report.rollout_feedback}{report.eval_context}"
+
+
+def _baseline_run(tmp_path: Path, cell, split, *, name: str = "baseline-run") -> Path:
+    """A deferred-baseline run: its own manifest over the same cell and split, its own
+    eval_before provenance, and nothing else. The v0 baselines are exactly this shape."""
+    baseline_dir = tmp_path / name
+    home = baseline_dir / "home"
+    home.mkdir(parents=True)
+    ctx = RunContext(
+        cell=replace(cell, eval_context="cold"),
+        split=split,
+        instruction=load_instruction(cell.instruction_arm),
+        harness=runner.harness_for(cell.harness),
+        run_id=f"{name}-20260101T000000Z",
+        run_dir=baseline_dir,
+        sandbox=CellSandbox(run_id="b", home=home, workdir=baseline_dir / "work"),
+    )
+    runner.write_json(
+        baseline_dir / "manifest.json", build_manifest(ctx, probes={"version": "t"})
+    )
+    for task_id in split.heldout.task_ids:
+        (baseline_dir / "eval_before" / f"task-{int(task_id):05d}").mkdir(parents=True)
+    return baseline_dir
+
+
+def test_a_rollout_only_source_pairs_through_its_named_baseline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The v0 shape: the rollout source measured no eval_before of its own, the baseline is a
+    separate run, and the marker records both identities: the source as terminal-state
+    lineage, the baseline as the pairing partner the assembler selects."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            baseline_run_dir=baseline_dir,
+            capture_egress=False,
+        )
+    )
+
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((new_run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["rebookend"]["rebookend_of"] == "source-run-20260101T000000Z"
+    assert manifest["rebookend"]["baseline_run_id"] == "baseline-run-20260101T000000Z"
+    assert set(launches) == {0, 1, 2}
+
+
+def test_a_before_less_source_requires_a_named_baseline(tmp_path: Path, monkeypatch) -> None:
+    """Without a baseline the bookend has nothing to pair with, and pairing against the
+    source's emptiness rendered every v0 row 0/120: the absence refuses in the runner and
+    blocks in the plan, naming why."""
+
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="no eval_before of its own"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+
+def test_cli_plan_surfaces_the_baseline_states(tmp_path: Path, capsys) -> None:
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    import shutil as _shutil
+
+    _shutil.rmtree(source_dir / "eval_before")
+
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["refusals"]["source_has_own_eval_before"] is False
+    assert plan["refusals"]["baseline_required"] is True
+    assert plan["baseline_run_id"] is None
+    assert cli_main(["rebookend", "--run", str(source_dir), "--go"]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "--baseline" in err
+
+    baseline_dir = _real_cell_source(tmp_path / "b")
+    assert (
+        cli_main(
+            ["rebookend", "--run", str(source_dir), "--baseline", str(baseline_dir)]
+        )
+        == 0
+    )
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["refusals"]["baseline_required"] is False
+    assert plan["refusals"]["baseline_cell_matches"] is True
+    assert plan["refusals"]["baseline_split_matches"] is True
+    assert plan["refusals"]["baseline_has_eval_before"] is True
+    assert plan["baseline_run_id"] == "source-run-20260101T000000Z"
+
+
+def test_a_baseline_over_a_different_split_or_cell_refuses(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The load-bearing check: before rows over different held-out ids would pair task
+    numbers that are not the same tasks, and a different cell is not this measurement."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    other_split = Split(
+        env="wordle_v1",
+        heldout=Side(task_ids=("7", "8")),
+        pool=Side(task_ids=("9",)),
+        provenance={"kind": "adopted"},
+        source=tmp_path / "other-split.json",
+    )
+    mismatched = _baseline_run(tmp_path, cell, other_split, name="baseline-other-split")
+    with pytest.raises(RuntimeError, match="same held-out ids"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=mismatched,
+                capture_egress=False,
+            )
+        )
+
+    foreign = _baseline_run(tmp_path, cell, split, name="baseline-other-cell")
+    manifest = json.loads((foreign / "manifest.json").read_text(encoding="utf-8"))
+    manifest["cell"]["name"] = "some-other-cell"
+    runner.write_json(foreign / "manifest.json", manifest)
+    with pytest.raises(RuntimeError, match="pairing across cells"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=foreign,
+                capture_egress=False,
+            )
+        )
+
+    bookend_baseline = _baseline_run(tmp_path, cell, split, name="baseline-bookend")
+    manifest = json.loads((bookend_baseline / "manifest.json").read_text(encoding="utf-8"))
+    manifest["rebookend"] = {"rebookend_of": "elsewhere"}
+    runner.write_json(bookend_baseline / "manifest.json", manifest)
+    with pytest.raises(RuntimeError, match="no before-side to"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=bookend_baseline,
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+
+def test_the_v0_shape_assembles_against_the_separate_baseline_artifact(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's end-to-end render, at the real scale: a rollout-only source artifact
+    with an all-missing before side, a separate baseline artifact with 118 of 120 scored
+    before rows, and a bookend whose marker names the source as lineage and the baseline as
+    the pairing partner. Assembled: 118 pairs, 2 unpaired, deltas over exactly the 118."""
+    from shobench.report import assemble, load_results, report_cell
+    from shobench.results import TaskResult, write_results
+
+    results = tmp_path / "results"
+    results.mkdir()
+    ids = list(range(120))
+
+    def row(idx: int, reward: float) -> TaskResult:
+        return TaskResult(
+            seq=idx, position=idx, task_idx=idx, closure="sealed", reward=reward,
+            success=False,
+        )
+
+    write_results(
+        results / "cell-a.json",
+        manifest={
+            "run_id": "rollout-source",
+            "cell": {"name": "cell-a", "rollout_feedback": "never", "eval_context": "cold"},
+        },
+        phases={"eval_before": [], "eval_after": [], "rollout": []},
+        stopping={"stop_reason": "agent_stopped_early"},
+        heldout_ids=ids,
+    )
+    write_results(
+        results / "baseline-run.json",
+        manifest={
+            "run_id": "baseline-run",
+            "cell": {"name": "cell-a", "rollout_feedback": "never", "eval_context": "cold"},
+        },
+        phases={
+            "eval_before": [row(i, 0.25) for i in ids if i not in (7, 11)],
+            "eval_after": [],
+            "rollout": [],
+        },
+        stopping={},
+        heldout_ids=ids,
+    )
+    write_results(
+        results / "bk.json",
+        manifest={
+            "run_id": "bk",
+            "cell": {"name": "cell-a", "rollout_feedback": "never", "eval_context": "resumed"},
+            "rebookend": {
+                "rebookend_of": "rollout-source",
+                "baseline_run_id": "baseline-run",
+                "source_rollout_feedback": "never",
+                "source_stop_reason": "agent_stopped_early",
+            },
+        },
+        phases={
+            "eval_before": [],
+            "eval_after": [row(i, 0.75) for i in ids],
+            "rollout": [],
+        },
+        stopping={},
+        heldout_ids=ids,
+    )
+
+    docs = assemble(load_results(results))
+    reports = {r.run_id: r for r in (report_cell(d, resamples=100, seed=1) for d in docs)}
+    bookend = reports["bk"]
+    assert bookend.pairing == "assembled"
+    assert bookend.baseline_run_id == "baseline-run"
+    assert bookend.rebookend_of == "rollout-source"
+    assert bookend.n_paired == 118
+    assert bookend.n_unpaired == 2
+    assert bookend.mean_delta == pytest.approx(0.5)
 
 
 def test_the_source_is_held_still_for_the_whole_snapshot(tmp_path: Path, monkeypatch) -> None:
@@ -1183,6 +1444,7 @@ def _real_cell_source(tmp_path: Path) -> Path:
         {"stop_reason": "pool_exhausted", "session_id": _SID},
     )
     (source_dir / runner.RUN_LOCK_FILE).write_text("{}", encoding="utf-8")
+    (source_dir / "eval_before" / "task-00000").mkdir(parents=True, exist_ok=True)
     return source_dir
 
 

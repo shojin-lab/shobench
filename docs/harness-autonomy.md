@@ -487,13 +487,21 @@ coexisting, self-paired through the provenance block, and it makes the leaf unpr
 before the run mints its id, so nothing can pre-occupy it, with the minted names still
 bounded against the source before the lock; the stem rides through every reopening (a
 resumed or repaired bookend republishes under its own run id, never the cell name). The
-report is where the halves meet: `shobench report` assembles each bookend with the source
-its provenance names, pairing the SOURCE's eval_before rows with the BOOKEND's eval_after
-rows through the same pairing every publisher uses, and every reported row carries its run
-id, its arm axes (pre-axis artifacts render their recorded arms, never plus cold, exactly as
-the recorded-axis helpers define absence), and its pairing, with a bookend whose source is
-not among the loaded files surfaced explicitly as SOURCE MISSING rather than reported as an
-unpaired zero. Chains are refused, not walked: a bookend of a bookend re-measures the same
+marker carries two identities, deliberately: `rebookend_of` is the terminal-state lineage
+(the run whose conversation this bookend resumes), and `baseline_run_id` is the pairing
+identity (the run whose eval_before rows the report joins with this bookend's after rows).
+They coincide only when the source measured its own before-side, which is the stated
+default; a rollout-only or after-only source (every v0 source, whose baselines are separate
+deferred runs) REQUIRES `--baseline`, validated before anything spends: a real run, not
+itself a bookend, the same cell, the same split id digest (the load-bearing check, because
+before rows over different held-out ids would pair task numbers that are not the same
+tasks), and carrying eval_before provenance of its own. The report is where the halves
+meet: `shobench report` assembles each bookend with the BASELINE its marker names, pairing
+the baseline's eval_before rows with the BOOKEND's eval_after rows through the same pairing
+every publisher uses, and every reported row carries its run id, its arm axes (pre-axis
+artifacts render their recorded arms, never plus cold, exactly as the recorded-axis helpers
+define absence), and its pairing, with a bookend whose baseline is not among the loaded
+files surfaced explicitly as BASELINE MISSING rather than reported as an unpaired zero. Chains are refused, not walked: a bookend of a bookend re-measures the same
 terminal state as rebookending the original directly (the bookend's home is the source's
 terminal home, copied, and its own eval_after advanced no rollout), so the runner and the
 plan refuse a source that is itself a rebookend, naming the original to bookend instead, and

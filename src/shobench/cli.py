@@ -413,6 +413,34 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     # deterministic leaf exists for anyone to pre-occupy; the runner still bounds the minted
     # concrete names before its lock. What the plan can state is the scheme and the lock
     # states.
+    # The baseline identity the runner will validate: the source's own before-side when it
+    # has one, an explicitly named run otherwise, with the same checks the runner applies.
+    source_has_before = runner._has_eval_before(source_dir)
+    baseline_dir = Path(args.baseline).resolve() if args.baseline else None
+    baseline_states: dict[str, object] = {
+        "source_has_own_eval_before": source_has_before,
+        "baseline_required": not source_has_before and baseline_dir is None,
+    }
+    baseline_run_id = manifest.get("run_id") if source_has_before else None
+    if baseline_dir is not None:
+        baseline_manifest_path = baseline_dir / "manifest.json"
+        if baseline_manifest_path.is_file():
+            baseline_manifest = json.loads(baseline_manifest_path.read_text(encoding="utf-8"))
+            baseline_run_id = baseline_manifest.get("run_id")
+            baseline_states.update(
+                {
+                    "baseline_is_bookend": "rebookend" in baseline_manifest,
+                    "baseline_cell_matches": baseline_manifest.get("cell", {}).get("name")
+                    == cell.name,
+                    "baseline_split_matches": baseline_manifest.get("split", {}).get(
+                        "id_digest"
+                    )
+                    == manifest.get("split", {}).get("id_digest"),
+                    "baseline_has_eval_before": runner._has_eval_before(baseline_dir),
+                }
+            )
+        else:
+            baseline_states["baseline_is_run_dir"] = False
     source_lock_present = (source_dir / runner.RUN_LOCK_FILE).is_file()
     source_live = False
     if source_lock_present:
@@ -431,6 +459,7 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         "terminal_transcript_resolvable": terminal_transcript is not None,
         "experiment_drift": drift,
         "missing_required_env": missing_required,
+        **baseline_states,
     }
     plan = {
         "source_run_dir": str(source_dir),
@@ -444,6 +473,7 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         },
         "source_stop_reason": source_stopping.get("stop_reason"),
         "terminal_session_id": terminal_session,
+        "baseline_run_id": baseline_run_id,
         # Every held-out task, because a rebookend is a fresh bookend rather than a repair:
         # nothing is already complete in a run directory that does not exist yet.
         "heldout_tasks_to_run": len(split.heldout),
@@ -480,6 +510,23 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             f"the source is itself a rebookend; rebookend the original run "
             f"({bookend_original}) instead"
         )
+    if refusals.get("baseline_required"):
+        blockers.append(
+            "the source has no eval_before of its own; name the baseline run with --baseline"
+        )
+    for state, why in (
+        ("baseline_is_run_dir", "the named baseline is not a run directory"),
+        ("baseline_is_bookend", None),
+        ("baseline_cell_matches", "the named baseline measured a different cell"),
+        ("baseline_split_matches", "the named baseline ran a different held-out split"),
+        ("baseline_has_eval_before", "the named baseline has no eval_before provenance"),
+    ):
+        value = refusals.get(state)
+        if state == "baseline_is_bookend":
+            if value is True:
+                blockers.append("the named baseline is itself a rebookend")
+        elif value is False:
+            blockers.append(why)
     if refusals["suspension_present"]:
         blockers.append("the source holds a suspension record; finish it with `shobench resume`")
     if not refusals["source_lock_present"]:
@@ -518,6 +565,7 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             source_dir,
             runs_dir=Path(args.runs),
             results_dir=Path(args.results),
+            baseline_run_dir=baseline_dir,
             agent_image=args.image,
             credentials=credentials.agent_env(cell.harness, cell.credential_mode, dict(os.environ)),
             capture_egress=not args.no_egress,
@@ -746,6 +794,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="give an existing run a resumed eval_after, as a new run; the source is untouched",
     )
     rebookend.add_argument("--run", required=True, help="the SOURCE run directory to bookend")
+    rebookend.add_argument(
+        "--baseline",
+        default=None,
+        help=(
+            "the run directory whose eval_before pairs with this bookend; required when the "
+            "source has no eval_before of its own, defaults to the source when it does"
+        ),
+    )
     rebookend.add_argument(
         "--go", action="store_true", help="actually run the bookend (real spend)"
     )

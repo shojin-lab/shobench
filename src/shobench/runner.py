@@ -2422,6 +2422,18 @@ def _same_or_under(resolved: Path, root_stat: os.stat_result) -> bool:
     return False
 
 
+def _has_eval_before(run_dir: Path) -> bool:
+    """Did this run measure an eval_before of its own: per-task provenance, not rows.
+
+    The eval phase records one directory per held-out task, so presence of any is what
+    distinguishes a run that measured a before-side from a rollout-only or after-only run.
+    """
+    phase_dir = run_dir / "eval_before"
+    if not phase_dir.is_dir():
+        return False
+    return any(p.is_dir() and p.name.startswith("task-") for p in phase_dir.iterdir())
+
+
 def _refuse_live_source(source_run_dir: Path) -> None:
     """Refuse a source whose run lock a live process still holds, without mutating the source.
 
@@ -2490,6 +2502,7 @@ async def rebookend_run(
     *,
     runs_dir: Path,
     results_dir: Path,
+    baseline_run_dir: Path | None = None,
     agent_image: str = AGENT_IMAGE,
     credentials: dict[str, str] | None = None,
     capture_egress: bool = True,
@@ -2536,6 +2549,58 @@ async def rebookend_run(
             f"directly. Rebookend the original run ({original}) instead."
         )
     cell = load_cell_by_name(source_manifest["cell"]["name"])
+    # The baseline is its own identity, not an assumption about the source. The v0 sources
+    # are rollout-only or after-only runs whose before-side was measured by a SEPARATE
+    # deferred-baseline run, so a marker that named only the rollout source left the
+    # assembler pairing against emptiness. A source that measured its own eval_before
+    # defaults to itself, which is the self-paired case stated rather than assumed; a source
+    # that did not REQUIRES the baseline run to be named, and every named baseline is
+    # validated here, before anything spends: it must be a run, must not itself be a bookend
+    # (the chain rule, for the same reason), must be the same cell, and, the load-bearing
+    # check, must carry the same split id digest, because before rows over different held-out
+    # ids would pair task numbers that are not the same tasks.
+    if baseline_run_dir is not None:
+        baseline_dir = Path(baseline_run_dir).resolve()
+        baseline_manifest_path = baseline_dir / "manifest.json"
+        if not baseline_manifest_path.is_file():
+            raise RuntimeError(
+                f"{baseline_dir} has no manifest.json; the baseline is not a run directory."
+            )
+        baseline_manifest = json.loads(baseline_manifest_path.read_text(encoding="utf-8"))
+        if "rebookend" in baseline_manifest:
+            raise RuntimeError(
+                f"{baseline_dir} is itself a rebookend, and a bookend has no before-side to "
+                "pair against; name the run that measured the baseline."
+            )
+        if baseline_manifest["cell"]["name"] != source_manifest["cell"]["name"]:
+            raise RuntimeError(
+                f"the baseline {baseline_dir} measured cell "
+                f"{baseline_manifest['cell']['name']!r}, not the source's "
+                f"{source_manifest['cell']['name']!r}; a pairing across cells is not a "
+                "measurement."
+            )
+        source_digest = source_manifest.get("split", {}).get("id_digest")
+        baseline_digest = baseline_manifest.get("split", {}).get("id_digest")
+        if source_digest != baseline_digest:
+            raise RuntimeError(
+                f"the baseline {baseline_dir} ran split id digest {baseline_digest!r} and "
+                f"the source ran {source_digest!r}: the before rows would not measure the "
+                "same held-out ids, so the pairing would be task numbers, not tasks."
+            )
+        if not _has_eval_before(baseline_dir):
+            raise RuntimeError(
+                f"the baseline {baseline_dir} has no eval_before provenance of its own, so "
+                "it holds no before rows to pair with."
+            )
+        baseline_run_id = str(baseline_manifest.get("run_id", ""))
+    elif _has_eval_before(source_run_dir):
+        baseline_run_id = str(source_manifest.get("run_id", ""))
+    else:
+        raise RuntimeError(
+            f"{source_run_dir} has no eval_before of its own (a rollout-only or after-only "
+            "run), so the bookend would have nothing to pair with. Name the run that "
+            "measured this cell's baseline with --baseline."
+        )
     # The recorded arm wins over the checkout's default, exactly as a resume recovers it: the
     # new measurement inherits the SOURCE's axes and changes exactly one of them, so a never-arm
     # source publishes honestly as never + resumed.
@@ -2596,6 +2661,7 @@ async def rebookend_run(
             cell=cell,
             split=split,
             instruction=instruction,
+            baseline_run_id=baseline_run_id,
             run_id=run_id,
             run_dir=run_dir,
             results_dir=results_dir,
@@ -2614,6 +2680,7 @@ async def _rebookend_owned(
     cell: Cell,
     split: Split,
     instruction: Instruction,
+    baseline_run_id: str,
     run_id: str,
     run_dir: Path,
     results_dir: Path,
@@ -2726,6 +2793,11 @@ async def _rebookend_owned(
         # carries no operator layout, and the id is what pairs it with the source post-hoc.
         manifest["rebookend"] = {
             "rebookend_of": str(source_manifest.get("run_id", "")),
+            # Two identities, deliberately: the source is the terminal-state lineage (whose
+            # conversation this run resumes), and the baseline is the pairing identity (whose
+            # eval_before rows the report joins this run's after rows with). They coincide
+            # only when the source measured its own before-side.
+            "baseline_run_id": baseline_run_id,
             "source_rollout_feedback": cell.rollout_feedback,
             "source_stop_reason": str(source_stopping.get("stop_reason", "")),
         }

@@ -49,6 +49,7 @@ class CellReport:
     rollout_feedback: str
     eval_context: str
     rebookend_of: str | None
+    baseline_run_id: str | None
     pairing: str
     n_paired: int
     n_unpaired: int
@@ -80,6 +81,7 @@ class CellReport:
             "rollout_feedback": self.rollout_feedback,
             "eval_context": self.eval_context,
             "rebookend_of": self.rebookend_of,
+            "baseline_run_id": self.baseline_run_id,
             "pairing": self.pairing,
             "n_paired": self.n_paired,
             "n_unpaired": self.n_unpaired,
@@ -144,15 +146,17 @@ def assemble(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     run it names in ``manifest.rebookend.rebookend_of``. Fed to the reporter raw, it showed
     ``n_paired 0`` beside a duplicate cell row, which is not the measurement the rebookend
     exists to create. So the assembler runs first: each bookend is matched to the loaded
-    artifact whose ``manifest.run_id`` its marker names, the SOURCE's eval_before block
-    replaces the bookend's empty one, and the pairing is recomputed through the same
-    ``pair_evals`` every publisher uses, over the bookend's committed held-out ids.
+    artifact whose ``manifest.run_id`` its marker's BASELINE identity names (falling back to
+    the lineage id for markers written before the field existed, whose source was their
+    baseline), the baseline's eval_before block replaces the bookend's empty one, and the
+    pairing is recomputed through the same ``pair_evals`` every publisher uses, over the
+    bookend's committed held-out ids.
 
-    A bookend whose source is not among the loaded files passes through UNASSEMBLED, with an
-    annotation the reporter surfaces as ``pairing: source_missing``: an explicit row, never a
-    silent unpaired zero, because a measurement that cannot find its other half is a fact the
-    reader needs. Non-bookend documents pass through untouched. Assembly is in-memory only;
-    no artifact is rewritten.
+    A bookend whose baseline is not among the loaded files passes through UNASSEMBLED, with
+    an annotation the reporter surfaces as ``pairing: baseline_missing``: an explicit row,
+    never a silent unpaired zero, because a measurement that cannot find its other half is a
+    fact the reader needs. Non-bookend documents pass through untouched. Assembly is
+    in-memory only; no artifact is rewritten.
     """
     from shobench.results import TaskResult, heldout_accounting, pair_evals
 
@@ -167,26 +171,31 @@ def assemble(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not marker:
             assembled.append(doc)
             continue
-        source = by_run_id.get(marker.get("rebookend_of"))
-        if source is not None and (
-            source is doc or "rebookend" in source.get("manifest", {})
+        # The before-side comes from the BASELINE identity, which is the pairing partner the
+        # marker records beside the lineage: the rollout source (rebookend_of) may be an
+        # after-only or rollout-only run whose eval_before never existed, measured instead by
+        # a separate deferred-baseline run. A marker from before the field existed named only
+        # the source, and for those the source IS the baseline, so the fallback keeps them
+        # assembling with their old meaning.
+        baseline_id = marker.get("baseline_run_id") or marker.get("rebookend_of")
+        baseline = by_run_id.get(baseline_id)
+        if baseline is not None and (
+            baseline is doc or "rebookend" in baseline.get("manifest", {})
         ):
-            # The named source is itself a bookend (a chain, a cycle, or a self-loop). Its
+            # The named baseline is itself a bookend (a chain, a cycle, or a self-loop). Its
             # eval_before is all missing by construction, so pairing against it would report
             # an assembled measurement whose before-side never existed. The runner refuses to
             # create such an artifact at the acceptance boundary; one that exists anyway (an
             # older branch, a hand-made file) is labeled for what it is, never "assembled".
             invalid = dict(doc)
-            invalid["assembly"] = {
-                "invalid_provenance": str(marker.get("rebookend_of") or "")
-            }
+            invalid["assembly"] = {"invalid_provenance": str(baseline_id or "")}
             assembled.append(invalid)
             continue
-        if source is None:
+        if baseline is None:
             assembled.append(doc)
             continue
         task_ids = [int(t) for t in doc.get("heldout", {}).get("task_ids", [])]
-        before = [TaskResult(**row) for row in source.get("eval_before", {}).get("tasks", [])]
+        before = [TaskResult(**row) for row in baseline.get("eval_before", {}).get("tasks", [])]
         after = [TaskResult(**row) for row in doc.get("eval_after", {}).get("tasks", [])]
         paired, unpaired = pair_evals(before, after, task_ids=task_ids)
         accounting = {
@@ -194,7 +203,7 @@ def assemble(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "eval_after": heldout_accounting(after, task_ids=task_ids),
         }
         joined = dict(doc)
-        joined["eval_before"] = source.get("eval_before", {})
+        joined["eval_before"] = baseline.get("eval_before", {})
         joined["paired"] = paired
         joined["unpaired"] = unpaired
         joined["heldout"] = {
@@ -202,7 +211,7 @@ def assemble(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             **accounting,
             "complete": all(entry["complete"] for entry in accounting.values()),
         }
-        joined["assembly"] = {"paired_with": source.get("manifest", {}).get("run_id")}
+        joined["assembly"] = {"paired_with": baseline.get("manifest", {}).get("run_id")}
         assembled.append(joined)
     return assembled
 
@@ -243,7 +252,7 @@ def report_cell(
     elif "invalid_provenance" in assembly:
         pairing = "invalid_provenance"
     else:
-        pairing = "source_missing"
+        pairing = "baseline_missing"
     return CellReport(
         cell=cell.get("name", "?"),
         env=cell.get("env", "?"),
@@ -257,6 +266,11 @@ def report_cell(
         rollout_feedback=recorded_rollout_feedback(manifest),
         eval_context=recorded_eval_context(manifest),
         rebookend_of=(str(marker.get("rebookend_of")) if marker else None),
+        baseline_run_id=(
+            str(marker.get("baseline_run_id") or marker.get("rebookend_of"))
+            if marker
+            else None
+        ),
         pairing=pairing,
         n_paired=len(paired),
         n_unpaired=len(unpaired),
@@ -318,11 +332,11 @@ def render_table(reports: Sequence[CellReport]) -> str:
             (
                 "self"
                 if r.pairing == "self"
-                else f"of {_run_suffix(r, r.rebookend_of)}"
+                else f"of {_run_suffix(r, r.baseline_run_id)}"
                 if r.pairing == "assembled"
                 else "INVALID PROVENANCE"
                 if r.pairing == "invalid_provenance"
-                else "SOURCE MISSING"
+                else "BASELINE MISSING"
             ),
             r.env,
             r.harness,
@@ -357,12 +371,12 @@ def render_table(reports: Sequence[CellReport]) -> str:
             "rebookend (a chain or a cycle). A bookend's before-side never exists, so no "
             "assembled measurement can be built from it; rebookend the original run instead.",
         ]
-    if any(r.pairing == "source_missing" for r in reports):
+    if any(r.pairing == "baseline_missing" for r in reports):
         lines += [
             "",
-            "SOURCE MISSING: this row is a rebookend whose source artifact (named in its "
-            "manifest.rebookend.rebookend_of) was not among the loaded results, so its after "
-            "side could not be paired with the source's before side. Load both files "
+            "BASELINE MISSING: this row is a rebookend whose baseline artifact (named in its "
+            "manifest.rebookend.baseline_run_id) was not among the loaded results, so its "
+            "after side could not be paired with the baseline's before side. Load both files "
             "together to assemble the measurement.",
         ]
     if any(not r.complete for r in reports):
