@@ -19,8 +19,13 @@ reported. The tests themselves are unchanged: where the data is provisioned, the
 Two mechanisms hold that line, because the two downloads leave through different doors. The
 tarball fetch is shogym's own function, refused by the fixture below. The Hub fetch belongs to
 ``datasets``, and it is stopped at the process level by ``conftest.py``, which pins the Hub
-client offline before anything imports it. What is left here is naming the absence: each test
-checks for the artifacts its env actually needs and skips on the ones it does not find.
+client offline before anything imports it.
+
+What is left here is naming the absence, and naming it only when it is real. A skip is a claim
+about the machine, so these tests skip on the two states that make the claim true, a refused
+fetch and a cache with nothing prepared in it, and on nothing else. Data that is present and
+then will not load is a failure. It reads as the harsher choice and is the honest one: a green
+run reporting absent data the machine is holding is worse than a red one.
 """
 
 from __future__ import annotations
@@ -37,6 +42,10 @@ from shobench.serving import env_factory
 from shobench.splits import load_split_by_name
 
 
+class _RefusedFetch(RuntimeError):
+    """Raised where a download would have been. It is the one absence this file can skip on."""
+
+
 @pytest.fixture(autouse=True)
 def _no_upstream_fetch(monkeypatch):
     """Refuse the pinned-tarball download an env construction would otherwise pay for.
@@ -50,40 +59,72 @@ def _no_upstream_fetch(monkeypatch):
     from shogym.envs import _upstream
 
     def refuse(package: str, *_rest: object) -> None:
-        raise RuntimeError(
+        raise _RefusedFetch(
             f"the pinned {package} source is not cached here, and a test will not download it"
         )
 
     monkeypatch.setattr(_upstream, "_download_package", refuse)
 
 
-def _prepared_hle_build(cache: Path) -> Path | None:
-    """The prepared ``cais/hle`` build under ``cache``, or None when nothing there is one.
+def _hle_cache_root(cache: Path) -> Path:
+    """Where ``datasets`` keeps its builds of the hle dataset under ``cache``, named its way.
 
-    ``datasets`` finishes a build at ``<cache>/<namespace>___<name>/<config>/<version>/<hash>/``,
-    where a ``dataset_info.json`` sits beside the arrow shards it describes. The rest of what that
-    root can hold is not a dataset: the lock a failed fetch leaves behind, a staging dir from a
-    partial one, an unrelated dataset cached under the same root by something else. Counting
-    entries cannot tell those apart from the real thing, so this asks for the pair, and a cache
-    miss becomes a skip that names what is missing.
+    The dataset's own id is the input, so a rename upstream moves this with it. Builds land in
+    ``<root>/<config>/<version>/<hash>/``.
     """
-    namespace = hle_data.HF_DATASET.replace("/", "___")
-    for info_path in sorted(cache.glob(f"{namespace}/*/*/*/dataset_info.json")):
-        try:
-            info = json.loads(info_path.read_text())
-        except (OSError, ValueError):
-            continue
-        splits = info.get("splits") or {}
-        if hle_data.HF_SPLIT in splits and any(info_path.parent.glob("*.arrow")):
-            return info_path.parent
-    return None
+    from datasets.naming import camelcase_to_snakecase
+
+    parts = hle_data.HF_DATASET.split("/")
+    parts[-1] = camelcase_to_snakecase(parts[-1])
+    return cache / "___".join(parts)
+
+
+def _hle_build_datasets_will_load(cache: Path) -> Path:
+    """The one build ``datasets`` will read out of ``cache``, chosen the way it chooses.
+
+    Which builds under the root look prepared is the wrong question, because the loader does not
+    ask it. It globs the candidates, keeps the ones whose recorded config matches the directory
+    they sit in, and takes whichever was modified last. A finished build beside a newer broken one
+    therefore loses to the broken one, and a check that reads any prepared build it can find has
+    checked something the loader will not open.
+
+    So the choice is made by the loader's own function rather than by a copy of it here. It is
+    private, and the day it moves this raises at import rather than quietly going back to
+    inspecting one build while the loader reads another. It raises on a cache it cannot choose
+    from, which is a failure and not a skip: by the time this is called, something under the root
+    has been prepared, so absence is not what is wrong.
+    """
+    from datasets.packaged_modules.cache.cache import _find_hash_in_cache
+
+    try:
+        config_name, version, build_hash = _find_hash_in_cache(
+            dataset_name=hle_data.HF_DATASET,
+            config_name=None,
+            cache_dir=str(cache),
+            config_kwargs={},
+            custom_features=None,
+        )
+    except Exception as exc:
+        raise AssertionError(
+            f"datasets cannot choose which build to load out of {cache}, and the hle data is "
+            f"cached there: {type(exc).__name__}: {exc}"
+        ) from exc
+    return _hle_cache_root(cache) / config_name / version / build_hash
 
 
 def _env(name: str, kwargs: dict):
+    """Construct the env the way the runner does.
+
+    One failure is a skip here, and it is the one this file arranges: the refused fetch, which
+    says the source is not on this machine. Every other failure fails. A test only reaches this
+    line once it has established that the data it needs is present, and printing "not provisioned"
+    over a machine holding the data would be a false reason for a green run, which is the exact
+    report these tests exist to make impossible.
+    """
     try:
         return env_factory(name, kwargs)(name)
-    except Exception as exc:  # noqa: BLE001 - the message is the skip reason
-        pytest.skip(f"{name} data not provisioned here: {type(exc).__name__}: {exc}")
+    except _RefusedFetch as exc:
+        pytest.skip(f"{name} data not provisioned here: {exc}")
 
 
 def test_tau2_manifest_ids_resolve_to_the_labels_it_records() -> None:
@@ -111,14 +152,28 @@ def test_automationbench_manifest_covers_the_env_exactly() -> None:
 
 def test_hle_manifest_ids_resolve_to_the_question_ids_it_records() -> None:
     # hle's tasks come off the Hub through ``datasets``, which the fixture above cannot cover:
-    # the download is not shogym's function. conftest.py pins the Hub client offline for the
-    # whole process, so the loader below reads the local cache or raises, and the check here is
-    # the cache the loader will be pointed at. Both are needed. Without the pin, a build this
-    # check rejected could still be completed over the network, and the same machine would pass
-    # online and skip offline.
+    # the download is not shogym's function. conftest.py pins the Hub client offline for the whole
+    # process, so the loader below reads this cache or raises, and reading this cache is what the
+    # pin also makes checkable: offline is the branch that selects a build from disk, and it is
+    # the branch every run takes.
+    #
+    # Nothing prepared under the root means nothing was ever cached, which is the only state that
+    # can honestly skip. Past that line the data is here, so the build the loader will select has
+    # to hold up, and if it does not, that is a failure with a true reason rather than a green run
+    # claiming data this machine has.
     cache = hle_data.cache_dir()
-    if _prepared_hle_build(cache) is None:
+    root = _hle_cache_root(cache)
+    if not any((c / "dataset_info.json").is_file() for c in root.glob("*/*/*")):
         pytest.skip(f"the gated hle dataset is not cached at {cache}, and a test will not fetch it")
+    build = _hle_build_datasets_will_load(cache)
+    info = json.loads((build / "dataset_info.json").read_text())
+    assert hle_data.HF_SPLIT in (info.get("splits") or {}), (
+        f"datasets will load {build}, which records no {hle_data.HF_SPLIT!r} split"
+    )
+    shards = sorted(build.glob("*.arrow"))
+    assert shards, f"datasets will load {build}, which holds no arrow shard"
+    empty = [s.name for s in shards if s.stat().st_size == 0]
+    assert not empty, f"datasets will load {build}, whose shards {empty} are empty files"
     split = load_split_by_name("hle")
     env = _env("hle", split.heldout.env_kwargs)
     assert env.num_tasks == split.total_tasks
