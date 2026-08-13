@@ -480,8 +480,15 @@ is read and never written or locked: it is an archived artifact, and the new run
 a `rebookend` provenance block and publishes under the incomplete name, since a run with no
 eval_before cannot account for the before side; pairing with the source happens post-hoc.
 The snapshot is MATERIALIZED, transcripts included: every symlink becomes the bytes it
-pointed at, so nothing in the new tree references the source and no later writer (the
-credential reseed was the demonstrated case) can reach the archive through a preserved link.
+names, resolved from the link's own parent (a valid relative link, the shape of every link in
+the real prime homes, materializes wherever the process happens to run; the stdlib copy read
+those as dangling and silently dropped them). Nothing in the new tree references the source,
+so no later writer (the credential reseed was the demonstrated case) can reach the archive
+through a preserved link; a genuinely dangling link drops, and a link resolving outside the
+source home, a cycle, or a special file refuses loudly. Publication is atomic everywhere
+(``write_results`` swaps the leaf entry in with ``os.replace``), and a rebookend additionally
+refuses up front any output directory, result leaf, or new run path that resolves into the
+source, so a link planted at a deterministic name is refused or replaced, never followed.
 Refused before anything is copied or spent: a source without a terminus, without a
 resolvable terminal session, holding a suspension record, or still owned by a live process
 (the source lock is probed non-mutatingly), and any output path at or under the source. A

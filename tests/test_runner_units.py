@@ -1422,6 +1422,33 @@ def test_no_durable_artifact_the_runner_writes_carries_an_absolute_path(tmp_path
         assert _absolute_path_values(doc) == [], f"{path.name} leaks an absolute path"
 
 
+def test_publication_replaces_a_planted_leaf_and_never_writes_through_it(
+    tmp_path: Path,
+) -> None:
+    """The result leaf names are deterministic, so an entry can be waiting there before the
+    run publishes: a symlink at the leaf turned publication into a write through the results
+    directory into wherever it pointed (an archived run, in review). Publication now swaps
+    the entry atomically, so whatever held the name is replaced and nothing is followed."""
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text("UNTOUCHED", encoding="utf-8")
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / "cell.incomplete.json").symlink_to(elsewhere)
+
+    path = write_results(
+        results / "cell.json",
+        manifest={},
+        phases={"eval_before": [], "eval_after": [], "rollout": []},
+        stopping={},
+        heldout_ids=[1],
+    )
+
+    assert path.name == "cell.incomplete.json"
+    assert not path.is_symlink()
+    assert elsewhere.read_text() == "UNTOUCHED"
+    assert json.loads(path.read_text(encoding="utf-8"))["schema"] == "shobench.results/1"
+
+
 def test_a_cell_leaves_one_results_file_whichever_way_its_run_ended(tmp_path: Path) -> None:
     """A results directory holds one artifact per cell.
 

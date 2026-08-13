@@ -20,6 +20,7 @@ a finished measurement.
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -398,7 +399,20 @@ def write_results(
     finished, partial = path, path.with_name(path.stem + INCOMPLETE_SUFFIX)
     path = finished if complete else partial
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    # Written beside the leaf and swapped in atomically, so publication REPLACES whatever
+    # holds the name: a stale file, a hard link, or a symlink someone left at the
+    # deterministic leaf. A plain write follows an existing symlink, which turned a link
+    # planted at the leaf name into a write through the results directory into wherever it
+    # pointed (an archived source run, in review); ``os.replace`` swaps the directory entry
+    # itself and follows nothing. Owned here rather than by each caller, so every publisher
+    # (a fresh cell, a resume, a rerun, a rebookend) inherits the same guarantee. The scratch
+    # name is unlinked first and opened exclusively for the same reason the swap exists: no
+    # step of publication may write through a pre-existing entry.
+    scratch = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    scratch.unlink(missing_ok=True)
+    with scratch.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(body, indent=2) + "\n")
+    os.replace(scratch, path)
     # A results directory holds one artifact per cell, and a rerun already replaces what the
     # last run wrote. Leaving the other name in place would leave two files describing one cell
     # from two runs, which is how a reader ends up reporting the one that reads better.

@@ -389,7 +389,7 @@ def test_the_snapshot_materializes_symlinks_so_no_writer_reaches_the_source(
     writer can do its worst."""
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split)
-    secrets = source_dir / "secrets"
+    secrets = source_dir / "home" / "codex-real"
     secrets.mkdir()
     (secrets / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
     (source_dir / "home" / ".codex").symlink_to(secrets)
@@ -416,6 +416,124 @@ def test_the_snapshot_materializes_symlinks_so_no_writer_reaches_the_source(
     # The reproduction's write, thrown at the copy: it stays in the copy.
     (new_home / ".codex" / "auth.json").write_text('{"auth_mode": "OVERWRITTEN"}')
     assert (secrets / "auth.json").read_text() == '{"auth_mode": "chatgpt"}'
+    assert _fingerprint(source_dir) == before
+
+
+def test_the_snapshot_materializes_valid_relative_links_from_their_own_parent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The round-2 silent loss, closed. copytree tested a link's textual target against the
+    process CWD, so valid RELATIVE links (the shape of every link in the real prime homes)
+    read as dangling and vanished. The materializer resolves from the link's parent, so the
+    CWD is irrelevant: valid file and directory links become their bytes, two links to one
+    target both materialize, an absolute in-source link materializes, and only the genuinely
+    dangling link drops."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    home = source_dir / "home"
+    real = home / "real"
+    real.mkdir()
+    (real / "payload").write_text("payload bytes", encoding="utf-8")
+    (home / "file-link").symlink_to("real/payload")
+    (home / "dir-link").symlink_to("real")
+    (home / "dir-link-two").symlink_to("real")
+    (home / "abs-link").symlink_to(real / "payload")
+    (home / "dangling").symlink_to("no-such-target")
+    before = _fingerprint(source_dir)
+    # The repro condition: run somewhere the RAW target strings resolve to nothing.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    new_home = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir()) / "home"
+    assert (new_home / "file-link").read_text() == "payload bytes"
+    assert (new_home / "dir-link" / "payload").read_text() == "payload bytes"
+    assert (new_home / "dir-link-two" / "payload").read_text() == "payload bytes"
+    assert (new_home / "abs-link").read_text() == "payload bytes"
+    assert not (new_home / "dangling").exists()
+    assert not any(p.is_symlink() for p in new_home.rglob("*"))
+    assert _fingerprint(source_dir) == before
+
+
+def test_the_snapshot_refuses_a_link_escaping_the_source_home(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A link resolving outside the source home refuses loudly rather than importing bytes
+    the run never saw: the snapshot must be OF the source, and with the write-through history
+    a silent import is the same class of surprise. (Both real homes carry only in-home
+    relative links, so this policy costs the report set nothing.)"""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    outside = source_dir / "secrets"
+    outside.mkdir()
+    (outside / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+    (source_dir / "home" / ".codex").symlink_to(outside)
+    before = _fingerprint(source_dir)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="outside the source home"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert _fingerprint(source_dir) == before
+
+
+def test_the_materializer_fails_loudly_on_a_link_cycle(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "sub").mkdir(parents=True)
+    (home / "sub" / "back").symlink_to("..")
+
+    with pytest.raises(RuntimeError, match="cycles"):
+        runner._materialize_home(home, tmp_path / "copy")
+
+
+def test_rebookend_refuses_a_result_leaf_linked_into_the_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The round-2 escape, closed pre-spend: the deterministic result leaf can pre-exist as a
+    link into the archive, and publication would land there after the whole eval was paid for.
+    The leaf resolves and refuses before anything launches; publication itself also replaces
+    atomically, so a link aimed anywhere else is replaced, never followed."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    archived = source_dir / "archive-byte"
+    archived.write_text("ARCHIVED BYTES", encoding="utf-8")
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / f"{cell.name}.incomplete.json").symlink_to(archived)
+    before = _fingerprint(source_dir)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="resolves into the source"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=results,
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+    assert archived.read_text() == "ARCHIVED BYTES"
     assert _fingerprint(source_dir) == before
 
 

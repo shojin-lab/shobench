@@ -66,6 +66,7 @@ from shobench.pins import SHOGYM_REPO, SHOGYM_REV
 from shobench.redact import MARKER as redact_marker
 from shobench.redact import Redactor, redactor_for, secrets_in_file
 from shobench.results import (
+    INCOMPLETE_SUFFIX,
     TaskResult,
     dispensed_positions,
     fill_missing,
@@ -2303,6 +2304,80 @@ async def _rerun_eval_owned(
         sandbox.down()
 
 
+def _materialize_home(
+    source: Path,
+    destination: Path,
+    *,
+    root: Path | None = None,
+    active: set[Path] | None = None,
+) -> None:
+    """Copy ``source`` into ``destination`` with every symlink turned into the bytes it names.
+
+    ``shutil.copytree(symlinks=False, ignore_dangling_symlinks=True)`` was not this: CPython
+    tests a link's TEXTUAL target against the process cwd rather than the link's parent, so a
+    valid relative link (the shape of every link in the real prime homes: in-home cache links,
+    all relative, all resolving) read as dangling and silently vanished from the snapshot.
+    Here each link resolves the way the filesystem resolves it, from its own parent:
+
+    - a link to a file inside the source home becomes that file's bytes;
+    - a link to a directory inside the source home becomes that tree, links within it
+      materialized the same way, with the chain of directories currently being materialized
+      tracked so a cycle fails loudly instead of recursing forever (two links to ONE target
+      are fine; a link into its own ancestry is not);
+    - a genuinely dangling link is dropped: it names no bytes, and the CLIs resolve it to
+      nothing as well;
+    - a link resolving OUTSIDE the source home is refused loudly. The snapshot must be of the
+      source, and importing whatever the operator's host keeps at that path would be
+      contamination wearing the archive's name; a container-absolute link (``/root/...``)
+      usually names nothing on the host and is dropped as dangling, but one that does resolve
+      here names bytes the run never saw, and that is a refusal, not an import;
+    - a special file (FIFO, socket) fails loudly, as the copy always did.
+    """
+    root = root if root is not None else source.resolve()
+    active = active if active is not None else {root}
+    destination.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(source.iterdir()):
+        target_path = destination / entry.name
+        if entry.is_symlink():
+            try:
+                resolved = Path(os.path.realpath(entry, strict=True))
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(f"cannot materialize the symlink {entry}: {exc}") from exc
+            if not (resolved == root or resolved.is_relative_to(root)):
+                raise RuntimeError(
+                    f"the symlink {entry} resolves outside the source home ({resolved}); a "
+                    "snapshot that imported those bytes would not be of the source. Remove "
+                    "the link from the archive copy, or bookend a source without it."
+                )
+            if resolved.is_dir():
+                if resolved in active:
+                    raise RuntimeError(
+                        f"the symlink {entry} cycles into a directory already being "
+                        f"materialized ({resolved})"
+                    )
+                active.add(resolved)
+                _materialize_home(resolved, target_path, root=root, active=active)
+                active.discard(resolved)
+            elif resolved.is_file():
+                shutil.copy2(resolved, target_path)
+            else:
+                raise RuntimeError(
+                    f"the symlink {entry} resolves to {resolved}, which is neither a file "
+                    "nor a directory; a special file cannot be part of the snapshot"
+                )
+        elif entry.is_dir():
+            _materialize_home(entry, target_path, root=root, active=active)
+        elif entry.is_file():
+            shutil.copy2(entry, target_path)
+        else:
+            raise RuntimeError(
+                f"{entry} is neither a file, a directory, nor a symlink; a special file "
+                "cannot be part of the snapshot"
+            )
+
+
 def _refuse_live_source(source_run_dir: Path) -> None:
     """Refuse a source whose run lock a live process still holds, without mutating the source.
 
@@ -2376,6 +2451,23 @@ async def rebookend_run(
     # source publishes honestly as never + resumed.
     recorded_regime = recorded_rollout_feedback(source_manifest)
     cell = replace(cell, rollout_feedback=recorded_regime, eval_context="resumed")
+    # The concrete artifacts too, not only their directories: the result leaf names are
+    # deterministic, and a link left at one of them would aim publication itself at the
+    # archive. Publication also replaces atomically (see ``write_results``), so a link
+    # resolving anywhere ELSE is replaced rather than followed; one resolving into the source
+    # refuses here, before anything spends, because even a replaced entry should never have
+    # been aimed at the archive.
+    for leaf in (
+        Path(results_dir) / f"{cell.name}.json",
+        Path(results_dir) / f"{cell.name}{INCOMPLETE_SUFFIX}",
+    ):
+        resolved_leaf = leaf.resolve()
+        if resolved_leaf == source_run_dir or resolved_leaf.is_relative_to(source_run_dir):
+            raise RuntimeError(
+                f"the result artifact {leaf} resolves into the source run directory, and a "
+                "rebookend never writes into the archive it bookends. Remove the link, or "
+                "point --results elsewhere."
+            )
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
     drift = experiment_drift(source_manifest, cell=cell, split=split, instruction=instruction)
@@ -2405,6 +2497,14 @@ async def rebookend_run(
     # genuinely fresh rather than fresh-if-nobody-else-was-quick.
     run_id = f"{_run_id(cell)}-rb{uuid.uuid4().hex[:8]}"
     run_dir = Path(runs_dir) / run_id
+    # The concrete run path, same rule as the leaves: the directory check above bounds the
+    # parent, and this bounds the entry the lock is about to create through.
+    resolved_run_dir = run_dir.resolve()
+    if resolved_run_dir == source_run_dir or resolved_run_dir.is_relative_to(source_run_dir):
+        raise RuntimeError(
+            f"the new run directory {run_dir} resolves into the source run directory, and a "
+            "rebookend never writes into the archive it bookends."
+        )
     lock_fd = _acquire_run_lock(run_dir)
     try:
         return await _rebookend_owned(
@@ -2476,15 +2576,14 @@ async def _rebookend_owned(
     # guarantee, because everything that runs afterwards writes into this tree (the credential
     # seeding, the runner files, the RW container mount), and a preserved link pointing back
     # into the source turns any of those writes into a write THROUGH the copy into the
-    # archive; a credential reseed did exactly that in review. So every link is resolved to
-    # the bytes it pointed at and copied as a real file, links inside and outside the source
-    # alike, and the snapshot references nothing beyond itself. A dangling link is dropped (it
-    # carries no bytes to materialize); a link cycle fails the copy loudly before anything is
-    # measured.
+    # archive; a credential reseed did exactly that in review. Every link becomes the bytes it
+    # names, resolved from the link's own parent (see ``_materialize_home`` for the whole
+    # policy: valid links materialize, dangling ones drop, escaping ones and cycles refuse
+    # loudly), and the snapshot references nothing beyond itself.
     source_home = source_run_dir / "home"
     if not source_home.is_dir():
         raise RuntimeError(f"{source_run_dir} has no home directory to bookend.")
-    shutil.copytree(source_home, sandbox.home, symlinks=False, ignore_dangling_symlinks=True)
+    _materialize_home(source_home, sandbox.home)
     shutil.copy2(source_run_dir / ROLLOUT_STOPPING_FILE, run_dir / ROLLOUT_STOPPING_FILE)
     source_stopping = json.loads(
         (source_run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
