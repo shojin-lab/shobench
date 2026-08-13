@@ -35,3 +35,44 @@ rollout_wall_clock_s = 28800
 # The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
 pool_ceiling = 74
 eval_task_timeout_s = 1800
+
+[env_kwargs]
+# The tau2 user simulator is served by us, not by the agent under test, and upstream
+# tau2-bench defaults it to gpt-4.1-2025-04-14. Serving it with gpt-5.6-luna instead cuts
+# the user-side bill by roughly an order of magnitude (cached input $0.02 against $0.50 per
+# Mtok), which is what makes four tau2 cells affordable to run.
+#
+# The user simulator is part of the environment, not part of the agent under test. Changing
+# it makes our tau2 numbers non-comparable to published tau2-bench results, and that is a
+# real cost, accepted deliberately. All four tau2 cells carry this identical block, so the
+# four stay comparable to each other, which is the comparison v0 is actually making.
+user_llm = "gpt-5.6-luna"
+
+# user_llm_args replaces tau2's DEFAULT_LLM_ARGS_USER wholesale rather than merging into it,
+# so every argument the user simulator needs has to be named here. Leaving this table out is
+# not a safe default: shogym would substitute tau2's {"temperature": 0.0}, which carries no
+# reasoning_effort, and every user turn would fail for the reason below.
+[env_kwargs.user_llm_args]
+# reasoning_effort is mandatory here, not a tuning choice. luna rejects any request carrying
+# function tools on /v1/chat/completions unless reasoning_effort is set explicitly: "Function
+# tools with reasoning_effort are not supported for gpt-5.6-luna in /v1/chat/completions. To
+# use function tools, use /v1/responses or set reasoning_effort to 'none'." The user simulator
+# always carries the telecom user tools, so omitting this 400s on every single user turn.
+#
+# "none" is honored rather than silently dropped, which matters because tau2 sets
+# litellm.drop_params = True and an unaccepted argument would otherwise vanish without an
+# error. On one reasoning-demanding prompt "none" reported
+# usage.completion_tokens_details.reasoning_tokens = 0 where "low" reported 38 and "medium"
+# 39, and it answered differently as a result. "none" is also the lowest honored value:
+# "minimal" is rejected outright as an unsupported value for this model.
+reasoning_effort = "none"
+# Accepted and transmitted, not dropped: the provider takes temperature whenever
+# reasoning_effort is co-present, and it measurably concentrates the output distribution
+# (3 to 4 distinct replies per 5 samples, against 5 distinct per 5 with temperature unset).
+#
+# It does not make the user simulator deterministic, so tau2 pins temperature for a
+# reproducibility it does not actually get here and run-to-run variance in the user's
+# phrasing remains. That is not a regression introduced by this pin: the incumbent
+# gpt-4.1-2025-04-14 at temperature 0.0 measured 2 to 3 distinct replies per 5 on the same
+# prompt, so the user simulator was never reproducible against this API under either model.
+temperature = 0.0

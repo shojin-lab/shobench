@@ -31,3 +31,10 @@ rollout_wall_clock_s = 28800
 # The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
 pool_ceiling = 300
 eval_task_timeout_s = 900
+
+[env_kwargs]
+# Pinned, not changed: gpt-5.4-nano is already shogym's DEFAULT_JUDGE_MODEL for HLE, so this
+# names today's behavior rather than altering it. Writing it down puts the judge in the
+# manifest as an explicit part of the cell, so a later change to the upstream default cannot
+# silently regrade results that were produced under this one.
+judge_model = "gpt-5.4-nano"
