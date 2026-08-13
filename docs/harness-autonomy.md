@@ -586,18 +586,42 @@ RECORDS across everything that shaped the before rows the bookend will carry. Fr
 the row's execution identity, which both sides must STATE rather than merely agree on, absence
 refusing exactly as a difference does: the split id digest and the blind-eval prompt digest, the
 `kickoff` every eval leg is actually sent (which no cell digest covers, the instructions living
-outside `cells/`), the `container.agent_image` and the `harness_probes` block probed inside it (an
-image tag is mutable, so the probe is the fact and both are compared), the effective credential
-mode from `axes` (which account served the legs, a thing the cell's REQUESTED mode does not
-settle), the whole `substrate` block (the shogym revision that serves and scores every task, its
-repo, and the MCP server name the agent's tools appear under), and the eval runtime. The two
-blocks are compared key by key rather than field by named field, so a key added to either is
-eval-defining until someone judges otherwise. What is deliberately absent from that set is
+outside `cells/`), the `container.agent_image` tag and the `harness_probes` block probed inside
+it, the effective credential mode from `axes`, the whole `substrate` block (the shogym revision
+that serves and scores every task, its repo, and the MCP server name the agent's tools appear
+under), the `axes.effort` block, the `split.provenance` block, and the eval runtime. Those four
+blocks are compared key by key rather than field by named field, so a key added to any of them is
+eval-defining until someone judges otherwise. The effort block is not a restatement of the cell's
+effort: `requested` is the ask, and `applied` and `how` are whether it reached the harness at all.
+The split provenance is not a restatement of `id_digest` either, which hashes the env name, the
+ids and the env kwargs, meaning POSITIONS rather than content: tau2 resolves those positions
+against a byte-verified upstream tree whose sha lives in the provenance, so two archives can share
+every id and score different task bytes. That check is only as good as what an env records, and
+hle carries no immutable dataset revision today, so for hle it proves the split file and not the
+dataset behind it. What the credential mode establishes is narrow and stated as such:
+`subscription`, `api_key` or `unknown`, never WHICH account, since the auth files carry rotating
+tokens (a hash of one fingerprints a credential rather than an account and would refuse a pairing
+across an ordinary refresh) and their only stable identifiers are the account email and id, which
+must never enter a published artifact.
+
+Two identities get a THREE-WAY rule instead of fail-closed absence, because fail-closed absence
+refuses history: no archive written before this change records the agent image's content id or the
+runner's own revision, and requiring them would refuse the pairings this entry exists for. Every
+run records both from now on (`container.image_digest` from `docker image inspect`, and
+`substrate.shobench_rev` with a `shobench_dirty` flag beside it, since shogym serves and scores a
+task while this package decides how it is launched and supervised). The pairing compares them when
+both archives state them, refuses when exactly one does, and passes when neither does while NAMING
+them in the plan (`baseline_pairing_unproven`) and in the bookend's manifest
+(`rebookend.pairing_identity_unproven`), so the artifact says what it could not establish instead
+of implying it established everything. It is the same versioned-absence idea as `rollout_feedback`
+and `eval_context` with the opposite reading: those two have a known pre-axis meaning, these have
+none, so they get visibility rather than a default. A dirty runner tree reads as an absence too,
+its commit not identifying the code that ran. What is deliberately absent from that set is
 enumerated in the runner with a reason each: the continuation cue no eval leg is sent, the rollout
 prompt a deferred baseline never used, the lookup names whose identities are the digests, the
 observed models and other OUTCOMES (the real terra pair records `['gpt-5.6-terra']` on the source
 from its rollout and `[]` on the baseline from its before legs, so comparing them would refuse a
-pairing for having measured something), the axes that restate compared cell fields, the run-local
+pairing for having measured something), `axes.model.requested`, which restates a compared cell field, the run-local
 bookkeeping, and the record's own schema version. One group is deliberately not compared, and the reason is checkable rather
 than stylistic: `rollout_feedback`, `max_in_flight`, `rollout_wall_clock_s` and `pool_ceiling`
 shape a rollout a deferred baseline never ran, `EvalStream` pins the blind feedback posture

@@ -453,6 +453,12 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
                     "baseline_pairing_drift": runner.pairing_drift(
                         manifest, baseline_manifest
                     ),
+                    # Not a refusal and not nothing: the identities NEITHER archive records,
+                    # named before the spend so the operator sees what this pairing will not
+                    # be able to prove. The bookend's manifest carries the same list.
+                    "baseline_pairing_unproven": runner.pairing_unproven(
+                        manifest, baseline_manifest
+                    ),
                 }
             )
         else:

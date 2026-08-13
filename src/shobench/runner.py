@@ -54,6 +54,7 @@ from shobench.containers import (
     docker,
     home_digest,
     home_inventory,
+    image_digest,
     run_relative,
     run_stem,
     write_json,
@@ -68,7 +69,7 @@ from shobench.credentials import (
 from shobench.credentials import effective_mode as credential_effective_mode
 from shobench.harness import Harness, LaunchSpec, StopKind, StopVerdict
 from shobench.harnesses import harness_for
-from shobench.pins import SHOGYM_REPO, SHOGYM_REV
+from shobench.pins import SHOGYM_REPO, SHOGYM_REV, shobench_revision
 from shobench.redact import MARKER as redact_marker
 from shobench.redact import Redactor, redactor_for, secrets_in_file
 from shobench.results import (
@@ -361,6 +362,7 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
     something the rollout wrote.
     """
     exclude = ctx.durable
+    runner_rev, runner_dirty = shobench_revision()
     return {
         "schema": "shobench.manifest/1",
         "run_id": ctx.run_id,
@@ -379,10 +381,17 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
                 "rollout_system" if ctx.cell.eval_context == "resumed" else "eval_system"
             ),
         },
+        # What the row was produced ON. shogym serves and scores the task; this package decides
+        # how the task is launched and supervised, which is the other half, so its revision is
+        # recorded beside shogym's rather than left for a reader to infer from a timestamp. The
+        # dirty flag says whether that revision identifies the code: a modified tree's commit
+        # does not, and a comparison has to be able to tell.
         "substrate": {
             "shogym_repo": SHOGYM_REPO,
             "shogym_rev": SHOGYM_REV,
             "mcp_server_name": SERVER_NAME,
+            "shobench_rev": runner_rev,
+            "shobench_dirty": runner_dirty,
         },
         "harness_probes": probes,
         # What the cell asked for, and what the harness will actually do with it. These used to
@@ -413,6 +422,11 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
         },
         "container": {
             "agent_image": ctx.agent_image,
+            # The tag names the image; this identifies it. Rebuilding one tag on a newer base
+            # or a different runtime leaves the tag and the harness version probe unchanged
+            # while changing the agent, so the content id is what a later comparison can rest
+            # on. Null where docker could not answer, which reads as the absence it is.
+            "image_digest": image_digest(ctx.agent_image),
             "network": ctx.sandbox.network,
             "netns_container": ctx.sandbox.netns_container,
             "home": run_relative(ctx.sandbox.home, ctx.run_dir),
@@ -1635,24 +1649,71 @@ IDENTITY_DIGESTS = (
 #
 # The held-out ids and the blind-eval prompt are what the row was measured over and under. The
 # kickoff is the user turn every eval leg actually sends, and the cell file's digest does not
-# cover it, the instructions living outside cells/. The agent image and the probed harness build
-# are the CLI that ran: an image tag is mutable, so the probe is the fact, and both are compared.
-# The effective credential mode is which account served the legs, which the cell's REQUESTED mode
-# does not settle.
+# cover it, the instructions living outside cells/. The agent image tag names the CLI that ran,
+# with its content id handled below, where absence has to be tolerated.
+#
+# The effective credential mode says which KIND of account served the legs (subscription, api_key,
+# or unknown) and no more than that: two different subscription accounts record the same value and
+# compare equal. It is compared because a mode change is a real change to how the legs were
+# served, and account identity is left unestablished deliberately. The auth files carry rotating
+# tokens, so a hash of them fingerprints a credential rather than an account and would refuse a
+# pairing across an ordinary token refresh; the only stable identifiers in them are the account
+# email and id, which must never enter a published artifact. So a pairing cannot tell two
+# subscription accounts apart, and this comment is the whole of the claim: quota and throttling
+# differences between two accounts are not excluded by anything here.
 PAIRING_IDENTITY_FIELDS = (
     ("split ids", "split.id_digest"),
     ("eval instruction", "instruction.eval_system_sha256"),
     ("eval kickoff", "instruction.kickoff"),
-    ("agent image", "container.agent_image"),
+    ("agent image tag", "container.agent_image"),
     ("credential mode", "axes.credential_mode.effective"),
 )
 
-# Blocks compared whole, key by key, because pinning the execution substrate is their entire
-# purpose: the shogym revision that serves and scores every task, the repo it comes from, the MCP
-# server name the agent's tools appear under, and whatever the harness probe reported from inside
-# the image. A key added to either is eval-defining until someone judges otherwise, which is the
-# fail-closed direction and the reason these are not enumerated field by field.
-PAIRING_IDENTITY_BLOCKS = ("substrate", "harness_probes")
+# Blocks compared whole, key by key, because pinning what produced a row is their entire purpose.
+#
+# substrate is the code the row ran on: the shogym revision that serves and scores every task, the
+# repo it comes from, the MCP server name the agent's tools appear under, and this runner's own
+# revision, whose absence is handled below.
+# harness_probes is what the harness reported from inside the image.
+# axes.effort is not a restatement of the cell's effort, which is why it moved here from the
+# excluded list: ``requested`` is the cell's ask, and ``applied`` and ``how`` are whether that ask
+# reached the harness at all. A before side that applied an effort the source's did not is a
+# different measurement, and only this block records the difference.
+# split.provenance is what the held-out POSITIONS resolve against. id_digest hashes the env name,
+# the ids and the env kwargs, which is positions rather than content: tau2 resolves those
+# positions against a byte-verified upstream tree whose sha lives here, so two archives can share
+# every id and score different task bytes. Recording is what makes this checkable, and it is only
+# as good as what an env records: hle carries no immutable dataset revision today, so for hle this
+# proves the split file and not the dataset behind it. That gap is real and is not closed here.
+#
+# A key added to any of these is eval-defining until someone judges otherwise, which is the
+# fail-closed direction and the reason they are compared whole rather than field by named field.
+PAIRING_IDENTITY_BLOCKS = ("substrate", "harness_probes", "axes.effort", "split.provenance")
+
+# The identities no archive carries yet, and the one place absence is tolerated rather than
+# refused. Every fact above is in every real archive, so requiring it costs nothing; these two are
+# in none, and requiring them would refuse every pairing that exists, including the two this entry
+# was written to make possible. Recording them starts now, and the comparison is three-way:
+#
+#   both sides state it   -> compared, and a difference refuses like any other identity;
+#   one side states it    -> refuses, because one archive proves what the other cannot;
+#   neither states it     -> passes, and the fact is NAMED as unproven in the plan and in the
+#                            bookend's manifest, so the artifact says what it could not establish
+#                            instead of implying it established everything.
+#
+# This is the same versioned-absence idea as rollout_feedback and eval_context, and the opposite
+# reading of the absence: those two have a known pre-axis meaning, these have none, so they get
+# visibility rather than a default. A dirty runner tree is treated as an absence too, its commit
+# not identifying the code that ran.
+PAIRING_VERSIONED_IDENTITY = (
+    ("agent image digest", "container.image_digest"),
+    ("runner revision", "substrate.shobench_rev"),
+)
+
+# Keys inside the compared blocks that identify nothing on their own. ``shobench_dirty`` says
+# whether the revision beside it identifies anything, and it is read exactly there; comparing it
+# separately would refuse a pair of edited checkouts for agreeing that they were edited.
+PAIRING_UNCOMPARED_IDENTITY_PATHS = ("substrate.shobench_dirty",)
 
 # Deliberately NOT compared, each for a reason a reader can check.
 #
@@ -1665,7 +1726,10 @@ PAIRING_IDENTITY_BLOCKS = ("substrate", "harness_probes")
 # the two sides' come from different phases: in the real terra pair the source recorded
 # ['gpt-5.6-terra'] from its rollout and the baseline [] from its before legs, so comparing them
 # would refuse a pairing for having measured something.
-# axes.model.requested and axes.effort restate cell fields already compared.
+# axes.model.requested restates a cell field already compared. axes.effort does NOT, and is
+# compared as a block above.
+# substrate.shobench_dirty is not compared for its own sake: it says whether the revision beside
+# it identifies anything, and that is read where the revision is compared.
 # container.network, container.netns_container, container.home, home, work, redaction,
 # credential_seed, run_id, started_at, ended_at, resumptions and eval_reruns are run-local
 # bookkeeping: they name this run's resources and history, not what its rows were produced by.
@@ -1891,6 +1955,38 @@ def _pairing_identity_lines(label: str, source_value: Any, baseline_value: Any) 
     return []
 
 
+def _versioned_identity(manifest: dict[str, Any], path: str) -> Any:
+    """A versioned identity as recorded, with a runner revision from a dirty tree read as absent.
+
+    A commit is an identity only when the tree that ran was that commit. A modified one shares
+    the sha and not the code, so treating it as a value would let two edited checkouts prove
+    something about each other; reading it as absence puts it in the unproven list instead, which
+    is what it is.
+    """
+    value = _recorded_path(manifest, path)
+    if path == "substrate.shobench_rev" and _recorded_path(manifest, "substrate.shobench_dirty"):
+        return _MISSING
+    return value
+
+
+def pairing_unproven(
+    source_manifest: dict[str, Any], baseline_manifest: dict[str, Any]
+) -> list[str]:
+    """The identities NEITHER archive states, named so the artifact can say what it did not prove.
+
+    Every other identity refuses on absence. These cannot, because no archive written before this
+    change records them and refusing would refuse the pairings the entry exists for, so silence
+    passes here and is published rather than swallowed: a reader of the delta sees exactly which
+    facts about the two sides were never established.
+    """
+    return [
+        path
+        for _, path in PAIRING_VERSIONED_IDENTITY
+        if _versioned_identity(source_manifest, path) is _MISSING
+        and _versioned_identity(baseline_manifest, path) is _MISSING
+    ]
+
+
 def pairing_drift(
     source_manifest: dict[str, Any], baseline_manifest: dict[str, Any]
 ) -> list[str]:
@@ -1932,25 +2028,39 @@ def pairing_drift(
             _recorded_path(source_manifest, path),
             _recorded_path(baseline_manifest, path),
         )
+    versioned = {path for _, path in PAIRING_VERSIONED_IDENTITY}
     for block in PAIRING_IDENTITY_BLOCKS:
-        source_block = source_manifest.get(block) or {}
-        baseline_block = baseline_manifest.get(block) or {}
-        if not source_block or not baseline_block:
-            # An empty block is not an empty difference: it is a record that names none of the
-            # substrate its rows were produced on, and nothing left to compare.
+        source_block = _recorded_path(source_manifest, block)
+        baseline_block = _recorded_path(baseline_manifest, block)
+        if not isinstance(source_block, dict) or not isinstance(baseline_block, dict):
+            # An absent block is not an empty difference: it is a record that names none of what
+            # its rows were produced by, leaving nothing to compare.
             lines.append(
                 f"{block} is not recorded on both sides (source "
-                f"{'recorded' if source_block else 'no such block'}, baseline "
-                f"{'recorded' if baseline_block else 'no such block'}), so nothing proves the two "
-                "archives ran on one substrate"
+                f"{'recorded' if isinstance(source_block, dict) else 'no such block'}, baseline "
+                f"{'recorded' if isinstance(baseline_block, dict) else 'no such block'}), so "
+                "nothing proves the two archives were produced the same way"
             )
             continue
         for key in sorted(set(source_block) | set(baseline_block)):
+            path = f"{block}.{key}"
+            if path in versioned or path in PAIRING_UNCOMPARED_IDENTITY_PATHS:
+                # Owned by the three-way rule below, or judged not to identify anything on its
+                # own. Comparing here as well would give one fact two verdicts.
+                continue
             lines += _pairing_identity_lines(
-                f"{block}.{key}",
-                _recorded_path(source_manifest, f"{block}.{key}"),
-                _recorded_path(baseline_manifest, f"{block}.{key}"),
+                path,
+                _recorded_path(source_manifest, path),
+                _recorded_path(baseline_manifest, path),
             )
+    for label, path in PAIRING_VERSIONED_IDENTITY:
+        source_value = _versioned_identity(source_manifest, path)
+        baseline_value = _versioned_identity(baseline_manifest, path)
+        if source_value is _MISSING and baseline_value is _MISSING:
+            # Neither archive can say. Passing here is what keeps the archives that predate the
+            # recording usable; ``pairing_unproven`` is where the silence becomes visible.
+            continue
+        lines += _pairing_identity_lines(f"{label} ({path})", source_value, baseline_value)
     source_runtime = _inheritable_eval_runtime(source_manifest)
     baseline_runtime = _inheritable_eval_runtime(baseline_manifest)
     for bound in BOOKEND_EVAL_RUNTIME_FIELDS:
@@ -3424,9 +3534,14 @@ async def rebookend_run(
             )
         baseline_run_id = str(baseline_manifest.get("run_id", ""))
         baseline_dir_resolved = baseline_dir
+        pairing_identity_manifest = baseline_manifest
     elif _has_eval_before(source_run_dir):
         baseline_run_id = str(source_manifest.get("run_id", ""))
         baseline_dir_resolved = source_run_dir
+        # Self-paired: the before rows are the source's own, so the two sides are one archive
+        # and every identity matches itself. What the source does not record about itself is
+        # still worth naming, since the bookend's after side runs on today's image and runner.
+        pairing_identity_manifest = source_manifest
     else:
         raise RuntimeError(
             f"{source_run_dir} has no eval_before of its own (a rollout-only or after-only "
@@ -3438,6 +3553,9 @@ async def rebookend_run(
     # "the file changed, so what governed this run?", and it goes into the manifest beside both
     # blocks; the refusal below is a different comparison, against the cell that actually runs.
     checkout_drift = cell_field_drift(source_manifest.get("cell", {}), cell.to_manifest())
+    # What the pairing could not establish, computed where both records are in hand and carried
+    # into the bookend's own manifest, so the artifact states it rather than a reader assuming.
+    unproven_identities = pairing_unproven(source_manifest, pairing_identity_manifest)
     # The record wins over the checkout for everything the new measurement inherits: the arm the
     # source's rollout served, and the eval runtime its before side was scored under.
     cell = bookend_cell(cell, source_manifest)
@@ -3509,6 +3627,7 @@ async def rebookend_run(
             baseline_run_id=baseline_run_id,
             baseline_dir=baseline_dir_resolved,
             checkout_drift=checkout_drift,
+            unproven_identities=unproven_identities,
             run_id=run_id,
             run_dir=run_dir,
             results_dir=results_dir,
@@ -3530,6 +3649,7 @@ async def _rebookend_owned(
     baseline_run_id: str,
     baseline_dir: Path,
     checkout_drift: dict[str, dict[str, Any]],
+    unproven_identities: list[str],
     run_id: str,
     run_dir: Path,
     results_dir: Path,
@@ -3690,6 +3810,12 @@ async def _rebookend_owned(
             # finding two checkouts to diff.
             "source_cell": dict(source_manifest.get("cell", {})),
             "cell_drift": checkout_drift,
+            # What the pairing could NOT establish, named rather than left to a reader's
+            # assumption: the identities neither archive recorded, which is empty for any pair
+            # of runs made after the recording started and never empty for the v0 archives.
+            # Every other identity refused before this run spent, so this list is the whole of
+            # what the published delta rests on trust for.
+            "pairing_identity_unproven": unproven_identities,
         }
         ctx.publish_json(run_dir / "manifest.json", manifest)
         return await _run_phases(

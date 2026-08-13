@@ -161,6 +161,13 @@ def _archived_manifest(ctx) -> dict:
         "source": "seeded file",
         "evidence": "",
     }
+    # Pinned rather than inherited from the machine. The builder asks docker for the image id
+    # and git for the runner revision, so a fixture that kept whatever they answered would
+    # model a different archive on a host without docker, and a dirty checkout would move the
+    # unproven list under a test that is not about either.
+    manifest["container"]["image_digest"] = "sha256:" + "a" * 64
+    manifest["substrate"]["shobench_rev"] = "b" * 40
+    manifest["substrate"]["shobench_dirty"] = False
     return manifest
 
 
@@ -310,6 +317,9 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
             "eval_task_timeout_s": cell.budget.eval_task_timeout_s,
             "eval_concurrency": cell.budget.eval_concurrency,
         },
+        # Both archives record the image id and the runner revision, so the pairing proved
+        # every identity it names and the list of what it could not prove is empty.
+        "pairing_identity_unproven": [],
     }
     # The source's recorded cell block is kept whole beside the block this run ran under, and
     # every field the checkout's file states differently is named with both values. Nothing but
@@ -2660,39 +2670,57 @@ def test_a_pairing_identity_that_is_unrecorded_refuses(tmp_path: Path, path: str
 
 @pytest.mark.parametrize("block", runner.PAIRING_IDENTITY_BLOCKS)
 def test_a_pairing_identity_block_is_compared_key_by_key(tmp_path: Path, block: str) -> None:
-    """The substrate and the probe are compared whole rather than field by field, so a key added
-    to either is eval-defining until someone judges otherwise. A block missing altogether names
-    none of what its rows ran on, which is a refusal of its own."""
+    """These blocks are compared whole rather than field by named field, so a key added to any of
+    them is eval-defining until someone judges otherwise. A block missing altogether names none
+    of what its rows were produced by, which is a refusal of its own."""
     source, baseline = _paired_manifests(tmp_path)
-    assert baseline[block], "the fixture must model an archive that records this block"
-    for key in baseline[block]:
+    owned_elsewhere = {path for _, path in runner.PAIRING_VERSIONED_IDENTITY} | set(
+        runner.PAIRING_UNCOMPARED_IDENTITY_PATHS
+    )
+    recorded = runner._recorded_path(baseline, block)
+    assert isinstance(recorded, dict) and recorded, "the fixture must record this block"
+    compared = [key for key in recorded if f"{block}.{key}" not in owned_elsewhere]
+    assert compared, (block, "every key is owned elsewhere; the block comparison is dead")
+    for key in compared:
         mutated = json.loads(json.dumps(baseline))
-        mutated[block][key] = "something-else"
+        _set_path(mutated, f"{block}.{key}", "something-else")
         drift = runner.pairing_drift(source, mutated)
         assert drift and any(f"{block}.{key}" in line for line in drift), (key, drift)
 
     without = json.loads(json.dumps(baseline))
-    del without[block]
+    _drop_path(without, block)
     drift = runner.pairing_drift(source, without)
-    assert drift and any("one substrate" in line or block in line for line in drift), drift
+    assert drift and any(block in line for line in drift), drift
 
 
 def test_the_pairing_identity_set_is_the_decided_one() -> None:
-    """The decision, written where removing a field breaks a test rather than a measurement.
+    """The decision, written where removing a fact breaks a test rather than a measurement.
 
-    Every entry is a recorded fact a before row was produced by: the ids it ran over, the blind
-    prompt and the user turn it was sent, the image and harness build that ran it, the account
-    that served it, and the substrate that served and scored it. What is deliberately absent is
+    Every entry is a recorded fact a before row was produced by: the ids it ran over and the
+    data behind them, the blind prompt and the user turn it was sent, the image and harness build
+    that ran it, the kind of account that served it, the effort that did or did not reach the
+    harness, and the code that served, scored and supervised it. What is deliberately absent is
     listed beside the constants in the runner, each with its reason.
     """
     assert runner.PAIRING_IDENTITY_FIELDS == (
         ("split ids", "split.id_digest"),
         ("eval instruction", "instruction.eval_system_sha256"),
         ("eval kickoff", "instruction.kickoff"),
-        ("agent image", "container.agent_image"),
+        ("agent image tag", "container.agent_image"),
         ("credential mode", "axes.credential_mode.effective"),
     )
-    assert runner.PAIRING_IDENTITY_BLOCKS == ("substrate", "harness_probes")
+    assert runner.PAIRING_IDENTITY_BLOCKS == (
+        "substrate",
+        "harness_probes",
+        "axes.effort",
+        "split.provenance",
+    )
+    # The two facts no archive written before this change carries, and the only place absence
+    # is tolerated rather than refused.
+    assert runner.PAIRING_VERSIONED_IDENTITY == (
+        ("agent image digest", "container.image_digest"),
+        ("runner revision", "substrate.shobench_rev"),
+    )
 
 
 def test_a_baseline_with_another_kickoff_is_refused_through_the_entry(
@@ -2721,3 +2749,130 @@ def test_a_baseline_with_another_kickoff_is_refused_through_the_entry(
         )
     assert launches == {}
     assert not (tmp_path / "runs").exists()
+
+
+# ----- the identities no archive carries yet ----------------------------------------------------
+#
+# Fail-closed absence refuses history. The image content id and the runner revision are recorded
+# from now on and are in no archive written before, so requiring them would refuse the two pairings
+# this entry exists for. They get a three-way rule instead, and the silence is published.
+
+
+@pytest.mark.parametrize(("label", "path"), runner.PAIRING_VERSIONED_IDENTITY)
+def test_a_versioned_identity_refuses_when_only_one_side_states_it(
+    tmp_path: Path, label: str, path: str
+) -> None:
+    """One archive proving what the other cannot is not a match. The pairing refuses rather
+    than reading the newer record's word for both."""
+    source, baseline = _paired_manifests(tmp_path)
+    _drop_path(baseline, path)
+
+    drift = runner.pairing_drift(source, baseline)
+    assert drift and any(path in line for line in drift), drift
+    assert runner.pairing_unproven(source, baseline) == [], "one side does state it"
+
+
+@pytest.mark.parametrize(("label", "path"), runner.PAIRING_VERSIONED_IDENTITY)
+def test_a_versioned_identity_that_differs_refuses(tmp_path: Path, label: str, path: str) -> None:
+    """Stated on both sides, it is an identity like any other."""
+    source, baseline = _paired_manifests(tmp_path)
+    _set_path(baseline, path, "something-the-source-never-ran")
+
+    drift = runner.pairing_drift(source, baseline)
+    assert drift and any(path in line for line in drift), drift
+
+
+def test_two_silent_archives_pair_and_the_silence_is_published(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The v0 shape: neither archive records the image id or the runner revision, so the pairing
+    passes and the artifact says which identities it could not establish. Absence is visible
+    here, never silent, which is the whole difference between this category and the rest."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    for run_dir in (source_dir, baseline_dir):
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        for _, path in runner.PAIRING_VERSIONED_IDENTITY:
+            _drop_path(manifest, path)
+        runner.write_json(run_dir / "manifest.json", manifest)
+    source = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    baseline = json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert runner.pairing_drift(source, baseline) == []
+    assert runner.pairing_unproven(source, baseline) == [
+        path for _, path in runner.PAIRING_VERSIONED_IDENTITY
+    ]
+
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+    results_path = asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            baseline_run_dir=baseline_dir,
+            capture_egress=False,
+        )
+    )
+
+    assert set(launches) == {0, 1, 2}, "a pairing of two silent archives still runs"
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((new_run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["rebookend"]["pairing_identity_unproven"] == [
+        "container.image_digest",
+        "substrate.shobench_rev",
+    ]
+    # And it reaches the published artifact, which is what a reader of the delta holds.
+    published = json.loads(results_path.read_text(encoding="utf-8"))
+    assert published["manifest"]["rebookend"]["pairing_identity_unproven"] == [
+        "container.image_digest",
+        "substrate.shobench_rev",
+    ]
+
+
+def test_a_dirty_runner_tree_does_not_prove_a_revision(tmp_path: Path) -> None:
+    """A modified checkout shares its commit and not its code, so two edited trees at one sha
+    must not prove anything about each other: the revision reads as unrecorded and lands in the
+    published unproven list instead of passing as a match."""
+    source, baseline = _paired_manifests(tmp_path)
+    for manifest in (source, baseline):
+        _set_path(manifest, "substrate.shobench_dirty", True)
+
+    assert runner.pairing_drift(source, baseline) == []
+    assert "substrate.shobench_rev" in runner.pairing_unproven(source, baseline)
+
+    # One clean side and one dirty side is the one-sided case: the clean archive states an
+    # identity the dirty one cannot, and the pairing refuses.
+    _set_path(baseline, "substrate.shobench_dirty", False)
+    drift = runner.pairing_drift(source, baseline)
+    assert drift and any("substrate.shobench_rev" in line for line in drift), drift
+
+
+def test_the_recorded_effort_block_is_compared(tmp_path: Path) -> None:
+    """requested is the cell's ask; applied and how are whether it reached the harness at all.
+    A before side that applied an effort the source's did not is a different measurement, and
+    the cell block alone cannot say so."""
+    source, baseline = _paired_manifests(tmp_path / "applied")
+    _set_path(baseline, "axes.effort.applied", not source["axes"]["effort"]["applied"])
+    assert any("axes.effort.applied" in line for line in runner.pairing_drift(source, baseline))
+
+    source, baseline = _paired_manifests(tmp_path / "how")
+    _set_path(baseline, "axes.effort.how", "a flag the source never passed")
+    assert any("axes.effort.how" in line for line in runner.pairing_drift(source, baseline))
+
+
+def test_the_split_provenance_is_compared(tmp_path: Path) -> None:
+    """id_digest hashes the env name, the ids and the env kwargs: POSITIONS, not the bytes they
+    resolve against. tau2 resolves them against a byte-verified upstream tree whose sha the
+    split records here, so two archives can share every id and score different task content."""
+    source, baseline = _paired_manifests(tmp_path / "upstream")
+    _set_path(baseline, "split.provenance.upstream_sha", "0" * 40)
+    drift = runner.pairing_drift(source, baseline)
+    assert drift and any("split.provenance.upstream_sha" in line for line in drift), drift
+
+    source, baseline = _paired_manifests(tmp_path / "kind")
+    _set_path(baseline, "split.provenance.kind", "regenerated")
+    assert any("split.provenance.kind" in line for line in runner.pairing_drift(source, baseline))
+    assert source["split"]["id_digest"] == baseline["split"]["id_digest"], (
+        "the point of the check is that the positions still agree"
+    )
