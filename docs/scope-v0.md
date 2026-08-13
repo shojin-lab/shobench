@@ -29,10 +29,17 @@ power; the full matrix is the target it grows back toward.
    (the env-agnostic "Get Better" prompt plus generic loop mechanics, no task or env
    specifics). The agent is free to write memory, skills, code, whatever its harness
    supports. Fixed budget per cell, identical across harnesses within an env.
-4. **Held-out eval, after.** The same held-out split, same order, fresh sessions, but the
-   agent home now carries whatever the rollout wrote. Fresh sessions are deliberate: they
-   strip conversational context, so the eval isolates the durable-artifact channel, which is
-   the honest meaning of "the agent improved" (see prior evidence below).
+4. **Held-out eval, after.** The same held-out split, same order, but each task resumes the
+   rollout conversation from its terminal state, as an independent fork per task (the per-task
+   home copies carry the rollout transcript, so the forks never see each other, only the
+   rollout's end). The after-bookend therefore measures the agent WITH its lived rollout
+   state: what is still in context and in the compaction summaries, plus whatever the rollout
+   wrote to the home. A resumed task launches with the ROLLOUT standing instruction rather
+   than the blind eval one: the conversation already carries the objective in its history
+   and summaries, and swapping the instruction mid-conversation would measure an agent that
+   never existed. This is the recorded `eval_context = "resumed"` default; the `"cold"` arm
+   (fresh sessions, blind eval instruction, durable channel only) is the ablation, and it is
+   what the pre-axis cells measured.
 5. **Report.** Per-task paired deltas; mean before, mean after; 95% CI on the mean delta by
    paired bootstrap; full-solve rate before and after; N. Secondary: when the agent chose to
    stop during the rollout (tasks attempted before stopping, whether it self-checkpointed),
@@ -46,9 +53,11 @@ for one harness on one env: improvement during a session is real and large
 context (+0.007, CI [-0.011, +0.025]), and held-out transfer of a written knowledge base was
 weak (+0.088 mean lift, flat full-solve). Three consequences for shōbench:
 
-- **Fresh-session eval is the right test.** Context transfer is established; the open
-  question is which harnesses can convert experience into artifacts that survive a session
-  boundary. That is exactly what before/after with fresh sessions measures.
+- **The lived context is part of the measurement.** Context transfer is established and
+  large, which is exactly why eval_after resumes the rollout conversation by default: an
+  after-bookend that strips it measures only the weak artifact channel and misses most of
+  what the rollout built. The cold arm (`eval_context = "cold"`) remains the ablation that
+  isolates artifacts surviving a session boundary, and it is the arm the pre-axis cells ran.
 - **Expect small effects; power accordingly.** At N=40 paired tasks a +0.088 mean lift was
   detectable but unconvincing; the tight null on the artifact channel was visible at N=120.
   Held-out splits below aim for N >= 60 where the env has the tasks to spare.

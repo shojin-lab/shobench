@@ -448,6 +448,196 @@ kernel, installing this package, importing it as `shogym_stream`, and pulling a 
 the interactive login this host does not yet have (see Credentials above), so it waits on the
 same login as the rest of the prime_agent leg, not on more wiring.
 
+## Forking the rollout into eval_after
+
+`eval_after` measures the agent with its lived rollout state, so under the default
+`eval_context = "resumed"` each held-out task resumes the rollout's terminal session rather
+than starting cold. The forks are independent by home isolation, not by session machinery:
+every task's throwaway HOME copy carries the harness's recorded session state (the
+`session_state_dirs` each harness declares) beside the durable self, and each launch resumes
+the rollout's session id inside its own copy. The runner refuses the whole phase up front when
+the recorded session id or its transcript is missing, because a phase that quietly ran cold
+would publish a mislabeled measurement; `eval_context = "cold"` on the cell is the recorded
+ablation, and eval_before is always cold since no conversation exists yet.
+
+The standing instruction follows the mode. A resumed fork launches with the ROLLOUT
+instruction (`rollout.system.txt`), not the eval one: the rule that the eval instruction
+never carries the improvement objective was designed for cold measurement, and a resumed
+conversation already carries the objective in its history and its compaction summaries, so
+swapping the standing instruction mid-conversation would measure an agent that never
+existed. The resumed after measures the agent as it lived, objective included. Every cold
+session (eval_before always, cold afters) keeps the blind `eval.system.txt`, and the
+manifest's instruction block records which one eval_after launched with
+(`instruction.eval_prompt_used`), so the artifact says it rather than leaving a reader to
+derive it from the axis.
+
+The preflight validates rather than globs, because existence is not resumability. Each
+harness's `session_transcript` resolves the file the way that CLI's own resume lookup does
+(exact naming, never a substring) and then requires the floor that CLI was observed to
+require, identity included. The floors were established empirically rather than guessed: for
+each harness a real session file was produced by driving the pinned CLI itself in the image
+(a credential-less run persists its session before failing auth), then minimized cut by cut
+with a re-resume after every cut, so each requirement in the predicate is one whose removal
+was seen to flip the CLI to a refusal, and each predicate's exact minimum body was seen to
+resume to the auth or transport boundary. Value domains got the same discipline as field
+presence: where a decoder checks a value's shape (claude's timestamp and content, prime's
+cwd) the predicate checks that shape and each rejected shape is one the CLI was observed to
+refuse, and where a decoder checks nothing (codex's payload values) the predicate adds
+nothing, so the predicate sits as close to the decoder it fronts as probing can place it.
+The decoding dialect itself is part of the discipline, because the preflight parses in
+Python and the CLIs do not: Python's json accepts NaN-family constants that JSON.parse
+refuses, escaped lone surrogates that serde refuses, and nesting far past serde's recursion
+boundary, so the preflight reads a strict dialect (`_strict_json_object`: constants raise,
+every decoded string must survive a strict UTF-8 encode, and no container may sit deeper
+than the bracketed serde boundary), and each of those has its observation (a NaN-carrying
+prime header is "No session found matching"; a surrogate-carrying codex meta is unreadable
+session metadata; 126 nested arrays resumed and 127 were refused). The byte layer below the
+dialect is mirrored per reader rather than shared: codex reads strict UTF-8 and one raw
+`0xFF` before a valid record is "stream did not contain valid UTF-8" (a UTF-8 BOM, valid
+bytes and invalid JSON, is refused too), while the Node-family CLIs decode invalid bytes to
+U+FFFD and carry on (a replaced byte inside a prime header string and inside a claude
+transcript string both resumed), so the codex reader treats a decode failure as the fatal
+first-record refusal and the other two decode with replacement, never with erasure, which
+could stitch refuse-worthy bytes into acceptable JSON. Anchoring is per CLI too: codex
+parses the literal first record and refuses the file when that fails, while prime's scanner
+skips lines its parser refuses, both observed with a valid record on line two. The refusals all this preempts would otherwise arrive per
+task, after the fan-out's copies, streams, and containers were already paid for. What no
+line-level predicate can promise is a file that carries the floor plus additional records
+the CLI cannot replay (a poisoned line elsewhere in a crashed file); that residue stays a
+per-task failure, and only a credentialed dry run could squeeze it further.
+
+Every claim below was produced against the pinned image (Claude Code 2.1.226, codex-cli
+0.147.0, prime-agent 0.7.1) with the network disabled and no credential present, so each probe
+stopped at authentication or transport and spent nothing. What that class of probe cannot show
+is a model actually continuing the conversation; see the unverified list.
+
+### claude_code (observed)
+
+`--resume <uuid>` resolves the id against the transcripts under
+`~/.claude/projects/<cwd-slug>/<uuid>.jsonl` in the HOME the process runs with. Observed, in a
+container with a fabricated transcript in a mounted HOME copy: a bogus id fails loudly
+(`No conversation found with session ID: ...`, `is_error: true`, exit 1), and a present
+transcript proceeds, emitting the normal `system/init` event with the **same** session id and
+appending the resumed turn to that same transcript file inside the copy. A resume does not
+fork the id, so the fork is the copy, which is exactly what the per-task HOME provides. The
+resumed argv carried `--append-system-prompt` with the eval instruction and
+`--permission-mode bypassPermissions`, both accepted and reflected in the init event; that
+matters because resume restores no flags (docs) and the runner rebuilds the whole argv every
+launch. The credential-less run then stopped at `authentication_failed` with zero tokens.
+
+The floor a transcript must carry, minimized from a transcript the CLI itself wrote and
+re-resumed after every cut (all observed): one `user` line holding a `message` with a role
+and non-empty content, a `timestamp`, and the `sessionId`. Exactly that line resumes to the
+auth boundary; without the `message` or without the `timestamp` the CLI reports
+`No conversation found with session ID` exactly as if the file were absent, and a `message`
+without content crashes the resume (`Failed to resume session: undefined is not an
+object`). The `uuid` field, present in every real line, is not required. A line that merely
+names the id is not a conversation, and the preflight requires the whole floor.
+
+The value domains are part of the floor, not only the fields (all observed, rest of the line
+held at the verified minimum). The timestamp must be the complete, calendar-valid,
+timezone-carrying ISO instant in the GRAMMAR the CLI accepts, which is narrower than ISO
+8601: the extended form, the space-separated form, and the numeric HH:MM offset each
+resumed, while a week date (`2026-W33-3T00:00:00Z`) and the basic form (`20260812T000000Z`)
+were refused as `No conversation found` alongside an object, an epoch number, a non-date
+string, and an ISO-shaped but calendar-invalid string (`2026-99-99T99:99:99Z`); comma
+fractions, arbitrary separators, and offsets carrying seconds are also refused per the
+review's probes. So the preflight pairs an end-anchored grammar for the accepted profile
+with a real datetime parse: the grammar cannot see that 2026-99-99 is not a date, and the
+parse alone certified every profile above that `fromisoformat` accepts and the CLI does not. The content must be a string
+or a list: an object resolves the session and then crashes the resume with
+`TypeError: e.map is not a function`, whose own text names the CLI's domain (a string is
+handled apart; everything else is mapped as an array), and a list of non-block elements
+resumed, its entries contributing empty text, so the preflight constrains a list's elements
+no further than the CLI does.
+
+### codex (observed for the resume mechanics, source elsewhere)
+
+`codex exec resume` exists at the pinned 0.147.0 as a non-interactive subcommand:
+`codex exec resume [SESSION_ID] [PROMPT]`, accepting `--json`, `-m`, `-c` overrides,
+`--dangerously-bypass-approvals-and-sandbox`, and `--skip-git-repo-check` (observed:
+`codex exec resume --help` in the image). Observed against a fabricated session file: a bogus
+id exits 1 with `no rollout found for thread id ... (code -32600)`, and a file at
+`~/.codex/sessions/YYYY/MM/DD/rollout-<stamp>-<thread-id>.jsonl` in the mounted HOME is found
+by the thread id embedded in its filename. The resumed run re-emits `thread.started` with the
+**same** thread id, appends the resumed turn to that file, starts the turn, and only then goes
+to the provider (blocked here by the disabled network, zero spend). The prompt-after-flags
+argv order the harness builds is the order the probe ran. One edge worth naming: `--last` and
+thread-name selection are cwd-filtered and `--all` disables the filter (help text); an
+explicit UUID, with rollout and eval both running at `/work`, does not touch that path.
+
+The floor a rollout must carry, minimized from a rollout the CLI itself wrote and re-resumed
+after every cut (all observed): the FIRST record must be the session metadata, decoded
+whole. A first line carrying the envelope `timestamp` and a `session_meta` payload holding
+`id`, `timestamp`, `cwd`, `originator`, and `cli_version`, with no items after it, resumes
+to the transport boundary. Dropping payload fields, or the envelope timestamp itself, is
+refused as `failed to read session metadata` or `rollout ... is empty`; an empty file the
+same; a parseable non-meta first line is refused as `does not start with session metadata`;
+and an UNPARSEABLE first line is refused as `failed to parse first rollout record` even with
+a fully valid meta on line two, so the preflight anchors on the literal first record the way
+the reader does, skipping nothing. Decoding is serde-strict at every layer: an escaped lone
+surrogate in any meta value is refused as unreadable session metadata (observed, with and
+without the envelope timestamp beside it); the raw bytes must be valid UTF-8 (one `0xFF`
+before the verified minimum is `stream did not contain valid UTF-8`, and a UTF-8 BOM, valid
+bytes and invalid JSON, is refused too); and nesting stops at serde's recursion boundary,
+bracketed exactly (an extra field wrapped in 126 arrays resumed, 127 was refused). The
+preflight's strict reader enforces all three.
+
+Beyond presence and decodability the VALUES are not domain-checked at 0.147.0. A bogus
+originator, a bogus cli_version, a non-date payload timestamp, a non-date envelope
+timestamp, and a relative cwd each resumed to the transport boundary (all observed, one
+variant at a time against the verified minimum), so the preflight constrains none of them;
+stricter would refuse rollouts the CLI accepts.
+
+### prime_agent (observed for the resume mechanics, source for the layout)
+
+`-r/--resume <path|id>` is a run option of the pinned 0.7.1 (help). Sessions are stored as
+`<sessions-dir>/<id>.jsonl` where the sessions dir is `<agent-dir>/sessions`, so
+`~/.prime/agent/sessions` in a cell HOME (source: `getSessionsDir` and `getSessionFilePath` in
+the installed bundle). The resolver matches the id against cwd-matching sessions first and all
+sessions second (source: `resolveSessionPath`), so the `/work` cwd shared by the rollout and
+every eval task finds the rollout's session in the local set. Observed against a fabricated
+session file: a bogus id exits 1 with `No session found matching '<id>'`, and a present file
+is resolved, re-emits the session header with the **same** id (the line
+`session_id_from_trace` reads), appends the resumed turn to that file, and stops at
+`No API key found for anthropic` with nothing spent. `--fork <path|id>` also exists at 0.7.1;
+the runner does not use it, since the per-task copy is the fork.
+
+The floor a session file must carry (all observed): a header naming the id and the resuming
+cwd, and it must be the FIRST parseable line. A one-line
+`{"type": "session", "version": 3, "id": ..., "cwd": "/work"}` file, timestamp absent and
+all, resumed to the auth boundary in a pristine home. Three things the CLI refuses around
+that. Anchoring: its scanner gives up on a file whose first parseable entry is not the
+header (source: `scanSessionInfo`), and a message line above a fully valid header is
+`No session found matching` for that id, the same answer a mismatched header id gets,
+because the scanner indexes by the header id and never the filename. The dialect: the
+scanner's parser is JSON.parse, so a header line carrying a NaN-family constant is
+unparseable to it and the session is `No session found matching`; the skipping cuts the
+other way too, since a NaN-poisoned junk line ABOVE a valid header is skipped and the
+session resumed (both observed), which is exactly the skip-then-anchor the preflight
+mirrors. Bytes are decoded with replacement rather than refused: an invalid raw byte inside
+a header string arrived as U+FFFD and the session resumed, and an invalid-byte junk line
+above the header was skipped like any other unparseable line (both observed), so the
+preflight decodes the same way and never erases. And the cwd, which is a value domain of the resume: a header without one, or
+recorded at another directory, resolves as `Session found in different project` and stalls
+on an interactive `Fork this session into current directory?` prompt, which under the
+runner's closed stdin is exit 13 and no resume (observed for both). Every leg runs at
+`/work`, so that is the cwd a forkable header must carry.
+
+The transcript is not the whole persisted session. Its artifact tree at
+`<agent-dir>/session-artifacts/<id>/` is part of it (source, in the installed bundle): the
+kernel snapshot `kernel-state.dill`/`kernel-state.json` is revived into the fresh kernel
+right after start ("Only persistent sessions (which have an artifact dir) get a revivable
+snapshot", and `restoreState` runs before the runtime bootstrap), the `sub-*` child session
+dirs are where the RLM runtime persists children and reads completed ones back ("completed
+children from their persisted session dirs, so the tree survives child disposal"), and the
+local harness-state dir and the session's scheduled jobs live beside them. A fork that
+carried the transcript alone would reopen the conversation while silently dropping the
+learned kernel state and every child conversation, so `session_state_dirs` carries both
+subtrees. The operational neighbors stay behind: leases are
+`<agent-dir>/session-leases/<hash>.lock` and daemon state is `<agent-dir>/daemon-workers`,
+both sibling subtrees the copy's noise rules already exclude (source: `leaseDirectory`).
+
 ## Docker checklist
 
 Applies to every harness:
@@ -477,3 +667,9 @@ stdin for all three.
 4. Whether prime-agent's own OAuth `/login` yields a subscription credential or an api key for
    each provider. That is answerable only after the interactive login, which only the owner can
    perform.
+5. No resumed eval_after leg has run against a live provider. The fork mechanics (session
+   lookup in a copied HOME, same-id resumption, append-to-copy, loud failure on a missing
+   transcript) and every preflight floor above are observed to the authentication or
+   transport boundary for all three harnesses. What remains: a model actually continuing the
+   resumed conversation, and a transcript that carries the floor plus additional records the
+   CLI cannot replay, both verifiable only by a credentialed run.

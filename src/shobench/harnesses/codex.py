@@ -14,7 +14,11 @@ from shobench.harness import (
     UsageLimitRule,
     stderr_evidence,
 )
-from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
+from shobench.harnesses._trace import (
+    _first_event_of_type,
+    _first_record_strict,
+    _last_event_of_type,
+)
 
 
 class Codex(Harness):
@@ -38,6 +42,12 @@ class Codex(Harness):
 
     name = "codex"
     # No base_env override: codex adds nothing to the base's clean NODE_OPTIONS.
+
+    # Where its recorded threads live: `codex exec resume <thread-id>` resolves the id against
+    # the rollout files under sessions/YYYY/MM/DD/ in the HOME it runs with (the thread id is
+    # embedded in the filename), errors with "no rollout found for thread id" when none
+    # matches, and appends the resumed turn to the file it found.
+    session_state_dirs = (".codex/sessions",)
 
     # codex exec's JSONL does not name a model anywhere, and this is declared rather than left
     # to be inferred from an empty list, because the two read as opposite things. Checked
@@ -78,6 +88,52 @@ class Codex(Harness):
         # codex announces its thread id as the first event and takes no id from the caller.
         started = _first_event_of_type(trace_path, ("thread.started",))
         return None if started is None else str(started.get("thread_id") or "") or None
+
+    def session_transcript(self, home: Path, session_id: str) -> Path | None:
+        """The rollout file whose name ends in this thread id, whose FIRST record is a meta
+        the CLI's own parser decodes.
+
+        The floor was established against the pinned CLI (network off, zero tokens). The
+        FIRST record must be the session metadata, with nothing skipped: a parseable non-meta
+        first line is refused as "does not start with session metadata", and an unparseable
+        first line is refused as "failed to parse first rollout record" even when a fully
+        valid meta sits on line two. The record must decode whole, in serde's strict dialect
+        (see ``_strict_json_object``: an escaped lone surrogate in any value is refused as
+        unreadable metadata). The line's own ``timestamp`` field is required beside the
+        payload, whose ``id``, ``timestamp``, ``cwd``, ``originator``, and ``cli_version``
+        must all be present: dropping any of them, the envelope timestamp included, is
+        refused as "failed to read session metadata" or "rollout ... is empty". No items
+        after the meta are required; a meta-only rollout resumed to the transport boundary.
+
+        Presence and decodability are the whole of it: the VALUES are not domain-checked at
+        0.147.0. A bogus originator, a bogus cli_version, a non-date payload or envelope
+        timestamp, and a relative cwd each resumed to the transport boundary (all observed),
+        so this predicate constrains none of them; requiring more than the CLI does would
+        refuse files the CLI accepts and prove nothing. Requiring the payload id to equal the
+        thread id still rejects a rollout recorded for some other thread, and the exact
+        filename suffix keeps a longer id that merely contains this one from standing in.
+        """
+        root = home / ".codex" / "sessions"
+        if not root.is_dir():
+            return None
+        suffix = f"-{session_id}.jsonl"
+        for path in sorted(root.rglob("*.jsonl")):
+            if not path.is_file() or not path.name.endswith(suffix):
+                continue
+            meta = _first_record_strict(path)
+            if meta is None or meta.get("type") != "session_meta":
+                continue
+            if not (isinstance(meta.get("timestamp"), str) and meta.get("timestamp")):
+                continue
+            payload = meta.get("payload") or {}
+            if payload.get("id") != session_id:
+                continue
+            if all(
+                isinstance(payload.get(key), str) and payload.get(key)
+                for key in ("timestamp", "cwd", "originator", "cli_version")
+            ):
+                return path
+        return None
 
     def version_probe(self) -> list[str]:
         return ["codex", "--version"]

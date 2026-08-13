@@ -7,10 +7,12 @@ held-out eval again, then writes the results and tears the sandbox down.
 Two structural choices are worth stating, because both are what the scope's protocol requires
 rather than conveniences:
 
-**One fresh session per eval task, enforced by the server.** Each eval task gets its own
+**One session per eval task, enforced by the server.** Each eval task gets its own
 single-task ``EvalStream``, so a session that ignores its instruction and pulls a second task
-is told the stream is done rather than quietly consuming the next task's measurement. The
-serving process is this one, so the dataset loads once per phase rather than once per task.
+is told the stream is done rather than quietly consuming the next task's measurement. Whether
+that session starts cold or forks the rollout's terminal conversation is the cell's
+``eval_context`` axis; the one-task rule holds either way. The serving process is this one, so
+the dataset loads once per phase rather than once per task.
 
 **The rollout is one honest run of the harness against one live stream.** A single harness
 invocation is driven against the pool for the cell's wall clock, and the runner does not
@@ -39,7 +41,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -79,8 +81,10 @@ from shobench.splits import Split, load_split_by_name
 # This list decides what the headline home digest means. A digest that includes session
 # transcripts and caches changes on every run whether or not the agent changed itself, so it
 # answers "did a session happen", which is always yes. Excluding them makes it answer "did the
-# rollout write something the next fresh session can use", which is the benchmark's question,
-# because eval sessions are fresh by design and only the durable channel survives them.
+# rollout write something a later session can use", which is the benchmark's question. What an
+# eval session inherits beyond that channel is the cell's recorded eval_context axis (a resumed
+# eval_after carries the rollout conversation itself), so the digest stays a statement about the
+# durable channel rather than about everything a session saw.
 
 # Directories that hold a session's byproducts rather than the agent's own writing. Matched on
 # any path component, since the three harnesses nest them differently.
@@ -356,7 +360,18 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
         "started_at": time.time(),
         "cell": ctx.cell.to_manifest(),
         "split": ctx.split.to_manifest(),
-        "instruction": ctx.instruction.to_manifest(),
+        "instruction": {
+            **ctx.instruction.to_manifest(),
+            # Which standing instruction eval_after launches with, so the artifact says it
+            # rather than leaving a reader to derive it from the eval_context axis: a resumed
+            # after carries the rollout instruction (the conversation already holds the
+            # objective; swapping it mid-conversation would measure an agent that never
+            # existed), a cold one the blind eval instruction. eval_before is always the
+            # eval instruction regardless.
+            "eval_prompt_used": (
+                "rollout_system" if ctx.cell.eval_context == "resumed" else "eval_system"
+            ),
+        },
         "substrate": {
             "shogym_repo": SHOGYM_REPO,
             "shogym_rev": SHOGYM_REV,
@@ -721,7 +736,7 @@ def _eval_container_name(netns_container: str, phase: str, idx: int) -> str:
     return f"{netns_container[: 63 - len(suffix)]}{suffix}"
 
 
-def _copy_task_home(base: Path, dst: Path) -> None:
+def _copy_task_home(base: Path, dst: Path, *, keep: tuple[str, ...] = ()) -> None:
     """Copy one eval task's working HOME off the phase's base home.
 
     The task reads the accumulated durable self the phase is measuring (whatever the rollout
@@ -736,6 +751,12 @@ def _copy_task_home(base: Path, dst: Path) -> None:
     session fresh, since a task that wants a cache rebuilds its own. Credential files are noise
     for the digest but the harness cannot authenticate without them, so those alone cross even
     though the rest of the noise does not.
+
+    ``keep`` names HOME subtrees that cross despite being noise. A resumed eval_after is the
+    case that needs it: each task forks the rollout's terminal session, and the harness can only
+    reopen a session whose transcript is in the HOME it runs with, so the harness's recorded
+    conversations ride into the copy. They stay out of every digest either way, since the
+    durability filter is not this copy.
     """
     dst.mkdir(parents=True, exist_ok=True)
     if not base.exists():
@@ -744,7 +765,8 @@ def _copy_task_home(base: Path, dst: Path) -> None:
         if not path.is_file():
             continue
         rel = path.relative_to(base).as_posix()
-        if is_noise(rel) and path.name not in CREDENTIAL_FILES:
+        kept = any(rel == prefix or rel.startswith(prefix + "/") for prefix in keep)
+        if not kept and is_noise(rel) and path.name not in CREDENTIAL_FILES:
             continue
         target = dst / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -793,15 +815,67 @@ def _eval_pending_ids(phase_dir: Path, task_ids: Sequence[str]) -> list[str]:
     ]
 
 
-async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
-    """Serve the held-out split, one fresh session per task, up to N tasks at once.
+def _rollout_terminal_session(ctx: RunContext) -> str:
+    """The session the rollout ended in, proven forkable from the cell's base home.
 
-    Each task gets its own single-task stream on its own port, its own fresh session, its own
+    Read from the run's own record rather than from live objects, because eval_after does not
+    always run in the process that ran the rollout: a fresh cell has just written
+    ``rollout_stopping.json``, while a resume or a reopened run has only the disk. The stopping
+    record's ``session_id`` is the terminal one (it is updated to the id the last leg really ran
+    under); a record without it falls back to the last rollout leg that names one. The id alone
+    is not enough: the transcript must be in the base home the forks copy from, since each
+    per-task launch would otherwise discover the absence only after its copy, its stream, and
+    its container were already paid for, one task at a time.
+
+    Both absences raise. The axis is a recorded claim about what the measurement was, and the
+    one wrong recovery is to run cold under the resumed label; an operator who wants the cold
+    measurement has a cell axis that says so.
+    """
+    stopping_path = ctx.run_dir / ROLLOUT_STOPPING_FILE
+    session_id: str | None = None
+    if stopping_path.is_file():
+        stopping = json.loads(stopping_path.read_text(encoding="utf-8"))
+        session_id = str(stopping.get("session_id") or "") or None
+        if session_id is None:
+            for leg in reversed(stopping.get("legs", [])):
+                if leg.get("session_id"):
+                    session_id = str(leg["session_id"])
+                    break
+    if session_id is None:
+        raise RuntimeError(
+            f"{ctx.cell.name}: eval_context is 'resumed' but the rollout record at "
+            f"{stopping_path.name} names no session to fork, so eval_after cannot carry the "
+            "rollout's context. Running it cold instead would publish a mislabeled "
+            "measurement; use a cell with eval_context = 'cold' if cold is the intent."
+        )
+    if ctx.harness.session_transcript(ctx.sandbox.home, session_id) is None:
+        raise RuntimeError(
+            f"{ctx.cell.name}: eval_context is 'resumed' but the rollout session "
+            f"{session_id} has no resumable transcript under the cell home's "
+            f"{', '.join(ctx.harness.session_state_dirs) or 'session state'}: nothing there "
+            f"both names that session and carries what {ctx.harness.name} itself requires to "
+            "reopen it. Nothing has been spent; restore the home or run a cell with "
+            "eval_context = 'cold' if cold is the intent."
+        )
+    return session_id
+
+
+async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
+    """Serve the held-out split, one session per task, up to N tasks at once.
+
+    Each task gets its own single-task stream on its own port, its own session, its own
     throwaway copy of the phase's home, and its own throwaway ``/work``, so the one-session-per-task
     rule is enforced by the server and nothing a task does can reach another task or the base home.
     Concurrency is bounded by ``budget.eval_concurrency``; the tasks are independent, so a task that
     fails to run lands unscored (``reconcile`` records the dispense-without-seal) rather than
     sinking the batch, and the reported rows are sorted by task id regardless of finish order.
+
+    What the session starts from is the ``eval_context`` axis, and it decides what the phase
+    measures. Under "resumed", eval_after forks the rollout's terminal session into every task:
+    the transcript rides in the task's own home copy, so the forks are independent by the same
+    isolation that keeps their writes apart, and each one carries what the rollout still held in
+    context, compaction summaries included. Under "cold" (and always for eval_before, which has
+    no conversation to resume) the session is fresh and only the durable channels cross.
 
     Only the ids that lack a valid completed row are run, which is what makes this both a fresh
     phase and a resume: a fresh phase has none done and runs all of them, a resumed one runs only
@@ -816,6 +890,13 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     # The home every task copies from: pristine-plus-credential for eval_before, the rollout's
     # accumulated home for eval_after. It is read only from here on, since tasks write to copies.
     base_home = ctx.sandbox.home
+    # The session every task forks, when this phase carries the rollout's context. Resolved and
+    # proven present before anything is copied, served, or launched: a missing session must fail
+    # the phase here, loudly, because the axis is a recorded claim about what was measured and a
+    # fallback to cold would publish a mislabeled measurement. There is no such fallback.
+    resume_session: str | None = None
+    if phase == "eval_after" and ctx.cell.eval_context == "resumed":
+        resume_session = _rollout_terminal_session(ctx)
     # Provision the env's upstream once, before the fan-out, so the first wave of streams reuses
     # the on-disk cache instead of racing to fetch it. Read-only serving-side data, safe to share.
     await asyncio.to_thread(warm_env, ctx.cell)
@@ -842,7 +923,14 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
             shutil.rmtree(prov_dir, ignore_errors=True)
             prov_dir.mkdir(parents=True, exist_ok=True)
             try:
-                _copy_task_home(base_home, task_home)
+                # A resumed fork's copy also carries the harness's recorded conversations,
+                # which are noise everywhere else; the transcript has to be in the HOME the
+                # harness runs with or there is nothing to reopen.
+                _copy_task_home(
+                    base_home,
+                    task_home,
+                    keep=ctx.harness.session_state_dirs if resume_session else (),
+                )
                 # A fresh empty /work of its own, discarded with the home. /work is the writable
                 # cwd every harness runs in and is not part of the measured self, so sharing it
                 # would leak one task's files into another with nothing in the HOME digest to show
@@ -866,10 +954,26 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                         ctx,
                         phase=phase,
                         leg=idx,
-                        system_prompt=ctx.instruction.eval_system,
+                        # A resumed fork carries the ROLLOUT's standing instruction, not the
+                        # eval one. The rule that the eval instruction never carries the
+                        # improvement objective was designed for cold measurement; a resumed
+                        # conversation already carries the objective in its history and its
+                        # compaction summaries, and swapping the standing instruction
+                        # mid-conversation would measure an agent that never existed. The
+                        # resumed after measures the agent as it lived, objective included;
+                        # every cold session (eval_before always) keeps the blind eval
+                        # instruction.
+                        system_prompt=(
+                            ctx.instruction.rollout_system
+                            if resume_session
+                            else ctx.instruction.eval_system
+                        ),
                         user_prompt=ctx.instruction.kickoff,
-                        session_id=str(uuid.uuid4()),
-                        resume=False,
+                        # A resumed fork names the rollout's terminal session; every task names
+                        # the same one, and the per-task home copies are what keep the forks
+                        # independent. A cold task pins a fresh id instead.
+                        session_id=resume_session or str(uuid.uuid4()),
+                        resume=resume_session is not None,
                         timeout_s=ctx.cell.budget.eval_task_timeout_s,
                         task_idx=idx,
                         consumed_before=0,
@@ -954,8 +1058,6 @@ def read_eval_phase(phase_dir: Path, task_ids: Sequence[str] | Sequence[int]) ->
 
 def _single_task_split(split: Split, phase: str, task_id: str) -> Split:
     """A one-task view of the split, so the phase's stream can only dispense that task."""
-    from dataclasses import replace
-
     from shobench.splits import Side
 
     side = side_for_phase(split, phase)
@@ -1071,6 +1173,17 @@ def recorded_rollout_feedback(manifest: dict[str, Any]) -> str:
     never rather than as whatever the checkout's default is today.
     """
     return str(manifest.get("cell", {}).get("rollout_feedback") or "never")
+
+
+def recorded_eval_context(manifest: dict[str, Any]) -> str:
+    """The eval context the recorded run actually measured under.
+
+    Same rule as the feedback arm: a manifest written before the axis existed carries no key,
+    and cold was the only eval posture then, so absence reads as cold rather than as the
+    checkout's default today. A continuation that read the default instead would fork a
+    conversation into a measurement whose before-bookend never had one.
+    """
+    return str(manifest.get("cell", {}).get("eval_context") or "cold")
 
 
 def experiment_drift(
@@ -1898,10 +2011,20 @@ async def _resume_cell_owned(
         # provenance directory under the other regime anyway; this makes the recovery explicit
         # instead of a refusal the operator has to decode. Backfilled into the manifest below,
         # so later resumptions read an explicit value.
-        from dataclasses import replace
-
         cell = replace(cell, rollout_feedback=recorded_regime)
     manifest["cell"]["rollout_feedback"] = recorded_regime
+    recorded_context = recorded_eval_context(manifest)
+    if cell.eval_context != recorded_context:
+        # Same recovery for the eval context: the run's recorded posture wins, so a pre-axis
+        # run's remaining eval tasks run cold, the way the finished ones were measured.
+        cell = replace(cell, eval_context=recorded_context)
+    manifest["cell"]["eval_context"] = recorded_context
+    # The instruction record stays consistent with the recovered axis, so the artifact keeps
+    # naming the prompt its eval_after actually launches with; a pre-axis manifest recovers
+    # cold and so names the blind eval instruction.
+    manifest.setdefault("instruction", {})["eval_prompt_used"] = (
+        "rollout_system" if recorded_context == "resumed" else "eval_system"
+    )
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
     drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)
@@ -2086,10 +2209,18 @@ async def _rerun_eval_owned(
         # Same recovery as a resume: the run's recorded arm wins over the checkout's default,
         # even though an eval re-run never constructs a rollout stream, so the manifest this
         # process republishes keeps describing the experiment that actually ran.
-        from dataclasses import replace
-
         cell = replace(cell, rollout_feedback=recorded_regime)
     manifest["cell"]["rollout_feedback"] = recorded_regime
+    recorded_context = recorded_eval_context(manifest)
+    if cell.eval_context != recorded_context:
+        # And for the eval context, which a re-run acts on directly: the holes are re-run
+        # under the posture the finished ids were measured under, never today's default.
+        cell = replace(cell, eval_context=recorded_context)
+    manifest["cell"]["eval_context"] = recorded_context
+    # Same consistency rule as a resume: the record names the prompt its eval_after runs with.
+    manifest.setdefault("instruction", {})["eval_prompt_used"] = (
+        "rollout_system" if recorded_context == "resumed" else "eval_system"
+    )
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
     drift = experiment_drift(manifest, cell=cell, split=split, instruction=instruction)

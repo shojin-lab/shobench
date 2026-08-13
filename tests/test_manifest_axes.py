@@ -283,11 +283,17 @@ def test_an_environment_credential_reports_the_name_it_arrived_by(tmp_path: Path
 # ----- helpers ---------------------------------------------------------------------------------
 
 
-def _manifest(tmp_path: Path, harness: str, *, effort: str) -> dict:
-    """A manifest built by the real builder, for a cell whose effort the test chooses."""
+def _manifest(
+    tmp_path: Path, harness: str, *, effort: str = "", eval_context: str = "resumed"
+) -> dict:
+    """A manifest built by the real builder, for a cell the test shapes."""
     from dataclasses import replace
 
-    cell = replace(load_cell_by_name("smoke-automationbench-claude-code"), effort=effort)
+    cell = replace(
+        load_cell_by_name("smoke-automationbench-claude-code"),
+        effort=effort,
+        eval_context=eval_context,
+    )
     run_dir = tmp_path / "run"
     sandbox = CellSandbox(run_id="r", home=run_dir / "home", workdir=run_dir / "work")
     sandbox.home.mkdir(parents=True)
@@ -339,6 +345,56 @@ def test_a_never_cell_loads_and_an_unknown_regime_is_refused(tmp_path: Path) -> 
     typo = tmp_path / "typo.toml"
     typo.write_text(base.format(regime='rollout_feedback = "always"'), encoding="utf-8")
     with pytest.raises(ValueError, match="rollout_feedback"):
+        load_cell(typo)
+
+
+def test_eval_context_defaults_to_resumed_and_reaches_the_manifest() -> None:
+    """The correction is the default: eval_after forks the rollout conversation unless a cell
+    names the cold ablation, and the manifest records which of the two the run was."""
+    cell = load_cell_by_name("automationbench-claude_code-claude-opus-5")
+
+    assert cell.eval_context == "resumed"
+    assert cell.to_manifest()["eval_context"] == "resumed"
+
+
+def test_the_manifest_names_the_eval_prompt_the_context_selects(tmp_path: Path) -> None:
+    """The artifact says which standing instruction its eval_after launched with, rather than
+    leaving a reader to derive it from the axis: a resumed after carries the rollout
+    instruction (its conversation already holds the objective, and swapping the instruction
+    mid-conversation would measure an agent that never existed), a cold one stays blind."""
+    resumed = _manifest(tmp_path / "resumed", "claude_code")
+    assert resumed["cell"]["eval_context"] == "resumed"
+    assert resumed["instruction"]["eval_prompt_used"] == "rollout_system"
+
+    cold = _manifest(tmp_path / "cold", "claude_code", eval_context="cold")
+    assert cold["cell"]["eval_context"] == "cold"
+    assert cold["instruction"]["eval_prompt_used"] == "eval_system"
+
+
+def test_a_cold_cell_loads_and_an_unknown_eval_context_is_refused(tmp_path: Path) -> None:
+    """The ablation arm is explicit, and a typo is a config error rather than a silent arm."""
+    from shobench.config import load_cell
+
+    base = "\n".join(
+        [
+            "[cell]",
+            'name = "t"',
+            'env = "automationbench"',
+            'harness = "claude_code"',
+            'model = "m"',
+            'split = "automationbench"',
+            "{context}",
+            "[budget]",
+            "rollout_wall_clock_s = 60",
+        ]
+    )
+    cold = tmp_path / "cold.toml"
+    cold.write_text(base.format(context='eval_context = "cold"'), encoding="utf-8")
+    assert load_cell(cold).eval_context == "cold"
+
+    typo = tmp_path / "typo.toml"
+    typo.write_text(base.format(context='eval_context = "warm"'), encoding="utf-8")
+    with pytest.raises(ValueError, match="eval_context"):
         load_cell(typo)
 
 

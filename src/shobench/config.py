@@ -104,9 +104,12 @@ def load_instruction(arm: str, *, root: Path | None = None) -> Instruction:
     """Read an instruction arm from ``instructions/<arm>/``.
 
     Every arm supplies four files. ``rollout.system.txt`` is the standing instruction for the
-    improvement rollout, ``eval.system.txt`` the one for both eval phases (never carrying the
-    improvement objective, because an eval is a measurement), ``kickoff.txt`` the minimal user
-    turn, and ``continue.txt`` the cue the runner sends to resume a rollout.
+    improvement rollout, and also for a RESUMED eval_after: that conversation already carries
+    the objective in its history and its compaction summaries, so swapping the standing
+    instruction mid-conversation would measure an agent that never existed. ``eval.system.txt``
+    is the one for every cold eval session (eval_before always, cold afters), never carrying
+    the improvement objective, because a cold eval is a blind measurement. ``kickoff.txt`` is
+    the minimal user turn, and ``continue.txt`` the cue the runner sends to resume a rollout.
     """
     base = (root or repo_root()) / "instructions" / arm
     if not base.is_dir():
@@ -194,6 +197,13 @@ class Cell:
     # the rollout a feedback-ablation arm. Both eval phases stay pinned to never regardless,
     # so held-out measurement is always blind.
     rollout_feedback: str = "immediate"
+    # What conversation each eval_after session starts from. "resumed" forks the rollout's
+    # terminal session into every held-out task, so the after-bookend measures the agent WITH
+    # its lived rollout state: what is still in context, compaction summaries included, and not
+    # only what reached the durable channels. "cold" starts every task fresh, which measures the
+    # durable channels alone and is the ablation. eval_before is cold whatever this says, since
+    # no conversation exists yet to resume.
+    eval_context: str = "resumed"
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -204,6 +214,7 @@ class Cell:
             "effort": self.effort,
             "max_in_flight": self.max_in_flight,
             "rollout_feedback": self.rollout_feedback,
+            "eval_context": self.eval_context,
             "split": self.split,
             "instruction_arm": self.instruction_arm,
             "credential_mode": self.credential_mode,
@@ -245,6 +256,11 @@ def load_cell(path: Path) -> Cell:
         raise ValueError(
             f"{path}: rollout_feedback {rollout_feedback!r} is not one of ('immediate', 'never')"
         )
+    eval_context = str(cell.get("eval_context", "resumed"))
+    if eval_context not in ("resumed", "cold"):
+        raise ValueError(
+            f"{path}: eval_context {eval_context!r} is not one of ('resumed', 'cold')"
+        )
 
     budget = Budget(
         rollout_wall_clock_s=int(_require(budget_table, "rollout_wall_clock_s", path)),
@@ -268,6 +284,7 @@ def load_cell(path: Path) -> Cell:
         effort=str(cell.get("effort", "")),
         max_in_flight=max_in_flight,
         rollout_feedback=rollout_feedback,
+        eval_context=eval_context,
     )
 
 

@@ -148,13 +148,22 @@ def _http_leg(*, usage_limit_ids: tuple[int, ...] = (), dispatched: list[int]):
 
 
 def _wordle_ctx(
-    tmp_path: Path, *, heldout: tuple[str, ...], pool: tuple[str, ...] = ("3", "4")
+    tmp_path: Path,
+    *,
+    heldout: tuple[str, ...],
+    pool: tuple[str, ...] = ("3", "4"),
+    eval_context: str = "cold",
 ) -> RunContext:
     cell = load_cell_by_name(_SMOKE_CELL)
     cell = replace(
         cell,
         env="wordle_v1",
         budget=replace(cell.budget, eval_concurrency=1, eval_task_timeout_s=120),
+        # Cold by default: most of these tests are about suspension and republication
+        # mechanics, and a resumed eval_after would demand a rollout session their fixtures
+        # never record. The resumed suspension test asks for the fork explicitly and records
+        # the terminus it forks.
+        eval_context=eval_context,
     )
     run_dir = tmp_path / "run"
     sandbox = CellSandbox(run_id="test", home=run_dir / "home", workdir=run_dir / "work")
@@ -325,6 +334,134 @@ def test_eval_after_resume_republishes_the_rollout_and_eval_before_intact(
     assert not published["unpaired"]
 
 
+def test_usage_limit_mid_resumed_eval_after_suspends_and_resume_cell_finishes_the_fork(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The resumed axis through the whole suspension chain, provider-free.
+
+    A usage limit closes the window in the middle of a RESUMED eval_after, and the real
+    suspension writes the real record (only the hard exit itself is stubbed, into an
+    exception). The continuation then goes through ``resume_cell``: `_resume_cell_owned`
+    reconstructs the cell from the persisted manifest, the real ``_run_phases`` carries the
+    recorded eval_before and rollout forward, ``rollout_stopping.json`` is re-resolved, only
+    the pending ids are recopied and relaunched, every relaunch names the rollout's terminal
+    session with its transcript in that task's own private copy, and the published result has
+    the whole cell in it. Docker, egress, and the checkout config loaders are the only stubs:
+    the cell under test is synthetic (wordle over the smoke cell), so the loaders return the
+    recorded definitions the drift check expects, exactly as the checkout would for a real
+    cell.
+    """
+    sid = "dddddddd-5555-5555-5555-dddddddddddd"
+    ctx = _wordle_ctx(tmp_path, heldout=("0", "1", "2"), eval_context="resumed")
+    run_dir = ctx.run_dir
+
+    # The state a real cell has when its eval_after starts: eval_before measured, the rollout
+    # run with its stop classification persisted, and the terminal session's transcript in the
+    # cell home.
+    for idx in (0, 1, 2):
+        _play_eval_task(run_dir / "eval_before" / f"task-{idx:05d}", idx, terminate=True)
+    _play_rollout(run_dir / "rollout", ("3", "4"))
+    runner.write_json(
+        run_dir / ROLLOUT_STOPPING_FILE,
+        {"stop_reason": "pool_exhausted", "session_id": sid},
+    )
+    transcript = ctx.sandbox.home / ".claude" / "projects" / "-work" / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "kickoff"},
+                "timestamp": "2026-08-12T00:00:00.000Z",
+                "sessionId": sid,
+            }
+        )
+        + "\n"
+    )
+    manifest = build_manifest(ctx, probes={"version": "test"})
+    runner.write_json(run_dir / "manifest.json", manifest)
+    monkeypatch.setattr(runner, "warm_env", lambda cell: None)
+
+    launches: list[tuple[int, str, bool, bool]] = []
+
+    def capturing(inner):
+        def leg(ctx_arg, **kw):
+            launches.append(
+                (
+                    int(kw["task_idx"]),
+                    str(kw["session_id"]),
+                    bool(kw["resume"]),
+                    (Path(kw["home"]) / ".claude/projects/-work" / f"{sid}.jsonl").is_file(),
+                )
+            )
+            return inner(ctx_arg, **kw)
+
+        return leg
+
+    # Act 1: the window closes on task 1. The suspension itself is real, record and all; only
+    # the process exit is turned into an exception this test can catch.
+    class _HardExit(Exception):
+        pass
+
+    monkeypatch.setattr(runner.os, "_exit", lambda code: (_ for _ in ()).throw(_HardExit(code)))
+    dispatched: list[int] = []
+    monkeypatch.setattr(
+        runner, "run_leg", capturing(_http_leg(usage_limit_ids=(1,), dispatched=dispatched))
+    )
+
+    with pytest.raises(_HardExit):
+        asyncio.run(runner.run_eval_phase(ctx, "eval_after"))
+
+    assert dispatched == [0, 1]
+    record = json.loads((run_dir / SUSPENSION_FILE).read_text())
+    assert record["phase"] == "eval_after"
+    assert record["completed_task_ids"] == [0]
+    assert record["pending_task_ids"] == [1, 2]
+
+    # Act 2: the window reopens and the operator runs `shobench resume`. The loaders hand back
+    # the recorded synthetic definitions; everything else is the real continuation.
+    monkeypatch.setattr(
+        CellSandbox, "up", lambda self, **kw: self.home.mkdir(parents=True, exist_ok=True)
+    )
+    monkeypatch.setattr(CellSandbox, "down", lambda self: None)
+    monkeypatch.setattr(runner, "seed_home", lambda spec, home: {})
+    monkeypatch.setattr(runner, "load_cell_by_name", lambda name, **kw: ctx.cell)
+    monkeypatch.setattr(runner, "load_split_by_name", lambda name, **kw: ctx.split)
+    dispatched.clear()
+    monkeypatch.setattr(runner, "run_leg", capturing(_http_leg(dispatched=dispatched)))
+
+    results_path = asyncio.run(
+        runner.resume_cell(run_dir, results_dir=tmp_path / "results", capture_egress=False)
+    )
+
+    # Only the pending ids re-ran, each fork resuming the rollout's terminal session with the
+    # transcript recopied into its own home; the finished id was neither recopied nor
+    # relaunched, before or after the interruption.
+    assert sorted(dispatched) == [1, 2]
+    assert 0 not in dispatched
+    assert launches and [entry[0] for entry in launches] == [0, 1, 1, 2]
+    for _idx, session, resumed, transcript_in_copy in launches:
+        assert session == sid
+        assert resumed is True
+        assert transcript_in_copy is True
+
+    # The published result is the whole cell: the carried-forward phases, the re-resolved
+    # rollout terminus, the recovered resumed axis, and the resumption on the record. The
+    # spent suspension is gone, so a second resume cannot replay it.
+    published = json.loads(results_path.read_text())
+    assert results_path.name == f"{ctx.cell.name}.json"
+    after = published["eval_after"]["tasks"]
+    assert [r["task_idx"] for r in after] == [0, 1, 2]
+    assert all(r["closure"] != "drained" for r in after)
+    assert published["eval_after"]["summary"]["n_scored"] == 3
+    assert published["eval_before"]["summary"]["n_scored"] == 3
+    assert published["rollout"]["stopping"]["stop_reason"] == "pool_exhausted"
+    assert published["rollout"]["stopping"]["session_id"] == sid
+    assert published["manifest"]["cell"]["eval_context"] == "resumed"
+    assert published["manifest"]["resumptions"][-1]["phase"] == "eval_after"
+    assert not (run_dir / SUSPENSION_FILE).exists()
+
+
 # ----- a held-out id that produced no row at all ----------------------------------------------
 #
 # The failure this section exists for is not a task that scored badly. It is a task that left the
@@ -476,6 +613,7 @@ def test_resume_cell_routes_an_eval_suspension_to_the_phases_that_remain(
         captured["recorded_phases"] = recorded_phases
         captured["suspended"] = suspended
         captured["resumptions"] = list(manifest.get("resumptions", []))
+        captured["cell"] = ctx.cell
         return results_dir / "x.json"
 
     monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
@@ -497,6 +635,10 @@ def test_resume_cell_routes_an_eval_suspension_to_the_phases_that_remain(
     assert captured["recorded_phases"] == want_recorded
     assert captured["suspended"] is None
     assert captured["resumptions"][-1]["phase"] == phase  # type: ignore[index]
+    # The manifest this suspension recorded says resumed explicitly (the checkout default at
+    # write time), and the continuation's cell must still say it: a resume that fell back to
+    # the checkout's value would re-run the pending ids under whatever the default had become.
+    assert captured["cell"].eval_context == "resumed"  # type: ignore[union-attr]
 
 
 # ----- the guaranteed hard exit, and publishing nothing --------------------------------------
@@ -629,9 +771,13 @@ def _reopenable_run(tmp_path, *, with_suspension=False, with_terminus=True, with
 
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
-    # Modeled on a wave-1 artifact: written before the rollout_feedback axis existed, so the
-    # key is absent and absence must read as never.
-    cell_manifest = {k: v for k, v in cell.to_manifest().items() if k != "rollout_feedback"}
+    # Modeled on a wave-1 artifact: written before the rollout_feedback and eval_context axes
+    # existed, so both keys are absent; absence must read as never and as cold.
+    cell_manifest = {
+        k: v
+        for k, v in cell.to_manifest().items()
+        if k not in ("rollout_feedback", "eval_context")
+    }
     manifest = {
         "run_id": "r-1",
         "cell": cell_manifest,
@@ -679,7 +825,12 @@ def test_rerun_eval_reopens_only_eval_after_and_records_itself(tmp_path, monkeyp
     captured = {}
 
     async def fake_run_phases(ctx, *, manifest, phases, results_dir, observer, **kwargs):
-        captured.update(phases=phases, recorded=kwargs.get("recorded_phases"), manifest=manifest)
+        captured.update(
+            phases=phases,
+            recorded=kwargs.get("recorded_phases"),
+            manifest=manifest,
+            cell=ctx.cell,
+        )
         return results_dir / "cell.json"
 
     monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
@@ -695,6 +846,14 @@ def test_rerun_eval_reopens_only_eval_after_and_records_itself(tmp_path, monkeyp
     assert captured["recorded"] == ("rollout",)
     rewritten = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert rewritten["cell"]["rollout_feedback"] == "never"
+    # The eval context recovers the same way: the pre-axis run measured cold, so its holes
+    # re-run cold whatever the checkout's default is today, on the cell the phases actually
+    # read and not only in the republished record.
+    assert rewritten["cell"]["eval_context"] == "cold"
+    assert captured["cell"].eval_context == "cold"
+    # The instruction record follows the recovered axis: a cold eval_after ran under the
+    # blind eval instruction, and the republished artifact says so explicitly.
+    assert rewritten["instruction"]["eval_prompt_used"] == "eval_system"
     assert rewritten["eval_reruns"] and rewritten["eval_reruns"][0]["phase"] == "eval_after"
 
     run_dir = _reopenable_run(tmp_path / "second", with_before=True)

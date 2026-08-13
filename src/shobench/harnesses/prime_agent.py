@@ -17,7 +17,11 @@ from shobench.harness import (
     stderr_evidence,
     tail,
 )
-from shobench.harnesses._trace import _first_event_of_type, _last_event_of_type
+from shobench.harnesses._trace import (
+    _first_event_of_type,
+    _first_parseable_event,
+    _last_event_of_type,
+)
 
 # The prime-agent skill that makes the served stream reachable. Declaring the HTTP server in
 # settings.json is only half of the wiring: prime-agent hands the model no MCP tools, it reaches
@@ -107,6 +111,20 @@ class PrimeAgent(Harness):
 
     name = "prime_agent"
 
+    # Where its persisted sessions live: --resume <id> resolves against <sessions>/<id>.jsonl
+    # in the HOME it runs with (cwd-matching sessions first, then all of them; every leg runs
+    # at /work so the rollout's session is in the local set), errors with "No session found
+    # matching" when none does, and appends the resumed turn to the file it found. The
+    # artifact tree rides beside the transcript because at 0.7.1 it IS part of the persisted
+    # session: session-artifacts/<id>/ holds the kernel snapshot (kernel-state.dill/json,
+    # revived into the fresh kernel right after start), the sub-* child session dirs the RLM
+    # runtime reads completed children back from, the local harness-state dir, and the
+    # session's scheduled jobs. A fork that carried the transcript alone would reopen the
+    # conversation while silently dropping the learned kernel state and every child
+    # conversation. Leases and daemon state live in sibling subtrees (session-leases/,
+    # daemon-workers/) and stay behind with the rest of the noise.
+    session_state_dirs = (".prime/agent/sessions", ".prime/agent/session-artifacts")
+
     # The structured signal, which is the cleanest of the three harnesses: a stream failure is
     # classified into a kind, and rate_limit is one of them.
     usage_limit_rules = (
@@ -188,6 +206,43 @@ class PrimeAgent(Harness):
         # prime-agent's first line is its session header, which carries the id.
         header = _first_event_of_type(trace_path, ("session",))
         return None if header is None else str(header.get("id") or "") or None
+
+    # Where every leg runs: the containers module mounts the task workdir at /work and starts
+    # the harness there, for the rollout and for every eval fork alike. The cwd is a value
+    # domain of the resume, not bookkeeping: the resolver treats a session recorded at any
+    # other cwd (or at none) as another project's, answers "Session found in different
+    # project", and stalls on an interactive "Fork this session into current directory?"
+    # prompt, which under the runner's closed stdin is exit 13 and no resume (observed).
+    LEG_CWD = "/work"
+
+    def session_transcript(self, home: Path, session_id: str) -> Path | None:
+        """The exactly-named session file, whose FIRST parseable line is a header naming this
+        id and recorded at the cwd the fork resumes in.
+
+        None of that is extra strictness; all of it is the CLI's own scanner and resolver. It
+        indexes saved sessions by the header id and never the filename (source:
+        ``scanSessionInfo``, and observed: a mismatched header is "No session found matching"
+        for the filename's id), it gives up on a file whose first parseable entry is not the
+        header (source: the scanner returns nothing for it, and observed: a message line
+        above a valid header is the same "No session found matching"), and it resumes in
+        place only a session whose header cwd matches the resuming cwd; recorded elsewhere,
+        the run dies on the interactive fork prompt (observed for an absent cwd and for a
+        different one). A header with the matching cwd is the whole floor: such a one-line
+        file, timestamp absent and all, resumed to the auth boundary against the pinned CLI
+        (observed, network off). An empty file has no header and is not found either.
+        """
+        path = home / ".prime" / "agent" / "sessions" / f"{session_id}.jsonl"
+        if not path.is_file():
+            return None
+        header = _first_parseable_event(path)
+        if (
+            header is not None
+            and header.get("type") == "session"
+            and str(header.get("id") or "") == session_id
+            and header.get("cwd") == self.LEG_CWD
+        ):
+            return path
+        return None
 
     def observed_models(self, trace_path: Path) -> list[str]:
         """Which model actually answered, off prime-agent's own assistant messages.

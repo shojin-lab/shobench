@@ -341,10 +341,17 @@ def write_results(
     and cannot be forgotten for a field added later.
     """
     cell_manifest = manifest.get("cell")
-    if isinstance(cell_manifest, dict) and "rollout_feedback" not in cell_manifest:
-        # A manifest written before the axis existed could only have served the never posture,
-        # so its absence is backfilled explicitly rather than left for every reader to infer.
-        manifest = {**manifest, "cell": {**cell_manifest, "rollout_feedback": "never"}}
+    if isinstance(cell_manifest, dict):
+        # A manifest written before an axis existed could only have run that axis's one
+        # pre-axis posture, so absence is backfilled explicitly rather than left for every
+        # reader to infer: never for the feedback arm, cold for the eval context.
+        backfill = {}
+        if "rollout_feedback" not in cell_manifest:
+            backfill["rollout_feedback"] = "never"
+        if "eval_context" not in cell_manifest:
+            backfill["eval_context"] = "cold"
+        if backfill:
+            manifest = {**manifest, "cell": {**cell_manifest, **backfill}}
     ids = [int(task_id) for task_id in heldout_ids]
     # Filled here as well as by the reader that produced the rows, so a caller that assembles a
     # phase some other way still cannot publish a hole. Filling twice is free: the second pass

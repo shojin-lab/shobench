@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime
 from pathlib import Path
 
 from shobench.harness import (
@@ -16,7 +18,7 @@ from shobench.harness import (
     jsonl_events,
     stderr_evidence,
 )
-from shobench.harnesses._trace import _last_event_of_type
+from shobench.harnesses._trace import _last_event_of_type, _strict_json_object
 
 
 class ClaudeCode(Harness):
@@ -40,6 +42,11 @@ class ClaudeCode(Harness):
     # Claude Code accepts --session-id, so the runner pins it before launch and an interrupted
     # leg is resumable even if it died before writing anything.
     pins_session_id = True
+    # Where its recorded conversations live: --resume resolves the id against the transcripts
+    # under projects/<cwd-slug>/<id>.jsonl in the HOME it runs with, fails loudly when none
+    # matches, and appends the resumed turn to that same file. Every leg runs at cwd /work, so
+    # a transcript recorded by the rollout is under the slug an eval fork resolves.
+    session_state_dirs = (".claude/projects",)
     # The result event's modelUsage names every model that was billed.
     reports_observed_models = True
     effort_flag = "--effort"
@@ -140,6 +147,30 @@ class ClaudeCode(Harness):
                 return str(event["session_id"])
         return None
 
+    def session_transcript(self, home: Path, session_id: str) -> Path | None:
+        """The exactly-named project transcript, and it must hold a conversation the CLI can
+        replay, not merely a line that names the session.
+
+        The CLI resolves ``--resume <id>`` to ``projects/<slug>/<id>.jsonl`` and then demands
+        an actual conversation record. The floor was established by minimizing a transcript
+        the pinned CLI itself wrote and re-resuming after each cut (network off, zero
+        tokens): a ``user`` line with a ``message`` carrying a role and non-empty content,
+        a ``timestamp``, and the ``sessionId``. Every cut below that flips the CLI to a
+        refusal: no ``message`` or no ``timestamp`` is "No conversation found with session
+        ID" exactly as if the file were absent, and a ``message`` without content crashes
+        the resume outright ("Failed to resume session"). An id in a line is not a
+        conversation; requiring the whole floor also rejects a file recording some other
+        session under this file name.
+        """
+        root = home / ".claude" / "projects"
+        if not root.is_dir():
+            return None
+        for project in sorted(p for p in root.iterdir() if p.is_dir()):
+            path = project / f"{session_id}.jsonl"
+            if path.is_file() and _carries_resumable_conversation(path, session_id):
+                return path
+        return None
+
     def observed_models(self, trace_path: Path) -> list[str]:
         # The result event's modelUsage is keyed by the models that were actually billed,
         # which includes the small model the harness uses for its own bookkeeping. Reporting
@@ -203,3 +234,84 @@ class ClaudeCode(Harness):
 def _last_result_event(path: Path) -> dict | None:
     """The final ``type: result`` event of a stream-json trace."""
     return _last_event_of_type(path, ("result",))
+
+
+# The timestamp grammar the pinned CLI accepts, end-anchored: extended calendar date, a T or
+# single-space separator, whole seconds, an optional dot fraction, and Z or an HH:MM offset.
+# Established by probing the CLI at the verified minimum: the extended form, the
+# space-separated form, and the +00:00 offset each resumed, while ISO profiles that
+# ``fromisoformat`` also accepts were each refused as "No conversation found": a week date
+# (2026-W33-3T...), the basic form (20260812T000000Z), a comma fraction, an arbitrary
+# separator, and an offset carrying seconds. Grammar and calendar are separate checks on
+# purpose: this pattern cannot see that 2026-99-99 is not a date, and the parse cannot see
+# that a week date is not this CLI's grammar.
+_CLI_INSTANT = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _is_zoned_instant(value: object) -> bool:
+    """Is this the complete, calendar-valid, timezone-carrying instant the CLI accepts?
+
+    Two checks, both observed to be load-bearing. The grammar (``_CLI_INSTANT``) pins the
+    accepted CLI profile, because ``fromisoformat`` alone certified week dates, the basic
+    form, comma fractions, and arbitrary separators the CLI refuses. The parse pins the
+    calendar, because a pattern alone certified "2026-99-99T99:99:99Z", which the CLI also
+    refuses. The timezone requirement rides in the grammar and is a deliberate narrowing: a
+    naive stamp was not probed, and no real transcript carries one, so refusing it costs
+    nothing and claims nothing.
+    """
+    if not isinstance(value, str) or not _CLI_INSTANT.match(value):
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _carries_resumable_conversation(path: Path, session_id: str) -> bool:
+    """Does any line of this transcript hold the conversation floor the pinned CLI requires?
+
+    The qualifying line is the shape a real transcript's kickoff turn always has and the
+    minimum the CLI was observed to accept: a ``user`` entry naming this ``sessionId``, with
+    an ISO-instant ``timestamp`` (see :func:`_is_zoned_instant`) and a ``message`` carrying a
+    role and non-empty content that is a string or a list. The value domains matter as much
+    as the fields: a truthy timestamp of the wrong shape is refused as "No conversation
+    found", and a truthy content of the wrong shape resolves and then crashes the resume
+    ("e.map is not a function", whose own text shows the CLI's domain: a string is handled
+    apart and anything else is mapped as an array). A list's elements are not constrained
+    here because the CLI constrains none: a list of non-blocks was observed to resume, its
+    entries contributing empty text. Lines are decoded in the shared strict dialect
+    (``_strict_json_object``), because the CLI's own JSON.parse never yields a line carrying
+    a NaN-family constant, so a qualifying line that needs one does not exist for it. Bytes
+    are decoded with replacement, the way the CLI's Node-family runtime decodes them: a raw
+    invalid byte inside a transcript string arrived as U+FFFD and the session resumed
+    (observed), while erasure could stitch refuse-worthy text into acceptable JSON.
+
+    Streamed and stopped at the first match, tolerant of a malformed line, because the file
+    was written by another process and a crash can cut it anywhere; a transcript cut after
+    its kickoff line is still one the CLI resumes.
+    """
+    try:
+        with path.open(encoding="utf-8", errors="replace") as lines:
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                event = _strict_json_object(line)
+                if event is None or event.get("sessionId") != session_id:
+                    continue
+                if event.get("type") != "user":
+                    continue
+                if not _is_zoned_instant(event.get("timestamp")):
+                    continue
+                message = event.get("message")
+                if not isinstance(message, dict) or not message.get("role"):
+                    continue
+                content = message.get("content")
+                if isinstance(content, str | list) and content:
+                    return True
+    except OSError:
+        return False
+    return False

@@ -197,6 +197,13 @@ class Harness:
     # the id back rather than assuming it.
     pins_session_id: bool = False
 
+    # HOME subtrees that hold this harness's recorded conversations, relative to the HOME.
+    # Everywhere else they are session byproducts (the durable digest rightly ignores them, and
+    # a cold eval copy leaves them behind), but a resumed eval_after fork cannot exist without
+    # them: each task's home copy carries these subtrees so the harness can reopen the rollout's
+    # terminal session inside the copy, where its own resume lookup goes searching for it.
+    session_state_dirs: tuple[str, ...] = ()
+
     # Does this harness's trace say which model answered? Declared rather than inferred from an
     # empty list, because the two mean opposite things: a harness that reports models and
     # returned none had none answer, while a harness that reports none has told us nothing. The
@@ -216,6 +223,23 @@ class Harness:
         This is what a resume has to target. A runner-chosen id would be wrong for any harness
         that mints its own, and resuming the wrong id starts a fresh session that has lost
         everything the rollout had built up in context.
+        """
+        return None
+
+    def session_transcript(self, home: Path, session_id: str) -> Path | None:
+        """The recorded conversation for ``session_id`` under ``home``, proven resumable.
+
+        Each harness resolves this the way its own resume lookup resolves it, and then
+        requires the minimum its pinned CLI requires before reopening the file, because
+        existence is not resumability: an empty or crashed file whose name carries the id
+        passes any filename test, and all three CLIs refuse exactly that file (observed, see
+        ``docs/harness-autonomy.md``). Without the validation the refusal arrives per task,
+        after every fork's copy, stream, and container are already paid for; with it, the one
+        pre-fan-out check refuses the phase instead. Identity is part of the minimum: the
+        file must name this session in its own recorded metadata, so a file that merely wears
+        the id in its filename cannot stand in for the conversation.
+
+        The base harness records no sessions, so there is nothing to resolve.
         """
         return None
 

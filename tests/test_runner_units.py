@@ -726,6 +726,521 @@ def test_a_trace_with_no_session_line_yields_no_id(tmp_path: Path) -> None:
         assert harness_for(name).session_id_from_trace(path) is None
 
 
+def test_a_resumed_eval_launch_names_the_rollout_session_per_harness(tmp_path: Path) -> None:
+    """The argv shape a resumed eval_after fork launches with, per harness.
+
+    Claude Code restores nothing on resume, so the rebuilt argv must still carry the eval
+    instruction and never a --session-id beside the --resume. codex takes the subcommand form
+    with the prompt as the trailing positional. prime-agent separates the id from the prompt
+    with --, so the id can never be read as a message.
+    """
+    kwargs = dict(
+        mcp_url="http://h:1/mcp",
+        system_prompt="EVALSYS",
+        user_prompt="go",
+        model="claude-opus-5",
+        trace_path=tmp_path / "t",
+        session_id="rollout-sid",
+        resume=True,
+    )
+
+    claude = harness_for("claude_code").launch(**kwargs).argv
+    assert claude[claude.index("--resume") + 1] == "rollout-sid"
+    assert "--session-id" not in claude
+    assert claude[claude.index("--append-system-prompt") + 1] == "EVALSYS"
+
+    codex = harness_for("codex").launch(**kwargs).argv
+    assert codex[:4] == ["codex", "exec", "resume", "rollout-sid"]
+    assert codex[-1] == "EVALSYS\n\ngo"
+
+    prime = harness_for("prime_agent").launch(**kwargs).argv
+    at = prime.index("--resume")
+    assert prime[at + 1] == "rollout-sid"
+    assert prime[at + 2 :] == ["--", "EVALSYS\n\ngo"]
+
+
+# What each harness's preflight requires of a transcript, per case. Every ``valid`` body was
+# resumed by its pinned CLI to the auth or transport boundary in a network-off probe, and each
+# was found by minimizing a record the CLI itself wrote, so the positive control is a proven
+# one rather than a guess. Every degenerate body was refused by that same CLI: empty and
+# ``undecodable`` files get the CLIs' own parse refusals ("No conversation found", "failed to
+# read session metadata", first-parseable-line anchoring), so a preflight that passed one
+# would only move the refusal to after the fan-out was paid for.
+_SID = "sid-123"
+_TS = "2026-08-12T00:00:00.000Z"
+_TRANSCRIPT_CASES = {
+    "claude_code": {
+        "rel": f".claude/projects/-work/{_SID}.jsonl",
+        # The verified floor: a user line with a message (role + content), a timestamp, and
+        # the sessionId. Dropping the timestamp or the message is "No conversation found";
+        # dropping the content crashes the resume.
+        "valid": json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "hello"},
+                "timestamp": _TS,
+                "sessionId": _SID,
+            }
+        )
+        + "\n",
+        # Identity-bearing but undecodable: the id without a conversation. This exact body
+        # was this file's previous positive control, and the CLI refuses it.
+        "undecodable": json.dumps({"type": "user", "sessionId": _SID}) + "\n",
+        "mismatch": None,  # filled below: the valid body recorded under another session's id
+        "substring_rel": f".claude/projects/-work/{_SID}4.jsonl",
+    },
+    "codex": {
+        "rel": f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl",
+        # The verified floor: a first-line session_meta whose payload decodes whole (id,
+        # timestamp, cwd, originator, cli_version). No items are required after it.
+        "valid": json.dumps(
+            {
+                "timestamp": _TS,
+                "type": "session_meta",
+                "payload": {
+                    "id": _SID,
+                    "timestamp": _TS,
+                    "cwd": "/work",
+                    "originator": "codex_exec",
+                    "cli_version": "0.147.0",
+                },
+            }
+        )
+        + "\n",
+        # Identity-bearing but undecodable: the previous positive control; the CLI refuses it
+        # as unreadable session metadata.
+        "undecodable": json.dumps(
+            {"type": "session_meta", "payload": {"id": _SID, "cwd": "/work"}}
+        )
+        + "\n",
+        "mismatch": None,
+        "substring_rel": f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}4.jsonl",
+    },
+    "prime_agent": {
+        # The verified floor is the header alone, and the CLI accepted exactly this body
+        # (timestamp absent and all), so unlike the other two it stays. What the CLI does
+        # refuse is a header that is not the FIRST parseable line, which is the undecodable
+        # case here.
+        "rel": f".prime/agent/sessions/{_SID}.jsonl",
+        "valid": json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/work"})
+        + "\n",
+        "undecodable": json.dumps(
+            {"type": "message", "id": "m1", "message": {"role": "user", "content": "x"}}
+        )
+        + "\n"
+        + json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/work"})
+        + "\n",
+        "mismatch": None,
+        "substring_rel": f".prime/agent/sessions/{_SID}4.jsonl",
+    },
+}
+# The mismatch case is the valid body verbatim with the identity swapped, so what it tests is
+# identity alone and never a second structural difference.
+for _case in _TRANSCRIPT_CASES.values():
+    _case["mismatch"] = _case["valid"].replace(_SID, "other-session")
+
+
+def _home_with(tmp_path: Path, rel: str, body: str) -> Path:
+    home = tmp_path
+    target = home / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+    return home
+
+
+@pytest.mark.parametrize("name", sorted(_TRANSCRIPT_CASES))
+def test_a_valid_transcript_resolves_and_lives_in_the_forked_subtrees(
+    tmp_path: Path, name: str
+) -> None:
+    """The positive case per harness: the real layout with the CLI's minimum content resolves,
+    and it sits inside a declared session-state subtree, which is what a fork's copy carries."""
+    case = _TRANSCRIPT_CASES[name]
+    home = _home_with(tmp_path, case["rel"], case["valid"])
+    harness = harness_for(name)
+
+    assert harness.session_transcript(home, _SID) == home / case["rel"]
+    assert harness.session_transcript(home, "absent-999") is None
+    assert any(case["rel"].startswith(prefix + "/") for prefix in harness.session_state_dirs)
+
+
+@pytest.mark.parametrize("name", sorted(_TRANSCRIPT_CASES))
+def test_a_transcript_that_only_wears_the_id_does_not_pass_the_preflight(
+    tmp_path: Path, name: str
+) -> None:
+    """The degenerate files the CLIs refuse must not pass the preflight either.
+
+    Five ways a file can wear the id without being the session: empty (a crashed leg's
+    leftover), malformed (a cut file with no parseable record), identity-bearing but
+    undecodable (the id is in the right place and the record around it does not decode as a
+    session; each harness's case is a body its pinned CLI was observed to refuse), an
+    identity mismatch (the file's own metadata names another session), and a filename that
+    merely contains the id (a longer id's file). Each gets its own home so one passing case
+    cannot mask another.
+    """
+    case = _TRANSCRIPT_CASES[name]
+    harness = harness_for(name)
+
+    empty = _home_with(tmp_path / "empty", case["rel"], "")
+    assert harness.session_transcript(empty, _SID) is None
+
+    malformed = _home_with(tmp_path / "malformed", case["rel"], "not json\n{cut mid-")
+    assert harness.session_transcript(malformed, _SID) is None
+
+    undecodable = _home_with(tmp_path / "undecodable", case["rel"], case["undecodable"])
+    assert harness.session_transcript(undecodable, _SID) is None
+
+    mismatch = _home_with(tmp_path / "mismatch", case["rel"], case["mismatch"])
+    assert harness.session_transcript(mismatch, _SID) is None
+
+    # A valid transcript for a LONGER id whose name contains this one: the substring trap.
+    longer = _home_with(
+        tmp_path / "substring", case["substring_rel"], case["valid"].replace(_SID, f"{_SID}4")
+    )
+    assert harness.session_transcript(longer, _SID) is None
+
+
+def _claude_line(**overrides) -> str:
+    body = {
+        "type": "user",
+        "message": {"role": "user", "content": "hello"},
+        "timestamp": _TS,
+        "sessionId": _SID,
+    }
+    body.update(overrides)
+    return json.dumps(body) + "\n"
+
+
+def test_claude_value_domains_follow_the_pinned_cli(tmp_path: Path) -> None:
+    """Truthiness is not the domain: the pinned CLI checks value shapes, so the preflight
+    must too.
+
+    Every refusal here is one the CLI was observed to make with the rest of the line held at
+    the verified floor: a timestamp that is an object, an epoch number, or a non-date string
+    is "No conversation found"; an object for content resolves and then crashes the resume
+    ("e.map is not a function"). And every acceptance is observed too: string content, and a
+    list whose elements are not even blocks, both resume, so the predicate refuses neither.
+    """
+    rel = f".claude/projects/-work/{_SID}.jsonl"
+    harness = harness_for("claude_code")
+
+    refused = {
+        "timestamp_object": _claude_line(timestamp={"x": 1}),
+        "timestamp_number": _claude_line(timestamp=1786579093000),
+        "timestamp_not_a_date": _claude_line(timestamp="not-a-date"),
+        # ISO-shaped is not ISO: the CLI refuses a calendar-invalid instant (observed), which
+        # is exactly what a prefix pattern certified. The parse is end-anchored and
+        # calendar-checked, so this is a value-domain case and not a syntax one.
+        "timestamp_bad_calendar": _claude_line(timestamp="2026-99-99T99:99:99Z"),
+        # A deliberate narrowing rather than an observed refusal: a naive stamp was not
+        # probed, and no CLI-written stamp lacks its timezone, so refusing it costs nothing.
+        "timestamp_naive": _claude_line(timestamp="2026-08-12T00:00:00"),
+        # ISO profiles fromisoformat accepts and the CLI's grammar refuses (week date and
+        # basic form observed refused; comma fraction, arbitrary separator, and an offset
+        # carrying seconds reported refused and grammar-excluded): the calendar parse alone
+        # certified every one of these.
+        "timestamp_week_date": _claude_line(timestamp="2026-W33-3T00:00:00Z"),
+        "timestamp_basic_form": _claude_line(timestamp="20260812T000000Z"),
+        "timestamp_comma_fraction": _claude_line(timestamp="2026-08-12T00:00:00,5Z"),
+        "timestamp_arbitrary_separator": _claude_line(timestamp="2026-08-12x00:00:00Z"),
+        "timestamp_offset_with_seconds": _claude_line(
+            timestamp="2026-08-12T00:00:00+01:00:30"
+        ),
+        "content_object": _claude_line(message={"role": "user", "content": {"x": 1}}),
+    }
+    for label, body in refused.items():
+        home = _home_with(tmp_path / label, rel, body)
+        assert harness.session_transcript(home, _SID) is None, label
+
+    accepted = {
+        "content_string": _claude_line(),
+        "content_blocks": _claude_line(
+            message={"role": "user", "content": [{"type": "text", "text": "hello"}]}
+        ),
+        "content_list_of_non_blocks": _claude_line(
+            message={"role": "user", "content": [1, 2]}
+        ),
+        # The rest of the accepted grammar, each observed to resume: the space-separated
+        # extended form and the numeric HH:MM offset.
+        "timestamp_space_separator": _claude_line(timestamp="2026-08-12 00:00:00Z"),
+        "timestamp_numeric_offset": _claude_line(timestamp="2026-08-12T00:00:00+00:00"),
+    }
+    for label, body in accepted.items():
+        home = _home_with(tmp_path / label, rel, body)
+        assert harness.session_transcript(home, _SID) == home / rel, label
+
+
+def test_prime_resumes_only_a_session_recorded_at_the_leg_cwd(tmp_path: Path) -> None:
+    """The cwd is a value domain of prime's resume, not bookkeeping.
+
+    A header without a cwd, or with another project's, resolves as a different-project
+    session and the CLI stalls on an interactive fork prompt (exit 13 under the runner's
+    closed stdin, observed); only a session recorded at /work, where every leg runs, resumes
+    in place.
+    """
+    rel = f".prime/agent/sessions/{_SID}.jsonl"
+    harness = harness_for("prime_agent")
+
+    no_cwd = _home_with(
+        tmp_path / "no-cwd",
+        rel,
+        json.dumps({"type": "session", "version": 3, "id": _SID}) + "\n",
+    )
+    assert harness.session_transcript(no_cwd, _SID) is None
+
+    elsewhere = _home_with(
+        tmp_path / "elsewhere",
+        rel,
+        json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/elsewhere"}) + "\n",
+    )
+    assert harness.session_transcript(elsewhere, _SID) is None
+
+    at_work = _home_with(
+        tmp_path / "at-work",
+        rel,
+        json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/work"}) + "\n",
+    )
+    assert harness.session_transcript(at_work, _SID) == at_work / rel
+
+
+def test_codex_meta_values_are_unconstrained_because_the_cli_constrains_none(
+    tmp_path: Path,
+) -> None:
+    """Codex 0.147.0 domain-checks no meta VALUE, so neither may the preflight.
+
+    Each body here resumed to the transport boundary against the pinned CLI (observed: bogus
+    originator, bogus cli_version, non-date payload and envelope timestamps, relative cwd).
+    A predicate stricter than the decoder would refuse rollouts the CLI accepts, which is a
+    false refusal of a real fork, so these are pinned as positives: presence of the five
+    payload fields is the whole floor, and the missing-field refusals have their own case in
+    the matrix above.
+    """
+    rel = f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl"
+    harness = harness_for("codex")
+    payload = {
+        "id": _SID,
+        "timestamp": _TS,
+        "cwd": "/work",
+        "originator": "codex_exec",
+        "cli_version": "0.147.0",
+    }
+    variants = {
+        "originator_bogus": {**payload, "originator": "bogus"},
+        "cli_version_bogus": {**payload, "cli_version": "bogus"},
+        "timestamp_not_a_date": {**payload, "timestamp": "not-a-date"},
+        "cwd_relative": {**payload, "cwd": "work"},
+    }
+    for label, body in variants.items():
+        home = _home_with(
+            tmp_path / label,
+            rel,
+            json.dumps({"timestamp": _TS, "type": "session_meta", "payload": body}) + "\n",
+        )
+        assert harness.session_transcript(home, _SID) == home / rel, label
+    envelope = _home_with(
+        tmp_path / "envelope",
+        rel,
+        json.dumps({"timestamp": "not-a-date", "type": "session_meta", "payload": payload})
+        + "\n",
+    )
+    assert harness.session_transcript(envelope, _SID) == envelope / rel
+
+
+def test_the_preflight_reads_the_decoders_json_dialect_not_pythons(tmp_path: Path) -> None:
+    """Python's json is not the dialect the session readers speak, and the gap certified
+    files the CLIs refuse.
+
+    Two lenient extensions matter: Python decodes NaN-family constants, which JSON.parse
+    refuses, and escaped lone surrogates, which serde refuses. Every refusal below is one the
+    pinned CLI was observed to make, and the acceptance is observed too: prime's scanner
+    SKIPS a line its parser refuses, so a NaN-poisoned junk line above a valid header still
+    resumes, and the preflight must not refuse it either. codex is the opposite: it parses
+    the literal first record and refuses the file when that fails, valid meta below or not.
+    """
+    codex = harness_for("codex")
+    codex_rel = f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl"
+    codex_meta = json.dumps(
+        {
+            "timestamp": _TS,
+            "type": "session_meta",
+            "payload": {
+                "id": _SID,
+                "timestamp": _TS,
+                "cwd": "/work",
+                "originator": "codex_exec",
+                "cli_version": "0.147.0",
+            },
+        }
+    )
+    # The review's verbatim counterexample: an escaped lone surrogate in the meta, no
+    # envelope timestamp. Refused by the CLI, and refused with the envelope restored (the
+    # encoding is fatal on its own), and refused with clean values but no envelope timestamp
+    # (that field is load-bearing on its own), and refused when the first line does not
+    # parse at all.
+    surrogate_payload = (
+        '{"id":"' + _SID + '","timestamp":"\\ud800","cwd":"/work",'
+        '"originator":"codex_exec","cli_version":"0.147.0"}'
+    )
+    codex_refused = {
+        "surrogate_verbatim": '{"type":"session_meta","payload":' + surrogate_payload + "}\n",
+        "surrogate_full_envelope": '{"timestamp":"'
+        + _TS
+        + '","type":"session_meta","payload":'
+        + surrogate_payload
+        + "}\n",
+        "no_envelope_timestamp": '{"type":"session_meta","payload":{"id":"'
+        + _SID
+        + '","timestamp":"'
+        + _TS
+        + '","cwd":"/work","originator":"codex_exec","cli_version":"0.147.0"}}\n',
+        "garbage_above_meta": "not json\n" + codex_meta + "\n",
+    }
+    for label, body in codex_refused.items():
+        home = _home_with(tmp_path / label, codex_rel, body)
+        assert codex.session_transcript(home, _SID) is None, label
+
+    prime = harness_for("prime_agent")
+    prime_rel = f".prime/agent/sessions/{_SID}.jsonl"
+    prime_header = json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/work"})
+    nan_header = _home_with(
+        tmp_path / "nan-header",
+        prime_rel,
+        '{"type":"session","version":3,"id":"' + _SID + '","cwd":"/work","extra":NaN}\n',
+    )
+    assert prime.session_transcript(nan_header, _SID) is None
+    nan_junk_above = _home_with(
+        tmp_path / "nan-junk-above",
+        prime_rel,
+        '{"junk":NaN}\n' + prime_header + "\n",
+    )
+    assert prime.session_transcript(nan_junk_above, _SID) == nan_junk_above / prime_rel
+
+    # The same constant in a claude qualifying line: JSON.parse refuses it, so the CLI's own
+    # loader never yields this line and the strict reader must not either.
+    claude = harness_for("claude_code")
+    claude_rel = f".claude/projects/-work/{_SID}.jsonl"
+    nan_line = _home_with(
+        tmp_path / "nan-line",
+        claude_rel,
+        '{"type":"user","message":{"role":"user","content":"hello"},"timestamp":"'
+        + _TS
+        + '","sessionId":"'
+        + _SID
+        + '","extra":NaN}\n',
+    )
+    assert claude.session_transcript(nan_line, _SID) is None
+
+
+def _home_with_bytes(tmp_path: Path, rel: str, body: bytes) -> Path:
+    home = tmp_path
+    target = home / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(body)
+    return home
+
+
+def test_the_preflight_reads_bytes_the_way_each_cli_does(tmp_path: Path) -> None:
+    """The byte layer below the JSON dialect, mirrored per reader (all observed).
+
+    codex reads strict UTF-8 and refuses invalid bytes outright: one raw 0xFF before the
+    verified minimum record is "stream did not contain valid UTF-8", and a UTF-8 BOM (valid
+    bytes, invalid JSON start) is refused too. The Node-family CLIs decode with replacement
+    and carry on: an invalid raw byte inside a prime header string arrived as U+FFFD and the
+    session resumed, an invalid-byte junk line above the header was skipped, and the same
+    replacement inside a claude transcript string resumed. Erasure is neither reader, which
+    is why the preflight never reads with errors="ignore": deleting bytes could stitch
+    refuse-worthy text into acceptable JSON.
+    """
+    codex = harness_for("codex")
+    codex_rel = f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl"
+    codex_meta = json.dumps(
+        {
+            "timestamp": _TS,
+            "type": "session_meta",
+            "payload": {
+                "id": _SID,
+                "timestamp": _TS,
+                "cwd": "/work",
+                "originator": "codex_exec",
+                "cli_version": "0.147.0",
+            },
+        }
+    ).encode("utf-8")
+    raw_byte = _home_with_bytes(tmp_path / "raw-byte", codex_rel, b"\xff" + codex_meta + b"\n")
+    assert codex.session_transcript(raw_byte, _SID) is None
+    bom = _home_with_bytes(tmp_path / "bom", codex_rel, b"\xef\xbb\xbf" + codex_meta + b"\n")
+    assert codex.session_transcript(bom, _SID) is None
+
+    prime = harness_for("prime_agent")
+    prime_rel = f".prime/agent/sessions/{_SID}.jsonl"
+    header = (
+        b'{"type":"session","version":3,"id":"' + _SID.encode() + b'","cwd":"/work"'
+    )
+    junk_above = _home_with_bytes(
+        tmp_path / "junk-above", prime_rel, b"\xff\xfe junk\n" + header + b"}\n"
+    )
+    assert prime.session_transcript(junk_above, _SID) == junk_above / prime_rel
+    byte_in_string = _home_with_bytes(
+        tmp_path / "byte-in-string", prime_rel, header + b',"note":"\xff"}\n'
+    )
+    assert prime.session_transcript(byte_in_string, _SID) == byte_in_string / prime_rel
+
+    claude = harness_for("claude_code")
+    claude_rel = f".claude/projects/-work/{_SID}.jsonl"
+    line = (
+        b'{"type":"user","message":{"role":"user","content":"hello"},"timestamp":"'
+        + _TS.encode()
+        + b'","sessionId":"'
+        + _SID.encode()
+        + b'","note":"\xff"}\n'
+    )
+    replaced = _home_with_bytes(tmp_path / "replaced", claude_rel, line)
+    assert claude.session_transcript(replaced, _SID) == replaced / claude_rel
+
+
+def _nested_arrays(levels: int) -> object:
+    value: object = 0
+    for _ in range(levels):
+        value = [value]
+    return value
+
+
+def test_the_preflight_stops_at_serdes_nesting_boundary(tmp_path: Path) -> None:
+    """The structural layer: serde parses only so deep, and Python parses much deeper.
+
+    The boundary was bracketed against the pinned codex, one variant at a time over the
+    verified minimum: an extra field wrapped in 126 nested arrays resumed to the transport
+    boundary and 127 was refused as unreadable session metadata. Both sides are pinned so the
+    cap can neither loosen back into certifying unreadable records nor quietly harden into
+    refusing rollouts the CLI accepts.
+    """
+    codex = harness_for("codex")
+    rel = f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl"
+
+    def meta(levels: int) -> str:
+        return (
+            json.dumps(
+                {
+                    "timestamp": _TS,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": _SID,
+                        "timestamp": _TS,
+                        "cwd": "/work",
+                        "originator": "codex_exec",
+                        "cli_version": "0.147.0",
+                    },
+                    "extra": _nested_arrays(levels),
+                }
+            )
+            + "\n"
+        )
+
+    accepted = _home_with(tmp_path / "accepted", rel, meta(126))
+    assert codex.session_transcript(accepted, _SID) == accepted / rel
+    refused = _home_with(tmp_path / "refused", rel, meta(127))
+    assert codex.session_transcript(refused, _SID) is None
+
+
 # ----- what counts as the agent's durable self ------------------------------------------------
 
 
@@ -969,3 +1484,40 @@ def test_a_resumed_run_keeps_the_arm_its_record_started_under() -> None:
     assert (
         recorded_rollout_feedback({"cell": {"rollout_feedback": "immediate"}}) == "immediate"
     )
+
+
+# ----- the eval context survives into the published record ------------------------------------
+
+
+def test_a_continued_run_keeps_the_eval_context_its_record_started_under() -> None:
+    """Absence in a pre-axis manifest reads as cold, never as today's resumed default: every
+    pre-axis eval task ran fresh, and a continuation that forked a conversation into that run
+    would append to a measurement whose before-bookend never had one."""
+    from shobench.runner import recorded_eval_context
+
+    assert recorded_eval_context({"cell": {"name": "c"}}) == "cold"
+    assert recorded_eval_context({}) == "cold"
+    assert recorded_eval_context({"cell": {"eval_context": "resumed"}}) == "resumed"
+
+
+def test_a_pre_axis_manifest_publishes_as_the_cold_context(tmp_path: Path) -> None:
+    """The published record backfills absence explicitly, and an explicit value is kept."""
+    path = write_results(
+        tmp_path / "cell.json",
+        manifest={"cell": {"name": "c"}},
+        phases={"eval_before": [], "eval_after": [], "rollout": []},
+        stopping={},
+        heldout_ids=(),
+    )
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["manifest"]["cell"]["eval_context"] == "cold"
+
+    explicit = write_results(
+        tmp_path / "explicit" / "cell.json",
+        manifest={"cell": {"name": "c", "eval_context": "resumed"}},
+        phases={"eval_before": [], "eval_after": [], "rollout": []},
+        stopping={},
+        heldout_ids=(),
+    )
+    doc = json.loads(explicit.read_text(encoding="utf-8"))
+    assert doc["manifest"]["cell"]["eval_context"] == "resumed"
