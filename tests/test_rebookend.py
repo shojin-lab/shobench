@@ -1085,6 +1085,27 @@ def test_cli_rebookend_plans_without_spending(tmp_path: Path, capsys) -> None:
     assert "assembles them by run id" in plan["result_artifact"]
 
 
+def test_cli_plan_refuses_an_unresolvable_transcript(tmp_path: Path, capsys) -> None:
+    """The reviewed fixture shape: a stopping record that names an id whose transcript is not
+    in the source home. The plan used to say resolvable and only the runner refused, after
+    minting; the plan now runs the same per-harness validation and blocks the --go."""
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    transcript = source_dir / "home" / ".claude" / "projects" / "-work" / f"{_SID}.jsonl"
+    transcript.unlink()
+
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["refusals"]["terminal_session_resolvable"] is True
+    assert plan["refusals"]["terminal_transcript_resolvable"] is False
+
+    assert cli_main(["rebookend", "--run", str(source_dir), "--go"]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "no resumable transcript" in err
+    assert not (tmp_path / "runs").exists()
+
+
 def test_cli_rebookend_reports_and_blocks_on_a_refusal_state(tmp_path: Path, capsys) -> None:
     """A missing terminus is visible in the dry plan and blocks a --go before anything spends:
     the runner entry is never reached."""
