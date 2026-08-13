@@ -155,6 +155,20 @@ class Harness:
         """
         return {}
 
+    def credential_provider(self, model: str) -> str:
+        """Which entry of a multi-provider credential file a cell running ``model`` will present.
+
+        Empty for a harness whose credential file holds one login and names no providers, which
+        is every harness here but prime-agent: there is nothing to select, so nothing to say.
+
+        It matters wherever the file can hold several, because those files accumulate. prime's
+        auth.json keeps an entry for every provider ever logged in, while a leg looks one of them
+        up by id, so a check that judged all of them would refuse a cell over a credential the
+        cell never reaches for. Declared on the harness rather than derived by a caller so the
+        answer comes from the same place the launch flag does.
+        """
+        return ""
+
     def base_env(self) -> dict[str, str]:
         """Environment every invocation of this harness needs, credentials excluded.
 

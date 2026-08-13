@@ -190,6 +190,15 @@ class PrimeAgent(Harness):
             )
         return provider
 
+    def credential_provider(self, model: str) -> str:
+        # The same resolution `launch` passes as --provider, so the credential preflight judges
+        # the entry 0.7.1 looks up and no other. Verified in the pinned bundle: the credential
+        # store reads `currentData[providerId]` and ignores every sibling entry, so a HOME
+        # carrying a live openai-codex login beside a long-expired anthropic one runs perfectly
+        # for a gpt cell, and refusing it over the anthropic entry would be refusing a credential
+        # no leg of that cell ever presents.
+        return self.provider_for(model)
+
     # prime-agent's MCP client resolves a bearer token before every connection and refuses to
     # open a session without one, even against a server that ignores it. The value is a
     # formality; its absence is a silent no-tools run.

@@ -1070,14 +1070,59 @@ def _rollout_terminal_session(ctx: RunContext) -> str:
 EVAL_LAUNCH_STAGGER_S = 2.0
 
 
+class _StaggeredAdmission:
+    """Hands the first launches of an eval phase out one at a time, a fixed gap apart.
+
+    It sits AFTER the concurrency gate on purpose. That costs a held slot for the length of the
+    spacing and buys the only property worth having: the first ``first_n`` LAUNCHES are spaced,
+    in the order the gate admitted them, whatever order the coroutines were scheduled in.
+    Spacing ahead of the gate spaces only the coroutines that sleep, and a task that skips the
+    sleep takes a free slot the sleeping ones have not claimed yet: eight tasks at a concurrency
+    of four launched in the order 5, 6, 7, 8, 1, 2, 3, 4, which is an unstaggered first wave
+    wearing reversed membership. Spacing where admission happens cannot be bypassed, because
+    there is no path to a launch that does not pass through it.
+
+    Once ``first_n`` launches have gone through this is a no-op forever. Past the first wave a
+    slot opens only when a task finishes, so the launches are already spread by the work itself.
+    """
+
+    def __init__(self, gap_s: float, first_n: int) -> None:
+        self._gap_s = gap_s
+        self._left = first_n
+        self._lock = asyncio.Lock()
+        # Monotonic, and zero until the first launch, so the first one is never delayed.
+        self._next_at = 0.0
+
+    async def wait(self) -> None:
+        if self._gap_s <= 0 or self._left <= 0:
+            return
+        # The lock is held across the sleep, which is what serializes the wave: each waiter takes
+        # its turn in arrival order, and the one behind it starts its own gap from there.
+        async with self._lock:
+            if self._left <= 0:
+                return
+            delay = self._next_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._left -= 1
+            self._next_at = time.monotonic() + self._gap_s
+
+
 def _preflight_eval_credential(ctx: RunContext) -> None:
     """Refuse the phase, before anything is spent, when the credential every task copies is dead.
 
-    Two steps, both free. The refresh takes the later of the cell HOME's credential and the
-    host's, which is the only refresh available here (see
-    :func:`shobench.credentials.refresh_seeded_credential`, and note that it is prime-specific
-    because prime's is the one seeded schema that states a readable expiry). The check is then
-    generic by credential schema, and a mode that seeds no file has nothing to check and passes.
+    Two steps, both free, and both judged on the ONE credential this cell will present. A
+    multi-provider file is the ordinary case rather than the exception: a real gpt-terra home
+    carries a live openai-codex login beside a long-expired anthropic one, and a check that
+    judged every entry would refuse that cell over a credential it never reaches for. Which
+    entry it reaches for is the harness's own resolution
+    (:meth:`shobench.harness.Harness.credential_provider`, which prime derives from the cell's
+    model exactly as ``launch`` derives the ``--provider`` it passes), so the two cannot drift.
+
+    The refresh is prime-specific and replaces one provider's entry rather than the file, so no
+    other provider's credential can be regressed by it; see
+    :func:`shobench.credentials.refresh_seeded_credential`. The check is generic by credential
+    schema, and a mode that seeds no file has nothing to check and passes.
 
     Raising is the point rather than a fallback. Fanning out anyway costs a container, a home
     copy, a stream and a port per held-out id before the first leg says the credential is no
@@ -1085,13 +1130,14 @@ def _preflight_eval_credential(ctx: RunContext) -> None:
     held-out set rather than as a phase that never authenticated.
     """
     spec = spec_for(ctx.harness.name, ctx.cell.credential_mode)
-    note = refresh_seeded_credential(spec, ctx.sandbox.home)
+    provider = ctx.harness.credential_provider(ctx.cell.model)
+    note = refresh_seeded_credential(spec, ctx.sandbox.home, provider=provider)
     if note:
         # A credential this runner just placed is one it can name, and naming it here rather than
         # waiting for the first leg's watcher keeps the window at zero.
         ctx.watch_credentials(ctx.sandbox.home)
         print(f"[shobench] {ctx.cell.name}: {note}", file=sys.stderr)
-    ok, why_not = preflight_seeded_credential(spec, ctx.sandbox.home)
+    ok, why_not = preflight_seeded_credential(spec, ctx.sandbox.home, provider=provider)
     if ok:
         return
     raise RuntimeError(
@@ -1161,21 +1207,22 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     # Whether this phase's launches need spacing at all, decided by the credential rather than by
     # the harness: the race is between N homes holding copies of one refreshable file.
     seeds_a_credential_file = bool(spec_for(ctx.harness.name, ctx.cell.credential_mode).seed_to)
-    stagger_s = EVAL_LAUNCH_STAGGER_S if seeds_a_credential_file else 0.0
+    admission = _StaggeredAdmission(
+        EVAL_LAUNCH_STAGGER_S if seeds_a_credential_file else 0.0, limit
+    )
 
-    async def one_task(task_id: str, position: int) -> None:
+    async def one_task(task_id: str) -> None:
         idx = int(task_id)
         prov_dir = phase_dir / f"task-{idx:05d}"
         task_home = phase_dir / "homes" / f"task-{idx:05d}"
         task_work = phase_dir / "work" / f"task-{idx:05d}"
         task_cfg = phase_dir / "cfg" / f"task-{idx:05d}"
-        # Only the first wave is spaced, and it is spaced before the gate rather than inside it,
-        # so a waiting slot is never held idle. Nothing about the phase's ordering or its
-        # accounting rides on this: the ids are gathered, the rows are read back by task id, and
-        # a task delayed here still runs the same leg against the same one-task stream.
-        if position < limit and stagger_s:
-            await asyncio.sleep(position * stagger_s)
         async with gate:
+            # Spaced inside the gate, where a launch actually becomes a launch. Nothing about the
+            # phase's ordering or its accounting rides on it: the ids are gathered, the rows are
+            # read back by task id, and a task held here runs the same leg against the same
+            # one-task stream a moment later.
+            await admission.wait()
             if usage_limit:
                 return  # a usage limit closed the window; this task waits for the resume
             # Clear any stale attempt (a drained row from an earlier suspension, a half-written
@@ -1276,7 +1323,7 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                 shutil.rmtree(task_work, ignore_errors=True)
 
     pending = _eval_pending_ids(phase_dir, side.task_ids)
-    await asyncio.gather(*(one_task(task_id, n) for n, task_id in enumerate(pending)))
+    await asyncio.gather(*(one_task(task_id) for task_id in pending))
     if usage_limit:
         # A provider stopped a leg, not the agent. The cell suspends where it stands: the finished
         # ids keep their rows, the interrupted one is left row-less-equivalent for the resume, and

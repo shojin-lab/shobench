@@ -48,6 +48,7 @@ from shobench.splits import Side, Split
 
 _SMOKE_CELL = "smoke-automationbench-claude-code"
 _PRIME_CELL = "hle-prime_agent-claude-opus-5"
+_TERRA_CELL = "hle-prime_agent-gpt-56-terra"
 
 
 def _ctx(
@@ -143,17 +144,25 @@ def _capture_launches(monkeypatch, launched: list[int], at: dict[int, float] | N
 # ----- the credential preflight ----------------------------------------------------------------
 
 
-def _prime_auth(*, lifetime_s: float, kind: str = "oauth") -> str:
-    """A prime auth.json with the schema the real one has and secrets that are not secrets."""
-    entry: dict[str, object] = {"type": kind, "key": "not-a-key"}
-    if kind == "oauth":
-        entry = {
-            "type": "oauth",
-            "access": "not-a-token",
-            "refresh": "not-a-token",
-            "expires": int((time.time() + lifetime_s) * 1000),
-        }
-    return json.dumps({"anthropic": entry})
+def _oauth(lifetime_s: float, **overrides: object) -> dict[str, object]:
+    """One provider's oauth entry in the schema prime 0.7.1 reads, with no secret in it.
+
+    The fields are the ones the pinned CLI actually uses: ``access`` is what ``getApiKey``
+    returns and presents, ``refresh`` is what ``refreshToken`` is called with, and ``expires`` is
+    what it compares against the clock to choose between them.
+    """
+    return {
+        "type": "oauth",
+        "access": "not-a-token",
+        "refresh": "not-a-token",
+        "expires": int((time.time() + lifetime_s) * 1000),
+        **overrides,
+    }
+
+
+def _prime_auth(**providers: object) -> str:
+    """A prime auth.json: a flat map of provider id to that provider's credential."""
+    return json.dumps(dict(providers))
 
 
 def _seed_prime_auth(
@@ -176,15 +185,110 @@ def _seed_prime_auth(
         )
     path = ctx.sandbox.home / ".prime" / "agent" / "auth.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_prime_auth(lifetime_s=lifetime_s), encoding="utf-8")
+    # The cell is claude-backed, so anthropic is the entry its legs will present.
+    path.write_text(_prime_auth(anthropic=_oauth(lifetime_s)), encoding="utf-8")
     return path
 
 
+def test_the_selected_provider_is_the_one_the_launch_names() -> None:
+    """The preflight and the launch must not be able to disagree about which credential a cell
+    uses, so both come from the harness. A harness whose credential file holds one login names
+    no provider at all, which is what makes the check generic rather than prime-shaped."""
+    prime = harness_for("prime_agent")
+    for model in ("claude-opus-5", "gpt-5.6-terra"):
+        spec = prime.launch(
+            mcp_url="http://h:1/mcp",
+            system_prompt="s",
+            user_prompt="u",
+            model=model,
+            trace_path=Path("/dev/null"),
+        )
+        named = spec.argv[spec.argv.index("--provider") + 1]
+        assert prime.credential_provider(model) == named
+    assert prime.credential_provider("claude-opus-5") == "anthropic"
+    assert prime.credential_provider("gpt-5.6-terra") == "openai-codex"
+    for other in ("claude_code", "codex"):
+        assert harness_for(other).credential_provider("claude-opus-5") == ""
+
+
+def test_the_preflight_judges_only_the_credential_the_cell_will_present(tmp_path: Path) -> None:
+    """A prime auth.json accumulates an entry for every provider ever logged in, and a leg looks
+    up exactly one of them by id. The real gpt-terra home is the case: a live openai-codex login
+    beside a long-expired anthropic one. Judging every entry refuses that cell over a credential
+    no leg of it ever presents, which is the thing this must not do."""
+    spec = spec_for("prime_agent", "subscription")
+    prime = harness_for("prime_agent")
+    terra = prime.credential_provider("gpt-5.6-terra")
+    opus = prime.credential_provider("claude-opus-5")
+    home = tmp_path / "home"
+    auth = home / ".prime" / "agent" / "auth.json"
+    auth.parent.mkdir(parents=True)
+
+    auth.write_text(
+        _prime_auth(anthropic=_oauth(-99999), **{"openai-codex": _oauth(86400)}), encoding="utf-8"
+    )
+    assert preflight_seeded_credential(spec, home, provider=terra) == (True, "")
+    ok, why = preflight_seeded_credential(spec, home, provider=opus)
+    assert not ok and "anthropic" in why
+
+    # The mirror, which is the same rule seen from the other side: a claude cell is not refused
+    # over a stale openai entry it will never reach for.
+    auth.write_text(
+        _prime_auth(anthropic=_oauth(86400), **{"openai-codex": _oauth(-99999)}), encoding="utf-8"
+    )
+    assert preflight_seeded_credential(spec, home, provider=opus) == (True, "")
+    ok, why = preflight_seeded_credential(spec, home, provider=terra)
+    assert not ok and "openai-codex" in why
+
+    # A provider with no entry of its own is a refusal, not a pass: the file authenticates
+    # something, just not this cell.
+    auth.write_text(_prime_auth(anthropic=_oauth(86400)), encoding="utf-8")
+    ok, why = preflight_seeded_credential(spec, home, provider=terra)
+    assert not ok and "declares no credential for openai-codex" in why
+
+
+def test_the_preflight_refuses_an_entry_prime_could_not_present(tmp_path: Path) -> None:
+    """Shape is not usability. Each of these parses, declares a provider and a credential type,
+    and would authenticate nothing: the pinned CLI presents ``access``, refreshes with
+    ``refresh``, and compares ``expires`` against the clock, so an empty one of those is a dead
+    credential. An oauth entry with no comparable expiry is the subtle one, because
+    ``Date.now() >= undefined`` is false: the CLI never refreshes it and presents a token it
+    cannot know is dead."""
+    spec = spec_for("prime_agent", "subscription")
+    home = tmp_path / "home"
+    auth = home / ".prime" / "agent" / "auth.json"
+    auth.parent.mkdir(parents=True)
+
+    unusable = {
+        "an oauth entry with no fields at all": {"type": "oauth"},
+        "an api_key entry with no key": {"type": "api_key"},
+        "an empty access": _oauth(86400, access=""),
+        "an empty refresh": _oauth(86400, refresh=""),
+        "a non-finite expiry": _oauth(86400, expires=float("inf")),
+        "a boolean expiry": _oauth(86400, expires=True),
+        "a credential type nothing presents": {"type": "keychain", "key": "k"},
+    }
+    for label, entry in unusable.items():
+        auth.write_text(_prime_auth(anthropic=entry), encoding="utf-8")
+        ok, why = preflight_seeded_credential(spec, home, provider="anthropic")
+        assert not ok, label
+        assert "anthropic" in why, label
+
+    for label, entry in {
+        "a live oauth entry": _oauth(PREFLIGHT_MIN_LIFETIME_S + 3600),
+        "an api_key entry with a key": {"type": "api_key", "key": "not-a-key"},
+    }.items():
+        auth.write_text(_prime_auth(anthropic=entry), encoding="utf-8")
+        assert preflight_seeded_credential(spec, home, provider="anthropic") == (True, ""), label
+
+
 def test_the_preflight_reads_structure_and_expiry_and_asks_no_provider(tmp_path: Path) -> None:
-    """Every state the check distinguishes, against the two schemas that seed a file.
+    """The states that do not depend on which provider was selected, across both seeded schemas.
 
     A mode that seeds nothing passes: its credential is an environment value, and the only way to
-    inspect one is to read it, which is the thing this module never does.
+    inspect one is to read it, which is the thing this module never does. A caller that names no
+    provider gets the weakest honest check, because guessing which entry a cell will present is
+    how a good credential gets refused.
     """
     prime = spec_for("prime_agent", "subscription")
     codex = spec_for("codex", "subscription")
@@ -193,29 +297,30 @@ def test_the_preflight_reads_structure_and_expiry_and_asks_no_provider(tmp_path:
 
     assert preflight_seeded_credential(spec_for("claude_code", "subscription"), home) == (True, "")
 
-    ok, why = preflight_seeded_credential(prime, home)
+    ok, why = preflight_seeded_credential(prime, home, provider="anthropic")
     assert not ok and "no .prime/agent/auth.json" in why
 
     auth = home / ".prime" / "agent" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text("{not json", encoding="utf-8")
-    ok, why = preflight_seeded_credential(prime, home)
+    ok, why = preflight_seeded_credential(prime, home, provider="anthropic")
     assert not ok and "not readable JSON" in why
 
     auth.write_text("{}", encoding="utf-8")
-    ok, why = preflight_seeded_credential(prime, home)
-    assert not ok and "declares no provider" in why
+    ok, why = preflight_seeded_credential(prime, home, provider="anthropic")
+    assert not ok and "declares no credential for anthropic" in why
 
     # Alive, but not for long enough to survive a phase that fans out under it.
-    auth.write_text(_prime_auth(lifetime_s=PREFLIGHT_MIN_LIFETIME_S - 60), encoding="utf-8")
+    auth.write_text(_prime_auth(anthropic=_oauth(PREFLIGHT_MIN_LIFETIME_S - 60)), encoding="utf-8")
+    ok, why = preflight_seeded_credential(prime, home, provider="anthropic")
+    assert not ok and "life left" in why
+
+    # Unnamed provider: an empty file is still a refusal, and a file with any usable entry passes
+    # without any one of them being judged.
+    auth.write_text("{}", encoding="utf-8")
     ok, why = preflight_seeded_credential(prime, home)
-    assert not ok and "anthropic" in why
-
-    auth.write_text(_prime_auth(lifetime_s=PREFLIGHT_MIN_LIFETIME_S + 3600), encoding="utf-8")
-    assert preflight_seeded_credential(prime, home) == (True, "")
-
-    # An entry that declares no expiry at all is left alone: nothing here can prove it is stale.
-    auth.write_text(_prime_auth(lifetime_s=0, kind="api_key"), encoding="utf-8")
+    assert not ok and "declares no provider" in why
+    auth.write_text(_prime_auth(anthropic=_oauth(-99999)), encoding="utf-8")
     assert preflight_seeded_credential(prime, home) == (True, "")
 
     codex_auth = home / ".codex" / "auth.json"
@@ -232,30 +337,71 @@ def test_the_preflight_reads_structure_and_expiry_and_asks_no_provider(tmp_path:
     assert preflight_seeded_credential(codex, home) == (True, "")
 
 
-def test_the_refresh_takes_the_later_expiry_of_the_two_files(tmp_path: Path) -> None:
-    """The cell home's credential is usually the fresher one and stays; the host's replaces it
-    only when the host has since logged in or refreshed. Expiry decides, not who wrote last."""
+def test_the_refresh_replaces_one_provider_and_can_regress_none(tmp_path: Path) -> None:
+    """A multi-provider file has no single freshness to compare. Ordering the files by their
+    soonest expiry says this host file is fresher (300s beats 100s) while its openai-codex entry
+    is older than the one it would overwrite (300s against 1000s), so a whole-file copy trades a
+    live credential for a staler one. Replacing the selected provider's entry cannot do that to
+    any other provider, and cannot do it to that one either."""
     host = tmp_path / "host-auth.json"
     home = tmp_path / "home"
     (home / ".prime" / "agent").mkdir(parents=True)
     seeded = home / ".prime" / "agent" / "auth.json"
     spec = replace(spec_for("prime_agent", "subscription"), seed_from=str(host))
 
-    host.write_text(_prime_auth(lifetime_s=3600), encoding="utf-8")
-    seeded.write_text(_prime_auth(lifetime_s=7200), encoding="utf-8")
+    host.write_text(
+        _prime_auth(anthropic=_oauth(5000), **{"openai-codex": _oauth(300)}), encoding="utf-8"
+    )
+    seeded.write_text(
+        _prime_auth(anthropic=_oauth(100), **{"openai-codex": _oauth(1000)}), encoding="utf-8"
+    )
+    before = json.loads(seeded.read_text())
+
+    # The gpt cell's provider: the host's is older, so nothing moves.
+    assert refresh_seeded_credential(spec, home, provider="openai-codex") == ""
+    assert json.loads(seeded.read_text()) == before
+
+    # The claude cell's provider: the host's outlives it, so that ONE entry is replaced and the
+    # live openai-codex credential beside it is left byte-identical.
+    note = refresh_seeded_credential(spec, home, provider="anthropic")
+    after = json.loads(seeded.read_text())
+    assert "anthropic" in note
+    assert after["anthropic"] == json.loads(host.read_text())["anthropic"]
+    assert after["openai-codex"] == before["openai-codex"]
+
+    # And the other direction for the same provider: a cell home that is already ahead keeps what
+    # it has, so a refresh can never walk a credential backwards.
+    assert refresh_seeded_credential(spec, home, provider="anthropic") == ""
+    assert json.loads(seeded.read_text()) == after
+
+
+def test_the_refresh_declines_what_it_cannot_order(tmp_path: Path) -> None:
+    """Every case where there is no fact to act on: no provider named, a host with nothing for
+    that provider, a seeded entry with no comparable expiry, and a schema that states none."""
+    host = tmp_path / "host-auth.json"
+    home = tmp_path / "home"
+    (home / ".prime" / "agent").mkdir(parents=True)
+    seeded = home / ".prime" / "agent" / "auth.json"
+    spec = replace(spec_for("prime_agent", "subscription"), seed_from=str(host))
+
+    host.write_text(_prime_auth(anthropic=_oauth(99999)), encoding="utf-8")
+    seeded.write_text(_prime_auth(anthropic=_oauth(100)), encoding="utf-8")
     kept = json.loads(seeded.read_text())
     assert refresh_seeded_credential(spec, home) == ""
+    assert refresh_seeded_credential(spec, home, provider="openai-codex") == ""
     assert json.loads(seeded.read_text()) == kept
 
-    host.write_text(_prime_auth(lifetime_s=99999), encoding="utf-8")
-    assert "re-seeded" in refresh_seeded_credential(spec, home)
-    assert (
-        json.loads(seeded.read_text())["anthropic"]["expires"]
-        == json.loads(host.read_text())["anthropic"]["expires"]
+    # An api_key entry cannot be ordered against an oauth one, so it is left where it is rather
+    # than replaced on a guess about which is better.
+    seeded.write_text(
+        _prime_auth(anthropic={"type": "api_key", "key": "not-a-key"}), encoding="utf-8"
     )
+    kept = json.loads(seeded.read_text())
+    assert refresh_seeded_credential(spec, home, provider="anthropic") == ""
+    assert json.loads(seeded.read_text()) == kept
 
-    # codex declares no readable expiry, so there is no fresher of the two to compute.
-    assert refresh_seeded_credential(spec_for("codex", "subscription"), home) == ""
+    # codex states no readable expiry at all, so there is no fresher of the two to compute.
+    assert refresh_seeded_credential(spec_for("codex", "subscription"), home, provider="x") == ""
 
 
 def test_a_dead_credential_refuses_the_phase_before_a_single_task_launches(
@@ -288,18 +434,56 @@ def test_a_credential_with_life_left_lets_the_phase_run(tmp_path: Path, monkeypa
     assert [r.task_idx for r in rows] == [1, 2]
 
 
+def test_a_gpt_cell_runs_against_the_home_a_real_gpt_cell_has(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The whole phase against the shape the real gpt-terra homes carry: a live openai-codex
+    login beside a long-expired anthropic one. This is the case a preflight that judged every
+    entry would refuse, and the refusal would land on a paused measurement's resume rather than
+    on anything actually wrong."""
+    ctx = _ctx(tmp_path, cell_name=_TERRA_CELL, heldout=("1", "2"))
+    assert ctx.cell.model == "gpt-5.6-terra"
+    _seed_prime_auth(ctx, lifetime_s=0, monkeypatch=monkeypatch)
+    (ctx.sandbox.home / ".prime" / "agent" / "auth.json").write_text(
+        _prime_auth(
+            anthropic=_oauth(-99999), **{"openai-codex": _oauth(PREFLIGHT_MIN_LIFETIME_S + 7200)}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner, "EVAL_LAUNCH_STAGGER_S", 0.0)
+    launched: list[int] = []
+    _capture_launches(monkeypatch, launched)
+
+    rows = asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
+
+    assert sorted(launched) == [1, 2]
+    assert [r.task_idx for r in rows] == [1, 2]
+
+
 # ----- the launch stagger ------------------------------------------------------------------------
 
 
-def test_the_first_wave_is_spaced_and_the_phase_is_otherwise_unchanged(
+def test_the_first_wave_is_spaced_and_no_task_launches_around_it(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The spacing is real, and it is the only thing that differs: the same ids run, they come
-    back in the same order, and every one of them is accounted for either way."""
+    """MORE tasks than slots, which is the only arrangement that can catch the bypass.
+
+    With exactly as many tasks as the concurrency limit there is no coroutine left over to
+    overtake the wave, so a stagger that spaced only the sleeping coroutines passed. With eight
+    tasks at a concurrency of four, spacing ahead of the gate let 5, 6, 7 and 8 take the free
+    slots the sleepers had not claimed yet and launch first, unspaced, so the real first wave was
+    both unstaggered and reversed. What this asserts is what the mechanism is for: the first four
+    LAUNCHES are the first four pending ids, each a gap after the last, and no fifth task starts
+    before the wave is out.
+    """
     gap = 0.05
+    limit = 4
     monkeypatch.setattr(runner, "EVAL_LAUNCH_STAGGER_S", gap)
-    ctx = _ctx(tmp_path, cell_name=_PRIME_CELL, heldout=("4", "1", "3", "2"))
-    ctx = replace(ctx, cell=replace(ctx.cell, budget=replace(ctx.cell.budget, eval_concurrency=4)))
+    ids = ("1", "2", "3", "4", "5", "6", "7", "8")
+    ctx = _ctx(tmp_path, cell_name=_PRIME_CELL, heldout=ids)
+    ctx = replace(
+        ctx, cell=replace(ctx.cell, budget=replace(ctx.cell.budget, eval_concurrency=limit))
+    )
     _seed_prime_auth(ctx, lifetime_s=PREFLIGHT_MIN_LIFETIME_S + 7200, monkeypatch=monkeypatch)
     launched: list[int] = []
     at: dict[int, float] = {}
@@ -307,20 +491,53 @@ def test_the_first_wave_is_spaced_and_the_phase_is_otherwise_unchanged(
 
     staggered = asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
 
-    # The wave really was spaced: its first and last launches are three gaps apart, not zero.
-    assert at[2] - at[4] >= 3 * gap * 0.8
-    assert sorted(launched) == [1, 2, 3, 4]
+    # The wave is the first four ids, in order, and nothing overtook it.
+    assert launched[:limit] == [1, 2, 3, 4]
+    wave = [at[idx] for idx in launched[:limit]]
+    # Pairwise, so a wave that arrived in one burst with a long tail cannot pass on its span.
+    assert min(later - earlier for earlier, later in zip(wave, wave[1:], strict=False)) >= gap * 0.8
+    assert min(at[idx] for idx in launched[limit:]) >= wave[-1]
+    assert sorted(launched) == [1, 2, 3, 4, 5, 6, 7, 8]
 
     # The same phase with no spacing at all: same ids, same rows, same order.
     monkeypatch.setattr(runner, "EVAL_LAUNCH_STAGGER_S", 0.0)
-    plain_ctx = _ctx(tmp_path / "plain", cell_name=_PRIME_CELL, heldout=("4", "1", "3", "2"))
+    plain_ctx = _ctx(tmp_path / "plain", cell_name=_PRIME_CELL, heldout=ids)
+    plain_ctx = replace(
+        plain_ctx,
+        cell=replace(plain_ctx.cell, budget=replace(plain_ctx.cell.budget, eval_concurrency=limit)),
+    )
     _seed_prime_auth(plain_ctx, lifetime_s=PREFLIGHT_MIN_LIFETIME_S + 7200, monkeypatch=monkeypatch)
     plain_launched: list[int] = []
     _capture_launches(monkeypatch, plain_launched)
     plain = asyncio.run(runner.run_eval_phase(plain_ctx, "eval_before"))
 
     assert sorted(launched) == sorted(plain_launched)
-    assert [r.task_idx for r in staggered] == [r.task_idx for r in plain] == [1, 2, 3, 4]
+    assert [r.task_idx for r in staggered] == [r.task_idx for r in plain] == list(range(1, 9))
+
+
+def test_the_stagger_stops_after_the_first_wave(tmp_path: Path, monkeypatch) -> None:
+    """Only the first wave is spaced. Past it a slot opens only when a task finishes, so the
+    launches are already spread and paying the gap again would be wall clock for nothing: at a
+    two-second gap over a 120-task phase it would be four minutes of sleeping."""
+    gap = 0.05
+    limit = 2
+    monkeypatch.setattr(runner, "EVAL_LAUNCH_STAGGER_S", gap)
+    ctx = _ctx(tmp_path, cell_name=_PRIME_CELL, heldout=tuple(str(i) for i in range(1, 9)))
+    ctx = replace(
+        ctx, cell=replace(ctx.cell, budget=replace(ctx.cell.budget, eval_concurrency=limit))
+    )
+    _seed_prime_auth(ctx, lifetime_s=PREFLIGHT_MIN_LIFETIME_S + 7200, monkeypatch=monkeypatch)
+    launched: list[int] = []
+    at: dict[int, float] = {}
+    _capture_launches(monkeypatch, launched, at)
+
+    started = time.monotonic()
+    asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
+
+    # Eight tasks, two staggered admissions: one gap of sleeping, not seven.
+    assert len(launched) == 8
+    assert time.monotonic() - started < gap * 4
+    assert at[launched[1]] - at[launched[0]] >= gap * 0.8
 
 
 def test_a_credential_the_harness_never_writes_is_not_staggered(

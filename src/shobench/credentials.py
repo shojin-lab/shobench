@@ -14,6 +14,7 @@ supported per harness, so the mode a cell ran under is recorded rather than assu
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import time
 from collections.abc import Sequence
@@ -267,29 +268,62 @@ def describe_seed(spec: CredentialSpec, body: Any) -> str:
 PREFLIGHT_MIN_LIFETIME_S = 900
 
 
-def _expiring_oauth_providers(body: Any, *, now: float | None = None) -> list[str]:
-    """Provider names whose oauth entry has less than the preflight margin of life left.
+def _oauth_expiry_ms(entry: Any) -> float | None:
+    """The expiry an oauth entry declares, in epoch milliseconds, when it declares a usable one.
 
-    ``expires`` is epoch milliseconds, which is what prime-agent writes. An entry that declares
-    no expiry at all is left alone: nothing here can prove such a credential is stale, and
-    refusing on an absence would refuse a perfectly good api_key entry as well. Names only; no
-    secret in the file is read.
+    ``None`` covers every way there is no number to compare: another credential type, a missing
+    field, a string, a bool (which is an ``int`` in Python and is not an expiry anywhere), and a
+    NaN or an infinity, none of which order against anything.
     """
-    deadline_ms = ((time.time() if now is None else now) + PREFLIGHT_MIN_LIFETIME_S) * 1000
-    if not isinstance(body, dict):
-        return []
-    return sorted(
-        name
-        for name, entry in body.items()
-        if isinstance(entry, dict)
-        and entry.get("type") == "oauth"
-        and isinstance(entry.get("expires"), int | float)
-        and float(entry["expires"]) < deadline_ms
-    )
+    if not isinstance(entry, dict) or entry.get("type") != "oauth":
+        return None
+    expires = entry.get("expires")
+    if isinstance(expires, bool) or not isinstance(expires, int | float):
+        return None
+    value = float(expires)
+    return value if math.isfinite(value) else None
+
+
+def _prime_entry_usable(provider: str, entry: Any, *, now: float | None = None) -> str:
+    """What is wrong with this one provider's credential, or an empty string when nothing is.
+
+    Judged against what the pinned prime-agent 0.7.1 actually does with the entry it looks up by
+    provider id, read out of the bundle rather than assumed. An oauth entry's ``access`` IS the
+    api key it presents (``getApiKey(credentials) { return credentials.access }``, for both the
+    anthropic and openai-codex providers), its ``refresh`` is the only thing
+    ``refreshToken(credentials.refresh)`` has to work with, and its ``expires`` is compared
+    against the clock to choose between the two. An api_key entry is presented as it stands.
+
+    So an empty field the CLI reads is a credential that authenticates nothing whatever the
+    file's shape suggests, and an oauth entry carrying no comparable expiry is worse than it
+    looks: ``Date.now() >= undefined`` is false, so the CLI never refreshes it and presents a
+    token it cannot know is dead. Neither passes.
+    """
+    if not isinstance(entry, dict):
+        return f"declares no credential for {provider}"
+    kind = entry.get("type")
+    if kind == "api_key":
+        if not str(entry.get("key") or ""):
+            return f"carries no key on its api_key entry for {provider}"
+        return ""
+    if kind != "oauth":
+        return f"carries a credential for {provider} of type {kind!r}, which authenticates nothing"
+    empty = [field for field in ("access", "refresh") if not str(entry.get(field) or "")]
+    if empty:
+        return f"carries an empty {' and '.join(empty)} on its oauth entry for {provider}"
+    expiry = _oauth_expiry_ms(entry)
+    if expiry is None:
+        return f"carries no usable expiry on its oauth entry for {provider}"
+    if expiry < ((time.time() if now is None else now) + PREFLIGHT_MIN_LIFETIME_S) * 1000:
+        return (
+            f"has under {PREFLIGHT_MIN_LIFETIME_S}s of life left on its oauth credential for "
+            f"{provider}"
+        )
+    return ""
 
 
 def preflight_seeded_credential(
-    spec: CredentialSpec, home: Path, *, now: float | None = None
+    spec: CredentialSpec, home: Path, *, provider: str = "", now: float | None = None
 ) -> tuple[bool, str]:
     """Is the credential already seeded into this cell's HOME still usable, judged for free.
 
@@ -303,6 +337,13 @@ def preflight_seeded_credential(
     without reading a secret, and it passes. A mode that seeds a FILE is both the one this can
     check and the one where the fan-out hands N homes copies of a single refreshable token.
 
+    ``provider`` names the ONE entry of a multi-provider file this cell will present, and it is
+    the difference between a useful check and a harmful one. prime's auth.json holds every
+    provider ever logged in, while a leg looks up exactly one by id: a real gpt-terra home
+    carries a live openai-codex login beside a long-expired anthropic one, and judging every
+    entry refuses that cell over a credential it never reaches for. A caller that names no
+    provider gets the weakest honest check instead, which is that the file declares something.
+
     Returns ``(ok, why_not)``. The reason names the file and what is wrong with it, never a value.
     """
     if not spec.seed_to:
@@ -314,15 +355,18 @@ def preflight_seeded_credential(
     if body is None:
         return False, f"the cell home's {spec.seed_to} is not readable JSON"
     if spec.seed_schema == "prime_auth":
-        if not _prime_providers(body):
+        if not provider:
+            if not _prime_providers(body):
+                return False, (
+                    f"the cell home's {spec.seed_to} declares no provider, so it authenticates "
+                    "nothing"
+                )
+            return True, ""
+        wrong = _prime_entry_usable(provider, (body or {}).get(provider), now=now)
+        if wrong:
             return False, (
-                f"the cell home's {spec.seed_to} declares no provider, so it authenticates nothing"
-            )
-        expiring = _expiring_oauth_providers(body, now=now)
-        if expiring:
-            return False, (
-                f"the cell home's {spec.seed_to} has under {PREFLIGHT_MIN_LIFETIME_S}s of life "
-                f"left on its oauth credential for {', '.join(expiring)}"
+                f"the cell home's {spec.seed_to} {wrong}, and {provider} is the provider this "
+                "cell's model resolves to"
             )
         return True, ""
     if spec.seed_schema == "codex_auth":
@@ -335,56 +379,55 @@ def preflight_seeded_credential(
     return True, ""
 
 
-def refresh_seeded_credential(spec: CredentialSpec, home: Path) -> str:
-    """Re-seed the cell HOME from the host file when the host's credential is the fresher one.
+def refresh_seeded_credential(spec: CredentialSpec, home: Path, *, provider: str = "") -> str:
+    """Replace ONE provider's entry in the cell HOME's credential when the host's outlives it.
 
     prime-agent specific, and it has to be: prime's auth.json is the only seeded schema that
     states its own expiry in a field this can read, so it is the only one where "fresher" is a
     computable fact rather than a guess. codex's auth.json carries no readable expiry (the
     lifetime lives inside the token), so nothing here touches it.
 
-    The direction of the copy is the point. The cell HOME's file is whatever the last leg's
-    harness refreshed it to, and it is usually the newer of the two; the host's is newer only
-    when something else on the host logged in or refreshed while this cell was running. Taking
-    the later expiry of the two is the only refresh available without a browser flow or a
-    provider call, and a credential file is excluded from the durable digest either way, so
-    replacing one cannot touch what the cell measures.
+    Per provider rather than per file, which is a correctness property and not a refinement.
+    These files hold several logins, and the file-level comparison this replaced (the soonest
+    expiry on either side) is not an ordering: a host file whose anthropic entry outlives the
+    cell's, but whose openai-codex entry is older, compared as fresher and overwrote a live
+    openai-codex credential with a staler one. Replacing a single key cannot do that to any
+    provider but the one asked for, and cannot do it to that one either, since the host's entry
+    has to outlive what is there.
+
+    The direction of the copy is the point. The cell HOME's entry is whatever the last leg's
+    harness refreshed it to and is usually the newer of the two; the host's is newer only when
+    something else on the host logged in or refreshed while this cell was running. Taking the
+    later of the two is the only refresh available without a browser flow or a provider call,
+    and a credential file is excluded from the durable digest either way, so this cannot touch
+    what the cell measures.
 
     Returns a short description for the operator's log, never a value.
     """
-    if spec.seed_schema != "prime_auth" or not spec.seed_from or not spec.seed_to:
+    if spec.seed_schema != "prime_auth" or not spec.seed_from or not spec.seed_to or not provider:
         return ""
-    source = Path(spec.seed_from).expanduser()
     target = home / spec.seed_to
-    host, seeded = _read_json(source), _read_json(target)
-    if not isinstance(host, dict):
+    host = _read_json(Path(spec.seed_from).expanduser())
+    seeded = _read_json(target)
+    if not isinstance(host, dict) or not isinstance(seeded, dict):
         return ""
-    host_life, seeded_life = _earliest_expiry(host), _earliest_expiry(seeded)
-    if host_life is None or (seeded_life is not None and host_life <= seeded_life):
+    host_expiry = _oauth_expiry_ms(host.get(provider))
+    if host_expiry is None:
         return ""
-    seed_home(spec, home)
+    seeded_expiry = _oauth_expiry_ms(seeded.get(provider))
+    if seeded_expiry is None and provider in seeded:
+        # An entry this cannot compare (an api_key, or an oauth entry with no readable expiry)
+        # is left where it is rather than replaced on a guess about which one is better.
+        return ""
+    if seeded_expiry is not None and seeded_expiry >= host_expiry:
+        return ""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({**seeded, provider: host.get(provider)}), encoding="utf-8")
+    target.chmod(0o600)
     return (
-        f"re-seeded {spec.seed_to} from {spec.seed_from}, which carried the later expiry of "
-        "the two"
+        f"replaced the {provider} entry of {spec.seed_to} from {spec.seed_from}, which carried "
+        "the later expiry; every other provider's entry is untouched"
     )
-
-
-def _earliest_expiry(body: Any) -> float | None:
-    """The soonest expiry any oauth entry in this file declares, in epoch milliseconds.
-
-    The soonest rather than the latest, because a file is only as good as its weakest provider:
-    the leg that needs the one expiring in a minute fails whatever the other one says.
-    """
-    if not isinstance(body, dict):
-        return None
-    expiries = [
-        float(entry["expires"])
-        for entry in body.values()
-        if isinstance(entry, dict)
-        and entry.get("type") == "oauth"
-        and isinstance(entry.get("expires"), int | float)
-    ]
-    return min(expiries) if expiries else None
 
 
 def credential_available(spec: CredentialSpec) -> tuple[bool, str]:
