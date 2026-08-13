@@ -828,6 +828,33 @@ def test_a_run_without_a_rollout_terminus_is_refused(tmp_path) -> None:
         asyncio.run(runner.rerun_eval(run_dir, results_dir=tmp_path / "results"))
 
 
+@pytest.mark.parametrize("bookend", [False, True])
+def test_a_repair_refuses_the_edit_a_rebookend_allows(tmp_path, bookend: bool) -> None:
+    """A retuned eval timeout is exactly what a rebookend runs under today's value of, and a
+    repair still refuses it, for a bookend as much as for an ordinary run.
+
+    The difference is what each entry produces. A rebookend measures every held-out task under
+    one definition and publishes both values in its record. A repair fills the ids this run is
+    missing beside ids it already measured, so a definitional edit would put two runtimes
+    inside one artifact with nothing in a row to say which one produced it. An operator refused
+    here has a way through that costs no honesty: rebookend the source again.
+    """
+    from shobench import runner
+
+    run_dir = _reopenable_run(tmp_path)
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["cell"]["budget"]["eval_task_timeout_s"] = 4242
+    # The digest the run recorded names bytes the checkout no longer holds, which is what a
+    # retuned cell file leaves behind.
+    manifest["cell"]["config_sha256"] = "0" * 64
+    if bookend:
+        manifest["rebookend"] = {"rebookend_of": "source-run", "baseline_run_id": "source-run"}
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no longer matches"):
+        asyncio.run(runner.rerun_eval(run_dir, results_dir=tmp_path / "results"))
+
+
 def test_rerun_eval_reopens_only_eval_after_and_records_itself(tmp_path, monkeypatch) -> None:
     """The reopened run carries its recorded phases, runs only eval_after, and the manifest
     says a re-run happened, with the arm recovered the way a resume recovers it."""

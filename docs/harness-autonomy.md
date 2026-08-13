@@ -536,6 +536,38 @@ source home, a cycle, or a special file refuses loudly. Publication is atomic ev
 (``write_results`` swaps the leaf entry in with ``os.replace``), and a rebookend additionally
 refuses up front any output directory, result leaf, or new run path that resolves into the
 source, so a link planted at a deterministic name is refused or replaced, never followed.
+The drift check a bookend applies is scoped to what its eval will measure, and it is the one
+place a rebookend is deliberately laxer than a resume. A resume and a rerun-eval write more of
+a measurement that already exists, under the run id that already names it, so they refuse on
+the cell file's digest: nothing about that run may change. A rebookend publishes a NEW run over
+a rollout that is finished and immutable, so an edit made after that rollout ended cannot reach
+it, and the file digest is the wrong question anyway, since it moves for a comment and for a
+swapped model alike (the real case: an eval timeout retuned after two rollouts finished refused
+both of their bookends). The bookend compares the recorded cell block field by field instead.
+Refusing: `env`, `harness`, `model`, `effort`, `credential_mode` and `env_kwargs`, which are
+what its own eval sessions are made of; `rollout_feedback`, the arm it inherits, compared
+against the recorded value the runner recovers onto the cell, so the comparison holds that
+recovery to its word; `max_in_flight`, `rollout_wall_clock_s` and `pool_ceiling`, which define
+the rollout it inherits a home from and would otherwise be published as numbers nobody ran;
+`required_env`, a precondition rather than a measurement, refused because a cell that needs a
+key it did not need before is a cell whose legs are produced differently; and the split's id
+digest and both system-prompt digests, which are the held-out ids and the prompts and are
+compared under either scope. Allowed: `eval_task_timeout_s` and `eval_concurrency`, which say
+only how this run's own eval legs are run. `eval_context` is not compared at all, being the one
+axis a rebookend changes by definition, and neither are the lookup keys (`split`,
+`instruction_arm`) whose identities are the digests, nor `config_path`, `note` and
+`config_sha256`. A field added to a cell later refuses by default: the excused fields are
+listed and everything else is measurement-defining until someone judges otherwise. The
+allowance is recorded rather than absorbed: the bookend's manifest carries the source's
+recorded cell block (`rebookend.source_cell`) beside the block it actually ran under (`cell`),
+plus `rebookend.cell_drift` naming every field the two state differently with both values, and
+the plan prints the same thing before anything spends, so a reader of the numbers sees that the
+eval ran under a retuned budget without finding two checkouts to diff. A repaired bookend keeps
+the strict comparison, deliberately: `rerun-eval` splices rows beside rows this run already
+measured, so a definitional edit would put two runtimes inside one artifact with nothing in a
+row to say which produced it, and the operator refused there can rebookend the source again,
+which measures the whole held-out set under one definition.
+
 Refused before anything is copied or spent: a source without a terminus, without a
 resolvable terminal session, holding a suspension record, or still owned by a live process,
 and any output path, result leaf, or new run path at or under the source. A

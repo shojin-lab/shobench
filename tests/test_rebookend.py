@@ -1765,3 +1765,351 @@ def test_a_suspension_written_between_probe_and_hold_refuses(
             )
         )
     assert launches == {}
+
+
+# ----- the drift comparison a bookend applies -------------------------------------------------
+#
+# A rebookend is a NEW run over a rollout that already ended, so the cell file's digest is the
+# wrong question: it moves for a comment and for a swapped model alike, and it refused the real
+# planned bookends after their cells' eval timeout was retuned. What the bookend measures still
+# has to be the source's arm; how long its own eval legs are given is this run's business.
+
+# The two planned bookends were recorded under this timeout, and their cells now carry a shorter
+# one. Every other field of those cells is untouched, which is exactly the shape modeled here.
+_RECORDED_EVAL_TIMEOUT_S = 1800
+
+
+def _retuned_timeout_source(cell_name: str):
+    """The recorded definitions of a run whose cell has since had only its eval timeout retuned.
+
+    Built from the COMMITTED cell rather than a synthetic one, so the comparison runs against
+    the real field set: same cell name, the timeout the run recorded, and the digest of the
+    file as it read then.
+    """
+    cell = load_cell_by_name(cell_name)
+    current_text = cell.source.read_text(encoding="utf-8")
+    recorded_text = current_text.replace(
+        f"eval_task_timeout_s = {cell.budget.eval_task_timeout_s}",
+        f"eval_task_timeout_s = {_RECORDED_EVAL_TIMEOUT_S}",
+    )
+    assert recorded_text != current_text, "the fixture models a cell whose timeout moved"
+    split = load_split_by_name(cell.split)
+    instruction = load_instruction(cell.instruction_arm)
+    recorded_cell = cell.to_manifest()
+    recorded_cell["budget"] = {
+        **recorded_cell["budget"],
+        "eval_task_timeout_s": _RECORDED_EVAL_TIMEOUT_S,
+    }
+    recorded_cell["config_sha256"] = hashlib.sha256(
+        recorded_text.encode("utf-8")
+    ).hexdigest()
+    manifest = {
+        "run_id": f"{cell_name}-20260813T003200Z",
+        "cell": recorded_cell,
+        "split": split.to_manifest(),
+        "instruction": instruction.to_manifest(),
+    }
+    return manifest, cell, split, instruction
+
+
+def _bookend_cell(manifest, cell):
+    """The cell the runner hands its own drift check: the source's recorded arm, resumed."""
+    return replace(
+        cell,
+        rollout_feedback=runner.recorded_rollout_feedback(manifest),
+        eval_context="resumed",
+    )
+
+
+@pytest.mark.parametrize(
+    "cell_name",
+    [
+        "automationbench-prime_agent-claude-opus-5",
+        "automationbench-prime_agent-gpt-56-terra",
+    ],
+)
+def test_a_bookend_of_a_retuned_cell_is_measurable(cell_name: str) -> None:
+    """The two real refusals. Both sources finished their rollouts before the timeout moved, so
+    nothing the edit touched can reach them, and the bookend's own legs run under today's
+    value with the record saying so."""
+    manifest, cell, split, instruction = _retuned_timeout_source(cell_name)
+
+    assert (
+        runner.experiment_drift(
+            manifest,
+            cell=_bookend_cell(manifest, cell),
+            split=split,
+            instruction=instruction,
+            scope=runner.DRIFT_BOOKEND,
+        )
+        == []
+    )
+    # The same edit still stops a continuation dead: resume and rerun-eval write more of a
+    # measurement that already exists, and nothing about that one may move.
+    continuation = runner.experiment_drift(
+        manifest, cell=cell, split=split, instruction=instruction
+    )
+    assert continuation and "cell config changed" in continuation[0]
+    # Allowed, never hidden: the field and both values are what the artifact will carry.
+    drift = runner.cell_field_drift(manifest["cell"], _bookend_cell(manifest, cell).to_manifest())
+    assert drift["budget.eval_task_timeout_s"] == {
+        "recorded": _RECORDED_EVAL_TIMEOUT_S,
+        "now": cell.budget.eval_task_timeout_s,
+    }
+    assert "config_sha256" in drift, "the reader is told the file itself moved"
+
+
+def test_a_bookend_allows_the_other_eval_runtime_field() -> None:
+    """eval_concurrency buys host resources: every held-out task runs in its own fresh session
+    against its own copy of the home whatever it says, so it cannot reach a score."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest["cell"]["budget"]["eval_concurrency"] = 1
+
+    assert (
+        runner.experiment_drift(
+            manifest,
+            cell=_bookend_cell(manifest, cell),
+            split=split,
+            instruction=instruction,
+            scope=runner.DRIFT_BOOKEND,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "recorded_value", "names"),
+    [
+        ("model", "claude-opus-4", "cell model"),
+        ("env", "wordle_v1", "cell env"),
+        ("harness", "claude_code", "cell harness"),
+        ("effort", "low", "cell effort"),
+        ("credential_mode", "api_key", "cell credential_mode"),
+        ("env_kwargs", {"judge_model": "a-different-judge"}, "cell env_kwargs"),
+        ("required_env", ["OPENAI_API_KEY"], "cell required_env"),
+        ("max_in_flight", 1, "cell max_in_flight"),
+    ],
+)
+def test_a_bookend_refuses_a_measurement_change(field, recorded_value, names) -> None:
+    """Everything the bookend's own eval sessions are made of: a bookend under any of these
+    measures something other than the run it claims to follow."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest["cell"][field] = recorded_value
+
+    drift = runner.experiment_drift(
+        manifest,
+        cell=_bookend_cell(manifest, cell),
+        split=split,
+        instruction=instruction,
+        scope=runner.DRIFT_BOOKEND,
+    )
+    assert drift and any(names in line for line in drift), drift
+
+
+def test_a_bookend_holds_the_arm_recovery_to_its_word() -> None:
+    """The feedback arm is inherited rather than read from the checkout, and the comparison is
+    what proves the inheritance happened: a cell handed in with the checkout's default instead
+    of the recorded arm is refused, not published under a label its rollout never wore."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest["cell"]["rollout_feedback"] = "never"
+
+    # Recovered, the way the runner and the plan both do it: no drift, and the bookend
+    # publishes the source's arm.
+    assert (
+        runner.experiment_drift(
+            manifest,
+            cell=_bookend_cell(manifest, cell),
+            split=split,
+            instruction=instruction,
+            scope=runner.DRIFT_BOOKEND,
+        )
+        == []
+    )
+    # Un-recovered, with the checkout's own default still on the cell: refused.
+    drift = runner.experiment_drift(
+        manifest,
+        cell=replace(cell, eval_context="resumed"),
+        split=split,
+        instruction=instruction,
+        scope=runner.DRIFT_BOOKEND,
+    )
+    assert drift and any("cell rollout_feedback" in line for line in drift), drift
+
+
+@pytest.mark.parametrize("field", ["rollout_wall_clock_s", "pool_ceiling"])
+def test_a_bookend_refuses_a_changed_rollout_budget(field: str) -> None:
+    """The bookend runs no rollout, so these cannot change its eval; it inherits the home that
+    rollout built and labels the arm, so publishing today's numbers would name a rollout
+    nobody ran."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest["cell"]["budget"][field] = 7
+
+    drift = runner.experiment_drift(
+        manifest,
+        cell=_bookend_cell(manifest, cell),
+        split=split,
+        instruction=instruction,
+        scope=runner.DRIFT_BOOKEND,
+    )
+    assert drift and any(f"cell budget.{field}" in line for line in drift), drift
+
+
+@pytest.mark.parametrize(
+    ("block", "key", "names"),
+    [
+        ("split", "id_digest", "split ids"),
+        ("instruction", "rollout_system_sha256", "rollout instruction"),
+        ("instruction", "eval_system_sha256", "eval instruction"),
+    ],
+)
+def test_a_bookend_refuses_a_changed_split_or_instruction(block, key, names) -> None:
+    """The held-out ids and the prompts are compared under both scopes: a bookend over other
+    ids pairs task numbers that are not the same tasks, and one under a reworded prompt
+    measures a different question."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    manifest[block][key] = "0" * 64
+
+    drift = runner.experiment_drift(
+        manifest,
+        cell=_bookend_cell(manifest, cell),
+        split=split,
+        instruction=instruction,
+        scope=runner.DRIFT_BOOKEND,
+    )
+    assert drift and any(names in line for line in drift), drift
+
+
+def test_every_cell_field_is_judged() -> None:
+    """A cell axis added later must not fall into the allowed set by default.
+
+    The excused fields are listed in the runner and the refusing ones are everything else, so
+    this is where the second list is written down: a new field breaks it, and whoever adds the
+    field decides which side it belongs on rather than inheriting an answer.
+    """
+    fields = set(
+        runner._flat_cell(load_cell_by_name("automationbench-prime_agent-claude-opus-5").to_manifest())
+    )
+    excused = set(runner.BOOKEND_RUNTIME_CELL_FIELDS) | set(runner.BOOKEND_UNCOMPARED_CELL_FIELDS)
+    assert excused <= fields, "an excused field no cell carries is a stale judgement"
+    assert fields - excused == {
+        "name",
+        "env",
+        "harness",
+        "model",
+        "effort",
+        "max_in_flight",
+        "rollout_feedback",
+        "credential_mode",
+        "env_kwargs",
+        "required_env",
+        "budget.rollout_wall_clock_s",
+        "budget.pool_ceiling",
+    }
+
+
+def test_an_unknown_drift_scope_is_refused() -> None:
+    """The scope decides what may change, so a misspelled one must not quietly pick a default."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+
+    with pytest.raises(ValueError, match="unknown drift scope"):
+        runner.experiment_drift(
+            manifest, cell=cell, split=split, instruction=instruction, scope="whatever"
+        )
+
+
+def test_the_bookend_manifest_records_both_runtimes(tmp_path: Path, monkeypatch) -> None:
+    """The whole point of allowing the drift: a reader sees that this eval ran under a
+    different budget than the source recorded, with both values in the artifact, rather than
+    having to find two checkouts and diff them."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    source_manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    # The source ran under a longer bound, and the file it hashed no longer exists.
+    source_manifest["cell"]["budget"]["eval_task_timeout_s"] = 300
+    source_manifest["cell"]["config_sha256"] = "0" * 64
+    runner.write_json(source_dir / "manifest.json", source_manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    results_path = asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    assert set(launches) == {0, 1, 2}, "the bookend ran rather than refusing"
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    manifest = json.loads((new_run / "manifest.json").read_text(encoding="utf-8"))
+    # What ran, what the source recorded, and the named difference between them.
+    assert manifest["cell"]["budget"]["eval_task_timeout_s"] == cell.budget.eval_task_timeout_s
+    assert manifest["rebookend"]["source_cell"] == source_manifest["cell"]
+    assert manifest["rebookend"]["cell_drift"]["budget.eval_task_timeout_s"] == {
+        "recorded": 300,
+        "now": cell.budget.eval_task_timeout_s,
+    }
+    assert "config_sha256" in manifest["rebookend"]["cell_drift"]
+    # And it reaches the published artifact, which is what anyone reading the numbers holds.
+    published = json.loads(results_path.read_text(encoding="utf-8"))
+    assert published["manifest"]["rebookend"]["cell_drift"]["budget.eval_task_timeout_s"] == {
+        "recorded": 300,
+        "now": cell.budget.eval_task_timeout_s,
+    }
+
+
+def test_cli_plans_a_bookend_whose_cell_timeout_was_retuned(tmp_path: Path, capsys) -> None:
+    """The refusal an operator actually met, at the entry they met it in: the plan runs the
+    checkout's real loaders, reports no drift, and names what will differ."""
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    cell = load_cell_by_name("smoke-automationbench-claude-code")
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["cell"]["budget"]["eval_task_timeout_s"] = _RECORDED_EVAL_TIMEOUT_S
+    manifest["cell"]["config_sha256"] = "0" * 64
+    runner.write_json(source_dir / "manifest.json", manifest)
+
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+
+    assert plan["refusals"]["experiment_drift"] == []
+    assert plan["cell_drift"]["budget.eval_task_timeout_s"] == {
+        "recorded": _RECORDED_EVAL_TIMEOUT_S,
+        "now": cell.budget.eval_task_timeout_s,
+    }
+    assert "config_sha256" in plan["cell_drift"]
+
+
+def test_cli_blocks_a_bookend_whose_cell_measures_something_else(
+    tmp_path: Path, capsys
+) -> None:
+    """A model swap is not a runtime detail, and the block lands before anything is minted."""
+    from shobench.cli import main as cli_main
+
+    source_dir = _real_cell_source(tmp_path)
+    manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["cell"]["model"] = "a-model-this-run-never-used"
+    runner.write_json(source_dir / "manifest.json", manifest)
+
+    assert cli_main(["rebookend", "--run", str(source_dir)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert any("cell model changed" in line for line in plan["refusals"]["experiment_drift"])
+
+    assert cli_main(["rebookend", "--run", str(source_dir), "--go"]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "cell model changed" in err
+    assert not (tmp_path / "runs").exists()
