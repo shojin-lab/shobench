@@ -34,9 +34,12 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      # --frozen so a lock that drifted from pyproject.toml is a failure here rather than a
-      # silent re-resolve that tests something other than what a developer runs.
-      - run: uv sync --frozen
+      # --locked, because drift is the thing --frozen does not look at: --frozen installs the lock
+      # as written, so a dependency added to pyproject.toml and never locked is simply missing
+      # from the environment and the job stays green without it. --locked checks the lock against
+      # pyproject.toml and fails when the two disagree. The run steps below stay --frozen; the
+      # gate has been passed by then, and re-resolving is not their job either.
+      - run: uv sync --locked
 
       - run: uv run --frozen ruff check .
 
