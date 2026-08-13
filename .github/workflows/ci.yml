@@ -1,10 +1,19 @@
 # The checks that cost nothing but runner minutes: ruff and the offline test suite.
 #
-# This workflow must never be able to spend money. It reads no secret, sets no provider key, and
-# runs no cell, no eval, and no harness. The suite it runs holds to the same line: every test that
-# would reach a network or a paid API skips itself instead, and the skip list is printed so a
-# green run that skipped everything is visible rather than silent. If a step here ever needs a
-# credential, it does not belong in this workflow.
+# This workflow must never be able to spend money. No provider credential exists anywhere in this
+# job: it reads no secret, sets no provider key, and runs no cell, no eval, and no harness. The
+# suite it runs holds to the same line: every test that would reach a network or a paid API skips
+# itself instead, and the skip list is printed so a green run that skipped everything is visible
+# rather than silent. A step here that needs a provider credential does not belong in this
+# workflow.
+#
+# One credential is present, and it is GitHub's own: the ephemeral job token, scoped by the
+# permissions block below to reading this repository and dead when the job ends. actions/checkout
+# is handed it and fetches with it, and the runner's cache service takes its own token from the
+# same source. Neither is a spend path and neither reaches the steps that run repository code:
+# the checkout is told not to leave it in the git config, the uv setup is told to decline it, and
+# no later step is passed it. That is the true statement, and it is worth more here than the
+# rounder claim that the job touches no credential at all.
 name: ci
 
 on:
@@ -25,9 +34,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          # checkout stores its token in the local git config by default, where ruff or pytest
-          # code from a pull request could read it back out. Nothing here pushes or calls the
-          # API, so the checkout keeps no credential and the boundary stated above holds.
+          # The action fetches with the job token either way. What this changes is what happens
+          # after: by default it writes that token into the local git config and leaves it there
+          # for the rest of the job, where ruff or pytest code from a pull request could read it
+          # back out. Nothing here pushes or calls the API, so the token's work ends with the
+          # fetch and nothing that runs repository code inherits it.
           persist-credentials: false
 
       - uses: astral-sh/setup-uv@v9.0.0
