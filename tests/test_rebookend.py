@@ -2096,7 +2096,7 @@ def test_a_baseline_measured_under_another_bound_is_refused(
     launches: dict[int, dict] = {}
     _wire_fakes(monkeypatch, cell, split, launches)
 
-    with pytest.raises(RuntimeError, match="one stopping rule"):
+    with pytest.raises(RuntimeError, match="would not be scored under one stopping rule"):
         asyncio.run(
             runner.rebookend_run(
                 source_dir,
@@ -2233,7 +2233,10 @@ def test_cli_blocks_a_baseline_measured_under_another_bound(tmp_path: Path, caps
         == 0
     )
     plan = json.loads(capsys.readouterr().out)
-    assert plan["refusals"]["baseline_eval_runtime_matches"] is False
+    assert any(
+        "eval runtime eval_task_timeout_s differs" in line
+        for line in plan["refusals"]["baseline_pairing_drift"]
+    )
 
     assert (
         cli_main(
@@ -2385,7 +2388,7 @@ def test_two_unrecorded_runtimes_are_not_an_agreement(tmp_path: Path, monkeypatc
     """A pair whose stopping rule neither side recorded is unproven, not matched. Silence is
     not a value, and the check exists to know that the before rows and the after rows stopped
     by the same rule."""
-    assert runner.eval_runtimes_agree({}, {}) is False
+    assert runner.pairing_drift({}, {}) != []
 
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split, with_before=False)
@@ -2398,7 +2401,7 @@ def test_two_unrecorded_runtimes_are_not_an_agreement(tmp_path: Path, monkeypatc
     launches: dict[int, dict] = {}
     _wire_fakes(monkeypatch, cell, split, launches)
 
-    with pytest.raises(RuntimeError, match="one stopping rule"):
+    with pytest.raises(RuntimeError, match="not known to stop by one rule"):
         asyncio.run(
             runner.rebookend_run(
                 source_dir,
@@ -2410,3 +2413,164 @@ def test_two_unrecorded_runtimes_are_not_an_agreement(tmp_path: Path, monkeypatc
         )
     assert launches == {}
     assert not (tmp_path / "runs").exists()
+
+
+# ----- the pairing is an equivalence, not a name match ------------------------------------------
+#
+# A bookend's after rows are guarded against the SOURCE's definition, and its before rows come
+# from the baseline's archive. Matching the cell name proves nothing about the version of that
+# cell the baseline ran, so everything that shaped its eval_before rows is compared too.
+
+
+def _divergent_baseline(tmp_path: Path, cell, split, **changes):
+    """A baseline archive whose recorded definition differs from the source's in one way."""
+    baseline_dir = _baseline_run(tmp_path, cell, split, name=f"baseline-{len(changes)}")
+    manifest = json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8"))
+    for dotted, value in changes.items():
+        block, _, key = dotted.partition(".")
+        manifest.setdefault(block, {})[key] = value
+    runner.write_json(baseline_dir / "manifest.json", manifest)
+    return baseline_dir
+
+
+@pytest.mark.parametrize(
+    ("change", "names"),
+    [
+        ({"cell.model": "a-model-the-source-never-ran"}, "model"),
+        ({"cell.env": "wordle_v2"}, "env"),
+        ({"cell.harness": "codex"}, "harness"),
+        ({"cell.effort": "low"}, "effort"),
+        ({"cell.credential_mode": "api_key"}, "credential_mode"),
+        ({"cell.env_kwargs": {"judge_model": "a-different-judge"}}, "env_kwargs"),
+        ({"instruction.eval_system_sha256": "0" * 64}, "eval instruction"),
+    ],
+)
+def test_a_baseline_measured_by_another_definition_is_refused(
+    tmp_path: Path, monkeypatch, change, names
+) -> None:
+    """Every field the baseline's before rows were produced by. A judge, a model, an effort or
+    a blind-eval prompt that differs makes the delta a comparison of two measurements, and the
+    cell name is not evidence that two archives ran the same version of that cell."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _divergent_baseline(tmp_path, cell, split, **change)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="was not measured by the same definition"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=baseline_dir,
+                capture_egress=False,
+            )
+        )
+    assert any(names in line for line in runner.pairing_drift(
+        json.loads((source_dir / "manifest.json").read_text(encoding="utf-8")),
+        json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8")),
+    ))
+    assert launches == {}
+    assert not (tmp_path / "runs").exists()
+
+
+def test_a_baseline_that_only_rolled_out_differently_still_pairs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The fields a deferred baseline cannot have used. It runs eval_before alone, the eval
+    stream pins the blind feedback posture whatever the cell's arm says, and the eval fan-out
+    is one session per task whatever max_in_flight says. Both v0 pairs really do differ here,
+    their sources having run the immediate arm and their baselines the never arm, so comparing
+    the rollout knobs would refuse every pairing there is over what cannot reach a row."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _divergent_baseline(
+        tmp_path,
+        cell,
+        split,
+        **{
+            "cell.rollout_feedback": "immediate" if cell.rollout_feedback == "never" else "never",
+            "cell.max_in_flight": cell.max_in_flight + 7,
+        },
+    )
+    baseline_manifest = json.loads((baseline_dir / "manifest.json").read_text(encoding="utf-8"))
+    baseline_manifest["cell"]["budget"]["rollout_wall_clock_s"] = 1
+    baseline_manifest["cell"]["budget"]["pool_ceiling"] = 1
+    runner.write_json(baseline_dir / "manifest.json", baseline_manifest)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            baseline_run_dir=baseline_dir,
+            capture_egress=False,
+        )
+    )
+    assert set(launches) == {0, 1, 2}
+
+
+@pytest.mark.parametrize(
+    ("block", "key", "names"),
+    [
+        ("split", "id_digest", "split ids"),
+        ("instruction", "rollout_system_sha256", "rollout instruction"),
+        ("instruction", "eval_system_sha256", "eval instruction"),
+    ],
+)
+def test_an_unrecorded_identity_digest_refuses_a_bookend(block, key, names) -> None:
+    """A bookend gives up the whole-cell digest, so the identity digests are the only proof
+    left that the held-out ids and the prompts are the ones the source used. An absent one is
+    not agreement: it is a record that cannot say what it measured, and it fails closed the
+    way an absent eval runtime does."""
+    manifest, cell, split, instruction = _retuned_timeout_source(
+        "automationbench-prime_agent-claude-opus-5"
+    )
+    del manifest[block][key]
+
+    drift = _bookend_drift(manifest, cell, split, instruction)
+    assert drift and any(names in line for line in drift), drift
+    assert any("not recorded" in line for line in drift), drift
+    # A continuation is unaffected by the absence: the whole-cell digest is proof of its own, so
+    # a record predating one of these is not refused for lacking it. The only continuation
+    # difference this fixture has is the retuned file it hashes.
+    continuation = runner.experiment_drift(
+        manifest, cell=cell, split=split, instruction=instruction
+    )
+    assert continuation and all("cell config changed" in line for line in continuation)
+
+
+def test_every_cell_field_is_judged_for_a_pairing() -> None:
+    """The pairing's field set, written down where a new cell axis breaks it.
+
+    The excluded groups are listed in the runner and everything else is eval-defining, so a
+    field added later refuses a pairing until someone decides otherwise. The one group excluded
+    for a reason other than bookkeeping is the rollout knobs, and the reason is checkable: a
+    deferred baseline runs eval_before alone, whose stream pins the blind posture and fans out
+    one session per task whatever those say.
+    """
+    fields = set(
+        runner._flat_cell(
+            load_cell_by_name("automationbench-prime_agent-claude-opus-5").to_manifest()
+        )
+    )
+    uncompared = set(runner.PAIRING_UNCOMPARED_CELL_FIELDS)
+    assert uncompared <= fields, "an uncompared field no cell carries is a stale judgement"
+    assert fields - uncompared == {
+        "name",
+        "env",
+        "harness",
+        "model",
+        "effort",
+        "credential_mode",
+        "env_kwargs",
+        "required_env",
+    }
+    # The eval runtime is not excused, only compared under the stricter rule: both archives
+    # must state it, so silence on either side refuses where mere equality would pass.
+    for field in runner.BOOKEND_EVAL_RUNTIME_FIELDS:
+        assert f"budget.{field}" in uncompared
+    assert runner.pairing_drift({}, {}) != []

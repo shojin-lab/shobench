@@ -446,11 +446,11 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
                     )
                     == manifest.get("split", {}).get("id_digest"),
                     "baseline_has_eval_before": runner._has_eval_before(baseline_dir),
-                    # The before side's stopping rule and the after side's must be one KNOWN
-                    # rule, so the runner refuses a baseline whose recorded eval runtime
-                    # differs from the source's or is missing on either side, and the plan
-                    # says so before anything spends.
-                    "baseline_eval_runtime_matches": runner.eval_runtimes_agree(
+                    # The whole pairing verdict, from the same helper the spending path
+                    # raises on, so a dry plan cannot say something a --go will not: every
+                    # definition the baseline's carried before rows were produced by, held
+                    # against the source's. Empty is the passing shape.
+                    "baseline_pairing_drift": runner.pairing_drift(
                         manifest, baseline_manifest
                     ),
                 }
@@ -544,11 +544,6 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         ("baseline_cell_matches", "the named baseline measured a different cell"),
         ("baseline_split_matches", "the named baseline ran a different held-out split"),
         ("baseline_has_eval_before", "the named baseline has no eval_before provenance"),
-        (
-            "baseline_eval_runtime_matches",
-            "the named baseline's recorded eval runtime does not pair with the source's, so "
-            "the before and after sides would not be scored under one stopping rule",
-        ),
     ):
         value = refusals.get(state)
         if state == "baseline_is_bookend":
@@ -556,6 +551,11 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
                 blockers.append("the named baseline is itself a rebookend")
         elif value is False:
             blockers.append(why)
+    if refusals.get("baseline_pairing_drift"):
+        blockers.append(
+            "the named baseline was not measured by the same definition as the source: "
+            + "; ".join(refusals["baseline_pairing_drift"])
+        )
     if refusals["suspension_present"]:
         blockers.append("the source holds a suspension record; finish it with `shobench resume`")
     if not refusals["source_lock_present"]:

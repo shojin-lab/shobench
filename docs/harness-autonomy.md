@@ -574,10 +574,24 @@ one; the marker becomes the published string only once the two sides are known t
 refusal line says `no such field` where the record says `<absent>`. The uncompared remainder is
 the bookkeeping that never reaches a session:
 the lookup keys `split` and `instruction_arm`, whose identities are the digests, plus
-`config_path`, `note` and `config_sha256`. The pairing gets the same rule as the ids: a named
-`--baseline` is refused unless both records state the same eval runtime, because the before and
-after sides would otherwise be scored under two stopping rules, and two silences are not an
-agreement about one. None of this is absorbed silently. The
+`config_path`, `note` and `config_sha256`. The identity digests fail closed in this scope too: a bookend has given up the whole-cell
+digest, so the split's id digest and the two prompt digests are the only proof left that its eval
+measures the source's held-out ids under the source's prompts, and a record that states none of
+them is refused rather than read as agreement (a continuation keeps the old rule, its whole-cell
+digest being proof of its own). The PAIRING is held to the same standard as the run: a named
+`--baseline` is not equivalent because it answers to the same cell name, two archives of one name
+being able to sit either side of any edit to the file, so `pairing_drift` compares the two
+RECORDS across everything that shaped the before rows the bookend will carry (`name`, `env`,
+`harness`, `model`, `effort`, `credential_mode`, `env_kwargs`, `required_env`), plus three both
+sides must STATE rather than merely agree on: the split id digest, the blind-eval prompt digest,
+and the eval runtime. One group is deliberately not compared, and the reason is checkable rather
+than stylistic: `rollout_feedback`, `max_in_flight`, `rollout_wall_clock_s` and `pool_ceiling`
+shape a rollout a deferred baseline never ran, `EvalStream` pins the blind feedback posture
+whatever the cell's arm says, and the eval fan-out is one session per task whatever
+`max_in_flight` says. Both v0 pairs really do differ there, their sources having run the immediate
+arm and their baselines the never arm, so comparing the rollout knobs would refuse every pairing
+that exists over what provably cannot reach a before row. The plan and the spending path call the
+same helper, so a dry run cannot report a pairing the `--go` will refuse. None of this is absorbed silently. The
 bookend's manifest carries `rebookend.eval_runtime_from_record` (the values that bounded its
 legs), the source's recorded cell block (`rebookend.source_cell`) beside the block it ran under
 (`cell`), and `rebookend.cell_drift` naming every field the checkout's file states differently

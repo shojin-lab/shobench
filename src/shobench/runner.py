@@ -1601,6 +1601,52 @@ BOOKEND_UNCOMPARED_CELL_FIELDS = (
 # name cannot differ, since the cell is loaded by the name the record carries. It refuses rather
 # than resting on that.
 
+# The cell fields that shape the ROLLOUT and reach nothing else, which is what makes them the one
+# group a PAIRING does not compare. A deferred baseline runs eval_before alone: ``EvalStream``
+# pins the blind feedback posture whatever the cell's arm says and refuses a provenance directory
+# recorded under any other, the eval fan-out is one session per task whatever max_in_flight says,
+# and neither the rollout's wall clock nor its serving ceiling is read by an eval phase. Both v0
+# pairs really do differ here, their sources having run the immediate arm and their deferred
+# baselines the never arm, so comparing these would refuse every pairing there is over what
+# provably cannot reach a before row. The source-to-checkout comparison still refuses them, for a
+# different reason: there they would relabel the arm the bookend publishes.
+ROLLOUT_ONLY_CELL_FIELDS = (
+    "rollout_feedback",
+    "max_in_flight",
+    "budget.rollout_wall_clock_s",
+    "budget.pool_ceiling",
+)
+
+# The identity a record must STATE for a bookend or a pairing to rest on it, as (label, block,
+# key). A bookend gives up the whole-cell digest, so these are the only proof left that the
+# held-out ids and the prompts are the ones the run measured under, and a record that carries none
+# of them is a record that cannot say what it measured. Absence therefore refuses rather than
+# reading as agreement; the two versioned legacy axes are the only absences with a meaning.
+IDENTITY_DIGESTS = (
+    ("split ids", "split", "id_digest"),
+    ("rollout instruction", "instruction", "rollout_system_sha256"),
+    ("eval instruction", "instruction", "eval_system_sha256"),
+)
+
+# The identity a PAIRING requires both archives to state: the held-out ids the before rows were
+# produced over, and the blind-eval prompt they were produced under. The rollout prompt is not
+# here on purpose, a deferred baseline having run no rollout; the bookend's own resumed after side
+# carries it, and it is checked against the SOURCE where it belongs.
+PAIRING_IDENTITY = (
+    ("split ids", "split", "id_digest"),
+    ("eval instruction", "instruction", "eval_system_sha256"),
+)
+
+# What a pairing compares between the two RECORDED runs, as everything the cell block carries
+# except these. The bookend's uncompared bookkeeping is uncompared here for the same reasons; the
+# rollout-only fields for the reason above; and the eval runtime because it is compared under the
+# stricter rule below, where both sides must state it rather than merely agree.
+PAIRING_UNCOMPARED_CELL_FIELDS = (
+    *BOOKEND_UNCOMPARED_CELL_FIELDS,
+    *ROLLOUT_ONLY_CELL_FIELDS,
+    *(f"budget.{field}" for field in BOOKEND_EVAL_RUNTIME_FIELDS),
+)
+
 # How a missing field is SHOWN, in a refusal line and in the record a bookend publishes.
 CELL_FIELD_ABSENT = "<absent>"
 
@@ -1769,18 +1815,75 @@ def recorded_eval_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
     return {field: budget.get(field, CELL_FIELD_ABSENT) for field in BOOKEND_EVAL_RUNTIME_FIELDS}
 
 
-def eval_runtimes_agree(manifest: dict[str, Any], other: dict[str, Any]) -> bool:
-    """Whether two runs are KNOWN to have been measured under one eval stopping rule.
+def _recorded_value(manifest: dict[str, Any], block: str, key: str) -> Any:
+    """One recorded field, with a null read as the absence it is rather than as a value."""
+    value = (manifest.get(block) or {}).get(key)
+    return _MISSING if value is None else value
 
-    Two absences are not an agreement. A run that recorded no bound is one nobody can say what
-    bounded it, so a pair with a missing side is unproven rather than matched, and unproven is
-    what this refuses: the point of the check is that the before rows and the after rows stopped
-    by the same rule, which is a fact about records rather than about their silence.
+
+def pairing_drift(
+    source_manifest: dict[str, Any], baseline_manifest: dict[str, Any]
+) -> list[str]:
+    """What the baseline's before rows were measured by that the source's after rows are not.
+
+    A rebookend publishes ONE measurement out of two archives: the after rows it runs against the
+    source's definition, and the before rows it carries from the baseline's. The delta between
+    them is only a measurement if both sides were produced the same way, and matching the cell
+    NAME is no evidence of that: two archived runs of one cell name can predate and postdate any
+    edit to the file, so the baseline can carry a different model, a different judge, a different
+    effort, a different account or a different blind-eval prompt and still answer to the name.
+    Reproduced through the real entry: a baseline with an edited model, judge and eval prompt
+    digest was accepted and published as the pairing partner of rows it shares nothing with.
+
+    So the comparison is over the definitions the two RECORDS state, field by field, and it is
+    the same shape as the source-to-checkout one: everything refuses except what provably cannot
+    reach a before row (see ``PAIRING_UNCOMPARED_CELL_FIELDS``), plus the identity a record must
+    state rather than merely agree on: the held-out ids, the blind-eval prompt the before rows
+    were produced under, and the eval runtime that bounded them.
+
+    The ROLLOUT instruction is deliberately not compared. A deferred baseline ran no rollout, and
+    its before rows were produced under the eval prompt; the rollout prompt the bookend's own
+    resumed after side carries is checked against the source instead, where it belongs.
+
+    Returned as lines rather than a bool so the refusal can name every difference at once, and
+    shared by the plan and the spending path so a dry run cannot say something the ``--go`` will
+    not. Empty means the two archives are the same measurement seen twice.
     """
-    known = _inheritable_eval_runtime(manifest)
-    return len(known) == len(BOOKEND_EVAL_RUNTIME_FIELDS) and known == _inheritable_eval_runtime(
-        other
-    )
+    lines = [
+        f"cell {name} differs (source {_shown(was)}, baseline {_shown(now)})"
+        for name, was, now in _cell_differences(
+            source_manifest.get("cell", {}), baseline_manifest.get("cell", {})
+        )
+        if name not in PAIRING_UNCOMPARED_CELL_FIELDS
+    ]
+    for label, block, key in PAIRING_IDENTITY:
+        source_value = _recorded_value(source_manifest, block, key)
+        baseline_value = _recorded_value(baseline_manifest, block, key)
+        if source_value is _MISSING or baseline_value is _MISSING:
+            lines.append(
+                f"{label} is not recorded on both sides "
+                f"(source {_shown(source_value)}, baseline {_shown(baseline_value)}), so nothing "
+                "proves the two archives measured the same thing"
+            )
+        elif source_value != baseline_value:
+            lines.append(
+                f"{label} differs (source {source_value!r}, baseline {baseline_value!r})"
+            )
+    source_runtime = _inheritable_eval_runtime(source_manifest)
+    baseline_runtime = _inheritable_eval_runtime(baseline_manifest)
+    for bound in BOOKEND_EVAL_RUNTIME_FIELDS:
+        was, now = source_runtime.get(bound, _MISSING), baseline_runtime.get(bound, _MISSING)
+        if was is _MISSING or now is _MISSING:
+            lines.append(
+                f"eval runtime {bound} is not recorded on both sides (source {_shown(was)}, "
+                f"baseline {_shown(now)}), so the two sides are not known to stop by one rule"
+            )
+        elif was != now:
+            lines.append(
+                f"eval runtime {bound} differs (source {was!r}, baseline {now!r}): the before "
+                "side and the after side would not be scored under one stopping rule"
+            )
+    return lines
 
 
 def experiment_drift(
@@ -1817,43 +1920,51 @@ def experiment_drift(
     if scope not in DRIFT_SCOPES:
         raise ValueError(f"unknown drift scope {scope!r}; expected one of {DRIFT_SCOPES}")
     recorded_cell = manifest.get("cell", {})
-    recorded_split = manifest.get("split", {})
-    recorded_instruction = manifest.get("instruction", {})
+    now_by_label = {
+        "split ids": split.to_manifest().get("id_digest"),
+        "rollout instruction": instruction.rollout_system_sha256,
+        "eval instruction": instruction.eval_system_sha256,
+    }
     checks = [
-        ("split ids", recorded_split.get("id_digest"), split.to_manifest().get("id_digest")),
-        (
-            "rollout instruction",
-            recorded_instruction.get("rollout_system_sha256"),
-            instruction.rollout_system_sha256,
-        ),
-        (
-            "eval instruction",
-            recorded_instruction.get("eval_system_sha256"),
-            instruction.eval_system_sha256,
-        ),
+        (label, _recorded_value(manifest, block, key), now_by_label[label])
+        for label, block, key in IDENTITY_DIGESTS
     ]
     if scope == DRIFT_CONTINUATION:
+        # The whole-cell digest is this scope's proof, and it is stronger than the three below,
+        # so a record that predates one of them is not refused for lacking it: the file it
+        # hashed is the file this process reads. Absence keeps its old meaning here.
         checks.insert(
             0,
             (
                 "cell config",
-                recorded_cell.get("config_sha256"),
+                _recorded_value(manifest, "cell", "config_sha256"),
                 cell.to_manifest().get("config_sha256"),
             ),
         )
-        cell_lines: list[str] = []
-    else:
-        cell_lines = [
-            f"cell {field} changed since the run started "
-            f"(recorded {_shown(was)}, checkout {_shown(now)})"
-            for field, was, now in _cell_differences(recorded_cell, cell.to_manifest())
-            if field not in BOOKEND_UNCOMPARED_CELL_FIELDS
+        return [
+            f"{what} changed since the run started (recorded {was}, now {now})"
+            for what, was, now in checks
+            if was is not _MISSING and now is not None and was != now
         ]
-    return cell_lines + [
-        f"{what} changed since the run started (recorded {was}, now {now})"
-        for what, was, now in checks
-        if was is not None and now is not None and was != now
+    # A bookend gives up the whole-cell digest, so these three are the only proof left that its
+    # eval measures the source's held-out ids under the source's prompts. An absent one is not
+    # agreement, it is a record that cannot say what it measured, and it fails closed the way an
+    # absent eval runtime does. Every archived run states all three.
+    lines = [
+        f"cell {field} changed since the run started "
+        f"(recorded {_shown(was)}, checkout {_shown(now)})"
+        for field, was, now in _cell_differences(recorded_cell, cell.to_manifest())
+        if field not in BOOKEND_UNCOMPARED_CELL_FIELDS
     ]
+    for what, was, now in checks:
+        if was is _MISSING or now is None:
+            lines.append(
+                f"{what} is not recorded (recorded {_shown(was)}), so nothing proves this "
+                "bookend measures what the run it follows measured"
+            )
+        elif was != now:
+            lines.append(f"{what} changed since the run started (recorded {was}, now {now})")
+    return lines
 
 
 def _fresh_session_id(ctx: RunContext) -> str | None:
@@ -3215,19 +3326,19 @@ async def rebookend_run(
                 f"the baseline {baseline_dir} has no eval_before provenance of its own, so "
                 "it holds no before rows to pair with."
             )
-        # The stopping rule, checked as strictly as the held-out ids and for the same reason.
-        # The bookend runs under the SOURCE's recorded eval runtime, so a baseline measured
-        # under a different one would put the pair's two sides under two rules: a task that
-        # seals between the two bounds is scoreable on one side and force-stopped on the other,
-        # and the delta would be an artifact of the bounds. Refused rather than reconciled,
-        # because nothing here can say which rule the pair should have had.
-        if not eval_runtimes_agree(source_manifest, baseline_manifest):
+        # The definition, compared as strictly as the held-out ids and for the same reason. The
+        # bookend runs its after side against the SOURCE's definition and carries this run's
+        # before rows, so anything that shaped those rows differently makes the published delta
+        # a comparison of two measurements: a different model or judge, a different blind-eval
+        # prompt, a different stopping rule. The cell NAME proves none of that, two archives of
+        # one name being able to sit either side of any edit to the file. Refused rather than
+        # reconciled, since nothing here can say which definition the pair should have had.
+        pairing = pairing_drift(source_manifest, baseline_manifest)
+        if pairing:
             raise RuntimeError(
-                f"the baseline {baseline_dir} recorded eval runtime "
-                f"{recorded_eval_runtime(baseline_manifest)} and the source recorded "
-                f"{recorded_eval_runtime(source_manifest)}: the before side and the after side "
-                "would not be scored under one stopping rule, so the paired delta would measure "
-                "the bounds as much as the agent."
+                f"the baseline {baseline_dir} was not measured by the same definition as the "
+                f"source: {'; '.join(pairing)}. Name a baseline of this definition, or measure "
+                "one."
             )
         baseline_run_id = str(baseline_manifest.get("run_id", ""))
         baseline_dir_resolved = baseline_dir
