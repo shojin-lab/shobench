@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -405,14 +406,24 @@ def write_results(
     # planted at the leaf name into a write through the results directory into wherever it
     # pointed (an archived source run, in review); ``os.replace`` swaps the directory entry
     # itself and follows nothing. Owned here rather than by each caller, so every publisher
-    # (a fresh cell, a resume, a rerun, a rebookend) inherits the same guarantee. The scratch
-    # name is unlinked first and opened exclusively for the same reason the swap exists: no
-    # step of publication may write through a pre-existing entry.
-    scratch = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    scratch.unlink(missing_ok=True)
-    with scratch.open("x", encoding="utf-8") as handle:
-        handle.write(json.dumps(body, indent=2) + "\n")
-    os.replace(scratch, path)
+    # (a fresh cell, a resume, a rerun, a rebookend) inherits the same guarantee.
+    #
+    # The scratch entry is per CALL, minted exclusively by mkstemp, in the same directory so
+    # the swap can never cross devices. A per-process name was not enough: two publishers in
+    # one process shared it, and the pre-unlink one needed to reuse the name let publisher B
+    # unlink A's scratch mid-write, so A swapped B's half-written inode into the leaf and
+    # reported success (reproduced). Exclusive creation of a fresh name has no such window,
+    # and the ``finally`` keeps a failed publication from leaving the scratch behind.
+    scratch_fd, scratch_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    scratch = Path(scratch_name)
+    try:
+        with os.fdopen(scratch_fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(body, indent=2) + "\n")
+        os.replace(scratch, path)
+    finally:
+        scratch.unlink(missing_ok=True)
     # A results directory holds one artifact per cell, and a rerun already replaces what the
     # last run wrote. Leaving the other name in place would leave two files describing one cell
     # from two runs, which is how a reader ends up reporting the one that reads better.

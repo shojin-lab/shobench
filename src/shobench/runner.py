@@ -2334,7 +2334,9 @@ def _materialize_home(
     - a special file (FIFO, socket) fails loudly, as the copy always did.
     """
     root = root if root is not None else source.resolve()
-    active = active if active is not None else {root}
+    root_stat = os.stat(root)
+    if active is None:
+        active = {(root_stat.st_dev, root_stat.st_ino)}
     destination.mkdir(parents=True, exist_ok=True)
     for entry in sorted(source.iterdir()):
         target_path = destination / entry.name
@@ -2345,21 +2347,23 @@ def _materialize_home(
                 continue
             except OSError as exc:
                 raise RuntimeError(f"cannot materialize the symlink {entry}: {exc}") from exc
-            if not (resolved == root or resolved.is_relative_to(root)):
+            if not _same_or_under(resolved, root_stat):
                 raise RuntimeError(
                     f"the symlink {entry} resolves outside the source home ({resolved}); a "
                     "snapshot that imported those bytes would not be of the source. Remove "
                     "the link from the archive copy, or bookend a source without it."
                 )
             if resolved.is_dir():
-                if resolved in active:
+                resolved_stat = os.stat(resolved)
+                key = (resolved_stat.st_dev, resolved_stat.st_ino)
+                if key in active:
                     raise RuntimeError(
                         f"the symlink {entry} cycles into a directory already being "
                         f"materialized ({resolved})"
                     )
-                active.add(resolved)
+                active.add(key)
                 _materialize_home(resolved, target_path, root=root, active=active)
-                active.discard(resolved)
+                active.discard(key)
             elif resolved.is_file():
                 shutil.copy2(resolved, target_path)
             else:
@@ -2376,6 +2380,32 @@ def _materialize_home(
                 f"{entry} is neither a file, a directory, nor a symlink; a special file "
                 "cannot be part of the snapshot"
             )
+    # The directory's own metadata, applied after its contents so the content writes cannot
+    # re-stamp it. mkdir alone left every directory with the process defaults, which widened
+    # the real homes' 0700 directories (session leases and daemon caches among them) to 0755:
+    # a loosened mode is not the snapshot, and a resumed CLI can behave differently over it.
+    # Every directory passes through here, ordinary ones and materialized link targets alike,
+    # because both recurse through this function.
+    shutil.copystat(source, destination)
+
+
+def _same_or_under(resolved: Path, root_stat: os.stat_result) -> bool:
+    """Is this resolved path the source home or inside it, by filesystem identity?
+
+    Identity, not spelling: on a case-insensitive volume one directory answers to many
+    spellings, ``realpath`` keeps whichever spelling the link used, and a lexical prefix test
+    refused valid in-home links over casing alone (observed on APFS). The test that cannot be
+    fooled by spelling is ``samestat`` against the root's device and inode, walked up the
+    resolved target's ancestry.
+    """
+    for candidate in (resolved, *resolved.parents):
+        try:
+            candidate_stat = os.stat(candidate)
+        except OSError:
+            continue
+        if os.path.samestat(candidate_stat, root_stat):
+            return True
+    return False
 
 
 def _refuse_live_source(source_run_dir: Path) -> None:
@@ -2383,27 +2413,50 @@ def _refuse_live_source(source_run_dir: Path) -> None:
 
     A source can hold a settled-looking terminus while its own eval_after or a later rerun
     still owns the directory, and a snapshot taken under a live writer is not an archived
-    state. The probe is a non-mutating flock attempt on the EXISTING lock file: opened
-    read-only, never created, tried non-blocking, and released the moment it answers. A
-    missing lock file means no owner was ever possible, and an acquired lock means every
-    prior owner is gone, since any hard ending releases it in the kernel.
+    state. The probe is a moment of :func:`_holding_source_still`: acquired and released the
+    instant it answers, for the fast refusal before anything is created; the snapshot itself
+    is taken under the held form.
+    """
+    with _holding_source_still(source_run_dir):
+        pass
+
+
+@contextlib.contextmanager
+def _holding_source_still(source_run_dir: Path):
+    """Hold the source still for the body of the block, without ever mutating the source.
+
+    A SHARED flock on the source's EXISTING lock file, opened read-only and never created.
+    Shared is exactly sufficient: every mutating owner (a run, a resume, a rerun) takes the
+    lock EXCLUSIVE through ``_acquire_run_lock``, so a held shared lock refuses acquisition
+    to any would-be mutator for as long as the block runs, a live mutator refuses THIS
+    acquisition, and concurrent rebookends of one source, which only read, can hold it
+    together. Releasing on the way out is what lets the archive be mutated again the moment
+    the snapshot no longer depends on it; the probe form releases immediately, and the
+    snapshot form holds across the whole materialization, because a lock released after a
+    probe left the copy racing any mutator that acquired in between (a concurrent rerun's
+    mid-copy write landed in the published snapshot, in review).
+
+    A missing lock file yields without holding: no owner ever wrote one, which is true only
+    of pre-lock-era archives and fixtures, and creating it here would itself write into the
+    source.
     """
     import fcntl
 
     lock_path = source_run_dir / RUN_LOCK_FILE
     if not lock_path.is_file():
+        yield
         return
     fd = os.open(lock_path, os.O_RDONLY)
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError:
             raise RuntimeError(
                 f"{source_run_dir} is owned by a live process, so its state is still moving: "
                 "a snapshot taken now would not be the archived run. Wait for it to finish, "
                 "or stop it first."
             ) from None
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        yield
     finally:
         os.close(fd)
 
@@ -2583,11 +2636,27 @@ async def _rebookend_owned(
     source_home = source_run_dir / "home"
     if not source_home.is_dir():
         raise RuntimeError(f"{source_run_dir} has no home directory to bookend.")
-    _materialize_home(source_home, sandbox.home)
-    shutil.copy2(source_run_dir / ROLLOUT_STOPPING_FILE, run_dir / ROLLOUT_STOPPING_FILE)
-    source_stopping = json.loads(
-        (source_run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
-    )
+    # Held STILL for the whole snapshot, not merely probed: a probe released before the copy
+    # left the copy racing any mutator that acquired in between, and a concurrent rerun's
+    # mid-copy write landed in the published snapshot. The shared hold refuses a live owner
+    # and blocks a would-be one until the copy is whole, and it is released here, before any
+    # spend, so the archive is never held during the eval itself.
+    with _holding_source_still(source_run_dir):
+        # The definition this run was planned from must still be the definition on disk: a
+        # mutator that ran between the earlier read and this hold rewrote the archive, and a
+        # snapshot of the new bytes under the old cell would be two runs wearing one name.
+        if json.loads((source_run_dir / "manifest.json").read_text(encoding="utf-8")) != (
+            source_manifest
+        ):
+            raise RuntimeError(
+                f"{source_run_dir}'s manifest changed between the plan and the snapshot; "
+                "the source was mutated. Re-run the rebookend against the settled archive."
+            )
+        _materialize_home(source_home, sandbox.home)
+        shutil.copy2(source_run_dir / ROLLOUT_STOPPING_FILE, run_dir / ROLLOUT_STOPPING_FILE)
+        source_stopping = json.loads(
+            (source_run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
+        )
 
     sandbox.up()
     spec = spec_for(cell.harness, cell.credential_mode)

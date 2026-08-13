@@ -8,6 +8,7 @@ interval is computed over, and how a leg's ending is classified.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -1447,6 +1448,66 @@ def test_publication_replaces_a_planted_leaf_and_never_writes_through_it(
     assert not path.is_symlink()
     assert elsewhere.read_text() == "UNTOUCHED"
     assert json.loads(path.read_text(encoding="utf-8"))["schema"] == "shobench.results/1"
+
+
+def test_concurrent_publications_of_one_leaf_each_land_whole(tmp_path: Path) -> None:
+    """Two publishers of one leaf must never braid: a per-process scratch name let publisher
+    B unlink A's scratch mid-write, so A swapped B's half-written inode into the leaf and
+    reported success (reproduced). Each publication now mints its own exclusive scratch, so
+    whatever the interleaving, the final artifact is one publisher's WHOLE body and no
+    scratch survives."""
+    import threading
+
+    results = tmp_path / "results"
+    results.mkdir()
+    errors: list[str] = []
+
+    def publish(marker: str) -> None:
+        try:
+            write_results(
+                results / "cell.json",
+                manifest={"cell": {"name": marker}},
+                phases={"eval_before": [], "eval_after": [], "rollout": []},
+                stopping={},
+                heldout_ids=(),
+            )
+        except Exception as exc:  # noqa: BLE001 - the failure mode IS the assertion
+            errors.append(f"{marker}: {type(exc).__name__}")
+
+    for _ in range(40):
+        a = threading.Thread(target=publish, args=("AAA",))
+        b = threading.Thread(target=publish, args=("BBB",))
+        a.start()
+        b.start()
+        a.join()
+        b.join()
+        published = json.loads((results / "cell.json").read_text(encoding="utf-8"))
+        assert published["manifest"]["cell"]["name"] in ("AAA", "BBB")
+        assert published["schema"] == "shobench.results/1"
+    assert errors == []
+    assert list(results.glob(".*tmp")) == []
+
+
+def test_a_failed_publication_leaves_no_scratch_behind(tmp_path: Path, monkeypatch) -> None:
+    """A publication that dies mid-flight must not leave its scratch entry in the results
+    directory: an orphan there is a file a reader can find and believe."""
+
+    def refuse_replace(src: object, dst: object) -> None:
+        raise OSError("simulated failure at the swap")
+
+    monkeypatch.setattr(os, "replace", refuse_replace)
+    results = tmp_path / "results"
+    results.mkdir()
+
+    with pytest.raises(OSError, match="simulated failure"):
+        write_results(
+            results / "cell.json",
+            manifest={},
+            phases={"eval_before": [], "eval_after": [], "rollout": []},
+            stopping={},
+            heldout_ids=(),
+        )
+    assert list(results.iterdir()) == []
 
 
 def test_a_cell_leaves_one_results_file_whichever_way_its_run_ended(tmp_path: Path) -> None:

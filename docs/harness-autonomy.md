@@ -476,9 +476,14 @@ NEW run (fresh unique id, its own lock) that copies the source's accumulated hom
 the source's recorded axes with `eval_context` forced to resumed, and runs exactly the
 resumed eval_after against the source's terminal session, resolved from the source's own
 stopping record and validated by the same preflight inside the copied home. The source run
-is read and never written or locked: it is an archived artifact, and the new run names it in
-a `rebookend` provenance block and publishes under the incomplete name, since a run with no
+is read and never written: it is an archived artifact, and the new run names it in a
+`rebookend` provenance block and publishes under the incomplete name, since a run with no
 eval_before cannot account for the before side; pairing with the source happens post-hoc.
+The source's existing lock file, when it has one, is held SHARED for exactly the duration of
+the snapshot: shared refuses a live mutator and blocks a would-be one (every mutating owner
+takes the lock exclusive) without writing a byte, and it is released before any spend, with
+the source manifest re-read under the hold so a mutation that ran whole between the plan
+read and the hold refuses rather than snapshotting new bytes under the old definition.
 The snapshot is MATERIALIZED, transcripts included: every symlink becomes the bytes it
 names, resolved from the link's own parent (a valid relative link, the shape of every link in
 the real prime homes, materializes wherever the process happens to run; the stdlib copy read
@@ -490,8 +495,8 @@ source home, a cycle, or a special file refuses loudly. Publication is atomic ev
 refuses up front any output directory, result leaf, or new run path that resolves into the
 source, so a link planted at a deterministic name is refused or replaced, never followed.
 Refused before anything is copied or spent: a source without a terminus, without a
-resolvable terminal session, holding a suspension record, or still owned by a live process
-(the source lock is probed non-mutatingly), and any output path at or under the source. A
+resolvable terminal session, holding a suspension record, or still owned by a live process,
+and any output path, result leaf, or new run path at or under the source. A
 bookend that a usage limit suspends resumes through the ordinary machinery and publishes the
 same shape an uninterrupted bookend does: its copied stopping record serves the preflight
 only and is never republished as the new run's rollout. The terminus is taken exactly where

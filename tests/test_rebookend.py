@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -681,6 +682,153 @@ def test_a_suspended_bookend_resumes_with_nothing_recorded(tmp_path: Path, monke
     assert captured["recorded_phases"] == ()
 
 
+def test_the_source_is_held_still_for_the_whole_snapshot(tmp_path: Path, monkeypatch) -> None:
+    """A probe released before the copy left the copy racing any mutator that acquired in
+    between (a concurrent rerun's write landed in the published snapshot, in review). The
+    shared hold spans the materialization: a would-be exclusive owner is refused for as long
+    as the copy runs, which is asserted from inside the copy itself."""
+    import fcntl
+
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    (source_dir / runner.RUN_LOCK_FILE).write_text("{}", encoding="utf-8")
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    real_materialize = runner._materialize_home
+    held: dict[str, bool] = {}
+
+    def probing_materialize(source, destination, **kw):
+        fd = os.open(source_dir / runner.RUN_LOCK_FILE, os.O_RDONLY)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held["exclusive_acquirable_mid_copy"] = True
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                held["exclusive_acquirable_mid_copy"] = False
+        finally:
+            os.close(fd)
+        return real_materialize(source, destination, **kw)
+
+    monkeypatch.setattr(runner, "_materialize_home", probing_materialize)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    # A mutator's exclusive acquisition failed WHILE the snapshot was being taken, and the
+    # bookend itself completed: the hold is shared, so the reader held it and the writer
+    # could not.
+    assert held == {"exclusive_acquirable_mid_copy": False}
+    assert set(launches) == {0, 1, 2}
+
+
+def test_a_source_mutated_between_read_and_snapshot_refuses(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The window between the manifest read and the hold: a mutator that ran whole inside it
+    leaves no live lock to refuse, so the manifest is re-read under the hold and any drift
+    refuses rather than snapshotting new bytes under the old definition."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    real_acquire = runner._acquire_run_lock
+
+    def mutating_acquire(run_dir: Path) -> int:
+        manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+        manifest["mutated_after_the_read"] = True
+        runner.write_json(source_dir / "manifest.json", manifest)
+        return real_acquire(run_dir)
+
+    monkeypatch.setattr(runner, "_acquire_run_lock", mutating_acquire)
+
+    with pytest.raises(RuntimeError, match="manifest changed"):
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+            )
+        )
+    assert launches == {}
+
+
+def test_the_snapshot_keeps_directory_modes(tmp_path: Path, monkeypatch) -> None:
+    """mkdir alone stamped every directory with the process defaults, which widened the real
+    homes' 0700 directories (session leases, daemon caches) to 0755: a loosened mode is not
+    the snapshot. Directory metadata is copied after contents, for ordinary directories and
+    materialized link targets alike."""
+    import stat as stat_module
+
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    home = source_dir / "home"
+    locked = home / "locked"
+    locked.mkdir()
+    (locked / "secret.txt").write_text("s", encoding="utf-8")
+    os.chmod(locked, 0o700)
+    real = home / "real-target"
+    real.mkdir()
+    (real / "payload").write_text("p", encoding="utf-8")
+    os.chmod(real, 0o700)
+    (home / "dir-link").symlink_to("real-target")
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    new_home = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir()) / "home"
+    for rel in ("locked", "real-target", "dir-link"):
+        mode = stat_module.S_IMODE((new_home / rel).stat().st_mode)
+        assert mode == 0o700, (rel, oct(mode))
+
+
+def test_a_case_variant_in_home_link_materializes(tmp_path: Path, monkeypatch) -> None:
+    """On a case-insensitive volume one directory answers to many spellings, and a lexical
+    prefix test refused a valid in-home link whose target spelled the home differently. The
+    boundary is filesystem identity now, so the spelling is irrelevant."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    home = source_dir / "home"
+    (home / "real").mkdir()
+    (home / "real" / "payload").write_text("payload bytes", encoding="utf-8")
+    variant = Path(str(home).replace("source-run", "SOURCE-RUN")) / "real" / "payload"
+    if not variant.exists():
+        pytest.skip("filesystem is case-sensitive; the casing trap cannot exist here")
+    (home / "case-link").symlink_to(variant)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    new_home = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir()) / "home"
+    assert (new_home / "case-link").read_text() == "payload bytes"
+    assert not (new_home / "case-link").is_symlink()
+
+
 def _real_cell_source(tmp_path: Path) -> Path:
     """A source built from the committed smoke cell, so the CLI's checkout loaders and drift
     check run for real."""
@@ -755,4 +903,38 @@ def test_cli_rebookend_reports_and_blocks_on_a_refusal_state(tmp_path: Path, cap
     assert cli_main(["rebookend", "--run", str(source_dir), "--go"]) == 1
     err = capsys.readouterr().err
     assert "BLOCKED" in err and "Nothing was spent" in err
+    assert not (tmp_path / "runs").exists()
+
+
+def test_cli_rebookend_plan_surfaces_a_planted_result_leaf(tmp_path: Path, capsys) -> None:
+    """The plan never says ready when --go would refuse: a leaf link into the source is a
+    refusal state the plan lists, and the same state blocks a --go before the runner entry."""
+    from shobench.cli import main as cli_main
+    from shobench.config import load_cell_by_name as load_cell
+
+    source_dir = _real_cell_source(tmp_path)
+    cell = load_cell("smoke-automationbench-claude-code")
+    archived = source_dir / "archive-byte"
+    archived.write_text("ARCHIVED BYTES", encoding="utf-8")
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / f"{cell.name}.incomplete.json").symlink_to(archived)
+
+    assert (
+        cli_main(["rebookend", "--run", str(source_dir), "--results", str(results)]) == 0
+    )
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["refusals"]["result_leaves_inside_source"] == [
+        str(results / f"{cell.name}.incomplete.json")
+    ]
+
+    assert (
+        cli_main(
+            ["rebookend", "--run", str(source_dir), "--results", str(results), "--go"]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "result leaves" in err
+    assert archived.read_text() == "ARCHIVED BYTES"
     assert not (tmp_path / "runs").exists()

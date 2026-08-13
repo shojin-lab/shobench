@@ -29,6 +29,7 @@ from shobench.config import load_all_cells, load_cell_by_name, load_instruction,
 from shobench.containers import AGENT_IMAGE, NETNS_IMAGE, CellSandbox, build_image, daemon_available
 from shobench.egress import EGRESS_IMAGE
 from shobench.pins import SHOGYM_REV
+from shobench.results import INCOMPLETE_SUFFIX
 from shobench.runner import SUSPENSION_FILE, resume_cell, run_cell
 from shobench.serving import DEFAULT_PORT
 from shobench.splits import load_split_by_name
@@ -394,6 +395,18 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         for out in (Path(args.runs), Path(args.results))
         if out.resolve() == source_resolved or out.resolve().is_relative_to(source_resolved)
     ]
+    # The concrete leaves too, exactly as the runner refuses them: a link planted at either
+    # deterministic result name aims publication at the archive, and a plan that said ready
+    # while --go would refuse is a plan that lied.
+    result_leaves_inside_source = [
+        str(leaf)
+        for leaf in (
+            Path(args.results) / f"{cell.name}.json",
+            Path(args.results) / f"{cell.name}{INCOMPLETE_SUFFIX}",
+        )
+        if leaf.resolve() == source_resolved
+        or leaf.resolve().is_relative_to(source_resolved)
+    ]
     try:
         runner._refuse_live_source(source_resolved)
         source_live = False
@@ -403,6 +416,7 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         "suspension_present": (source_dir / SUSPENSION_FILE).is_file(),
         "source_live": source_live,
         "outputs_inside_source": outputs_inside_source,
+        "result_leaves_inside_source": result_leaves_inside_source,
         "rollout_terminus_present": source_stopping_path.is_file(),
         "terminal_session_resolvable": terminal_session is not None,
         "experiment_drift": drift,
@@ -449,6 +463,11 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     if outputs_inside_source:
         blockers.append(
             f"outputs {outputs_inside_source} are inside the source run directory"
+        )
+    if result_leaves_inside_source:
+        blockers.append(
+            f"result leaves {result_leaves_inside_source} resolve into the source run "
+            "directory"
         )
     if not refusals["rollout_terminus_present"]:
         blockers.append("the source has no rollout terminus, so there is nothing to resume from")
