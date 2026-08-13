@@ -51,6 +51,27 @@ TOKEN = "sk-ant-oat01-TESTONLYbutlongenoughtolookreal-0123456789"
 _SMOKE_CELL = "smoke-automationbench-claude-code"
 
 
+class _FinishedProcess:
+    """What the leg supervisor needs of a process that has already done everything it will do.
+
+    The stand-ins below write their whole trace while ``Popen`` is being called, so by the time
+    the supervisor waits there is nothing left to run and ``wait`` answers at once with the exit
+    status the real docker client would have carried. ``kill`` is a failed assertion rather than
+    a no-op: a supervisor reaching for it here would be ending a leg that had already ended.
+    """
+
+    def __init__(self, argv: list[str], returncode: int) -> None:
+        self.args = argv
+        self.returncode = returncode
+        self.stdin = None
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        raise AssertionError("the supervisor killed a leg that had already exited")
+
+
 def _context(tmp_path: Path, *, redactor: Redactor) -> RunContext:
     cell = load_cell_by_name(_SMOKE_CELL)
     run_dir = tmp_path / "runs" / "run-1"
@@ -78,9 +99,7 @@ def _agent_that_dumps_its_environment(monkeypatch) -> None:
     redaction, the classification, the trace reads, the leg record) runs for real against bytes a
     harness actually produces.
     """
-    import subprocess as real_subprocess
-
-    def fake_run(argv, **kwargs):
+    def fake_popen(argv, **kwargs):
         out = kwargs["stdout"]
         err = kwargs["stderr"]
         # An assistant turn in which the agent ran `env` and the tool result came back with the
@@ -113,9 +132,9 @@ def _agent_that_dumps_its_environment(monkeypatch) -> None:
         err.write(f"warning: could not reach telemetry with token {TOKEN}\n")
         out.flush()
         err.flush()
-        return real_subprocess.CompletedProcess(argv, 0)
+        return _FinishedProcess(argv, 0)
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
 
 
 def _run_one_leg(ctx: RunContext) -> runner.LegRecord:
@@ -350,9 +369,7 @@ def _agent_that_refreshes_its_token(monkeypatch, home: Path) -> None:
     The two halves are the whole failure. The value is minted after the cell built its redactor,
     and it reaches the trace the ordinary way, through an agent reading its own configuration.
     """
-    import subprocess as real_subprocess
-
-    def fake_run(argv, **kwargs):
+    def fake_popen(argv, **kwargs):
         credentials = home / ".claude" / ".credentials.json"
         credentials.parent.mkdir(parents=True, exist_ok=True)
         credentials.write_text(_claude_credentials(_REFRESHED), encoding="utf-8")
@@ -383,9 +400,9 @@ def _agent_that_refreshes_its_token(monkeypatch, home: Path) -> None:
         err.write(f"warning: refreshed the session token to {_REFRESHED}\n")
         out.flush()
         err.flush()
-        return real_subprocess.CompletedProcess(argv, 0)
+        return _FinishedProcess(argv, 0)
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
 
 
 def test_a_token_minted_during_the_leg_is_redacted_like_the_one_the_cell_provisioned(
@@ -529,9 +546,7 @@ def _agent_that_overwrites_the_token_it_printed(
     whether the runner gets a chance to observe that generation at all. Without it the two writes
     are microseconds apart, which is the case no poller can be relied on to catch.
     """
-    import subprocess as real_subprocess
-
-    def fake_run(argv, **kwargs):
+    def fake_popen(argv, **kwargs):
         credentials = home / ".claude" / ".credentials.json"
         credentials.parent.mkdir(parents=True, exist_ok=True)
         credentials.write_text(_claude_credentials(_INTERMEDIATE), encoding="utf-8")
@@ -567,9 +582,9 @@ def _agent_that_overwrites_the_token_it_printed(
         err.write(f"[debug] refreshed session credentials to {_REFRESHED}\n")
         out.flush()
         err.flush()
-        return real_subprocess.CompletedProcess(argv, 1)
+        return _FinishedProcess(argv, 1)
 
-    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
 
 
 def test_a_token_the_harness_replaced_mid_leg_reaches_no_published_artifact(

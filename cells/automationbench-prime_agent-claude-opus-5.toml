@@ -32,4 +32,8 @@ rollout_wall_clock_s = 28800
 # The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
 # Capped at 200 for automationbench to keep a rollout inside a practical wall clock.
 pool_ceiling = 200
-eval_task_timeout_s = 1800
+# The backstop behind the drain watchdog, not the ordinary ending. A prime_agent leg has no
+# terminal condition of its own (autonomous with no quality gate), so the watchdog ends it a
+# couple of minutes after its held-out task seals and this is what catches a leg the watchdog
+# could not reach. It leaves the measurement alone: pooled time-to-terminal p99 was 665s.
+eval_task_timeout_s = 900

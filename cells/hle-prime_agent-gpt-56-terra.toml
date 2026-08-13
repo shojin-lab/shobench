@@ -31,6 +31,10 @@ note = "Answers are public. v0 observes leakage rather than gating it, so this i
 rollout_wall_clock_s = 28800
 # The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
 pool_ceiling = 300
+# The backstop behind the drain watchdog, not the ordinary ending. A prime_agent leg has no
+# terminal condition of its own (autonomous with no quality gate), so the watchdog ends it a
+# couple of minutes after its held-out task seals and this is what catches a leg the watchdog
+# could not reach. It leaves the measurement alone: pooled time-to-terminal p99 was 665s.
 eval_task_timeout_s = 900
 
 [env_kwargs]

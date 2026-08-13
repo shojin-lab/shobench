@@ -105,6 +105,15 @@ class PrimeAgent(Harness):
     the scope forbids. The runner raises all of them and reads a limit that was still reached
     as a cutoff.
 
+    Raising every budget has a consequence the flags do not show, and it is a finding rather than
+    a setting. Autonomy's continuation check consults the quality gates it was given, and this
+    launch passes none, so at 0.7.1 the check has nothing to evaluate and answers "keep going"
+    unconditionally: with the four budgets raised out of reach, a prime leg has no terminal
+    condition of its own. On the rollout that is exactly right, and is the thing being measured.
+    On an eval task it is pure waste, since the held-out row seals at the task's completion call
+    and everything after it is a session talking to itself, so the runner ends a drained eval leg
+    and records that ending as its own kind (see ``shobench.runner`` and ``StopKind.DRAINED``).
+
     Value-taking autonomous flags take a separate argument; ``--flag=value`` is rejected.
     stdin is closed, because print mode reads piped stdin and merges it into the prompt.
     """
@@ -181,6 +190,15 @@ class PrimeAgent(Harness):
             )
         return provider
 
+    def credential_provider(self, model: str) -> str:
+        # The same resolution `launch` passes as --provider, so the credential preflight judges
+        # the entry 0.7.1 looks up and no other. Verified in the pinned bundle: the credential
+        # store reads `currentData[providerId]` and ignores every sibling entry, so a HOME
+        # carrying a live openai-codex login beside a long-expired anthropic one runs perfectly
+        # for a gpt cell, and refusing it over the anthropic entry would be refusing a credential
+        # no leg of that cell ever presents.
+        return self.provider_for(model)
+
     # prime-agent's MCP client resolves a bearer token before every connection and refuses to
     # open a session without one, even against a server that ignores it. The value is a
     # formality; its absence is a silent no-tools run.
@@ -192,8 +210,25 @@ class PrimeAgent(Harness):
     # anything the agent chose to keep.
     runner_owned_home_files = (".prime/agent/settings.json",)
 
+    # The long prompt cache, which prime-agent asks for only when told to. Verified in the pinned
+    # 0.7.1 bundle inside the agent image: `resolveCacheRetention` takes an explicit option, then
+    # `PI_CACHE_RETENTION === "long"`, and otherwise returns "short"; "long" is what makes
+    # `getCacheControl` attach a 1h ttl on the anthropic path (24h on the openai-responses one)
+    # where the model supports it, and nothing in the CLI ever passes the option itself.
+    #
+    # What it buys is cross-harness parity in cost, not behavior. Claude Code already runs with 1h
+    # retention, so a prime cell measured against it was paying to rewrite a cache every five
+    # minutes for the same conversation: an asymmetry between two cells of the same matrix with no
+    # scientific content, since a cache hit and a cache miss return the same tokens. It changes
+    # nothing the agent sees, decides, or can act on.
+    CACHE_RETENTION_VAR = "PI_CACHE_RETENTION"
+
     def base_env(self) -> dict[str, str]:
-        return {**super().base_env(), self.MCP_TOKEN_VAR: "local"}
+        return {
+            **super().base_env(),
+            self.MCP_TOKEN_VAR: "local",
+            self.CACHE_RETENTION_VAR: "long",
+        }
 
     def home_seed_files(self) -> dict[str, str]:
         return shogym_stream_skill_files()

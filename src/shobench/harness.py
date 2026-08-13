@@ -43,6 +43,12 @@ class StopKind(StrEnum):
     USAGE_LIMIT = "usage_limit"
     # The runner ended the leg because the leg budget elapsed.
     LEG_TIMEOUT = "leg_timeout"
+    # The runner ended an eval leg that had nothing left to do: its held-out task was sealed and
+    # its stream was drained, and the harness kept running anyway. Its own kind because the fact
+    # it records is a result about the harness, not an accident of the budget. The value is not
+    # the bare word `drained`, which shogym already uses for a row a stream close cut off in
+    # flight; these are different events and a reader joining the two records must not merge them.
+    DRAINED = "stream_drained"
     # The harness failed for a reason that is neither of the above.
     ERROR = "error"
     # No rule matched. Treated as an error, reported as itself.
@@ -148,6 +154,20 @@ class Harness:
         read as something the rollout had written.
         """
         return {}
+
+    def credential_provider(self, model: str) -> str:
+        """Which entry of a multi-provider credential file a cell running ``model`` will present.
+
+        Empty for a harness whose credential file holds one login and names no providers, which
+        is every harness here but prime-agent: there is nothing to select, so nothing to say.
+
+        It matters wherever the file can hold several, because those files accumulate. prime's
+        auth.json keeps an entry for every provider ever logged in, while a leg looks one of them
+        up by id, so a check that judged all of them would refuse a cell over a credential the
+        cell never reaches for. Declared on the harness rather than derived by a caller so the
+        answer comes from the same place the launch flag does.
+        """
+        return ""
 
     def base_env(self) -> dict[str, str]:
         """Environment every invocation of this harness needs, credentials excluded.
@@ -263,6 +283,27 @@ class Harness:
         happens to hold. Every ``classify`` returns this first when ``timed_out`` is set.
         """
         return StopVerdict(StopKind.LEG_TIMEOUT, "the runner ended the leg at its budget")
+
+    def drained_verdict(self, *, grace_s: float) -> StopVerdict:
+        """The verdict for an eval leg the runner ended after its work was already finished.
+
+        Identical for every harness, and never overridden, for the same reason the timeout
+        verdict is: the decision was the runner's. What it records is that the held-out task was
+        sealed, the stream had nothing remaining and nothing in flight, and the harness was still
+        running ``grace_s`` later.
+
+        It is a third kind rather than either of the two it sits between, and both exclusions
+        matter. It is not a chosen stop, because the agent chose nothing here. It is not a leg
+        timeout, because the leg did not exhaust its budget and calling it one would hide the
+        finding inside a number the operator picked. The finding is that a harness launched
+        autonomously with no quality gate has no terminal condition of its own, and it stays
+        legible in the record exactly because this kind is its own.
+        """
+        return StopVerdict(
+            StopKind.DRAINED,
+            "the task was sealed and the stream drained; the runner ended a leg that did not end",
+            {"grace_s": grace_s},
+        )
 
     def _match_usage_limit(self, texts: dict[str, str]) -> StopVerdict | None:
         for rule in self.usage_limit_rules:
