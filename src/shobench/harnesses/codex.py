@@ -100,9 +100,14 @@ class Codex(Harness):
         ``originator``, and ``cli_version``, because dropping any of them is refused as
         "failed to read session metadata" and an empty file as "rollout ... is empty". No
         items after the meta are required; a meta-only rollout resumed to the transport
-        boundary. Requiring the payload id to equal the thread id also rejects a rollout
-        recorded for some other thread, and the exact filename suffix keeps a longer id that
-        merely contains this one from standing in.
+        boundary. Presence is also the whole of it: the VALUES of those fields are not
+        domain-checked at 0.147.0. A bogus originator, a bogus cli_version, a non-date
+        payload or envelope timestamp, and a relative cwd each resumed to the transport
+        boundary (all observed), so this predicate constrains none of them; requiring more
+        than the CLI does would refuse files the CLI accepts and prove nothing. Requiring the
+        payload id to equal the thread id still rejects a rollout recorded for some other
+        thread, and the exact filename suffix keeps a longer id that merely contains this one
+        from standing in.
         """
         root = home / ".codex" / "sessions"
         if not root.is_dir():

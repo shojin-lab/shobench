@@ -207,16 +207,27 @@ class PrimeAgent(Harness):
         header = _first_event_of_type(trace_path, ("session",))
         return None if header is None else str(header.get("id") or "") or None
 
+    # Where every leg runs: the containers module mounts the task workdir at /work and starts
+    # the harness there, for the rollout and for every eval fork alike. The cwd is a value
+    # domain of the resume, not bookkeeping: the resolver treats a session recorded at any
+    # other cwd (or at none) as another project's, answers "Session found in different
+    # project", and stalls on an interactive "Fork this session into current directory?"
+    # prompt, which under the runner's closed stdin is exit 13 and no resume (observed).
+    LEG_CWD = "/work"
+
     def session_transcript(self, home: Path, session_id: str) -> Path | None:
         """The exactly-named session file, whose FIRST parseable line is a header naming this
-        id.
+        id and recorded at the cwd the fork resumes in.
 
-        Neither half of that is extra strictness; both are the CLI's own scanner. It indexes
-        saved sessions by the header id and never the filename (source: ``scanSessionInfo``,
-        and observed: a mismatched header is "No session found matching" for the filename's
-        id), and it gives up on a file whose first parseable entry is not the header (source:
-        the scanner returns nothing for it, and observed: a message line above a valid header
-        is the same "No session found matching"). A header alone is enough: a header-only
+        None of that is extra strictness; all of it is the CLI's own scanner and resolver. It
+        indexes saved sessions by the header id and never the filename (source:
+        ``scanSessionInfo``, and observed: a mismatched header is "No session found matching"
+        for the filename's id), it gives up on a file whose first parseable entry is not the
+        header (source: the scanner returns nothing for it, and observed: a message line
+        above a valid header is the same "No session found matching"), and it resumes in
+        place only a session whose header cwd matches the resuming cwd; recorded elsewhere,
+        the run dies on the interactive fork prompt (observed for an absent cwd and for a
+        different one). A header with the matching cwd is the whole floor: such a one-line
         file, timestamp absent and all, resumed to the auth boundary against the pinned CLI
         (observed, network off). An empty file has no header and is not found either.
         """
@@ -228,6 +239,7 @@ class PrimeAgent(Harness):
             header is not None
             and header.get("type") == "session"
             and str(header.get("id") or "") == session_id
+            and header.get("cwd") == self.LEG_CWD
         ):
             return path
         return None

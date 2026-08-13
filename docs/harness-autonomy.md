@@ -468,11 +468,16 @@ each harness a real session file was produced by driving the pinned CLI itself i
 (a credential-less run persists its session before failing auth), then minimized cut by cut
 with a re-resume after every cut, so each requirement in the predicate is one whose removal
 was seen to flip the CLI to a refusal, and each predicate's exact minimum body was seen to
-resume to the auth or transport boundary. The refusals this preempts would otherwise arrive
-per task, after the fan-out's copies, streams, and containers were already paid for. What no
-line-level predicate can promise is a file that carries the floor plus additional records
-the CLI cannot replay (a poisoned line elsewhere in a crashed file); that residue stays a
-per-task failure, and only a credentialed dry run could squeeze it further.
+resume to the auth or transport boundary. Value domains got the same discipline as field
+presence: where a decoder checks a value's shape (claude's timestamp and content, prime's
+cwd) the predicate checks that shape and each rejected shape is one the CLI was observed to
+refuse, and where a decoder checks nothing (codex's payload values) the predicate adds
+nothing, so the predicate sits as close to the decoder it fronts as probing can place it.
+The refusals this preempts would otherwise arrive per task, after the fan-out's copies,
+streams, and containers were already paid for. What no line-level predicate can promise is a
+file that carries the floor plus additional records the CLI cannot replay (a poisoned line
+elsewhere in a crashed file); that residue stays a per-task failure, and only a credentialed
+dry run could squeeze it further.
 
 Every claim below was produced against the pinned image (Claude Code 2.1.226, codex-cli
 0.147.0, prime-agent 0.7.1) with the network disabled and no credential present, so each probe
@@ -502,6 +507,15 @@ without content crashes the resume (`Failed to resume session: undefined is not 
 object`). The `uuid` field, present in every real line, is not required. A line that merely
 names the id is not a conversation, and the preflight requires the whole floor.
 
+The value domains are part of the floor, not only the fields (all observed, rest of the line
+held at the verified minimum). The timestamp must be the ISO-instant string the CLI itself
+writes: an object, an epoch number, and a non-date string were each refused as
+`No conversation found`. The content must be a string or a list: an object resolves the
+session and then crashes the resume with `TypeError: e.map is not a function`, whose own text
+names the CLI's domain (a string is handled apart; everything else is mapped as an array),
+and a list of non-block elements resumed, its entries contributing empty text, so the
+preflight constrains a list's elements no further than the CLI does.
+
 ### codex (observed for the resume mechanics, source elsewhere)
 
 `codex exec resume` exists at the pinned 0.147.0 as a non-interactive subcommand:
@@ -526,6 +540,12 @@ Dropping payload fields is refused as `failed to read session metadata`; an empt
 with session metadata` even when a fully valid meta sits on line two, so the preflight
 anchors on the first parseable line the way the CLI does.
 
+Presence is the whole floor: the VALUES of those payload fields are not domain-checked at
+0.147.0. A bogus originator, a bogus cli_version, a non-date payload timestamp, a non-date
+envelope timestamp, and a relative cwd each resumed to the transport boundary (all observed,
+one variant at a time against the verified minimum), so the preflight constrains none of
+them; stricter would refuse rollouts the CLI accepts.
+
 ### prime_agent (observed for the resume mechanics, source for the layout)
 
 `-r/--resume <path|id>` is a run option of the pinned 0.7.1 (help). Sessions are stored as
@@ -540,14 +560,19 @@ is resolved, re-emits the session header with the **same** id (the line
 `No API key found for anthropic` with nothing spent. `--fork <path|id>` also exists at 0.7.1;
 the runner does not use it, since the per-task copy is the fork.
 
-The floor a session file must carry (all observed): the header alone, and it must be the
-FIRST parseable line. A one-line `{"type": "session", "version": 3, "id": ..., "cwd": ...}`
-file, timestamp absent and all, resumed to the auth boundary in a pristine home, so the
-header really is the whole floor. What the CLI refuses is anchoring: its scanner gives up on
-a file whose first parseable entry is not the header (source: `scanSessionInfo`), and a
-message line above a fully valid header is `No session found matching` for that id, the same
-answer a mismatched header id gets, because the scanner indexes by the header id and never
-the filename.
+The floor a session file must carry (all observed): a header naming the id and the resuming
+cwd, and it must be the FIRST parseable line. A one-line
+`{"type": "session", "version": 3, "id": ..., "cwd": "/work"}` file, timestamp absent and
+all, resumed to the auth boundary in a pristine home. Two things the CLI refuses around
+that. Anchoring: its scanner gives up on a file whose first parseable entry is not the
+header (source: `scanSessionInfo`), and a message line above a fully valid header is
+`No session found matching` for that id, the same answer a mismatched header id gets,
+because the scanner indexes by the header id and never the filename. And the cwd, which is a
+value domain of the resume: a header without one, or recorded at another directory, resolves
+as `Session found in different project` and stalls on an interactive
+`Fork this session into current directory?` prompt, which under the runner's closed stdin is
+exit 13 and no resume (observed for both). Every leg runs at `/work`, so that is the cwd a
+forkable header must carry.
 
 The transcript is not the whole persisted session. Its artifact tree at
 `<agent-dir>/session-artifacts/<id>/` is part of it (source, in the installed bundle): the

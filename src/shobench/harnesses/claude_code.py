@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from shobench.harness import (
@@ -234,15 +235,29 @@ def _last_result_event(path: Path) -> dict | None:
     return _last_event_of_type(path, ("result",))
 
 
+# The timestamp shape the CLI itself writes (an ISO instant), required as a value domain and
+# not merely a present field: with the rest of the line held at the verified floor, an object,
+# an epoch number, and a non-date string in this field were each refused by the pinned CLI as
+# "No conversation found", while this shape resumes.
+_ISO_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+
 def _carries_resumable_conversation(path: Path, session_id: str) -> bool:
     """Does any line of this transcript hold the conversation floor the pinned CLI requires?
 
     The qualifying line is the shape a real transcript's kickoff turn always has and the
-    minimum the CLI was observed to accept: a ``user`` entry naming this ``sessionId``, with a
-    ``message`` object carrying a role and non-empty content, and a ``timestamp``. Streamed
-    and stopped at the first match, tolerant of a malformed line, because the file was written
-    by another process and a crash can cut it anywhere; a transcript cut after its kickoff
-    line is still one the CLI resumes.
+    minimum the CLI was observed to accept: a ``user`` entry naming this ``sessionId``, with
+    an ISO-instant ``timestamp`` and a ``message`` carrying a role and non-empty content that
+    is a string or a list. The value domains matter as much as the fields: a truthy timestamp
+    of the wrong shape is refused as "No conversation found", and a truthy content of the
+    wrong shape resolves and then crashes the resume ("e.map is not a function", whose own
+    text shows the CLI's domain: a string is handled apart and anything else is mapped as an
+    array). A list's elements are not constrained here because the CLI constrains none: a
+    list of non-blocks was observed to resume, its entries contributing empty text.
+
+    Streamed and stopped at the first match, tolerant of a malformed line, because the file
+    was written by another process and a crash can cut it anywhere; a transcript cut after
+    its kickoff line is still one the CLI resumes.
     """
     try:
         with path.open(encoding="utf-8", errors="ignore") as lines:
@@ -256,14 +271,16 @@ def _carries_resumable_conversation(path: Path, session_id: str) -> bool:
                     continue
                 if not isinstance(event, dict) or event.get("sessionId") != session_id:
                     continue
-                if event.get("type") != "user" or not event.get("timestamp"):
+                if event.get("type") != "user":
+                    continue
+                stamp = event.get("timestamp")
+                if not isinstance(stamp, str) or not _ISO_STAMP.match(stamp):
                     continue
                 message = event.get("message")
-                if (
-                    isinstance(message, dict)
-                    and message.get("role")
-                    and message.get("content")
-                ):
+                if not isinstance(message, dict) or not message.get("role"):
+                    continue
+                content = message.get("content")
+                if isinstance(content, str | list) and content:
                     return True
     except OSError:
         return False

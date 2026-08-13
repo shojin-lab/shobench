@@ -899,6 +899,130 @@ def test_a_transcript_that_only_wears_the_id_does_not_pass_the_preflight(
     assert harness.session_transcript(longer, _SID) is None
 
 
+def _claude_line(**overrides) -> str:
+    body = {
+        "type": "user",
+        "message": {"role": "user", "content": "hello"},
+        "timestamp": _TS,
+        "sessionId": _SID,
+    }
+    body.update(overrides)
+    return json.dumps(body) + "\n"
+
+
+def test_claude_value_domains_follow_the_pinned_cli(tmp_path: Path) -> None:
+    """Truthiness is not the domain: the pinned CLI checks value shapes, so the preflight
+    must too.
+
+    Every refusal here is one the CLI was observed to make with the rest of the line held at
+    the verified floor: a timestamp that is an object, an epoch number, or a non-date string
+    is "No conversation found"; an object for content resolves and then crashes the resume
+    ("e.map is not a function"). And every acceptance is observed too: string content, and a
+    list whose elements are not even blocks, both resume, so the predicate refuses neither.
+    """
+    rel = f".claude/projects/-work/{_SID}.jsonl"
+    harness = harness_for("claude_code")
+
+    refused = {
+        "timestamp_object": _claude_line(timestamp={"x": 1}),
+        "timestamp_number": _claude_line(timestamp=1786579093000),
+        "timestamp_not_a_date": _claude_line(timestamp="not-a-date"),
+        "content_object": _claude_line(message={"role": "user", "content": {"x": 1}}),
+    }
+    for label, body in refused.items():
+        home = _home_with(tmp_path / label, rel, body)
+        assert harness.session_transcript(home, _SID) is None, label
+
+    accepted = {
+        "content_string": _claude_line(),
+        "content_blocks": _claude_line(
+            message={"role": "user", "content": [{"type": "text", "text": "hello"}]}
+        ),
+        "content_list_of_non_blocks": _claude_line(
+            message={"role": "user", "content": [1, 2]}
+        ),
+    }
+    for label, body in accepted.items():
+        home = _home_with(tmp_path / label, rel, body)
+        assert harness.session_transcript(home, _SID) == home / rel, label
+
+
+def test_prime_resumes_only_a_session_recorded_at_the_leg_cwd(tmp_path: Path) -> None:
+    """The cwd is a value domain of prime's resume, not bookkeeping.
+
+    A header without a cwd, or with another project's, resolves as a different-project
+    session and the CLI stalls on an interactive fork prompt (exit 13 under the runner's
+    closed stdin, observed); only a session recorded at /work, where every leg runs, resumes
+    in place.
+    """
+    rel = f".prime/agent/sessions/{_SID}.jsonl"
+    harness = harness_for("prime_agent")
+
+    no_cwd = _home_with(
+        tmp_path / "no-cwd",
+        rel,
+        json.dumps({"type": "session", "version": 3, "id": _SID}) + "\n",
+    )
+    assert harness.session_transcript(no_cwd, _SID) is None
+
+    elsewhere = _home_with(
+        tmp_path / "elsewhere",
+        rel,
+        json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/elsewhere"}) + "\n",
+    )
+    assert harness.session_transcript(elsewhere, _SID) is None
+
+    at_work = _home_with(
+        tmp_path / "at-work",
+        rel,
+        json.dumps({"type": "session", "version": 3, "id": _SID, "cwd": "/work"}) + "\n",
+    )
+    assert harness.session_transcript(at_work, _SID) == at_work / rel
+
+
+def test_codex_meta_values_are_unconstrained_because_the_cli_constrains_none(
+    tmp_path: Path,
+) -> None:
+    """Codex 0.147.0 domain-checks no meta VALUE, so neither may the preflight.
+
+    Each body here resumed to the transport boundary against the pinned CLI (observed: bogus
+    originator, bogus cli_version, non-date payload and envelope timestamps, relative cwd).
+    A predicate stricter than the decoder would refuse rollouts the CLI accepts, which is a
+    false refusal of a real fork, so these are pinned as positives: presence of the five
+    payload fields is the whole floor, and the missing-field refusals have their own case in
+    the matrix above.
+    """
+    rel = f".codex/sessions/2026/08/12/rollout-2026-08-12T00-00-00-{_SID}.jsonl"
+    harness = harness_for("codex")
+    payload = {
+        "id": _SID,
+        "timestamp": _TS,
+        "cwd": "/work",
+        "originator": "codex_exec",
+        "cli_version": "0.147.0",
+    }
+    variants = {
+        "originator_bogus": {**payload, "originator": "bogus"},
+        "cli_version_bogus": {**payload, "cli_version": "bogus"},
+        "timestamp_not_a_date": {**payload, "timestamp": "not-a-date"},
+        "cwd_relative": {**payload, "cwd": "work"},
+    }
+    for label, body in variants.items():
+        home = _home_with(
+            tmp_path / label,
+            rel,
+            json.dumps({"timestamp": _TS, "type": "session_meta", "payload": body}) + "\n",
+        )
+        assert harness.session_transcript(home, _SID) == home / rel, label
+    envelope = _home_with(
+        tmp_path / "envelope",
+        rel,
+        json.dumps({"timestamp": "not-a-date", "type": "session_meta", "payload": payload})
+        + "\n",
+    )
+    assert harness.session_transcript(envelope, _SID) == envelope / rel
+
+
 # ----- what counts as the agent's durable self ------------------------------------------------
 
 
