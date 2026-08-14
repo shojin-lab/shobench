@@ -249,11 +249,10 @@ BANKING_POOL_N = 47
 BANKING_TOTAL = 97
 BANKING_ELIGIBLE_N = 87
 
-# The reward bases tau2's ``env`` evaluator actually scores. It starts a task's reward at 1.0 and
-# multiplies it only for these two, so a task whose basis holds anything else is scored on less
-# than it declares: an ACTION-only task returns 1.0 for any run that terminates normally, and a
-# DB + NL_ASSERTION task keeps only its DB half. The offline cells serve this evaluator, so the
-# population is the tasks it scores in full and the rest are excluded rather than reported.
+# The reward bases tau2's ``env`` evaluator scores. It starts a task's reward at 1.0 and
+# multiplies it only for these two, so a basis holding anything else is left unscored rather than
+# scored down: an ACTION-only task returns 1.0 for any normally terminated run, and a
+# DB + NL_ASSERTION task is scored on its DB half alone.
 BANKING_HONORED_BASES = frozenset({"DB", "ENV_ASSERTION"})
 
 
@@ -265,19 +264,13 @@ def _banking_basis(task: Any) -> frozenset[str]:
 
 
 def build_tau2_banking_knowledge(out: Path) -> Path:
-    """Draw and publish a split, because banking ships no split file to honor.
-
-    telecom's sizes are upstream's; these are chosen. Held-out is 40, the size upstream declares
-    for telecom, so the two tau2 envs are read against the same held-out N, and the pool is the
-    87-task eligible population's remaining 47.
-    """
+    """Draw and publish a split, because banking ships no split file to honor."""
     import os
 
     from shobench import tau2_data
 
-    # Read the ids through the loader the env reads them through. banking's tasks come from a
-    # directory of per-task files in sorted order rather than from tasks.json, and a manifest id
-    # is a position in the list that loader returns.
+    # banking's tasks come from a directory of per-task files in sorted order, not from
+    # tasks.json, so the ids have to come from the loader the env reads them through.
     os.environ["TAU2_DATA_DIR"] = str(tau2_data.require())
     from shogym.envs.tau2 import mcp_server
 
@@ -290,8 +283,7 @@ def build_tau2_banking_knowledge(out: Path) -> Path:
             "the domain drifted"
         )
 
-    # Eligible positions, in the env's own task order. A task with no declared basis is excluded
-    # too: the evaluator hands those a free 1.0 by the same arithmetic.
+    # An empty basis is excluded by the same arithmetic: the evaluator hands those a free 1.0.
     bases = [_banking_basis(task) for task in tasks]
     eligible = [i for i, basis in enumerate(bases) if basis and basis <= BANKING_HONORED_BASES]
     excluded = {

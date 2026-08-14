@@ -44,10 +44,9 @@ eval_task_timeout_s = 1800
 user_llm = "gpt-5.6-luna"
 
 # tau2's evaluator restricted to its offline half: env scores DB state and env assertions, so a
-# served run needs no judge LLM. It does not fall back to something weaker for a task whose
-# basis it does not cover, it declines to score it, starting the reward at 1.0 and multiplying
-# only for DB and ENV_ASSERTION. An ACTION-only task would therefore pass unconditionally. The
-# split answers that by drawing only over the 87 tasks this evaluator scores in full.
+# served run needs no judge LLM. It leaves a basis it does not cover unscored rather than scoring
+# it down, so an ACTION-only task passes unconditionally. The split draws only the 87 tasks it
+# scores in full, and changing this value means redrawing it.
 evaluation_type = "env"
 
 # Naming this table replaces tau2's DEFAULT_LLM_ARGS_USER wholesale, so both arguments have to

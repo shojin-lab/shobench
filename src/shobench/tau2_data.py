@@ -58,8 +58,8 @@ _TAU2_PREFIX = "tau2"
 # moving the pin means re-recording them, and a test holds the manifest to the sha so a bumped pin
 # cannot keep checking the old commit's bytes. What the manifest does not do is digest all
 # ~730 MB: that would gate files no cell touches at a cost on every check, so ``--force`` is what
-# replaces a tree whose ungated bulk is suspect. The served domains are gated in full, though, so
-# the ungated remainder is bulk no cell reads: 806 files and 17 MB verify in about 60 ms.
+# replaces a tree whose ungated bulk is suspect. Both served domains are gated in full, so the
+# ungated remainder is bulk no cell reads.
 _MANIFEST_PATH = Path(__file__).with_name("tau2_data_manifest.json")
 _MANIFEST: dict[str, dict[str, Any]] = json.loads(
     _MANIFEST_PATH.read_text(encoding="utf-8")
