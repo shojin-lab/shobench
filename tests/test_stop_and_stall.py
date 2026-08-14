@@ -954,3 +954,156 @@ def test_a_stop_after_a_transcript_lands_says_it_can_be(
     err = capsys.readouterr().err
     assert "terminus is resumable" in err
     assert "rebookend --run" in err
+
+
+# ----- the watcher's lifetime really is the lock's lifetime -------------------------------------
+
+
+def test_a_second_ask_inside_one_ownership_is_also_consumed(tmp_path: Path) -> None:
+    """An owner that consumed one ask goes on holding the directory, still advertising, through
+    leg shutdown, publication and teardown.
+
+    A watcher that returned after the first ask left all of that advertising support it no longer
+    had: a second stop passed the capability check, wrote a request nothing could consume, and
+    left it for the next resume to latch. That is the same landmine the advertisement exists to
+    prevent, reached from inside instead of from an older build, and it is why the command
+    documents itself as safe to call twice.
+    """
+    run_dir = tmp_path / "twice"
+    with runner.owning_run(run_dir) as stop:
+        runner.write_stop_request(run_dir, reason="first")
+        assert stop.fired.wait(timeout=5.0)
+        assert _gone_within(run_dir / STOP_REQUEST_FILE, 5.0)
+
+        # Everything after this is the finalization window the reviewer's reproduction used.
+        runner.write_stop_request(run_dir, reason="second")
+        assert _gone_within(run_dir / STOP_REQUEST_FILE, 5.0)
+
+    assert not (run_dir / STOP_REQUEST_FILE).exists()
+    # Consumed, not re-decided: the ending is still the one that got there first.
+    assert stop.verdict is not None
+    assert stop.verdict.evidence["reason"] == "first"
+
+
+def test_the_command_is_safe_to_call_twice(tmp_path: Path) -> None:
+    """The contract the docstring states, through the real command both times."""
+    run_dir = tmp_path / "twice-cli"
+    with runner.owning_run(run_dir):
+        assert main(["stop", "--run", str(run_dir), "--reason", "one"]) == 0
+        assert main(["stop", "--run", str(run_dir), "--reason", "two"]) == 0
+
+    assert not (run_dir / STOP_REQUEST_FILE).exists()
+
+
+def test_an_ask_left_by_an_interrupted_command_is_still_consumed(tmp_path: Path) -> None:
+    """An operator who interrupts the command mid-wait leaves the request on disk. The owner is
+    still there and still watching, so it consumes it: nothing about the acknowledgment depends on
+    the command surviving to see it."""
+    run_dir = tmp_path / "interrupted"
+    with runner.owning_run(run_dir) as stop:
+        assert stop.fired.wait(timeout=0.1) is False
+        # What an interrupted `shobench stop` leaves behind, with nobody waiting on it.
+        runner.write_stop_request(run_dir, reason="ctrl-c'd while waiting")
+        assert _gone_within(run_dir / STOP_REQUEST_FILE, 5.0)
+        assert stop.fired.is_set()
+
+    assert not (run_dir / STOP_REQUEST_FILE).exists()
+
+
+def test_a_later_owner_does_not_inherit_the_advertisement(tmp_path: Path) -> None:
+    """The lock file outlives every owner, so the bytes on disk between one owner taking the lock
+    and writing its own payload are the previous owner's.
+
+    An owner that does not watch, briefly wearing a previous owner's advertisement, is the one
+    state that produces an ask nobody consumes, so the payload is emptied before it is written and
+    the window reads as an owner advertising nothing.
+    """
+    run_dir = tmp_path / "reused"
+    with runner.owning_run(run_dir):
+        assert runner.read_lock_holder(run_dir)["stop_protocol"] == runner.STOP_PROTOCOL
+
+    # The same directory, reopened by an entry that starts no watcher.
+    lock_fd = runner._acquire_run_lock(run_dir)
+    try:
+        assert "stop_protocol" not in runner.read_lock_holder(run_dir)
+    finally:
+        runner._release_run_lock(lock_fd)
+
+
+# ----- a link is a path the agent can write through --------------------------------------------
+
+
+def test_a_symlinked_directory_is_not_reported_as_a_complete_walk(tmp_path: Path) -> None:
+    """``os.walk`` does not descend into a directory symlink by default and does not fingerprint
+    it either, so a tree the agent was actively writing through read as a stable ``(0, 0, 0)``.
+
+    ``/work`` is the agent's own writable cwd, so a link out of it is an ordinary thing for a
+    working rollout to make, and the leg that made one was the leg being killed for silence.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    os.symlink(target, work / "linked")
+
+    before = runner._tree_pulse(work)
+    (target / "work.txt").write_text("the agent is working\n", encoding="utf-8")
+
+    assert runner._tree_pulse(work) != before
+
+
+def test_a_symlinked_file_moves_when_its_target_moves(tmp_path: Path) -> None:
+    """The other half: an ``lstat`` fingerprints the link, whose size and mtime do not move when
+    the thing it points at is written."""
+    work = tmp_path / "work"
+    work.mkdir()
+    target = tmp_path / "notes.txt"
+    target.write_text("a", encoding="utf-8")
+    os.symlink(target, work / "notes-link")
+
+    before = runner._tree_pulse(work)
+    target.write_text("a much longer body the agent wrote\n", encoding="utf-8")
+
+    assert runner._tree_pulse(work) != before
+
+
+def test_a_symlink_cycle_terminates_as_unreadable(tmp_path: Path) -> None:
+    """Following links makes the walk unbounded in principle, so the limit counts directories as
+    well as files: a cycle made only of directories would spin forever on a file count alone, once
+    a minute, for the life of the rollout."""
+    root = tmp_path / "cycle"
+    root.mkdir()
+    os.symlink(root, root / "self")
+
+    reading = runner._tree_pulse(root, limit=200)
+
+    assert reading[:2] == (-1, -1)
+
+
+def test_a_resolving_link_inside_the_tree_keeps_a_real_fingerprint(tmp_path: Path) -> None:
+    """The regression the blunt fix would introduce, held down.
+
+    Calling every symlink unreadable is the simple fail-safe, and it would have quietly disabled
+    the detector for prime, whose real homes carry relative in-home links that all resolve. A tree
+    reached twice by two links is counted twice, which is deterministic, so the fingerprint still
+    moves if and only if something moved.
+    """
+    home = tmp_path / "home"
+    (home / "real").mkdir(parents=True)
+    (home / "real" / "kernel-state.json").write_text("{}", encoding="utf-8")
+    os.symlink(home / "real", home / "cache-link")
+
+    reading = runner._tree_pulse(home)
+
+    assert reading[:2] != (-1, -1)
+    assert reading == runner._tree_pulse(home)
+
+
+def test_a_leg_whose_only_activity_is_through_a_link_is_not_stalled(tmp_path: Path) -> None:
+    """End to end: work that lands outside the watched tree by a path inside it is still work."""
+    ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
+    target = tmp_path / "outside"
+    target.mkdir()
+    os.symlink(target, ctx.sandbox.workdir / "linked")
+
+    _never_stalls(ctx, _appender(target / "solver.py"), bound_s=0.2, poll_s=0.02)

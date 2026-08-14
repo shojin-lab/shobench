@@ -2798,17 +2798,33 @@ def _tree_pulse(root: Path, *, limit: int | None = None) -> tuple[int, int, int]
       absence unreadable would disable the detector for every cell until then.
     - **Read to the bottom.** The fingerprint.
     - **Not read to the bottom**, whether that is a permission error, a directory that vanished
-      mid-walk, or a tree past the walk limit. This answers unreadable.
+      mid-walk, a link whose target cannot be reached, or a tree past the walk limit. This
+      answers unreadable, and the caller records progress.
 
-    The middle case is why ``os.walk`` is given an ``onerror`` that raises. Its default is to
-    SWALLOW a directory whose ``scandir`` fails and carry on as though it were not there, so a
-    mode-000 subtree under ``/work`` produced a perfectly stable ``(0, 0, 0)`` on every reading
-    while the container went on writing inside it, and a leg doing real work under it was
-    indistinguishable from a leg doing nothing. Nothing here may report a partial walk as a
-    complete one.
+    "To the bottom" is the load-bearing phrase, and two defaults of ``os.walk`` are against it.
+
+    Its ``onerror`` default SWALLOWS a directory whose listing fails and carries on as though it
+    were not there, so a mode-000 subtree under ``/work`` produced a perfectly stable ``(0, 0, 0)``
+    on every reading while the container went on writing inside it. It is given a callback that
+    raises instead.
+
+    Its ``followlinks`` default puts a symlinked directory in the walk's directory list and never
+    descends into it, and the matching ``lstat`` on a symlinked file fingerprints the LINK rather
+    than the thing it points at, whose size and mtime are the ones that move. Both produced a
+    complete-looking constant for a tree the agent was actively writing through, and ``/work`` is
+    the agent's own writable cwd, so a link out of it is an ordinary thing for a working rollout
+    to make. Links are followed here for exactly that reason: what is being asked is whether the
+    agent wrote anything, and a path it can write through is part of the answer wherever it lands.
+
+    Following makes the walk unbounded in principle, so the limit counts DIRECTORIES as well as
+    files. That is what terminates a symlink cycle, including one made only of directories, which
+    a file count alone would spin on forever; it reports unreadable, which is the fail-safe
+    answer. Nothing here needs to deduplicate a tree reached twice by two links: counting it twice
+    is deterministic, so the fingerprint still moves if and only if something moved.
     """
     limit = PROGRESS_WALK_LIMIT if limit is None else limit
     files = 0
+    entries = 0
     total = 0
     newest = 0
 
@@ -2823,14 +2839,20 @@ def _tree_pulse(root: Path, *, limit: int | None = None) -> tuple[int, int, int]
         # There, and not listable from here: a statement about this reading, not about the tree.
         return _unreadable_pulse()
     try:
-        for parent, _dirs, names in os.walk(root, onerror=cannot_read):
+        for parent, _dirs, names in os.walk(root, onerror=cannot_read, followlinks=True):
+            entries += 1
             for name in names:
                 files += 1
-                if files > limit:
+                entries += 1
+                if entries > limit:
                     raise _PulseUnreadable("tree past the walk limit")
-                stat = os.stat(Path(parent) / name, follow_symlinks=False)
-                total += stat.st_size
-                newest = max(newest, stat.st_mtime_ns)
+                # Through the link, not at it. A dangling one raises here and reads as unreadable,
+                # which is the safe direction: it makes the check inert rather than blind.
+                info = os.stat(Path(parent) / name)
+                total += info.st_size
+                newest = max(newest, info.st_mtime_ns)
+            if entries > limit:
+                raise _PulseUnreadable("tree past the walk limit")
     except (OSError, _PulseUnreadable):
         return _unreadable_pulse()
     return (files, total, newest)
@@ -3542,12 +3564,15 @@ def _acquire_run_lock(run_dir: Path, *, stoppable: bool = False) -> int:
     holder: dict[str, Any] = {"pid": os.getpid(), "at": time.time()}
     if stoppable:
         holder["stop_protocol"] = STOP_PROTOCOL
-    payload = json.dumps(holder).encode("utf-8")
-    # Written before the truncate, so a reader racing this never sees an empty file where a
-    # complete one is about to be: the worst it can read is a longer stale tail, which fails to
-    # parse and is treated as an owner that advertises nothing, which is the fail-closed answer.
-    os.pwrite(fd, payload, 0)
-    os.ftruncate(fd, len(payload))
+    # Emptied first, then written. The file outlives every owner, so between taking the lock and
+    # writing this payload the bytes on disk are the PREVIOUS owner's, and a reader in that window
+    # would read this owner's support from a claim it never made: an owner that does not watch,
+    # briefly inheriting an advertisement, is the one state that produces an ask nobody consumes.
+    # Truncating first makes the window read as an owner that advertises nothing, which refuses
+    # and costs an operator a re-run, rather than as one that advertises falsely, which costs a
+    # stale request. A torn read of a longer payload fails to parse and lands in the same place.
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, json.dumps(holder).encode("utf-8"), 0)
     return fd
 
 
@@ -3582,10 +3607,20 @@ def owning_run(run_dir: Path):
     and the thread start. An ask landing inside that window is not lost: the watcher's first
     action is to read the file, so it finds one already there.
 
-    The watcher is stopped BEFORE ownership is released, so no ask is consumed by a process that
-    has already let go of the directory. One written after that point is one this run genuinely
-    cannot honour, and it is the CLI's business to notice the lock went free with its request
-    unread and to take it back.
+    The watcher does NOT stop at the first ask it consumes, and that is the whole of the
+    invariant rather than a detail. An owner goes on holding the directory, still advertising,
+    through leg shutdown, publication, the observer stopping and the sandbox coming down; a
+    watcher that returned after one ask left every one of those moments advertising support it no
+    longer had, so a second stop passed the capability check, wrote a request nothing could
+    consume, and left it on disk for the next resume to latch. That is the failure this entry
+    exists to prevent, reached from inside instead of from an older build. So it keeps polling
+    until ownership ends, and a later ask is acknowledged (unlinked) even though the handle it
+    fires is already latched, which is also what makes the command safe to call twice.
+
+    The watcher is stopped BEFORE ownership is released, and takes one last look on its way out,
+    so the residual window is the few statements between that look and the release. An ask landing
+    in it is one this run genuinely cannot honour, and it is the CLI's business to notice the lock
+    went free with its request unread and to take it back.
     """
     stop = EarlyEnding()
     fd = _acquire_run_lock(run_dir, stoppable=True)
@@ -3593,9 +3628,11 @@ def owning_run(run_dir: Path):
 
     def poll() -> None:
         while True:
-            if _honor_stop_request(run_dir, stop):
-                return
+            _honor_stop_request(run_dir, stop)
             if done.wait(STOP_POLL_S):
+                # Ownership is ending. One last look, so an ask written between the previous poll
+                # and here is consumed rather than left behind by a hair.
+                _honor_stop_request(run_dir, stop)
                 return
 
     watcher = threading.Thread(target=poll, name="shobench-stop", daemon=True)
