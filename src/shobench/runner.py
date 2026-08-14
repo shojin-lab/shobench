@@ -1365,6 +1365,11 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
             await admission.wait()
             if usage_limit:
                 return  # a usage limit closed the window; this task waits for the resume
+            if ctx.operator_stop.fired.is_set():
+                # An operator ended the run while this task waited on the gate. Admitting it would
+                # copy a home, start a container and have the supervisor kill it a second later,
+                # once per remaining held-out id, which is the whole fan-out spent on nothing.
+                return
             # Clear any stale attempt (a drained row from an earlier suspension, a half-written
             # dispense) so a run leaves exactly one row. A fresh phase's directory is empty and
             # this is a no-op; a resume's incomplete id starts clean, which is what keeps the
@@ -1612,6 +1617,23 @@ def read_stop_request(run_dir: Path) -> dict[str, Any] | None:
     return request if isinstance(request, dict) else None
 
 
+def _honor_stop_request(ctx: RunContext) -> bool:
+    """Latch an operator's ask onto the run's handle and consume it. Says whether there was one.
+
+    Consumed the moment it is latched, because it is a one-shot ask and the leg verdict is where
+    it becomes durable. Left on disk it would end the next process to open this directory, so an
+    operator who stopped a run and later reopened it to repair an eval hole would watch the repair
+    stop itself.
+    """
+    request = read_stop_request(ctx.run_dir)
+    if request is None:
+        return False
+    ctx.operator_stop.fire(ctx.harness.operator_verdict(request=request))
+    with contextlib.suppress(OSError):
+        (ctx.run_dir / STOP_REQUEST_FILE).unlink()
+    return True
+
+
 @contextlib.contextmanager
 def _watching_for_stop(ctx: RunContext):
     """Fire the run's operator-stop handle as soon as an operator asks for one, for this block.
@@ -1621,6 +1643,10 @@ def _watching_for_stop(ctx: RunContext):
     well, where no stream and no loop task exists to hang a watcher off. It runs for the whole of
     the phases, so a stop asked for at any moment of a run reaches whatever is running then.
 
+    The first read is taken here on the calling thread rather than by the poller, so a run that
+    opens with an ask already on disk honors it before it launches anything, rather than racing
+    its own watcher for the length of one leg.
+
     Firing the handle is all it does. What that means for a leg is the supervisor's (it ends the
     container the way a timeout does), and what it means for the run is the phase loop's (no
     further phase starts). Nothing here writes a record or ends a process: an operator stop that
@@ -1629,20 +1655,11 @@ def _watching_for_stop(ctx: RunContext):
     done = threading.Event()
 
     def poll() -> None:
-        while True:
-            request = read_stop_request(ctx.run_dir)
-            if request is not None:
-                ctx.operator_stop.fire(ctx.harness.operator_verdict(request=request))
-                # Consumed the moment it is latched, because it is a one-shot ask and the leg
-                # verdict is where it becomes durable. Left on disk it would end the next process
-                # to open this directory, so an operator who stopped a run and later reopened it
-                # to repair an eval hole would watch the repair stop itself.
-                with contextlib.suppress(OSError):
-                    (ctx.run_dir / STOP_REQUEST_FILE).unlink()
-                return
-            if done.wait(STOP_POLL_S):
+        while not done.wait(STOP_POLL_S):
+            if _honor_stop_request(ctx):
                 return
 
+    _honor_stop_request(ctx)
     watcher = threading.Thread(target=poll, name="shobench-stop", daemon=True)
     watcher.start()
     try:
@@ -2823,12 +2840,18 @@ async def _watch_for_no_progress(
     again gets the whole bound again from the line.
     """
     poll_s = _progress_poll_s(bound_s) if poll_s is None else poll_s
-    pulse = rollout_progress(ctx, trace_path=trace_path, prov_dir=prov_dir)
+
+    def read() -> tuple[Any, ...]:
+        return rollout_progress(ctx, trace_path=trace_path, prov_dir=prov_dir)
+
+    # Off the loop, because the reading walks directories the agent is writing and a loop parked
+    # on a filesystem walk is a loop not serving the stream the leg is talking to.
+    pulse = await asyncio.to_thread(read)
     since = time.monotonic()
     while True:
         await asyncio.sleep(poll_s)
         try:
-            reading = rollout_progress(ctx, trace_path=trace_path, prov_dir=prov_dir)
+            reading = await asyncio.to_thread(read)
         except Exception:
             # A watcher that cannot read the state never ends a leg on that failure. It reads
             # files another party is writing, and the cost of guessing wrong in this direction is

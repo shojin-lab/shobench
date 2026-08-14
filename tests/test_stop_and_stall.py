@@ -41,14 +41,22 @@ from shobench.containers import CellSandbox
 from shobench.harness import StopKind
 from shobench.harnesses import harness_for
 from shobench.results import TaskResult
-from shobench.runner import STOP_REQUEST_FILE, EarlyEnding, RunContext, build_manifest
+from shobench.runner import (
+    STOP_REQUEST_FILE,
+    EarlyEnding,
+    LegRecord,
+    RunContext,
+    build_manifest,
+)
 from shobench.splits import Side, Split
 
 _SMOKE_CELL = "smoke-automationbench-claude-code"
 _PRIME_CELL = "hle-prime_agent-claude-opus-5"
 
 
-def _ctx(tmp_path: Path, *, cell_name: str = _SMOKE_CELL) -> RunContext:
+def _ctx(
+    tmp_path: Path, *, cell_name: str = _SMOKE_CELL, heldout: tuple[str, ...] = ("1",)
+) -> RunContext:
     cell = load_cell_by_name(cell_name)
     run_dir = tmp_path / "run"
     sandbox = CellSandbox(run_id="test", home=run_dir / "home", workdir=run_dir / "work")
@@ -56,7 +64,7 @@ def _ctx(tmp_path: Path, *, cell_name: str = _SMOKE_CELL) -> RunContext:
     sandbox.workdir.mkdir(parents=True)
     split = Split(
         env=cell.env,
-        heldout=Side(task_ids=("1",)),
+        heldout=Side(task_ids=heldout),
         pool=Side(task_ids=("900", "901")),
         provenance={"kind": "adopted"},
         source=tmp_path / "split.json",
@@ -241,6 +249,47 @@ def test_the_ask_is_consumed_so_a_later_reopening_is_not_stopped_by_it(
 
     assert not (run_dir / STOP_REQUEST_FILE).exists()
     assert json.loads((run_dir / "legs.json").read_text())[0]["verdict"]["evidence"]["reason"]
+
+
+def test_a_stop_during_an_eval_phase_admits_no_further_tasks(tmp_path: Path, monkeypatch) -> None:
+    """A stop is an ask about the run, and the eval fan-out is where ignoring it costs most.
+
+    Every leg the supervisor kills a second after launching still paid for a home copy and a
+    container start, once per remaining held-out id, so a phase that kept admitting would spend
+    the whole fan-out on nothing. Admission closes on the ask exactly as it does on a usage limit.
+    """
+    ctx = _ctx(tmp_path, heldout=tuple(str(i) for i in range(1, 13)))
+    launched: list[int] = []
+
+    def fake_run_leg(ctx_arg: RunContext, **kw: object) -> LegRecord:
+        idx = int(kw["task_idx"])  # type: ignore[arg-type]
+        launched.append(idx)
+        # The first leg to run is the moment the operator's ask lands.
+        ctx_arg.operator_stop.fire(ctx_arg.harness.operator_verdict(request={"reason": "enough"}))
+        return LegRecord(
+            leg=idx,
+            phase=str(kw["phase"]),
+            task_idx=idx,
+            started_at=0.0,
+            ended_at=1.0,
+            returncode=-1,
+            verdict=ctx_arg.operator_stop.verdict,  # type: ignore[arg-type]
+            tasks_consumed_before=0,
+            tasks_consumed_after=0,
+            trace_path="t",
+            run_dir=ctx_arg.run_dir,
+        )
+
+    monkeypatch.setattr(runner, "warm_env", lambda cell: None)
+    monkeypatch.setattr(runner, "build_stream", lambda *a, **k: _FakeStream())
+    monkeypatch.setattr(runner, "_served", _fake_served)
+    monkeypatch.setattr(runner, "EVAL_LAUNCH_STAGGER_S", 0.0)
+    monkeypatch.setattr(runner, "read_phase", lambda prov_dir: [])
+    monkeypatch.setattr(runner, "run_leg", fake_run_leg)
+    asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
+
+    # The first wave was already admitted when the ask landed; nothing behind it was.
+    assert 0 < len(launched) <= ctx.cell.budget.eval_concurrency < 12
 
 
 def test_the_watcher_fires_on_an_ask_and_leaves_a_quiet_run_alone(tmp_path: Path) -> None:
