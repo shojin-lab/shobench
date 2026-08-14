@@ -22,6 +22,7 @@ from shobench.leakage import (
     ANSWER_SOURCES,
     BUCKETS,
     UNCLASSIFIED,
+    _invocations,
     _invokes_a_fetch,
     classify_run,
     content_url_kind,
@@ -625,7 +626,10 @@ def test_an_unfinished_run_is_refused_rather_than_graded(tmp_path: Path, capsys)
         .path
     )
     assert main([str(run_dir)]) == 1
-    assert "refusing" in capsys.readouterr().out
+    # The refusal is a diagnostic, so it goes where diagnostics go.
+    captured = capsys.readouterr()
+    assert "refusing" in captured.err
+    assert "refusing" not in captured.out
 
 
 def test_an_unfinished_run_graded_on_request_clears_nothing(tmp_path: Path) -> None:
@@ -842,7 +846,7 @@ def test_the_advertised_override_is_reachable_from_the_command_line(
         .path
     )
     assert cli_main(["leakage", str(run_dir)]) == 1
-    assert "--allow-unfinished" in capsys.readouterr().out
+    assert "--allow-unfinished" in capsys.readouterr().err
     assert cli_main(["leakage", str(run_dir), "--allow-unfinished"]) == 0
     assert "unclassified" in capsys.readouterr().out
 
@@ -1342,3 +1346,203 @@ def test_an_answered_and_an_unanswered_invocation_reach_the_same_bucket(
         trace='{"lease":"lease-a"}\n' + answered,
     )
     assert _buckets(run) == {7: "unresolved_leakage"}
+
+
+# ----- narration, unbounded windows, interrupted starts, quoted code, and the JSON stream ----
+
+
+def test_narration_naming_the_terminal_call_does_not_seal_an_episode(tmp_path: Path) -> None:
+    """An agent saying it will submit has not submitted, and its lease is still live.
+
+    Sealing on the words would end the episode early and hand its traffic to nobody, which is
+    how a live lease came to be reported clean.
+    """
+    run = classify_run(
+        RunDir(tmp_path / "r")
+        .egress(_watching((250.0, "huggingface.co", "tls")))
+        .rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 200.0, True)])
+        .leg("rollout", 0, 50.0, 400.0)
+        .trace(
+            "rollout",
+            "leg-0000.stream.jsonl",
+            codex(
+                {"lease_seen": "lease-a"},
+                {"command": "echo planning",
+                 "output": "I should call submit_answer for lease-a next"},
+                {"lease_seen": "lease-b"},
+            ),
+        )
+        .path
+    )
+    graded = {e.episode.seq: e for e in run.episodes}
+    assert graded[1].episode.ended_at == 400.0
+    assert graded[1].bucket == "attempted_leakage"
+
+
+def test_a_structured_terminal_call_still_seals(tmp_path: Path) -> None:
+    run = classify_run(
+        RunDir(tmp_path / "r")
+        .egress(_watching((250.0, "huggingface.co", "tls")))
+        .rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 200.0, True)])
+        .leg("rollout", 0, 50.0, 400.0)
+        .trace(
+            "rollout",
+            "leg-0000.stream.jsonl",
+            codex(
+                {"lease_seen": "lease-a"},
+                {"submit": "lease-a"},
+                {"lease_seen": "lease-b"},
+            ),
+        )
+        .path
+    )
+    graded = {e.episode.seq: e for e in run.episodes}
+    assert graded[1].episode.ended_at == 200.0
+    assert graded[1].bucket == "computed_locally"
+    assert graded[2].bucket == "attempted_leakage"
+
+
+def test_an_episode_with_no_end_bound_is_not_cleared(tmp_path: Path) -> None:
+    """Nothing finite contains an unbounded window, so no segment can cover it."""
+    run = classify_run(
+        RunDir(tmp_path / "r", ended_at=None)
+        .egress(_capture((0.0, "chatgpt.com", "dns"), (500.0, "chatgpt.com", "dns")))
+        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .leg("eval_after", 9, 1.0, 2.0, task=3)
+        .path
+    )
+    assert run.episodes[0].episode.ended_at is None
+    assert run.episodes[0].covered is False
+    assert _buckets(run) == {7: UNCLASSIFIED}
+
+
+def test_a_missing_leg_record_falls_back_to_the_runs_own_end(tmp_path: Path) -> None:
+    """A finished run has a last moment, and that is a sound bound where a leg record is not."""
+    run = classify_run(
+        RunDir(tmp_path / "r", ended_at=500.0)
+        .egress(_capture((0.0, "chatgpt.com", "dns"), (500.0, "chatgpt.com", "dns")))
+        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .leg("eval_after", 9, 1.0, 2.0, task=3)
+        .path
+    )
+    assert run.episodes[0].episode.ended_at == 500.0
+    assert _buckets(run) == {7: "computed_locally"}
+
+
+def test_an_interrupted_prime_cell_keeps_its_request(tmp_path: Path) -> None:
+    """A trace ending after a prime start still says what the cell was going to fetch."""
+    started = json.dumps(
+        {
+            "type": "tool_execution_start",
+            "toolCallId": "c1",
+            "args": {"code": f"requests.get('{_PARQUET}')"},
+        }
+    )
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace='{"lease":"lease-a"}\n' + started + "\n",
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+    assert "file_download_requested" in run.episodes[0].reasons
+
+
+def test_an_interrupted_codex_command_keeps_its_request(tmp_path: Path) -> None:
+    started = json.dumps(
+        {
+            "type": "item.started",
+            "item": {
+                "id": "item_1",
+                "type": "command_execution",
+                "command": f"curl -sL -o /tmp/k.parquet '{_PARQUET}'",
+                "status": "in_progress",
+            },
+        }
+    )
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace='{"lease":"lease-a"}\n' + started + "\n",
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+
+
+def test_a_completed_codex_command_is_not_counted_twice(tmp_path: Path) -> None:
+    """The started record is dropped when its completion arrives."""
+    trace = "\n".join(
+        [
+            '{"lease":"lease-a"}',
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {"id": "item_1", "type": "command_execution",
+                             "command": "echo hi", "status": "in_progress"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": "item_1", "type": "command_execution",
+                             "command": "echo hi", "aggregated_output": "hi",
+                             "exit_code": 0, "status": "completed"},
+                }
+            ),
+        ]
+    )
+    path = tmp_path / "leg.stream.jsonl"
+    path.write_text(trace + "\n", encoding="utf-8")
+    assert len(read_trace(path, []).actions) == 1
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # A separator inside quotes is data, so the interpreter keeps its source.
+        ('python3 -c "import requests; requests.get(\'https://h/x/resolve/main/d.parquet\')"', 1),
+        # And a real sequence of shell commands still splits.
+        ("echo one; echo two", 2),
+        # The wrapper the harnesses use is opened up and its script split.
+        ('/bin/bash -lc "printf hi; curl -s https://h/x"', 2),
+    ],
+)
+def test_command_splitting_respects_quoting(command: str, expected: int) -> None:
+    assert len(_invocations(command)) == expected
+
+
+def test_a_semicolon_inside_interpreter_source_keeps_the_fetch(tmp_path: Path) -> None:
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {"command": f"python3 -c \"import requests; requests.get('{_PARQUET}')\"",
+             "output": ""},
+        ),
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+    assert run.episodes[0].requested == (_PARQUET,)
+
+
+def test_the_json_stream_stays_json_when_a_target_is_refused(
+    tmp_path: Path, capsys
+) -> None:
+    """stdout is the document this advertises, so a refusal belongs on the other stream."""
+    finished = (
+        RunDir(tmp_path / "finished")
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .leg("rollout", 0, 50.0, 200.0)
+        .path
+    )
+    unfinished = (
+        RunDir(tmp_path / "unfinished", ended_at=None)
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .rollout([(1, 7, "lease-b", 100.0, True)])
+        .leg("rollout", 0, 50.0, 200.0)
+        .path
+    )
+    assert main([str(finished), str(unfinished), "--format", "json"]) == 1
+    captured = capsys.readouterr()
+    assert "refusing" in captured.err
+    document = json.loads(captured.out)
+    assert [run["run_id"] for run in document["runs"]] == ["finished"]

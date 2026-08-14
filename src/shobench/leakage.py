@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from bisect import bisect_left
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -150,14 +151,15 @@ _ARTIFACT_SUFFIXES = (".parquet", ".csv", ".tsv", ".jsonl", ".arrow", ".zip", ".
 # Library calls whose only purpose is pulling a dataset or a repo file off the Hub.
 _HUB_CALLS = ("load_dataset(", "hf_hub_download(", "snapshot_download(")
 
-_SUBMIT = re.compile(r"submit_answer")
 _URL = re.compile(r"https?://[^\s\"'\\<>)\]}]+")
 # A comment runs to the end of its line. The ``#`` has to follow whitespace or start the text,
 # so a URL fragment stays part of its URL. What an agent wrote a note about is not what it ran.
 _COMMENT = re.compile(r"(?:(?<=\s)|^)#[^\n]*")
-# Where one command ends and the next begins, so a URL is read against the command that used it.
-# Command substitution counts as a boundary: what is inside ``$(...)`` or backticks is run.
-_SEPARATORS = re.compile(r"\|\||&&|\$\(|[;|\n&`]")
+# What separates one command from the next, recognised only outside quotes.
+_BOUNDARIES = ("&&", "||", "$(", ";", "|", "&", "\n", "`")
+# Shells, because their ``-c`` argument is a script and has to be split as one.
+_SHELL_NAMES = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
+_DASH_C = re.compile(r"(?:^|\s)-[A-Za-z]*c[A-Za-z]*(?=\s)")
 # Programs that go out and get something, and the calls that do it from inside a program.
 _FETCH_COMMANDS = ("curl", "wget", "aria2c", "axel", "lftp", "scp", "rsync")
 _FETCH_CALLS = (
@@ -238,9 +240,82 @@ def _fetches(action: Action, invocation: str) -> bool:
     return any(call in invocation for call in _FETCH_CALLS)
 
 
-def _invocations(command: str) -> list[str]:
-    """One command per entry, with comments removed."""
-    return [part.strip() for part in _SEPARATORS.split(_COMMENT.sub("", command)) if part.strip()]
+def _split_unquoted(text: str) -> list[str]:
+    """Split on shell separators, but only where a shell would see them.
+
+    A separator inside quotes is data. ``python3 -c "import requests; requests.get(...)"`` is one
+    command whose argument happens to contain a semicolon, and splitting there hands the
+    interpreter to one fragment and the call to another, so neither looks like a fetch.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        hit = next((b for b in _BOUNDARIES if text.startswith(b, index)), None)
+        if hit is not None:
+            parts.append("".join(current))
+            current = []
+            index += len(hit)
+            continue
+        current.append(char)
+        index += 1
+    parts.append("".join(current))
+    return parts
+
+
+def _shell_script(fragment: str) -> str | None:
+    """The script a shell was handed with ``-c``, when this fragment is such a call.
+
+    The harnesses wrap almost everything in ``/bin/bash -lc "..."``, so the real commands live
+    inside one quoted argument. Keeping quotes intact means that argument arrives whole, and it
+    then has to be split as the shell text it is, or a compound script reads as whatever its
+    first command happens to be.
+    """
+    tokens = fragment.split()
+    index = 0
+    while index < len(tokens) and _ASSIGNMENT.match(tokens[index]):
+        index += 1
+    if index >= len(tokens):
+        return None
+    if tokens[index].strip("\"'").rsplit("/", 1)[-1] not in _SHELL_NAMES:
+        return None
+    rest = fragment.split(tokens[index], 1)[1]
+    flag = _DASH_C.search(rest)
+    if flag is None:
+        return None
+    tail = rest[flag.end() :].lstrip()
+    if tail[:1] in ("\"", "'"):
+        closing = tail.find(tail[0], 1)
+        return tail[1:closing] if closing > 0 else tail[1:]
+    return tail or None
+
+
+def _invocations(command: str, depth: int = 0) -> list[str]:
+    """One command per entry, with comments removed and shell arguments opened up."""
+    out: list[str] = []
+    for fragment in _split_unquoted(_COMMENT.sub("", command)):
+        fragment = fragment.strip()
+        if not fragment:
+            continue
+        script = _shell_script(fragment) if depth < 4 else None
+        if script:
+            out.extend(_invocations(script, depth + 1))
+        else:
+            out.append(fragment)
+    return out
 
 
 def _matches(host: str, patterns: Iterable[str]) -> bool:
@@ -375,7 +450,10 @@ class Capture:
         )
 
     def covers(self, start: float | None, end: float | None) -> bool:
-        if start is None:
+        # A window with no end is not a window: nothing finite can contain it, and reading the
+        # missing bound as "ends where it starts" would clear an episode over one instant of a
+        # capture that demonstrably stops.
+        if start is None or end is None:
             return False
         if self.blinded(start, end):
             return False
@@ -532,7 +610,7 @@ def _request_text(arguments: Any) -> str:
     name instead, so the field is unwrapped and everything else keeps its envelope.
     """
     if isinstance(arguments, dict):
-        for field in ("command", "cmd", "script"):
+        for field in ("command", "cmd", "script", "code"):
             value = arguments.get(field)
             if isinstance(value, str):
                 return value
@@ -560,7 +638,8 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
     first_seen: dict[str, int] = {}
     sealed_at: dict[str, int] = {}
     pending: dict[str, tuple[str, str, int]] = {}
-    prime_args: dict[str, str] = {}
+    prime_args: dict[str, tuple[str, int]] = {}
+    started: dict[str, tuple[str, int]] = {}
 
     for offset, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines()):
         for lease in wanted:
@@ -574,20 +653,15 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
             continue
         kind = event.get("type")
 
-        # The terminal call, wherever a harness puts it. codex and claude_code call the tool
-        # directly and their arguments are parsed below; prime-agent writes
-        # ``await shogym_stream.submit_answer(..., lease='...')`` inside an ipython cell, so the
-        # lease is in the code rather than in a field. A line that names the terminal call and a
-        # lease this run dispensed is that lease sealing, in any of the three.
-        if _SUBMIT.search(line):
-            for lease in wanted:
-                if lease not in sealed_at and lease in line:
-                    sealed_at[lease] = offset
-
         # codex: completed items carry the command and its aggregated output, or an MCP call
         # with its arguments and its result.
-        if kind == "item.completed" and isinstance(event.get("item"), dict):
+        if kind == "item.started" and isinstance(event.get("item"), dict):
             item = event["item"]
+            if item.get("type") == "command_execution":
+                started[str(item.get("id"))] = (item.get("command") or "", offset)
+        elif kind == "item.completed" and isinstance(event.get("item"), dict):
+            item = event["item"]
+            started.pop(str(item.get("id")), None)
             if item.get("type") == "command_execution":
                 exit_code = item.get("exit_code")
                 actions.append(
@@ -644,11 +718,20 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
 
         # prime-agent: the arguments arrive when execution starts and the result when it ends.
         elif kind == "tool_execution_start":
-            prime_args[str(event.get("toolCallId"))] = json.dumps(event.get("args") or {})
-        elif kind == "tool_execution_end":
-            request = prime_args.pop(str(event.get("toolCallId")), "") or json.dumps(
-                event.get("args") or {}
+            prime_args[str(event.get("toolCallId"))] = (
+                _request_text(event.get("args") or {}),
+                offset,
             )
+        elif kind == "tool_execution_end":
+            request, _ = prime_args.pop(str(event.get("toolCallId")), ("", offset))
+            request = request or _request_text(event.get("args") or {})
+            # prime-agent runs the terminal call inside the cell it executes, so its seal is in
+            # that code. Only here: a line of prose naming the call is narration, and the other
+            # two harnesses expose the call itself as a structured tool invocation.
+            if "submit_answer" in request:
+                for lease in wanted:
+                    if lease not in sealed_at and lease in request:
+                        sealed_at[lease] = offset
             result = event.get("result")
             failed = event.get("isError") or (
                 isinstance(result, dict) and result.get("isError")
@@ -669,9 +752,15 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
     # because nothing answered would lose a known request and report the episode lower than the
     # ceiling. It is kept with no result and marked failed, since nothing says it succeeded.
     for tool, request, offset in pending.values():
-        actions.append(
-            Action(offset, f"tool:{tool}", request, "", ok=False, trace=transcript)
-        )
+        actions.append(Action(offset, f"tool:{tool}", request, "", ok=False, trace=transcript))
+    for request, offset in prime_args.values():
+        actions.append(Action(offset, "tool:ipython", request, "", ok=False, trace=transcript))
+        if "submit_answer" in request:
+            for lease in wanted:
+                if lease not in sealed_at and lease in request:
+                    sealed_at[lease] = offset
+    for request, offset in started.values():
+        actions.append(Action(offset, "command", request, "", ok=False, trace=transcript))
     actions.sort(key=lambda a: a.offset)
     return Trace(path, tuple(actions), first_seen, sealed_at)
 
@@ -751,6 +840,7 @@ def _rollout_episodes(
     run_dir: Path,
     legs: list[dict[str, Any]],
     traces: dict[str, Trace],
+    run_end: float | None = None,
 ) -> list[Episode]:
     """Windows that run from a dispense to a bound on the seal, not to the next dispense.
 
@@ -783,7 +873,10 @@ def _rollout_episodes(
         for started, ended, name in spans:
             if started <= when and (ended is None or when <= ended):
                 return name, ended
-        return "rollout", None
+        # No leg record covers this dispense, which a lost or mismatched legs.json looks like.
+        # The run's own end is the last moment anything in it could have happened, and where
+        # even that is missing the episode has no upper bound and cannot be cleared.
+        return "rollout", run_end
 
     # Where each lease starts and seals in the transcripts, merged across this phase's legs.
     first_seen: dict[str, tuple[str, int]] = {}
@@ -1224,7 +1317,9 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
     source = ANSWER_SOURCES.get(env)
     budget = cell.get("budget") or {}
     timeout = float(budget.get("eval_task_timeout_s") or 900)
-    finished = manifest.get("ended_at") is not None
+    run_end = manifest.get("ended_at")
+    run_end = float(run_end) if isinstance(run_end, (int, float)) else None
+    finished = run_end is not None
 
     capture = read_capture(run_dir)
     legs = _legs(run_dir)
@@ -1236,7 +1331,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         traces["rollout"] = {
             str(p): read_trace(p, leases) for p in _trace_files(run_dir, "rollout")
         }
-        episodes += _rollout_episodes(run_dir, legs, traces["rollout"])
+        episodes += _rollout_episodes(run_dir, legs, traces["rollout"], run_end)
     for phase in ("eval_before", "eval_after"):
         if (run_dir / phase).is_dir():
             phase_episodes = _eval_episodes(run_dir, phase, legs, timeout)
@@ -1582,10 +1677,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     refused = [d for d in targets if not _finished(d)]
     if refused and not args.allow_unfinished:
         for run_dir in refused:
+            # On stderr, because stdout is the document this command advertises and a refusal
+            # printed into it makes the JSON unparseable for whatever reads it next.
             print(
                 f"refusing {run_dir}: its manifest has no ended_at, so the run was still going "
                 "and the egress record cannot be complete. Pass --allow-unfinished to grade it "
-                "anyway, where every episode is unclassified rather than clean."
+                "anyway, where every episode is unclassified rather than clean.",
+                file=sys.stderr,
             )
         targets = [d for d in targets if d not in refused]
         if not targets:
