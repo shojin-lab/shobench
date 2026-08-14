@@ -1517,11 +1517,11 @@ def test_a_source_mutated_between_read_and_snapshot_refuses(
 
     real_acquire = runner._acquire_run_lock
 
-    def mutating_acquire(run_dir: Path) -> int:
+    def mutating_acquire(run_dir: Path, **kw: object) -> int:
         manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
         manifest["mutated_after_the_read"] = True
         runner.write_json(source_dir / "manifest.json", manifest)
-        return real_acquire(run_dir)
+        return real_acquire(run_dir, **kw)  # type: ignore[arg-type]
 
     monkeypatch.setattr(runner, "_acquire_run_lock", mutating_acquire)
 
@@ -1808,11 +1808,11 @@ def test_a_suspension_written_between_probe_and_hold_refuses(
 
     real_acquire = runner._acquire_run_lock
 
-    def suspending_acquire(run_dir: Path) -> int:
+    def suspending_acquire(run_dir: Path, **kw: object) -> int:
         # The mutator that ran whole between the early probe and the hold: it suspended the
         # source and released the lock, leaving the manifest untouched.
         runner.write_json(source_dir / SUSPENSION_FILE, {"phase": "eval_after"})
-        return real_acquire(run_dir)
+        return real_acquire(run_dir, **kw)  # type: ignore[arg-type]
 
     monkeypatch.setattr(runner, "_acquire_run_lock", suspending_acquire)
 
@@ -2111,6 +2111,10 @@ def test_every_cell_field_is_judged() -> None:
         "budget.pool_ceiling",
         "budget.eval_task_timeout_s",
         "budget.eval_concurrency",
+        # Judged on the refusing side, like every other bound that shapes the rollout a bookend
+        # inherits a home from. It compares equal because the bookend RECOVERS it from the
+        # record, so what the comparison holds is that the recovery happened.
+        "budget.rollout_no_progress_s",
     }
 
 

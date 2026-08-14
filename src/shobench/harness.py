@@ -49,6 +49,14 @@ class StopKind(StrEnum):
     # the bare word `drained`, which shogym already uses for a row a stream close cut off in
     # flight; these are different events and a reader joining the two records must not merge them.
     DRAINED = "stream_drained"
+    # An operator asked for the run to end, and the runner ended the leg through its normal path
+    # so the records got written. Its own kind: the treatment was cut short by a person, and how
+    # far the agent had got when that happened is still a real terminus.
+    OPERATOR = "operator_stop"
+    # The runner ended a rollout leg that had shown no evidence of progress anywhere for the
+    # cell's bound. Its own kind: the container was alive and still being paid for, and nothing
+    # the agent could be observed doing had moved.
+    STALLED = "no_progress"
     # The harness failed for a reason that is neither of the above.
     ERROR = "error"
     # No rule matched. Treated as an error, reported as itself.
@@ -316,6 +324,40 @@ class Harness:
             StopKind.DRAINED,
             "the task was sealed and the stream drained; the runner ended a leg that did not end",
             {"grace_s": grace_s},
+        )
+
+    def operator_verdict(self, *, request: dict[str, Any]) -> StopVerdict:
+        """The verdict for a leg an operator asked the runner to end.
+
+        Identical for every harness and never overridden: the decision was neither the agent's nor
+        the harness's. Its own kind and none of the three it sits between: not a chosen stop (the
+        stopping metrics must not count it), not a leg timeout (the budget did not run out), not a
+        usage-limit suspension (nothing waits for a window to reopen). The terminus it leaves is
+        still real, so the run stays bookendable.
+
+        ``request`` is carried into the evidence so the leg says who ended it and why.
+        """
+        return StopVerdict(
+            StopKind.OPERATOR,
+            "an operator asked for this run to end; the runner ended the leg through its "
+            "normal path so the run's records were written",
+            dict(request),
+        )
+
+    def no_progress_verdict(self, *, bound_s: float, silent_s: float) -> StopVerdict:
+        """The verdict for a rollout leg the runner ended for showing no progress anywhere.
+
+        Identical for every harness, and its own kind: the condition is an absence across every
+        source a working leg writes to (see :func:`shobench.runner.rollout_progress`), held for
+        the cell's own bound while the container was alive.
+
+        Both numbers travel: ``bound_s`` is the rule, ``silent_s`` is what actually happened.
+        """
+        return StopVerdict(
+            StopKind.STALLED,
+            "no trace record, sealed row, session artifact or /work change for the cell's "
+            "no-progress bound; the runner ended a leg that was producing nothing",
+            {"bound_s": bound_s, "silent_s": silent_s},
         )
 
     def _match_usage_limit(self, texts: dict[str, str]) -> StopVerdict | None:

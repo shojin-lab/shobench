@@ -24,7 +24,6 @@ import asyncio
 import contextlib
 import json
 import subprocess
-import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -43,7 +42,7 @@ from shobench.credentials import (
 from shobench.harness import Harness, StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.results import TaskResult
-from shobench.runner import DrainWatchdog, LegRecord, RunContext, run_leg
+from shobench.runner import EarlyEnding, LegRecord, RunContext, run_leg
 from shobench.splits import Side, Split
 
 _SMOKE_CELL = "smoke-automationbench-claude-code"
@@ -607,21 +606,30 @@ def test_the_watchdog_fires_only_after_the_grace_and_only_when_finished(tmp_path
     grace = 0.2
 
     async def body(stream, client):
-        watchdog = DrainWatchdog(threading.Event(), grace)
-        await client.call_tool("get_task", {})
-        # In flight: the watchdog waits, and goes on waiting.
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(
-                runner._watch_for_drain(stream, prov, 0, watchdog, poll_s=0.01), timeout=grace * 3
+        ending = EarlyEnding()
+        harness = harness_for("claude_code")
+
+        def watching():
+            return runner._watch_for_drain(
+                stream, prov, 0, ending, grace_s=grace, harness=harness, poll_s=0.01
             )
-        assert not watchdog.fired.is_set()
+
+        await client.call_tool("get_task", {})
+        # In flight: the watcher waits, and goes on waiting.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(watching(), timeout=grace * 3)
+        assert not ending.fired.is_set()
 
         await client.call_tool("terminate", {})
         started = time.monotonic()
-        assert await runner._watch_for_drain(stream, prov, 0, watchdog, poll_s=0.01) is True
-        assert watchdog.fired.is_set()
+        assert await watching() is True
+        assert ending.fired.is_set()
         # It waited the grace out rather than firing on the first finished reading.
         assert time.monotonic() - started >= grace
+        # The verdict travels with the decision, and it says what the leg was given.
+        assert ending.verdict is not None
+        assert ending.verdict.kind is StopKind.DRAINED
+        assert ending.verdict.evidence["grace_s"] == grace
 
     _against_a_real_stream(prov, 0, body)
 
@@ -675,9 +683,21 @@ def test_prime_ends_a_finished_leg_on_sight_and_the_others_wait_their_grace(
 
         monkeypatch.setattr(runner, "_eval_task_is_finished", counted)
         monkeypatch.setattr(runner, "time", clock)
-        watchdog = DrainWatchdog(threading.Event(), harness_for(name).eval_drain_grace_s)
-        assert await runner._watch_for_drain(stream, prov, 0, watchdog, poll_s=0.001) is True
-        assert watchdog.fired.is_set()
+        ending = EarlyEnding()
+        harness = harness_for(name)
+        assert (
+            await runner._watch_for_drain(
+                stream,
+                prov,
+                0,
+                ending,
+                grace_s=harness.eval_drain_grace_s,
+                harness=harness,
+                poll_s=0.001,
+            )
+            is True
+        )
+        assert ending.fired.is_set()
         waited = clock.readings[-1] - clock.readings[0] if clock.readings else 0.0
         return polls, waited
 
@@ -700,7 +720,7 @@ def test_prime_ends_a_finished_leg_on_sight_and_the_others_wait_their_grace(
 
 
 def test_the_phase_bounds_every_leg_by_its_own_harness_grace(tmp_path: Path, monkeypatch) -> None:
-    """What the harness declares reaches the leg: the watchdog a phase builds carries its own
+    """What the harness declares reaches the leg: the drain watcher a phase builds waits its own
     harness's grace, which is the one place the runner reads it."""
     monkeypatch.setattr(runner, "EVAL_LAUNCH_STAGGER_S", 0.0)
 
@@ -709,11 +729,16 @@ def test_the_phase_bounds_every_leg_by_its_own_harness_grace(tmp_path: Path, mon
         _capture_launches(monkeypatch, launched)
         captured = runner.run_leg
         seen: list[float | None] = []
+        real_watch = runner._watch_for_drain
+
+        async def watch(*args: object, **kw: object) -> bool:
+            seen.append(kw["grace_s"])  # type: ignore[arg-type]
+            return await real_watch(*args, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(runner, "_watch_for_drain", watch)
 
         def record(ctx_arg: RunContext, **kw: object) -> LegRecord:
-            watchdog = kw["watchdog"]
-            assert isinstance(watchdog, DrainWatchdog)
-            seen.append(watchdog.grace_s)
+            assert isinstance(kw["endings"], tuple)
             return captured(ctx_arg, **kw)  # type: ignore[arg-type]
 
         monkeypatch.setattr(runner, "run_leg", record)
@@ -771,7 +796,7 @@ def _supervising(monkeypatch, proc: object, removed: list[str]) -> None:
 
 
 def _supervise(
-    tmp_path: Path, *, timeout_s: int, watchdog: DrainWatchdog
+    tmp_path: Path, *, timeout_s: int, ending: EarlyEnding
 ) -> tuple[int, bool, bool]:
     with (tmp_path / "o").open("w") as out, (tmp_path / "e").open("w") as err:
         return runner._supervise(
@@ -781,7 +806,7 @@ def _supervise(
             stdin_data=None,
             timeout_s=timeout_s,
             container="cell-eval-t1",
-            watchdog=watchdog,
+            endings=(ending,),
         )
 
 
@@ -793,10 +818,10 @@ def test_the_supervisor_ends_a_fired_leg_the_way_the_timeout_path_does(
     proc = _NeverExits()
     removed: list[str] = []
     _supervising(monkeypatch, proc, removed)
-    watchdog = DrainWatchdog(threading.Event(), 1.0)
-    watchdog.fired.set()
+    ending = EarlyEnding()
+    ending.fire(StopVerdict(StopKind.DRAINED, "sealed"))
 
-    assert _supervise(tmp_path, timeout_s=600, watchdog=watchdog) == (-1, False, True)
+    assert _supervise(tmp_path, timeout_s=600, ending=ending) == (-1, False, True)
     assert proc.killed
     assert removed == ["cell-eval-t1"]
 
@@ -808,7 +833,7 @@ def test_the_supervisor_still_reports_an_elapsed_budget_as_a_timeout(
     removed: list[str] = []
     _supervising(monkeypatch, _NeverExits(), removed)
 
-    result = _supervise(tmp_path, timeout_s=0, watchdog=DrainWatchdog(threading.Event(), 1.0))
+    result = _supervise(tmp_path, timeout_s=0, ending=EarlyEnding())
 
     assert result == (-1, True, False)
     assert removed == ["cell-eval-t1"]
@@ -819,10 +844,17 @@ def test_a_leg_that_ends_first_is_neither_drained_nor_killed(tmp_path: Path, mon
     removed: list[str] = []
     _supervising(monkeypatch, _ExitsAtOnce(), removed)
 
-    result = _supervise(tmp_path, timeout_s=600, watchdog=DrainWatchdog(threading.Event(), 1.0))
+    result = _supervise(tmp_path, timeout_s=600, ending=EarlyEnding())
 
     assert result == (0, False, False)
     assert removed == []
+
+
+def _drained(grace_s: float | None) -> EarlyEnding:
+    """The handle a drain watcher hands the supervisor, already fired, with its own verdict."""
+    ending = EarlyEnding()
+    ending.fire(Harness().drained_verdict(grace_s=grace_s))
+    return ending
 
 
 def _leg(ctx: RunContext, **kw: object) -> LegRecord:
@@ -855,7 +887,7 @@ def test_a_drained_leg_carries_its_own_verdict_and_never_the_harness_classificat
 
     monkeypatch.setattr(ctx.harness, "classify", refuse)
 
-    record = _leg(ctx, watchdog=DrainWatchdog(threading.Event(), 120.0))
+    record = _leg(ctx, endings=(_drained(120.0),))
 
     assert record.verdict.kind is StopKind.DRAINED
     assert record.verdict.kind is not StopKind.CHOSEN
@@ -878,7 +910,7 @@ def test_a_leg_that_was_given_no_grace_says_so_in_the_record(tmp_path: Path, mon
     ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
     monkeypatch.setattr(runner, "_supervise", lambda *a, **kw: (-1, False, True))
 
-    record = _leg(ctx, watchdog=DrainWatchdog(threading.Event(), None))
+    record = _leg(ctx, endings=(_drained(None),))
 
     assert record.verdict.kind is StopKind.DRAINED
     assert record.verdict.evidence["grace_s"] is None
@@ -905,7 +937,7 @@ def test_a_leg_the_watchdog_did_not_end_is_classified_by_its_harness(
 
     monkeypatch.setattr(ctx.harness, "classify", fake_classify)
 
-    record = _leg(ctx, watchdog=DrainWatchdog(threading.Event(), 120.0))
+    record = _leg(ctx, endings=(_drained(120.0),))
 
     assert record.verdict.kind is StopKind.CHOSEN
     assert seen["timed_out"] is False

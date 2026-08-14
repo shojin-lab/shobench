@@ -150,6 +150,12 @@ class Budget:
     # clock without touching the one-session-per-task guarantee. The rollout is unaffected: it
     # is a single sustained run, never a fan-out.
     eval_concurrency: int = 4
+    # Seconds the ROLLOUT leg may show no evidence of progress from any source before the runner
+    # ends it. 0 disables the check, which is what every run recorded before this existed ran
+    # under. A bound on silence rather than on work: the default sits above the longest single
+    # tool call in the archives (a yc_bench hour), and a cell with longer tasks raises it. The
+    # eval phases are untouched, being bounded per task by eval_task_timeout_s.
+    rollout_no_progress_s: int = 7200
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -157,6 +163,7 @@ class Budget:
             "pool_ceiling": self.pool_ceiling,
             "eval_task_timeout_s": self.eval_task_timeout_s,
             "eval_concurrency": self.eval_concurrency,
+            "rollout_no_progress_s": self.rollout_no_progress_s,
         }
 
 
@@ -267,6 +274,7 @@ def load_cell(path: Path) -> Cell:
         pool_ceiling=budget_table.get("pool_ceiling"),
         eval_task_timeout_s=int(budget_table.get("eval_task_timeout_s", 3600)),
         eval_concurrency=int(budget_table.get("eval_concurrency", 4)),
+        rollout_no_progress_s=int(budget_table.get("rollout_no_progress_s", 7200)),
     )
     return Cell(
         name=_require(cell, "name", path),

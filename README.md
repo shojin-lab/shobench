@@ -32,6 +32,7 @@ measurement isolates the durable-artifact channel.
     uv run shobench creds --cell <name>         # the credential negative control alone
     uv run shobench run --cell <name>           # a plan, no spend
     uv run shobench run --cell <name> --go      # the cell, for real
+    uv run shobench stop --run runs/<run-id>    # end a live run through its normal ending
     uv run shobench report results/             # the summary table
 
 `--go` is the safety story. Every command that spends prints its plan and exits without it,
@@ -99,6 +100,50 @@ is driven against the pool for the cell's wall clock, and the runner does not re
 because whether a harness sustains autonomous operation is one of the things being measured. A
 run that ends on the agent's own terms while the queue still had tasks is the stop the charter
 asks about, and nothing prompts the agent onward.
+
+**Stopping a run is a command, not a kill.** `pkill` plus `docker rm -f` ends the runner before
+it can write `legs.json` and `rollout_stopping.json`, and a run without those has no terminus:
+`rebookend` refuses it forever and the cell can never produce an `eval_after`, so the cheap way
+to stop a wedged run destroys the measurement while leaving it to burn its whole clock preserves
+it. `stop` inverts that. It spends nothing, so it takes no `--go`, and it is safe to call twice
+and safe to call on a run that has already finished:
+
+    uv run shobench stop --run runs/<run-id> --reason "wedged on a non-terminating tool call"
+
+It writes a one-shot ask into the live run directory (a file, not a signal: a run outlives the
+process that started it, and the only pid a run records is in a lock file that is never
+unlinked). The runner ends its current leg the way a budget does, records the leg as
+`operator_stop`, which is its own kind and neither a chosen stop nor a timeout nor a usage-limit
+suspension, starts no further phase, and publishes what it has. That the treatment was shorter
+than the cell intended is then a fact the artifact states rather than a record nobody can produce.
+
+**An ask is only written where it will be read.** A run's owner advertises that it is watching, in
+the lock it holds, and the watcher's lifetime is that lock's lifetime: setup, phases, publication
+and teardown alike. An owner that does not advertise is refused with nothing written, because a
+process started before this command existed holds its directory exactly as a current one does and
+reads nothing, so an ask left there would not stop it and would instead be waiting for the next
+`resume` or `rerun-eval` to act on. The command then waits to be acknowledged, the runner's unlink
+of the request being the acknowledgment, and takes the ask back if the owner releases the
+directory without having read it. Nothing reports success until the ask has actually landed.
+
+**Whether the ending can be bookended is checked, not promised.** A stop can end a leg before a
+resumable conversation exists, and a session id in the record is not evidence that one does: the
+runner pins claude's id before launch, and codex and prime mint theirs into a trace a stopped leg
+may never have reached. So the run resolves the transcript through the harness's own resume
+validation at the terminus and records `terminus_rebookendable` in `rollout_stopping.json`, and
+says which of the two endings it got. A rollout that reached one can be handed to
+`shobench rebookend`; one that did not says why not instead of sending you to a refusal.
+
+**A rollout leg that stops getting anywhere is ended the same way.** The rollout is the one leg
+with no other bound, every eval leg being bounded per task by `eval_task_timeout_s`, and a
+non-terminating tool call there pegs a core and seals nothing for the rest of an eight-hour
+clock. What ends it is an absence of progress from EVERY source, not silence in the trace: trace
+records, sealed rows, the harness's session state under the cell HOME (which is where a
+delegating agent's children are written), and file changes under `/work` each reset the clock.
+Keying on the trace alone would end exactly the legs worth keeping, since a task can take an hour
+inside one tool call and an agent that delegates goes quiet in its own trace by design. The bound
+is the per-cell `budget.rollout_no_progress_s`, two hours by default and `0` to disable it, and a
+leg it ends is recorded as `no_progress`.
 
 **A provider usage limit suspends the cell rather than ending it.** That interruption is not
 the agent's doing, so the run stops where it stands and an operator continues it once the

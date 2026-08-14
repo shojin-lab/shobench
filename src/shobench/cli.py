@@ -5,13 +5,15 @@
     shobench creds --cell <name>            # the negative-control protocol for one cell
     shobench build                          # build the three images
     shobench run --cell <name> --go         # run one cell (real spend without --go: a plan)
+    shobench stop --run <run-dir>           # end a live run through its normal ending
     shobench resume --run <run-dir> --go    # continue a cell a usage limit suspended
     shobench rerun-eval --run <run-dir> --go # finish an eval_after that lost tasks
     shobench rebookend --run <run-dir> --go # a resumed eval_after for an existing run, as a new run
     shobench report [results/]              # the summary table
 
 ``--go`` is the whole safety story: every command that spends prints its plan and exits unless
-it is present. Nothing here launches the matrix; a cell is run one at a time by name.
+it is present. Nothing here launches the matrix; a cell is run one at a time by name. ``stop``
+carries no ``--go``: it can only reduce what a run spends.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -35,6 +38,11 @@ from shobench.serving import DEFAULT_PORT
 from shobench.splits import load_split_by_name
 
 DOCKER_DIR = "docker"
+
+# Seconds `stop` waits for the run's owner to acknowledge its ask by consuming the request, and
+# how often it looks. Expiring leaves the request in place for the owner to read.
+STOP_ACK_TIMEOUT_S = 60.0
+STOP_ACK_POLL_S = 0.2
 
 
 def _cmd_cells(args: argparse.Namespace) -> int:
@@ -637,6 +645,130 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     return 0
 
 
+def _owner_is_live(run_dir: Path) -> bool:
+    """Does a live process hold this run's directory?
+
+    Proven the way `rebookend` proves it: a SHARED flock on the run's own lock file, which every
+    mutating owner holds EXCLUSIVE. The run's pid is never consulted, because the lock file is
+    never unlinked and a finished run therefore names a pid the system may since have reissued.
+    """
+    import fcntl
+
+    fd = os.open(run_dir / runner.RUN_LOCK_FILE, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _withdraw_stop_request(run_dir: Path) -> bool:
+    """Take back an ask no owner consumed, under a shared lock so no new owner can be reading it.
+
+    A mutating owner takes the run lock EXCLUSIVE, so holding it SHARED here means no owner
+    exists for the duration and the request cannot be latched between the check and the removal.
+    """
+    import fcntl
+
+    fd = os.open(run_dir / runner.RUN_LOCK_FILE, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            # An owner appeared after all, so the ask is theirs to read and must stay.
+            return False
+        try:
+            path = run_dir / runner.STOP_REQUEST_FILE
+            existed = path.is_file()
+            path.unlink(missing_ok=True)
+            return existed
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _cmd_stop(args: argparse.Namespace) -> int:
+    """Ask a live run to end through its normal ending, so its records get written.
+
+    Spends nothing, so it takes no ``--go``, and it is safe to call twice and on a finished run.
+
+    A busy lock is not enough to write an ask on: a live owner started before the stop path
+    existed never reads a request. So the owner has to ADVERTISE that it is watching
+    (``stop_protocol`` in the lock it holds), and one that does not is refused with nothing
+    written, because an ask accepted and never consumed is left on disk for the next resume or
+    rerun to latch. Delivery is not reported until the runner unlinks the request, which also
+    closes the window where the owner finishes between the liveness probe and the write.
+    """
+    run_dir = Path(args.run)
+    if not (run_dir / runner.RUN_LOCK_FILE).is_file():
+        print(
+            f"{run_dir} has no {runner.RUN_LOCK_FILE}, so no shobench process ever owned it: "
+            "this is not a live run directory and there is nothing to stop.",
+            file=sys.stderr,
+        )
+        return 1
+    if not _owner_is_live(run_dir):
+        # Deliberately not a written request: a run nobody owns will not read one, and a file
+        # left behind would end the next process to reopen the directory.
+        print(
+            f"{run_dir} is not owned by a live process, so it has already finished or was "
+            "killed. Nothing was written and nothing was stopped.",
+            file=sys.stderr,
+        )
+        return 0
+    holder = runner.read_lock_holder(run_dir)
+    if not holder.get("stop_protocol"):
+        print(
+            f"BLOCKED: {run_dir} is owned by a live process that does not watch for a stop "
+            f"(its {runner.RUN_LOCK_FILE} advertises no stop protocol), so an ask written here "
+            "would never be read and would be left behind for the next resume or rerun-eval to "
+            "act on. Nothing was written and nothing was stopped.\n\n"
+            "A process started before this command existed is the usual cause. Let it finish, or "
+            "end it by hand and accept that it will leave no rollout terminus and so cannot be "
+            "bookended.",
+            file=sys.stderr,
+        )
+        return 1
+    request = runner.write_stop_request(run_dir, reason=args.reason)
+    print(json.dumps(request, indent=2))
+    deadline = time.monotonic() + STOP_ACK_TIMEOUT_S
+    while True:
+        if not (run_dir / runner.STOP_REQUEST_FILE).is_file():
+            print(
+                f"\n[shobench] stop acknowledged by the owner of {run_dir}. It ends its current "
+                "leg through the normal path, writes the run's records, and publishes what it "
+                "has; the run's own output says whether the terminus it reached can be "
+                "bookended.",
+                file=sys.stderr,
+            )
+            return 0
+        if not _owner_is_live(run_dir):
+            withdrawn = _withdraw_stop_request(run_dir)
+            print(
+                f"\nBLOCKED: the owner of {run_dir} released it without reading the stop, so "
+                "nothing was stopped: it had already finished, or it ended some other way. The "
+                + ("request was withdrawn" if withdrawn else "request was already gone")
+                + ", so nothing is left behind for a later resume or rerun-eval to act on.",
+                file=sys.stderr,
+            )
+            return 1
+        if time.monotonic() >= deadline:
+            print(
+                f"\nBLOCKED: the owner of {run_dir} has not acknowledged the stop within "
+                f"{STOP_ACK_TIMEOUT_S:.0f}s. It is still live and still advertises the stop "
+                "protocol, so the request is left in place for it to read; re-run this to wait "
+                "again, and check that the process is not itself wedged.",
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(STOP_ACK_POLL_S)
+
+
 def _cmd_resume(args: argparse.Namespace) -> int:
     """Continue a cell a provider usage limit suspended, and let it finish.
 
@@ -826,6 +958,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="skip the negative control; never appropriate for a reported cell",
     )
     run.set_defaults(func=_cmd_run)
+
+    stop = sub.add_parser(
+        "stop", help="end a live run through its normal ending, so its records are written"
+    )
+    stop.add_argument("--run", required=True, help="the live run directory to end")
+    stop.add_argument(
+        "--reason",
+        default="",
+        help="what to record about why, carried into the leg's stop verdict",
+    )
+    stop.set_defaults(func=_cmd_stop)
 
     res = sub.add_parser("resume", help="continue a cell a usage limit suspended")
     res.add_argument("--run", required=True, help="the run directory holding suspended.json")
