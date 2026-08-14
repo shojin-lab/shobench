@@ -14,7 +14,7 @@ Three provenance kinds appear in v0:
     The benchmark declares its own split and we honor it. tau2_telecom does this.
 ``seeded``
     No canonical split exists, so this repo draws one, records the seed and the algorithm, and
-    publishes it. hle does this.
+    publishes it. hle and tau2_banking_knowledge do this.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def splits_dir(root: Path | None = None) -> Path:
 class Side:
     """One side of a split: the ids, in served order, plus how to construct the env for them.
 
-    ``env_kwargs`` exists because two of the three v0 envs address a task by its position
+    ``env_kwargs`` exists because some v0 envs address a task by its position
     inside an env-level split rather than by a global id. tau2_telecom serves its held-out set
     as ``task_split="test"`` and its pool as ``task_split="train"``; hle does the same over its
     own 80/20 slice. Carrying the kwargs on the side, not on the cell, is what keeps ids

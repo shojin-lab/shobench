@@ -19,8 +19,8 @@ analysis. The replication data for published results lives in
 
 ## The v0 runner
 
-`docs/scope-v0.md` is the charter. v0 is 3 environments by 4 harness-model pairs, and each
-of those 12 cells runs three phases: the held-out split cold, then an improvement rollout
+`docs/scope-v0.md` is the charter. v0 is 4 environments by 4 harness-model pairs, and each
+of those 16 cells runs three phases: the held-out split cold, then an improvement rollout
 under the env-agnostic "Get Better" instruction, then the same held-out split again with
 whatever the rollout wrote still in place. Eval sessions are fresh by design, so the
 measurement isolates the durable-artifact channel.
@@ -48,15 +48,18 @@ dataset, no judge key, and no broker credential.
 |---|---|
 | automationbench | nothing; the pinned upstream source is fetched once into shogym's cache |
 | tau2_telecom | the tau2-bench `data/` tree at sha `1d244f5d` (about 730 MB), provisioned once with `uv run python tools/provision_tau2_data.py`; the runner then points `TAU2_DATA_DIR` at it. Plus `OPENAI_API_KEY` for the user simulator |
+| tau2_banking_knowledge | the same `data/` tree and the same `OPENAI_API_KEY` as tau2_telecom. Retrieval is pinned to the offline `bm25_grep` variant and evaluation to tau2's `env` type, so nothing else is keyed |
 | hle | the gated `cais/hle` dataset, so `HF_TOKEN` unless it is already cached, and `OPENAI_API_KEY` for the judge |
 
 shogym provisions each env's upstream *source* at runtime but does not carry tau2's ~730 MB of
 `data/`, so that one subtree is provisioned separately by the command above (idempotent: a tree
 that already is the pinned data is verified and skipped, and `--force` re-fetches and replaces
 what is there). What "is the pinned data" means is settled by a committed digest manifest, not by
-a file list: every file a tau2_telecom run reads has to match the size and sha256 the pinned
-commit has, so a stale checkout handed in through `TAU2_DATA_DIR`, or an edited policy or DB, is
-refused by name instead of quietly moving the numbers. A refused tree that the operator named
+a file list: every file a tau2 run reads has to match the size and sha256 the pinned commit has,
+so a stale checkout handed in through `TAU2_DATA_DIR`, or an edited policy or DB, is refused by
+name instead of quietly moving the numbers. Both served domains are covered in full, banking's 97
+task files and its whole 698-document retrieval corpus included, which is 806 files and 17 MB and
+verifies in about 60 ms. A refused tree that the operator named
 through `TAU2_DATA_DIR` is then left exactly as it was, along with everything else living in it:
 only `--force` replaces that one, and a tree that passes is only read, not even annotated, so a
 read-only checkout works. The runner sets `TAU2_DATA_DIR` itself and refuses a tau2 cell

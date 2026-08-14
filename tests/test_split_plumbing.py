@@ -152,6 +152,58 @@ def test_tau2_manifest_ids_resolve_to_the_labels_it_records() -> None:
         assert resolved == list(side.labels)
 
 
+def test_tau2_banking_manifest_ids_resolve_to_the_labels_it_records() -> None:
+    # banking declares no train/test split, so both sides index the one task list and one env
+    # answers for both.
+    if not tau2_data.is_present():
+        pytest.skip(f"tau2 data not provisioned; run {tau2_data.PROVISION_COMMAND}")
+    os.environ["TAU2_DATA_DIR"] = str(tau2_data.resolve_data_dir())
+    split = load_split_by_name("tau2_banking_knowledge")
+    assert split.heldout.env_kwargs == split.pool.env_kwargs
+    env = _env("tau2_banking_knowledge", split.heldout.env_kwargs)
+    assert env.num_tasks == split.total_tasks
+    for side in (split.heldout, split.pool):
+        resolved = [env._resolve_task_id(t) for t in side.task_ids]
+        assert resolved == list(side.labels)
+
+
+def test_tau2_banking_split_serves_only_tasks_the_env_evaluator_scores() -> None:
+    """Every served banking task declares a basis tau2's ``env`` evaluator actually scores.
+
+    That evaluator leaves any other basis unscored rather than scoring it down, so an ACTION-only
+    task on either side would publish a free 1.0 as a measurement.
+    """
+    if not tau2_data.is_present():
+        pytest.skip(f"tau2 data not provisioned; run {tau2_data.PROVISION_COMMAND}")
+    os.environ["TAU2_DATA_DIR"] = str(tau2_data.resolve_data_dir())
+    from shogym.envs.tau2 import mcp_server
+
+    honored = {"DB", "ENV_ASSERTION"}
+    tasks = mcp_server.load_tasks("banking_knowledge")
+    basis_by_id = {
+        str(task.id): {
+            getattr(member, "value", member)
+            for member in (getattr(task.evaluation_criteria, "reward_basis", None) or ())
+        }
+        for task in tasks
+    }
+    split = load_split_by_name("tau2_banking_knowledge")
+    served = list(split.heldout.labels) + list(split.pool.labels)
+    unscored = {
+        label: sorted(basis_by_id[label])
+        for label in served
+        if not basis_by_id[label] or not basis_by_id[label] <= honored
+    }
+    assert not unscored, f"served tasks the env evaluator does not score in full: {unscored}"
+
+    # And the draw covers the whole eligible population, not an arbitrary subset of it.
+    eligible = {
+        label for label, basis in basis_by_id.items() if basis and basis <= honored
+    }
+    assert set(served) == eligible
+    assert split.provenance["excluded_tasks"].keys() == basis_by_id.keys() - eligible
+
+
 def test_automationbench_manifest_covers_the_env_exactly() -> None:
     split = load_split_by_name("automationbench")
     env = _env("automationbench", split.heldout.env_kwargs)

@@ -38,25 +38,28 @@ from typing import Any
 UPSTREAM_SHA = "1d244f5dca42944b67a379b44bfeb9f5748f189d"
 _TARBALL_URL = f"https://github.com/sierra-research/tau2-bench/archive/{UPSTREAM_SHA}.tar.gz"
 
-# Envs whose construction reads tau2 data. v0 ships only tau2_telecom, but every tau2 domain
-# resolves its tasks from this tree, so the gate is by prefix rather than by an explicit list.
+# Envs whose construction reads tau2 data. Every tau2 domain resolves its tasks from this tree,
+# so the gate is by prefix rather than by an explicit list.
 _TAU2_PREFIX = "tau2"
 
-# The manifest: every file the pinned tau2_telecom runtime reads, with the size and sha256 of the
-# pinned commit's bytes. It is committed data and it is both halves of the gate at once. The file
-# list says what has to exist, and it was traced rather than guessed (every ``open`` under
-# ``TAU2_DATA_DIR`` recorded across env construction, session start, and a user turn), which is
-# why it carries the tech support manual the env reads unconditionally and the guidelines the user
-# simulator reads when it builds its system prompt, and carries no voice or other-domain bulk. The
-# digests say what those files have to *be*. Paths are relative to the ``data/`` dir
-# ``TAU2_DATA_DIR`` names; upstream reads ``DATA_DIR / "tau2" / ...`` from there.
+# The manifest: every file the pinned tau2_telecom and tau2_banking_knowledge runtimes read, with
+# the size and sha256 of the pinned commit's bytes. It is committed data and it is both halves of
+# the gate at once. The file list says what has to exist, and it was traced rather than guessed
+# (every ``open`` under ``TAU2_DATA_DIR`` recorded across env construction, session start, and a
+# user turn), which is why it carries the tech support manual telecom reads unconditionally,
+# banking's whole 698-document retrieval corpus and its 97 task files, and the guidelines the user
+# simulator reads when it builds its system prompt, and carries no voice or unserved-domain bulk.
+# It names one of banking's prompt templates rather than all of them because the retrieval variant
+# is fixed on the env class. The digests say what those files have to *be*. Paths are relative to
+# the ``data/`` dir ``TAU2_DATA_DIR`` names; upstream reads ``DATA_DIR / "tau2" / ...`` from there.
 #
 # The digests come from the pinned commit itself, each file fetched from upstream at
 # ``UPSTREAM_SHA`` and hashed, so they are independent of whatever a local cache happens to hold;
 # moving the pin means re-recording them, and a test holds the manifest to the sha so a bumped pin
 # cannot keep checking the old commit's bytes. What the manifest does not do is digest all
 # ~730 MB: that would gate files no cell touches at a cost on every check, so ``--force`` is what
-# replaces a tree whose ungated bulk is suspect.
+# replaces a tree whose ungated bulk is suspect. Both served domains are gated in full, so the
+# ungated remainder is bulk no cell reads.
 _MANIFEST_PATH = Path(__file__).with_name("tau2_data_manifest.json")
 _MANIFEST: dict[str, dict[str, Any]] = json.loads(
     _MANIFEST_PATH.read_text(encoding="utf-8")
