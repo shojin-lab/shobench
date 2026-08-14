@@ -9,6 +9,7 @@
     shobench rerun-eval --run <run-dir> --go # finish an eval_after that lost tasks
     shobench rebookend --run <run-dir> --go # a resumed eval_after for an existing run, as a new run
     shobench report [results/]              # the summary table
+    shobench leakage <run-dir> ...          # per-episode leakage, from the run's egress record
 
 ``--go`` is the whole safety story: every command that spends prints its plan and exits unless
 it is present. Nothing here launches the matrix; a cell is run one at a time by name.
@@ -24,7 +25,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from shobench import credentials, report, runner, tau2_data
+from shobench import credentials, leakage, report, runner, tau2_data
 from shobench.config import load_all_cells, load_cell_by_name, load_instruction, repo_root
 from shobench.containers import AGENT_IMAGE, NETNS_IMAGE, CellSandbox, build_image, daemon_available
 from shobench.egress import EGRESS_IMAGE
@@ -793,6 +794,14 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_leakage(args: argparse.Namespace) -> int:
+    """Read-only over finished run directories: it opens the record and writes nothing to it."""
+    argv = [*args.run_dirs, "--format", args.format]
+    if args.out:
+        argv += ["--out", args.out]
+    return leakage.main(argv)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="shobench", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -877,6 +886,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     rep.add_argument("results", nargs="?", default="results")
     rep.add_argument("--format", choices=["table", "json"], default="table")
     rep.set_defaults(func=lambda a: report.main([str(a.results), "--format", a.format]))
+
+    leak = sub.add_parser(
+        "leakage", help="per-episode leakage buckets, read off a run's egress record"
+    )
+    leak.add_argument("run_dirs", nargs="+", help="completed run directories")
+    leak.add_argument("--format", choices=["table", "json"], default="table")
+    leak.add_argument("--out", default=None, help="write the output here instead of printing it")
+    leak.set_defaults(func=_cmd_leakage)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
