@@ -1965,8 +1965,11 @@ PAIRING_UNCOMPARED_IDENTITY_PATHS = ("substrate.shobench_dirty",)
 # substrate.shobench_dirty is not compared for its own sake: it says whether the revision beside
 # it identifies anything, and that is read where the revision is compared.
 # container.network, container.netns_container, container.home, home, work, redaction,
-# credential_seed, run_id, started_at, ended_at, resumptions and eval_reruns are run-local
-# bookkeeping: they name this run's resources and history, not what its rows were produced by.
+# credential_seed, run_id, started_at, ended_at, resumptions, eval_reruns and operator_stop are
+# run-local bookkeeping: they name this run's resources and history, not what its rows were
+# produced by. operator_stop belongs here for the same reason resumptions does: it says how this
+# run ended, which a reader needs and a pairing does not, since a row an operator's stop kept from
+# being measured is absent rather than measured differently.
 # schema names the record's shape rather than the measurement, and every field the pairing rests
 # on is compared by name, so a purely additive bump must not refuse every archive that predates
 # it.
