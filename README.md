@@ -114,10 +114,25 @@ It writes a one-shot ask into the live run directory (a file, not a signal: a ru
 process that started it, and the only pid a run records is in a lock file that is never
 unlinked). The runner ends its current leg the way a budget does, records the leg as
 `operator_stop`, which is its own kind and neither a chosen stop nor a timeout nor a usage-limit
-suspension, starts no further phase, and publishes what it has. An operator-ended rollout keeps a
-real terminus, being the agent's state at the moment it was stopped, so `shobench rebookend` can
-still give it an `eval_after`; that the treatment was shorter than the cell intended is a fact
-the artifact states rather than a record nobody can produce.
+suspension, starts no further phase, and publishes what it has. That the treatment was shorter
+than the cell intended is then a fact the artifact states rather than a record nobody can produce.
+
+**An ask is only written where it will be read.** A run's owner advertises that it is watching, in
+the lock it holds, and the watcher's lifetime is that lock's lifetime: setup, phases, publication
+and teardown alike. An owner that does not advertise is refused with nothing written, because a
+process started before this command existed holds its directory exactly as a current one does and
+reads nothing, so an ask left there would not stop it and would instead be waiting for the next
+`resume` or `rerun-eval` to act on. The command then waits to be acknowledged, the runner's unlink
+of the request being the acknowledgment, and takes the ask back if the owner releases the
+directory without having read it. Nothing reports success until the ask has actually landed.
+
+**Whether the ending can be bookended is checked, not promised.** A stop can end a leg before a
+resumable conversation exists, and a session id in the record is not evidence that one does: the
+runner pins claude's id before launch, and codex and prime mint theirs into a trace a stopped leg
+may never have reached. So the run resolves the transcript through the harness's own resume
+validation at the terminus and records `terminus_rebookendable` in `rollout_stopping.json`, and
+says which of the two endings it got. A rollout that reached one can be handed to
+`shobench rebookend`; one that did not says why not instead of sending you to a refusal.
 
 **A rollout leg that stops getting anywhere is ended the same way.** The rollout is the one leg
 with no other bound, every eval leg being bounded per task by `eval_task_timeout_s`, and a
