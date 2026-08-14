@@ -2717,7 +2717,7 @@ PROGRESS_POLL_FRACTION = 0.1
 PROGRESS_POLL_CEILING_S = 60.0
 
 
-def _tree_pulse(root: Path, *, limit: int = PROGRESS_WALK_LIMIT) -> tuple[int, int, int]:
+def _tree_pulse(root: Path, *, limit: int | None = None) -> tuple[int, int, int]:
     """A cheap fingerprint of a directory tree: how many files, how many bytes, newest write.
 
     Any write anywhere under ``root`` moves at least one of the three, and none of them moves on
@@ -2729,6 +2729,7 @@ def _tree_pulse(root: Path, *, limit: int = PROGRESS_WALK_LIMIT) -> tuple[int, i
     fail-safe direction: an unreadable or enormous tree makes the check inert rather than making
     it fire.
     """
+    limit = PROGRESS_WALK_LIMIT if limit is None else limit
     files = 0
     total = 0
     newest = 0

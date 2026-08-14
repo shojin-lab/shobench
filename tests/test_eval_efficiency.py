@@ -24,7 +24,6 @@ import asyncio
 import contextlib
 import json
 import subprocess
-import threading
 import time
 from dataclasses import replace
 from pathlib import Path
