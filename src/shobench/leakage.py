@@ -155,6 +155,28 @@ _URL = re.compile(r"https?://[^\s\"'\\<>)\]}]+")
 # A comment runs to the end of its line. The ``#`` has to follow whitespace or start the text,
 # so a URL fragment stays part of its URL. What an agent wrote a note about is not what it ran.
 _COMMENT = re.compile(r"(?:(?<=\s)|^)#[^\n]*")
+# Where one command ends and the next begins, so a URL is read against the command that used it.
+_SEPARATORS = re.compile(r"\|\||&&|[;|\n&]")
+# Programs and calls that go out and get something. A URL is only a request for a body when one
+# of these asked for it: printing a link, grepping for one, or writing one into a file are all
+# things an agent does with a URL as data.
+_FETCH_COMMANDS = ("curl", "wget", "aria2c", "axel", "lftp", "scp", "rsync")
+_FETCH_CALLS = (
+    "urlretrieve", "urlopen", "urllib.request", "requests.get", "requests.post", "httpx.get",
+    "wget.download", *_HUB_CALLS,
+)
+# The name has to sit where a command sits, so a fetch word inside a URL path is part of the URL.
+_FETCH_WORD = re.compile(r"(?<![\w./-])(?:" + "|".join(_FETCH_COMMANDS) + r")\b")
+
+
+def _invocations(command: str) -> list[str]:
+    """One command per entry, with comments removed."""
+    return [part.strip() for part in _SEPARATORS.split(_COMMENT.sub("", command)) if part.strip()]
+
+
+def _is_network_fetch(request: str) -> bool:
+    """Does this command go out and get something?"""
+    return bool(_FETCH_WORD.search(request)) or any(call in request for call in _FETCH_CALLS)
 def _matches(host: str, patterns: Iterable[str]) -> bool:
     host = host.lower().rstrip(".")
     return any(fnmatchcase(host, pattern) for pattern in patterns)
@@ -299,78 +321,92 @@ class Capture:
 
 
 def egress_segments(run_dir: Path) -> list[Path]:
-    """The capture's segment files, without reading any stretch of it twice.
-
-    A continuation gets a segment of its own rather than truncating the first, because the
-    capture command truncates whatever file it is pointed at. When that continuation's observer
-    stops, the runner appends its segment into ``egress.tsv`` so the published record covers the
-    whole cell, and leaves the numbered file where it is. Reading both then counts every
-    continuation observation twice, in the totals and in each episode's evidence.
-
-    So a numbered segment already folded into the base is skipped, and one that is not is read.
-    Which it is comes from the record rather than from the run's status: a run interrupted before
-    its observer stopped has a segment that was never folded, and that traffic is evidence.
-    """
+    """Every file the capture was written into, base first."""
     first = run_dir / "egress.tsv"
     numbered = sorted(
         (p for p in run_dir.glob("egress.*.tsv") if p.stem.split(".")[-1].isdigit()),
         key=lambda p: int(p.stem.split(".")[-1]),
     )
+    return ([first] if first.exists() else []) + numbered
+
+
+def capture_segments(run_dir: Path) -> list[tuple[str, list[str]]]:
+    """One entry per observer process, with each stretch of the capture appearing once.
+
+    A continuation gets a file of its own, because the capture command truncates whatever file it
+    is pointed at. When that continuation's observer stops, the runner appends its file into
+    ``egress.tsv`` so the published record covers the whole cell, and leaves the numbered file
+    behind. Reading both counts that stretch twice.
+
+    Skipping the numbered file is not the fix either: the base then reads as one observer running
+    from its first row to its last, which papers over the interruption in the middle. The gap
+    between one observer stopping and the next starting is exactly where this cannot say the cell
+    was quiet, so the folded stretch is taken back out of the base and handed to the file it came
+    from, and the two intervals stay apart.
+    """
+    first = run_dir / "egress.tsv"
+    numbered = [p for p in egress_segments(run_dir) if p != first]
     if not first.exists():
-        return numbered
-    base = first.read_text(encoding="utf-8", errors="ignore")
-    kept = [first]
-    for segment in numbered:
-        text = segment.read_text(encoding="utf-8", errors="ignore")
-        if text and text in base:
-            continue
-        kept.append(segment)
-    return kept
+        return [(p.name, p.read_text(encoding="utf-8", errors="ignore").splitlines())
+                for p in numbered]
+    base = first.read_text(encoding="utf-8", errors="ignore").splitlines()
+    tail = [(p, p.read_text(encoding="utf-8", errors="ignore").splitlines()) for p in numbered]
+    # Backwards, because the runner appends them in order, so the last one folded is the last
+    # stretch of the base.
+    for _, rows in reversed(tail):
+        if rows and len(rows) <= len(base) and base[-len(rows):] == rows:
+            base = base[: -len(rows)]
+    return [(first.name, base)] + [(p.name, rows) for p, rows in tail]
 
 
 def read_capture(run_dir: Path) -> Capture:
-    """Read every segment, counting the rows that could not be read rather than dropping them."""
+    """Read every observer's stretch, counting the rows that could not be read."""
     connections: list[Connection] = []
     segments: list[Segment] = []
-    for path in egress_segments(run_dir):
-        rows = malformed = 0
+    for name, rows in capture_segments(run_dir):
+        readable = malformed = 0
         first = last = None
         blind: list[list[float]] = []
         pending_blind = 0
-        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        for line in rows:
             if not line.strip():
                 continue
             fields = line.split("\t")
             fields += [""] * (6 - len(fields))
+            hosts = []
+            for column, kind in ((4, "dns"), (5, "tls")):
+                for raw in fields[column].split(","):
+                    host = raw.strip().rstrip(".").lower()
+                    if host:
+                        hosts.append((host, kind))
             try:
                 epoch = float(fields[0])
             except ValueError:
+                epoch = None
+            # The display filter emits a row only for an outbound DNS question or a TLS client
+            # hello, so a row carrying neither name is a torn one however well its timestamp
+            # parses. Counting it as a readable observation would let a truncated line extend
+            # the stretch this claims to have been watching.
+            if epoch is None or not hosts:
                 malformed += 1
                 pending_blind += 1
                 continue
             while pending_blind:
-                # The unreadable row sat between the last readable one and this one. With no
-                # readable row before it, its lower bound is the start of time.
                 blind.append([last if last is not None else float("-inf"), epoch])
                 pending_blind -= 1
-            rows += 1
+            readable += 1
             first = epoch if first is None else min(first, epoch)
             last = epoch if last is None else max(last, epoch)
-            for column, kind in ((4, "dns"), (5, "tls")):
-                for host in fields[column].split(","):
-                    host = host.strip().rstrip(".").lower()
-                    if host:
-                        connections.append(Connection(epoch, host, kind, path.name))
+            connections.extend(Connection(epoch, host, kind, name) for host, kind in hosts)
         while pending_blind:
-            # Nothing readable followed it, so its upper bound is the end of time.
             blind.append([last if last is not None else float("-inf"), float("inf")])
             pending_blind -= 1
         segments.append(
             Segment(
-                path.name,
+                name,
                 first or 0.0,
                 last or 0.0,
-                rows,
+                readable,
                 malformed,
                 tuple((low, high) for low, high in blind),
             )
@@ -997,9 +1033,13 @@ def _requested_urls(actions: Sequence[Action]) -> list[str]:
     for action in actions:
         if action.kind.startswith("mcp:"):
             continue
-        # Comments are stripped first: a link the agent wrote a note about is not a request.
-        for match in _URL.finditer(_COMMENT.sub("", action.request)):
-            urls.append(_tidy_url(match.group(0)))
+        # Only from an invocation that fetches. A URL the agent printed, grepped for or wrote
+        # into a file is data it handled, and nothing there asked the remote host for a body.
+        for invocation in _invocations(action.request):
+            if not _is_network_fetch(invocation):
+                continue
+            for match in _URL.finditer(invocation):
+                urls.append(_tidy_url(match.group(0)))
     return list(dict.fromkeys(urls))
 
 
@@ -1131,8 +1171,15 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
     ordered = sorted(episodes, key=lambda e: (e.started_at if e.started_at is not None else 0.0))
     graded: list[EpisodeLeakage] = []
     # When each leg first reached the answer source, so a later episode in the same container is
-    # not cleared over a file that may have been sitting on its disk since.
+    # not cleared over a file that may have been sitting on its disk since. The time comes from
+    # the observed connection where there is one, because an episode's window is not when its
+    # traffic happened: charging contact to the window's start taints episodes that had already
+    # ended when the connection was made. A request seen only in the transcript has no epoch, so
+    # that one falls back to the window's start, which taints the most and claims the least.
     contacted: dict[str, float] = {}
+    # What the rollout leaves in the HOME its eval_after tasks are copies of.
+    seeded_home_contact = False
+    seeded_home_blind = False
 
     for episode in ordered:
         evidence = _window_evidence(episode, capture.connections, starts)
@@ -1195,7 +1242,10 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         # dataset pull from any other, and bucketing it as leakage while the run's own note says
         # the two cannot be distinguished would be the metadata contradicting the number.
         if source is not None and any(
-            call in _COMMENT.sub("", a.request) for a in actions for call in _HUB_CALLS
+            call in invocation
+            for a in actions
+            for invocation in _invocations(a.request)
+            for call in _HUB_CALLS
         ):
             bucket = _raise_to(bucket, "attempted_leakage")
             _note(reasons, "hub_download_call")
@@ -1213,8 +1263,34 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         ):
             bucket = _raise_to(bucket, "unresolved_leakage")
             _note(reasons, "answer_source_contact_earlier_in_leg")
-        if _rank(bucket) >= _rank("attempted_leakage") and episode.started_at is not None:
-            contacted.setdefault(episode.leg, episode.started_at)
+
+        # An eval_after task runs against a copy of the HOME the rollout accumulated, so a
+        # rollout that reached the answer source hands every one of them a disk this cannot
+        # clear, and a rollout this could not classify hands them one it cannot describe.
+        if episode.phase == "eval_after" and bucket != UNCLASSIFIED:
+            if seeded_home_blind:
+                bucket = UNCLASSIFIED
+                _note(reasons, "rollout_home_unaccounted")
+            elif seeded_home_contact:
+                bucket = _raise_to(bucket, "unresolved_leakage")
+                _note(reasons, "rollout_reached_the_answer_source")
+
+        reached = _rank(bucket) >= _rank("attempted_leakage")
+        if reached and episode.started_at is not None:
+            when = min(
+                (
+                    c.epoch
+                    for c in evidence
+                    if host_role(c.host, source).startswith("answer_source")
+                ),
+                default=episode.started_at,
+            )
+            contacted[episode.leg] = min(contacted.get(episode.leg, when), when)
+        if episode.phase == "rollout":
+            if bucket == UNCLASSIFIED:
+                seeded_home_blind = True
+            elif reached:
+                seeded_home_contact = True
 
         graded.append(
             EpisodeLeakage(
