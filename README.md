@@ -33,6 +33,7 @@ measurement isolates the durable-artifact channel.
     uv run shobench run --cell <name>           # a plan, no spend
     uv run shobench run --cell <name> --go      # the cell, for real
     uv run shobench report results/             # the summary table
+    uv run shobench leakage runs/<run-id>       # per-episode leakage, off the egress record
 
 `--go` is the safety story. Every command that spends prints its plan and exits without it,
 and cells are run one at a time by name; nothing here launches the matrix.
@@ -76,6 +77,7 @@ it is only needed on a cold cache.
 | credentials | `src/shobench/credentials.py` | isolated HOME plus the negative control |
 | egress | `src/shobench/egress.py` | passive per-cell capture that restricts nothing |
 | reporting | `src/shobench/report.py` | the paired bootstrap and the summary table |
+| leakage | `src/shobench/leakage.py` | the egress record read as a per-episode leakage bucket |
 
 ### A few things worth knowing before reading the code
 
@@ -127,3 +129,14 @@ digests the manifest recorded, or the run would publish one run id describing tw
 Each of those refusals leaves the suspension record where it is, so the run stays resumable
 once the shell or the checkout is put right. `docs/harness-autonomy.md` records how each
 harness announces a usage limit, and where each rule came from.
+
+**Some environments publish their answers, so a correct-rate needs a bucket.** hle's questions
+and answers are a public dataset, the cell has open egress by design, and the runner observes
+rather than gates. An episode won by reasoning and an episode won by downloading the answer key
+earn the same reward, so `shobench leakage` grades every episode from the run's egress capture
+before either number is read: computed locally, general web reference, attempted leakage,
+achieved leakage, with the correct-rate reported per bucket and never blended. The capture is
+the floor because the agent has no mount of it; the trace refines and can only raise, since the
+transcript names the endpoint a command asked for while the observer sees whether a body moved.
+The command prints what egress cannot establish alongside the counts, which is most of the
+point: hostnames and times, never payloads.
