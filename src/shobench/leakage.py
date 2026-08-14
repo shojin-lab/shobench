@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import posixpath
 import re
 from bisect import bisect_left
 from collections.abc import Iterable, Sequence
@@ -158,6 +159,7 @@ _ARTIFACT_SUFFIXES = (".parquet", ".csv", ".tsv", ".jsonl", ".arrow", ".zip", ".
 # Library calls whose only purpose is pulling a dataset or a repo file off the Hub.
 _HUB_CALLS = ("load_dataset(", "hf_hub_download(", "snapshot_download(")
 
+_SUBMIT = re.compile(r"submit_answer")
 _URL = re.compile(r"https?://[^\s\"'\\<>)\]}]+")
 # Where a shell command says to put what it fetches.
 _DESTINATION = re.compile(
@@ -255,7 +257,11 @@ def destination_persistence(path: str) -> str:
     elif expanded.startswith("$HOME"):
         expanded = AGENT_HOME + expanded[len("$HOME") :]
     if not expanded.startswith("/"):
-        expanded = f"{AGENT_WORK}/{expanded.lstrip('./')}"
+        expanded = f"{AGENT_WORK}/{expanded}"
+    # Dot segments are resolved before the mounts are tested, because a prefix is not a path:
+    # ``/work/../root/key.parquet`` is a HOME file and reads as a working-directory one to
+    # anything comparing the first characters.
+    expanded = posixpath.normpath(expanded)
     for root, label in ((AGENT_HOME, "home"), (AGENT_WORK, "work")):
         if expanded == root or expanded.startswith(f"{root}/"):
             return label
@@ -319,7 +325,13 @@ class Segment:
             "last": self.last,
             "rows": self.rows,
             "malformed": self.malformed,
-            "blind": [list(interval) for interval in self.blind],
+            # An open bound has no JSON number, and ``Infinity`` is not one: a bound that
+            # reaches past every readable row is published as null rather than as a token a
+            # strict reader refuses.
+            "blind": [
+                [None if low == float("-inf") else low, None if high == float("inf") else high]
+                for low, high in self.blind
+            ],
         }
 
 
@@ -517,6 +529,16 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
             continue
         kind = event.get("type")
 
+        # The terminal call, wherever a harness puts it. codex and claude_code call the tool
+        # directly and their arguments are parsed below; prime-agent writes
+        # ``await shogym_stream.submit_answer(..., lease='...')`` inside an ipython cell, so the
+        # lease is in the code rather than in a field. A line that names the terminal call and a
+        # lease this run dispensed is that lease sealing, in any of the three.
+        if _SUBMIT.search(line):
+            for lease in wanted:
+                if lease not in sealed_at and lease in line:
+                    sealed_at[lease] = offset
+
         # codex: completed items carry the command and its aggregated output, or an MCP call
         # with its arguments and its result.
         if kind == "item.completed" and isinstance(event.get("item"), dict):
@@ -672,25 +694,25 @@ def _legs(run_dir: Path) -> list[dict[str, Any]]:
 def _rollout_episodes(
     run_dir: Path,
     legs: list[dict[str, Any]],
-    max_in_flight: int,
     traces: dict[str, Trace],
 ) -> list[Episode]:
     """Windows that run from a dispense to a bound on the seal, not to the next dispense.
 
     The stream records when a task was handed out and not when it was sealed, and above one
-    lease in flight the agent can still be working an older task when the next is pulled. Two
-    things bound the seal, and the tighter one wins.
+    lease in flight the agent can still be working an older task when the next is pulled. Only
+    the transcript can say when a lease ended: the ``submit_answer`` that ends an episode sits
+    at a definite place in the order, so the seal happened no later than the dispense of the
+    first task pulled at or after it. For a strictly sequential agent that lands on the next
+    dispense; for one that interleaves it lands later and the windows overlap, which is the
+    point.
 
-    The stream itself bounds it. At capacity ``get_task`` force-seals the oldest live episode
-    before dispensing, so a task is certainly sealed by the time ``max_in_flight`` further tasks
-    have been handed out. That bound needs nothing but the dispense record and holds whatever
-    the agent did.
-
-    The transcript bounds it better when it can be read. The ``submit_answer`` that ends an
-    episode appears in the trace at a definite place in the order, so the seal happened before
-    the dispense of the first task pulled after it. For a strictly sequential agent that lands
-    exactly on the next dispense; for one that interleaves it lands later, and the windows
-    overlap, which is the point.
+    Capacity is deliberately not a bound. ``get_task`` force-drains only when a pull finds every
+    slot occupied, so a newer lease that submits frees a slot and lets the next dispense through
+    with an older lease still live: at capacity three, dispense A B C, submit B, dispense D,
+    submit C, dispense E leaves A open past two later dispenses. Ending A at
+    ``index + max_in_flight`` would invent a seal the stream never performed and hand A's later
+    traffic to somebody else. With no seal in the transcript the only sound bound is the leg,
+    which is where the container that could have opened the connection stops existing.
     """
     phase_dir = run_dir / "rollout"
     dispenses = sorted(_read_jsonl(phase_dir / "dispenses.jsonl"), key=lambda d: d["dispensed_at"])
@@ -718,24 +740,25 @@ def _rollout_episodes(
 
     times = {str(d["lease"]): float(d["dispensed_at"]) for d in dispenses}
     episodes = []
-    for index, dispense in enumerate(dispenses):
+    for dispense in dispenses:
         lease = str(dispense["lease"])
         started = float(dispense["dispensed_at"])
         leg, leg_end = leg_of(started)
 
-        # The stream's own bound, from the capacity rule.
-        ahead = index + max(int(max_in_flight), 1)
-        bounds = [dispenses[ahead]["dispensed_at"]] if ahead < len(dispenses) else []
-        kind = "capacity_bound"
+        bounds = []
+        kind = "leg_bound"
 
-        # The transcript's bound, when this lease's seal can be placed in the order.
+        # The transcript's bound, when this lease's seal can be placed in the order. The seal
+        # happened no later than the dispense of the first task pulled at or after it. At or
+        # after, because a harness that submits and pulls again inside one action puts both on
+        # the same line, and the lease it pulls there was dispensed after this one sealed.
         seal = sealed_at.get(lease)
         if seal is not None:
             trace_name, offset = seal
             after = [
                 times[other]
                 for other, (name, where) in first_seen.items()
-                if name == trace_name and where > offset and other in times
+                if name == trace_name and where >= offset and other != lease and other in times
             ]
             if after:
                 bounds.append(min(after))
@@ -743,8 +766,6 @@ def _rollout_episodes(
         if leg_end is not None:
             bounds.append(leg_end)
         ended = min(bounds) if bounds else None
-        if ended is not None and leg_end is not None and ended >= leg_end:
-            kind = kind if kind == "trace_seal_bound" else "leg_bound"
 
         correct, success, reward = _outcome(results.get(lease))
         episodes.append(
@@ -830,6 +851,11 @@ class EpisodeLeakage:
     requested: tuple[str, ...]
     covered: bool
     shared_with: tuple[dict[str, Any], ...]
+    # Every confirmed landing, not only the one the headline acquisition names. An episode that
+    # fetched twice put two files on disk, and the second is as durable as the first.
+    landings: tuple[dict[str, Any], ...]
+    # Leases whose live region overlaps this episode's, so its commands are not exclusively its.
+    action_rivals: tuple[str, ...]
     acquisition: dict[str, Any] | None
     inherited_from: dict[str, Any] | None
 
@@ -847,6 +873,8 @@ class EpisodeLeakage:
                 "capture_covers": self.covered,
                 "shared_with": list(self.shared_with),
             },
+            "landings": [dict(landing) for landing in self.landings],
+            "action_rivals": list(self.action_rivals),
             "bucket": self.bucket,
             "reasons": list(self.reasons),
             "evidence": [c.to_json() for c in self.evidence],
@@ -996,31 +1024,54 @@ def _window_evidence(
     return out
 
 
-def _actions_for(
-    episode: Episode, traces: dict[str, Trace], phase_dir_name: str
-) -> list[Action]:
-    """The actions this episode ran, cut out of its phase's transcripts by lease.
+def _lease_regions(trace: Trace) -> dict[str, tuple[int, int]]:
+    """Where each lease is live in one transcript: first appearance to seal.
+
+    A lease with no seal in the transcript is live to the end of it. That is the honest end for
+    a harness whose terminal call cannot be found, and it is why a missing seal shows up as
+    wide, shared ownership rather than as a confident slice of somebody's commands.
+    """
+    end_of_trace = max((a.offset for a in trace.actions), default=0) + 1
+    return {
+        lease: (start, trace.sealed_at.get(lease, end_of_trace))
+        for lease, start in trace.first_seen.items()
+    }
+
+
+def _actions_for(episode: Episode, traces: dict[str, Trace]) -> tuple[list[Action], list[str]]:
+    """The actions this episode could have run, and the leases that could equally own them.
 
     An eval task's trace is named for its task, so the whole file is one episode. A rollout is
-    one transcript for hundreds, and the lease ids cut it: an episode's actions are the ones
-    between where its lease first appears and where the next lease does.
+    one transcript for hundreds, and the lease ids cut it: an episode's actions run from where
+    its lease first appears to where that lease seals.
+
+    Those cuts overlap when the agent holds more than one lease, and an action inside an overlap
+    has no owner the transcript can name. Giving it to whichever lease was pulled most recently
+    is a guess that goes wrong in both directions at once: it clears the lease that really ran
+    the command and charges the one that did not. So an overlapping action belongs to every
+    lease live at that point and the rivals travel with the record, which is what the egress
+    side already does with a connection inside two open windows.
     """
     out: list[Action] = []
+    rivals: set[str] = set()
     for name, trace in traces.items():
         named = _TASK_TRACE.match(Path(name).name)
         if named is not None:
             if int(named.group(1)) == episode.task_idx:
                 out.extend(trace.actions)
             continue
-        start = trace.first_seen.get(episode.lease)
-        if start is None:
+        regions = _lease_regions(trace)
+        if episode.lease not in regions:
             continue
-        later = [o for o in trace.first_seen.values() if o > start]
-        end = min(later) if later else None
-        out.extend(
-            a for a in trace.actions if a.offset >= start and (end is None or a.offset < end)
-        )
-    return out
+        for action in trace.actions:
+            live = [
+                lease for lease, (start, end) in regions.items() if start <= action.offset <= end
+            ]
+            if episode.lease not in live:
+                continue
+            out.append(action)
+            rivals.update(lease for lease in live if lease != episode.lease)
+    return out, sorted(rivals)
 
 
 _TASK_TRACE = re.compile(r"^task-(\d+)-leg-")
@@ -1198,23 +1249,26 @@ def _inherited_artifacts(
     # bookend was seeded from.
     carried = [
         {
-            "destination": e.acquisition["destination"],
-            "persistence": e.acquisition["persistence"],
+            "destination": landing["destination"],
+            "persistence": "home",
             "reach": "run",
             "phase": None,
             "leg": None,
             "acquisition": {
-                **e.acquisition["episode"],
+                **e.episode.identity(),
                 "run_id": source.run_id,
-                "destination": e.acquisition["destination"],
-                "persistence": e.acquisition["persistence"],
+                "destination": landing["destination"],
+                "persistence": "home",
                 "reach": "run",
             },
         }
-        for e in source.acquisitions()
-        if e.acquisition.get("destination")
-        and e.acquisition.get("persistence") == "home"
-        and e.episode.phase == "rollout"
+        # Every landing, not only the headline one. An episode that saved to scratch and then to
+        # HOME left a durable file behind either way, and reading only the first acquisition
+        # would hand this bookend a clean bill on the strength of the scratch copy.
+        for e in source.episodes
+        if e.episode.phase == "rollout"
+        for landing in e.landings
+        if landing.get("destination") and landing.get("persistence") == "home"
     ]
     notes = []
     if carried:
@@ -1243,7 +1297,6 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
     source = ANSWER_SOURCES.get(env)
     budget = cell.get("budget") or {}
     timeout = float(budget.get("eval_task_timeout_s") or 900)
-    max_in_flight = int(cell.get("max_in_flight") or 1)
     finished = manifest.get("ended_at") is not None
 
     capture = read_capture(run_dir)
@@ -1256,7 +1309,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         traces["rollout"] = {
             str(p): read_trace(p, leases) for p in _trace_files(run_dir, "rollout")
         }
-        episodes += _rollout_episodes(run_dir, legs, max_in_flight, traces["rollout"])
+        episodes += _rollout_episodes(run_dir, legs, traces["rollout"])
     for phase in ("eval_before", "eval_after"):
         if (run_dir / phase).is_dir():
             phase_episodes = _eval_episodes(run_dir, phase, legs, timeout)
@@ -1293,7 +1346,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
 
     for episode in ordered:
         evidence = _window_evidence(episode, capture.connections, starts)
-        actions = _actions_for(episode, traces.get(episode.phase, {}), episode.phase)
+        actions, action_rivals = _actions_for(episode, traces.get(episode.phase, {}))
         requested = _requested_urls(actions)
         covered = capture.covers(episode.started_at, episode.ended_at)
         reasons: list[str] = []
@@ -1346,7 +1399,10 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
                 _note(reasons, "answer_rows_requested")
             elif kind == "file_download":
                 _note(reasons, "file_download_requested")
-        if any(call in a.request for a in actions for call in _HUB_CALLS):
+        # Only where the environment has an answer source at all. Without one this cannot tell a
+        # dataset pull from any other, and bucketing it as leakage while the run's own note says
+        # the two cannot be distinguished would be the metadata contradicting the number.
+        if source is not None and any(call in a.request for a in actions for call in _HUB_CALLS):
             bucket = _raise_to(bucket, "attempted_leakage")
             _note(reasons, "hub_download_call")
 
@@ -1421,13 +1477,13 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         # no trace the observer can see and this instrument will not guess either way.
         reachable = [r for r in resident if _still_reachable(r, episode)]
         if reachable and acquisition is None:
+            # The same standard a download confirmation has to meet. Deleting a file, moving
+            # it, or printing its name are all things an episode does with a path it never
+            # opened, and none of them is the answer key being consulted.
             read = [
                 r
                 for r in reachable
-                if any(
-                    a.ok and (r["destination"] in a.request or r["destination"] in a.result)
-                    for a in actions
-                )
+                if any(a.ok and _reads_the_file(a, r["destination"]) for a in actions)
             ]
             if read:
                 bucket = _raise_to(bucket, "achieved_leakage")
@@ -1465,6 +1521,8 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
                 requested=tuple(requested),
                 covered=covered,
                 shared_with=(),
+                landings=tuple(landed),
+                action_rivals=tuple(action_rivals),
                 acquisition=acquisition,
                 inherited_from=inherited,
             )
@@ -1702,6 +1760,8 @@ def _mark_shared_windows(graded: Sequence[EpisodeLeakage]) -> list[EpisodeLeakag
                 requested=row.requested,
                 covered=row.covered,
                 shared_with=rivals,
+                landings=row.landings,
+                action_rivals=row.action_rivals,
                 acquisition=row.acquisition,
                 inherited_from=row.inherited_from,
             )
