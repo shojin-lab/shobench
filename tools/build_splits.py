@@ -7,10 +7,11 @@ rerun it and get byte-identical output.
     uv run python tools/build_splits.py automationbench --shorep ../shorep
     uv run python tools/build_splits.py tau2_telecom
     uv run python tools/build_splits.py hle
+    uv run python tools/build_splits.py tau2_banking_knowledge
 
-The three builders differ because the three splits have different authority. automationbench
-adopts a published split, tau2_telecom honors upstream's declared one, and hle has none to
-honor so this repo draws and publishes its own.
+The builders differ because the splits have different authority. automationbench adopts a
+published split, tau2_telecom honors upstream's declared one, and hle and
+tau2_banking_knowledge have none to honor so this repo draws and publishes its own.
 """
 
 from __future__ import annotations
@@ -241,22 +242,104 @@ def build_hle(out: Path) -> Path:
     )
 
 
+# ----- tau2_banking_knowledge ------------------------------------------------------------
+
+BANKING_HELDOUT_N = 40
+BANKING_POOL_N = 57
+BANKING_TOTAL = 97
+
+
+def build_tau2_banking_knowledge(out: Path) -> Path:
+    """Draw and publish a split, because banking ships no split file to honor.
+
+    telecom's sizes are upstream's; these are chosen. Held-out is 40, the size upstream declares
+    for telecom, so the two tau2 envs are read against the same held-out N, and the pool is the
+    remaining 57.
+    """
+    import os
+
+    from shobench import tau2_data
+
+    # Read the ids through the loader the env reads them through. banking's tasks come from a
+    # directory of per-task files in sorted order rather than from tasks.json, and a manifest id
+    # is a position in the list that loader returns.
+    os.environ["TAU2_DATA_DIR"] = str(tau2_data.require())
+    from shogym.envs.tau2 import mcp_server
+
+    task_ids = [str(task.id) for task in mcp_server.load_tasks("banking_knowledge")]
+    n = len(task_ids)
+    if n != BANKING_TOTAL:
+        raise SystemExit(
+            f"banking_knowledge has {n} tasks and the manifest expects {BANKING_TOTAL}: "
+            "the domain drifted"
+        )
+
+    order = list(range(n))
+    random.Random(SEED).shuffle(order)
+    heldout_idx = sorted(order[:BANKING_HELDOUT_N])
+    pool_idx = sorted(order[BANKING_HELDOUT_N : BANKING_HELDOUT_N + BANKING_POOL_N])
+
+    return write_split(
+        out,
+        env="tau2_banking_knowledge",
+        total_tasks=n,
+        heldout=[str(i) for i in heldout_idx],
+        pool=[str(i) for i in pool_idx],
+        heldout_labels=[task_ids[i] for i in heldout_idx],
+        pool_labels=[task_ids[i] for i in pool_idx],
+        provenance={
+            "kind": "seeded",
+            "seed": SEED,
+            "upstream": "sierra-research/tau2-bench",
+            "upstream_sha": TAU2_UPSTREAM_SHA,
+            "source": "data/tau2/domains/banking_knowledge/tasks",
+            "population": "all 97 banking_knowledge tasks, which upstream ships undivided",
+            "authority": (
+                "banking_knowledge ships no split_tasks.json, so there is no declared split to "
+                "honor the way telecom's is honored, and no prior published run over these "
+                "tasks to adopt. This repo draws one and publishes it."
+            ),
+            "procedure": (
+                "Shuffle the population's positions once with the recorded seed, take the first "
+                "40 as held-out and the remaining 57 as the improvement pool, then sort each "
+                "side ascending so serving order is stable and reviewable. Held-out is 40 "
+                "because upstream declares 40 for telecom, so the two tau2 envs are read "
+                "against the same held-out N. The pool is a ceiling on what the rollout may "
+                "serve, not a quota."
+            ),
+            "id_meaning": (
+                "A shogym tau2 task_id is the stringified index into the env's task list. "
+                "banking_knowledge declares no train/test split, so both sides index the same "
+                "97-task list and disjointness is checked on the ids themselves; labels carry "
+                "upstream's own task ids."
+            ),
+            "shogym_rev": SHOGYM_REV,
+        },
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("env", choices=["automationbench", "tau2_telecom", "hle", "all"])
+    parser.add_argument(
+        "env",
+        choices=["automationbench", "tau2_telecom", "hle", "tau2_banking_knowledge", "all"],
+    )
     parser.add_argument("--shorep", type=Path, default=Path("../shorep"))
     parser.add_argument("--cache", type=Path, default=Path.home() / ".cache" / "shobench")
     parser.add_argument("--out-dir", type=Path, default=None)
     args = parser.parse_args(argv)
 
     out_dir = args.out_dir or splits_dir()
-    targets = ["automationbench", "tau2_telecom", "hle"] if args.env == "all" else [args.env]
+    all_envs = ["automationbench", "tau2_telecom", "hle", "tau2_banking_knowledge"]
+    targets = all_envs if args.env == "all" else [args.env]
     for env in targets:
         out = out_dir / f"{env}.json"
         if env == "automationbench":
             build_automationbench(args.shorep.resolve(), out)
         elif env == "tau2_telecom":
             build_tau2_telecom(out, args.cache)
+        elif env == "tau2_banking_knowledge":
+            build_tau2_banking_knowledge(out)
         else:
             build_hle(out)
         print(f"wrote {out}")

@@ -1,0 +1,57 @@
+# tau2_banking_knowledge x claude_code @ claude-opus-5
+#
+# One cell of the v0 matrix. Everything that distinguishes it from another cell is here, so
+# the matrix is reviewable as data and a new experiment arm is a new file. The
+# generation-effect study rides this same runner by varying instruction_arm alone.
+
+[cell]
+name = "tau2_banking_knowledge-claude_code-claude-opus-5"
+env = "tau2_banking_knowledge"
+harness = "claude_code"
+model = "claude-opus-5"
+# Effort is a cell axis: a different effort is a different cell file. v0 starts every base
+# cell at xhigh, the effort the registered conversation-not-memories training ran at.
+effort = "xhigh"
+# How many tasks may be live at once (shogym max_in_flight). Above 1 the agent holds
+# several tasks, every env tool is lease-wrapped, and a pull at the limit displaces the
+# oldest. v0 serves 8 so one-at-a-time is a choice the agent makes, not the only option.
+max_in_flight = 8
+split = "tau2_banking_knowledge"
+instruction_arm = "get-better"
+# Subscription is the preferred mode for every v0 cell. The runner supports both modes and
+# records which one the cell actually ran under.
+credential_mode = "subscription"
+# OPENAI_API_KEY is the user simulator's, server-side; the pinned bm25_grep retrieval is local
+# and adds no key of its own. TAU2_DATA_DIR is not listed here: the runner provisions the
+# ~730 MB tau2 data into shogym's cache and points TAU2_DATA_DIR at it, rather than requiring
+# the operator to export it. `uv run python tools/provision_tau2_data.py`.
+required_env = ["OPENAI_API_KEY"]
+note = "Our seeded 40/57 draw: banking declares no split, and 40 held-out matches telecom's so the two tau2 envs are read against the same held-out N. Served offline (bm25_grep retrieval, env-only evaluation), so these numbers are not comparable to published tau2-bench banking results."
+
+[budget]
+# Wall-clock parity, decided in the scope: identical across harnesses within an env, no token
+# ceiling, because the cells run on subscription billing.
+rollout_wall_clock_s = 28800
+# The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
+pool_ceiling = 57
+eval_task_timeout_s = 1800
+
+[env_kwargs]
+# gpt-5.6-luna serves tau2's user simulator in place of upstream tau2-bench's canonical
+# gpt-4.1-2025-04-14. Every tau2 cell carries this identical block, so they stay comparable to
+# each other, but none of them is comparable to published tau2-bench results.
+user_llm = "gpt-5.6-luna"
+
+# tau2's evaluator restricted to its offline half. The domain's own default scores one task's
+# NL assertions through a judge LLM; env scores DB state and env assertions alone, so a served
+# run needs no judge. The nine action-basis tasks are then scored on DB state rather than on
+# action match, which is the price of serving the domain offline.
+evaluation_type = "env"
+
+# Naming this table replaces tau2's DEFAULT_LLM_ARGS_USER wholesale, so both arguments have to
+# appear here. reasoning_effort is required rather than optional: luna refuses any request
+# carrying function tools unless it is set explicitly, and the user simulator always carries
+# the banking user tools, so omitting it fails every user turn with a 400.
+[env_kwargs.user_llm_args]
+reasoning_effort = "none"
+temperature = 0.0

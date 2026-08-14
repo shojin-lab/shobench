@@ -152,6 +152,21 @@ def test_tau2_manifest_ids_resolve_to_the_labels_it_records() -> None:
         assert resolved == list(side.labels)
 
 
+def test_tau2_banking_manifest_ids_resolve_to_the_labels_it_records() -> None:
+    # banking declares no train/test split, so both sides index the one task list and carry the
+    # same env kwargs. One env answers for both, and the manifest has to cover that list exactly.
+    if not tau2_data.is_present():
+        pytest.skip(f"tau2 data not provisioned; run {tau2_data.PROVISION_COMMAND}")
+    os.environ["TAU2_DATA_DIR"] = str(tau2_data.resolve_data_dir())
+    split = load_split_by_name("tau2_banking_knowledge")
+    assert split.heldout.env_kwargs == split.pool.env_kwargs
+    env = _env("tau2_banking_knowledge", split.heldout.env_kwargs)
+    assert env.num_tasks == split.total_tasks
+    for side in (split.heldout, split.pool):
+        resolved = [env._resolve_task_id(t) for t in side.task_ids]
+        assert resolved == list(side.labels)
+
+
 def test_automationbench_manifest_covers_the_env_exactly() -> None:
     split = load_split_by_name("automationbench")
     env = _env("automationbench", split.heldout.env_kwargs)

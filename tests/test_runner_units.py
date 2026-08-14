@@ -118,10 +118,15 @@ def test_every_cell_config_loads_and_names_a_committed_split() -> None:
         load_instruction(cell.instruction_arm)
 
 
-def test_the_v0_matrix_is_three_envs_by_four_harness_model_pairs() -> None:
+def test_the_v0_matrix_is_four_envs_by_four_harness_model_pairs() -> None:
     cells = [c for c in load_all_cells() if not c.name.startswith("smoke")]
-    assert len(cells) == 12
-    assert {c.env for c in cells} == {"automationbench", "tau2_telecom", "hle"}
+    assert len(cells) == 16
+    assert {c.env for c in cells} == {
+        "automationbench",
+        "tau2_telecom",
+        "hle",
+        "tau2_banking_knowledge",
+    }
     pairs = {(c.harness, c.model) for c in cells}
     assert pairs == {
         ("claude_code", "claude-opus-5"),
