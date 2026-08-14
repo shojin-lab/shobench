@@ -156,17 +156,86 @@ _URL = re.compile(r"https?://[^\s\"'\\<>)\]}]+")
 # so a URL fragment stays part of its URL. What an agent wrote a note about is not what it ran.
 _COMMENT = re.compile(r"(?:(?<=\s)|^)#[^\n]*")
 # Where one command ends and the next begins, so a URL is read against the command that used it.
-_SEPARATORS = re.compile(r"\|\||&&|[;|\n&]")
-# Programs and calls that go out and get something. A URL is only a request for a body when one
-# of these asked for it: printing a link, grepping for one, or writing one into a file are all
-# things an agent does with a URL as data.
+# Command substitution counts as a boundary: what is inside ``$(...)`` or backticks is run.
+_SEPARATORS = re.compile(r"\|\||&&|\$\(|[;|\n&`]")
+# Programs that go out and get something, and the calls that do it from inside a program.
 _FETCH_COMMANDS = ("curl", "wget", "aria2c", "axel", "lftp", "scp", "rsync")
 _FETCH_CALLS = (
     "urlretrieve", "urlopen", "urllib.request", "requests.get", "requests.post", "httpx.get",
     "wget.download", *_HUB_CALLS,
 )
-# The name has to sit where a command sits, so a fetch word inside a URL path is part of the URL.
-_FETCH_WORD = re.compile(r"(?<![\w./-])(?:" + "|".join(_FETCH_COMMANDS) + r")\b")
+# Words that stand in front of the command actually being run, rather than being it.
+_WRAPPERS = frozenset(
+    {
+        "bash", "sh", "zsh", "dash", "ksh", "env", "timeout", "nohup", "sudo", "nice", "time",
+        "command", "exec", "xargs", "stdbuf", "setsid", "do", "then", "else", "elif", "while",
+        "until", "if", "eval",
+    }
+)
+# Interpreters, because a fetch written as a library call is only a fetch when one is running.
+_INTERPRETERS = ("python", "ipython", "node", "ruby", "perl", "php", "deno", "bun")
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+# Tool names whose input is the request rather than a shell line.
+_FETCH_TOOLS = frozenset({"webfetch", "websearch"})
+_SHELL_TOOLS = frozenset({"bash", "shell", "sh", "run_command", "execute"})
+
+
+def invoked_command(invocation: str) -> str | None:
+    """The program this fragment actually runs, or None if it runs nothing recognisable.
+
+    A fetch is a command that was invoked, not a word that appears. ``printf "%s" "curl <url>"``
+    contains ``curl`` and runs ``printf``, and reading the first as a request would let an agent
+    quoting a snippet look like an agent downloading a dataset. So the tokens are walked from
+    the left, past environment assignments and past the wrappers that stand in front of a real
+    command, and what is left at the front is what ran.
+    """
+    tokens = invocation.split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index].strip("\"'`(){}").lstrip("$")
+        if not token:
+            index += 1
+            continue
+        if _ASSIGNMENT.match(token):
+            index += 1
+            continue
+        base = token.rsplit("/", 1)[-1]
+        if base in _WRAPPERS:
+            index += 1
+            while index < len(tokens):
+                following = tokens[index].strip("\"'`")
+                if following.startswith("-") or (base == "timeout" and _DURATION.match(following)):
+                    index += 1
+                    continue
+                break
+            continue
+        return base
+    return None
+
+
+def _invokes_a_fetch(invocation: str) -> bool:
+    command = invoked_command(invocation)
+    if command is None:
+        return False
+    if command in _FETCH_COMMANDS:
+        return True
+    return command.startswith(_INTERPRETERS) and any(c in invocation for c in _FETCH_CALLS)
+
+
+def _fetches(action: Action, invocation: str) -> bool:
+    """Did this fragment of this action ask a remote host for something?
+
+    A shell line is read for the command at its front. A tool whose whole job is fetching is a
+    fetch whatever its input looks like. And a tool whose input is code rather than a command
+    line has no command position to read, so there the call itself is the signal.
+    """
+    tool = action.kind.split(":", 1)[-1].lower()
+    if tool in _FETCH_TOOLS:
+        return True
+    if action.kind == "command" or tool in _SHELL_TOOLS:
+        return _invokes_a_fetch(invocation)
+    return any(call in invocation for call in _FETCH_CALLS)
 
 
 def _invocations(command: str) -> list[str]:
@@ -174,9 +243,6 @@ def _invocations(command: str) -> list[str]:
     return [part.strip() for part in _SEPARATORS.split(_COMMENT.sub("", command)) if part.strip()]
 
 
-def _is_network_fetch(request: str) -> bool:
-    """Does this command go out and get something?"""
-    return bool(_FETCH_WORD.search(request)) or any(call in request for call in _FETCH_CALLS)
 def _matches(host: str, patterns: Iterable[str]) -> bool:
     host = host.lower().rstrip(".")
     return any(fnmatchcase(host, pattern) for pattern in patterns)
@@ -458,6 +524,21 @@ class Trace:
     sealed_at: dict[str, int] = field(default_factory=dict)
 
 
+def _request_text(arguments: Any) -> str:
+    """A tool's input as the text that was run, where there is one.
+
+    A shell tool carries its command in a field, and the command is what has a program at its
+    front. Handing the JSON envelope to a tokeniser looking for that program finds the field
+    name instead, so the field is unwrapped and everything else keeps its envelope.
+    """
+    if isinstance(arguments, dict):
+        for field in ("command", "cmd", "script"):
+            value = arguments.get(field)
+            if isinstance(value, str):
+                return value
+    return json.dumps(arguments)
+
+
 def _blocks_text(blocks: Any) -> str:
     if isinstance(blocks, str):
         return blocks
@@ -478,7 +559,7 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
     actions: list[Action] = []
     first_seen: dict[str, int] = {}
     sealed_at: dict[str, int] = {}
-    pending: dict[str, tuple[str, str]] = {}
+    pending: dict[str, tuple[str, str, int]] = {}
     prime_args: dict[str, str] = {}
 
     for offset, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines()):
@@ -541,13 +622,15 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     name = str(block.get("name"))
                     arguments = block.get("input") or {}
-                    pending[str(block.get("id"))] = (name, json.dumps(arguments))
+                    pending[str(block.get("id"))] = (name, _request_text(arguments), offset)
                     if name.endswith("submit_answer") and arguments.get("lease") in wanted:
                         sealed_at[str(arguments["lease"])] = offset
         elif kind == "user" and isinstance(event.get("message"), dict):
             for block in event["message"].get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
-                    tool, request = pending.pop(str(block.get("tool_use_id")), ("tool", ""))
+                    tool, request, _ = pending.pop(
+                        str(block.get("tool_use_id")), ("tool", "", offset)
+                    )
                     actions.append(
                         Action(
                             offset,
@@ -581,6 +664,15 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
                 )
             )
 
+    # An invocation whose result never arrived: a timeout, a kill, or a transcript that ends
+    # mid-turn. What it asked for is the evidence this phase reads, and dropping the record
+    # because nothing answered would lose a known request and report the episode lower than the
+    # ceiling. It is kept with no result and marked failed, since nothing says it succeeded.
+    for tool, request, offset in pending.values():
+        actions.append(
+            Action(offset, f"tool:{tool}", request, "", ok=False, trace=transcript)
+        )
+    actions.sort(key=lambda a: a.offset)
     return Trace(path, tuple(actions), first_seen, sealed_at)
 
 
@@ -1036,7 +1128,7 @@ def _requested_urls(actions: Sequence[Action]) -> list[str]:
         # Only from an invocation that fetches. A URL the agent printed, grepped for or wrote
         # into a file is data it handled, and nothing there asked the remote host for a body.
         for invocation in _invocations(action.request):
-            if not _is_network_fetch(invocation):
+            if not _fetches(action, invocation):
                 continue
             for match in _URL.finditer(invocation):
                 urls.append(_tidy_url(match.group(0)))

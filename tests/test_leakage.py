@@ -22,6 +22,7 @@ from shobench.leakage import (
     ANSWER_SOURCES,
     BUCKETS,
     UNCLASSIFIED,
+    _invokes_a_fetch,
     classify_run,
     content_url_kind,
     egress_segments,
@@ -1241,3 +1242,103 @@ def test_an_episode_that_ended_before_the_contact_is_not_tainted(tmp_path: Path)
     # B sealed before the connection was made, so it never saw it and is not tainted by it.
     assert graded[2].episode.ended_at == 900.0 or graded[2].bucket in BUCKETS
     assert "answer_source_contact_earlier_in_leg" not in graded[2].reasons
+
+
+# ----- a fetch is a command that ran, not a word that appears ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "fetches"),
+    [
+        # Quoting a snippet is not running it.
+        ('printf "%s\\n" "curl https://h/x/resolve/main/d.parquet"', False),
+        ('echo "wget https://h/x/resolve/main/d.parquet" > note.txt', False),
+        ("grep -r 'curl' .", False),
+        ("cat /tmp/k.parquet", False),
+        # The wrappers a real command hides behind.
+        ("curl -sL -o /tmp/k.parquet 'https://h/x'", True),
+        ('/bin/bash -lc "curl -L -s -o /tmp/k.parquet \'https://h/x\'"', True),
+        ("env HTTPS_PROXY= curl -s https://h/x", True),
+        ("timeout 20 curl -s https://h/x", True),
+        ("do curl -L --max-time 20 -s 'https://h/x'", True),
+        ("xargs curl -O", True),
+        ("sudo /usr/bin/wget -O /tmp/k https://h/x", True),
+        ("python3 -c \"urlretrieve('https://h/x', '/tmp/k')\"", True),
+    ],
+)
+def test_only_an_invoked_fetch_counts(command: str, fetches: bool) -> None:
+    assert _invokes_a_fetch(command) is fetches
+
+
+def test_a_fetch_word_inside_quoted_data_does_not_raise_an_episode(tmp_path: Path) -> None:
+    """Printing a snippet that contains ``curl`` asks nobody for anything."""
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {"command": f'printf "%s\\n" "curl {_PARQUET}"', "output": f"curl {_PARQUET}"},
+        ),
+    )
+    assert _buckets(run) == {7: "computed_locally"}
+    assert run.episodes[0].requested == ()
+
+
+def test_a_fetch_behind_a_wrapper_still_raises_it(tmp_path: Path) -> None:
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {"command": f"env FOO=1 timeout 30 curl -sL -o /tmp/k.parquet '{_PARQUET}'",
+             "output": ""},
+        ),
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+    assert "file_download_requested" in run.episodes[0].reasons
+
+
+def test_an_interrupted_invocation_keeps_its_request(tmp_path: Path) -> None:
+    """A tool_use whose result never arrived still says what was asked for."""
+    interrupted = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "Bash",
+                        "input": {"command": f"curl -sL -o /tmp/k.parquet '{_PARQUET}'"},
+                    }
+                ]
+            },
+        }
+    )
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace='{"lease":"lease-a"}\n' + interrupted + "\n",
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+    assert "file_download_requested" in run.episodes[0].reasons
+
+
+def test_an_answered_and_an_unanswered_invocation_reach_the_same_bucket(
+    tmp_path: Path,
+) -> None:
+    """The request is the evidence, so a failed result and no result read the same."""
+    answered = claude(
+        {
+            "tool": "Bash",
+            "input": {"command": f"curl -sL -o /tmp/k.parquet '{_PARQUET}'"},
+            "output": "curl: (28) Operation timed out",
+            "failed": True,
+        }
+    )
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace='{"lease":"lease-a"}\n' + answered,
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
