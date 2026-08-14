@@ -302,8 +302,8 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
     exactly what a ``--go`` will pay for.
 
     With ``--refresh-baseline`` the plan also names what catching the bookend's carried before
-    rows up to its baseline would add, upgrade, and refuse, computed by the same function the
-    spending path acts on, so a plan cannot say something a ``--go`` will not.
+    rows up to its baseline would add, upgrade and refuse, from the same function the spending
+    path acts on.
     """
     run_dir = Path(args.run)
     manifest_path = run_dir / "manifest.json"
@@ -465,7 +465,7 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     }
     baseline_run_id = manifest.get("run_id") if source_has_before else None
     # The run whose rows the bookend will carry, which is the source itself when it measured
-    # its own before-side. Resolved here because the carry's completeness is read off it.
+    # its own before-side.
     carried_from: Path | None = None
     if baseline_dir is not None:
         baseline_manifest_path = baseline_dir / "manifest.json"
@@ -508,9 +508,8 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             manifest, manifest
         )
     if carried_from is not None:
-        # What the carry would freeze, read off the baseline's own provenance by the function
-        # the creation path reads it with. A baseline mid-repair is the one refusal state a
-        # plan could not see, and the run it named went on to seal the rest minutes later.
+        # What the carry would freeze, read by the function the creation path reads it with, so
+        # the plan's verdict on a mid-repair baseline is the creation's verdict.
         heldout_ids = [int(task_id) for task_id in split.heldout.task_ids]
         try:
             gaps = runner.baseline_carry_gaps(
@@ -582,8 +581,6 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         # Every held-out task, because a rebookend is a fresh bookend rather than a repair:
         # nothing is already complete in a run directory that does not exist yet.
         "heldout_tasks_to_run": len(split.heldout),
-        # Whether an operator has decided to carry a baseline that cannot account for every
-        # held-out id, which is what turns the refusal below into a recorded choice.
         "allow_partial_baseline": args.allow_partial_baseline,
         # The artifact is SELF-CONTAINED: it carries the baseline run's eval_before rows
         # as its own before block, labeled eval_before.source_run_id, so the paired delta

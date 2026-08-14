@@ -1470,11 +1470,9 @@ def test_a_marker_bearing_run_refuses_to_publish_without_its_carried_rows(
 
 # ----- a carry taken from a baseline that had not finished ------------------------------------
 #
-# The race the carry made invisible: a baseline mid-repair passes every identity check, the
-# creation snapshots whatever it holds at that instant, and the repair finishing minutes later
-# leaves the bookend's artifact reporting holes forever against a baseline that has none. So
-# creation refuses a baseline that cannot account for every held-out id, and a bookend created
-# over one anyway (or created before this guard existed) can be caught up.
+# A baseline mid-repair passes every identity check, and the creation snapshots whatever it
+# holds at that instant. So creation refuses a baseline that cannot account for every held-out
+# id, and a carry taken over one anyway can be caught up afterwards.
 
 
 def _drained(idx: int) -> TaskResult:
@@ -1496,8 +1494,8 @@ def _bookend_over(
 ) -> tuple[Path, Path, object, object]:
     """A real bookend, created by the entry, over a baseline holding ``before_rows``.
 
-    The baseline is a sibling of the bookend under the same runs directory, which is where
-    every real pair lives and what a refresh resolves by run id when no baseline is named.
+    The baseline is a sibling under the same runs directory, which is what a refresh resolves
+    by run id when no baseline is named.
     """
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split, with_before=False)
@@ -1522,8 +1520,8 @@ def _bookend_over(
 def _legs_from_here(monkeypatch) -> list[int]:
     """The task ids any further leg runs, on top of the fakes already wired.
 
-    A rerun's fakes have to keep reading the after rows the bookend already measured, so its
-    launch record cannot also be the proof that nothing new ran; this is that proof.
+    A rerun's fakes have to keep reading the after rows the bookend already measured, so their
+    launch record cannot also be the proof that nothing new ran.
     """
     wired = runner.run_leg
     calls: list[int] = []
@@ -1547,9 +1545,9 @@ def _carried(run_dir: Path) -> dict[int, list[dict]]:
 def test_rebookend_refuses_a_baseline_that_has_not_finished_its_eval_before(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The creation guard, naming the ids and the repair: a baseline with a row-less id and a
-    baseline with a drained one are both still moving, and a carry taken from either freezes
-    the holes into an artifact that can never account for them."""
+    """The creation guard, naming the ids and the repair: a row-less id and a drained one are
+    both a baseline still moving, and a carry from either freezes the holes into an artifact
+    that can never account for them."""
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split, with_before=False)
     baseline_dir = _baseline_run(tmp_path, cell, split)
@@ -1579,10 +1577,8 @@ def test_the_cli_plan_names_a_partial_baseline_and_blocks_before_minting_a_run(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     """The front door, not only the backstop. The runner's refusal fires after ``owning_run``
-    has minted the new directory and its lock, so a plan that could not see a mid-repair
-    baseline sent an operator to a refusal that left an orphan run directory behind. The plan
-    names the ids, the --go blocks on them having created nothing, and the override is what
-    turns the block into the recorded choice the runner carries into the manifest."""
+    has minted the new directory and its lock, so a plan blind to a mid-repair baseline sent an
+    operator to a refusal that left an orphan run directory behind."""
     from shobench.cli import main as cli_main
 
     cell = load_cell_by_name("smoke-automationbench-claude-code")
@@ -1661,8 +1657,7 @@ def test_a_refresh_adds_an_id_the_carry_has_no_row_for(tmp_path: Path, monkeypat
     assert next((tmp_path / "results").glob(f"{run_dir.name}*")).name.endswith(
         ".incomplete.json"
     )
-    # The baseline finished after the carry was taken, and nothing names it: the refresh
-    # resolves it as the sibling run its marker names.
+    # Nothing names the baseline, so the refresh resolves it as the sibling its marker names.
     _wire_fakes(monkeypatch, cell, split, launches)
     reran = _legs_from_here(monkeypatch)
 
@@ -1687,8 +1682,8 @@ def test_a_refresh_adds_an_id_the_carry_has_no_row_for(tmp_path: Path, monkeypat
     (refresh,) = manifest["rebookend"]["baseline_refreshes"]
     assert (refresh["tasks_added"], refresh["tasks_upgraded"]) == ([1], [])
     assert refresh["refreshed_at"] > 0
-    # And the republished artifact accounts for the id the carry had lost, so it takes the
-    # finished name instead of the incomplete one it was published under.
+    # The republished artifact accounts for the id the carry had lost, so it takes the finished
+    # name instead of the incomplete one it was published under.
     assert results_path.name == f"{run_dir.name}.json"
     published = json.loads(results_path.read_text(encoding="utf-8"))
     assert published["eval_before"]["summary"]["complete"] is True
@@ -1699,8 +1694,7 @@ def test_a_refresh_upgrades_a_carried_drained_row_to_the_settled_one(
     tmp_path: Path, monkeypatch
 ) -> None:
     """A drained row is scored, so the carry counts it as present and no repair of this run can
-    reach it: the id reads as a zero the agent earned when what failed was the window. The
-    refresh replaces it with the outcome the baseline's own repair reached."""
+    reach it: the id reads as a zero the agent earned when what failed was the window."""
     launches: dict[int, dict] = {}
     run_dir, baseline_dir, cell, split = _bookend_over(
         tmp_path, monkeypatch, launches, before_rows={2: [_drained(2)]}
@@ -1862,8 +1856,7 @@ def test_the_cli_plan_shows_what_a_refresh_would_change(
     assert plan["baseline_refresh"]["refused"] == []
     assert plan["baseline_refresh"]["baseline_run_id"] == "source-run-20260101T000000Z"
 
-    # The same plan over a carry the baseline no longer agrees with: named in the plan, and a
-    # --go blocked by it rather than spending and refusing later.
+    # A carry the baseline no longer agrees with: named in the plan, and blocked at --go.
     carry(_sealed(kept, reward=0.9))
     assert (
         cli_main(
