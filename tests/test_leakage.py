@@ -1873,3 +1873,81 @@ def test_a_fully_watched_general_web_rollout_still_clears_what_it_seeded(
         .path
     )
     assert _buckets(bookend) == {12: "computed_locally"}
+
+
+# ----- the report never writes into what it read, and a torn record is not a crash ------------
+
+
+def _readable_run(tmp_path: Path, name: str = "r") -> Path:
+    return (
+        RunDir(tmp_path / name)
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .leg("rollout", 0, 50.0, 200.0)
+        .path
+    )
+
+
+@pytest.mark.parametrize("target", ["manifest.json", "egress.tsv", "legs.json",
+                                    "rollout/dispenses.jsonl", "rollout/report.json"])
+def test_the_report_refuses_to_write_inside_the_run_it_read(
+    tmp_path: Path, capsys, target: str
+) -> None:
+    """A report that can land on a manifest can destroy the evidence it was made from."""
+    run_dir = _readable_run(tmp_path)
+    destination = run_dir / target
+    before = destination.read_bytes() if destination.exists() else None
+    assert main([str(run_dir), "--format", "json", "--out", str(destination)]) == 1
+    assert "refusing to write" in capsys.readouterr().err
+    # Whatever was there is still there, and whatever was not was not created.
+    assert (destination.read_bytes() if destination.exists() else None) == before
+
+
+def test_the_refusal_follows_a_symlink_into_the_run(tmp_path: Path, capsys) -> None:
+    """A path that only reaches the run through a link reaches it just the same."""
+    run_dir = _readable_run(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(run_dir)
+    before = (run_dir / "manifest.json").read_bytes()
+    assert main([str(run_dir), "--format", "json", "--out", str(link / "manifest.json")]) == 1
+    assert "refusing to write" in capsys.readouterr().err
+    assert (run_dir / "manifest.json").read_bytes() == before
+
+
+def test_a_path_outside_every_run_still_writes(tmp_path: Path) -> None:
+    """The control: refusing the archive is not refusing to write a report."""
+    run_dir = _readable_run(tmp_path)
+    out = tmp_path / "report.json"
+    assert main([str(run_dir), "--format", "json", "--out", str(out)]) == 0
+    assert json.loads(out.read_text())["runs"][0]["run_id"] == "r"
+
+
+def _torn(run_dir: Path) -> Path:
+    """The shape a record has when the process writing it was killed mid-line."""
+    path = run_dir / "rollout" / "dispenses.jsonl"
+    path.write_text(path.read_text() + '{"seq": 2, "lease": "m", "env": "hle", "task_i')
+    return run_dir
+
+
+def test_a_torn_provenance_line_is_missing_evidence_not_a_crash(tmp_path: Path) -> None:
+    run = classify_run(_torn(_readable_run(tmp_path)))
+    # What could be read is still reported, and what could not is said out loud.
+    assert len(run.episodes) == 1
+    assert any("1 provenance line could not be read" in note for note in run.notes)
+
+
+def test_the_unfinished_override_survives_the_record_it_exists_for(
+    tmp_path: Path, capsys
+) -> None:
+    """A run killed mid-write is the case ``--allow-unfinished`` is for, half a line and all."""
+    run_dir = _torn(
+        RunDir(tmp_path / "live", ended_at=None)
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .leg("rollout", 0, 50.0, 200.0)
+        .path
+    )
+    assert main([str(run_dir)]) == 1
+    assert "refusing" in capsys.readouterr().err
+    assert main([str(run_dir), "--allow-unfinished"]) == 0
+    assert "provenance line could not be read" in capsys.readouterr().out

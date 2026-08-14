@@ -855,14 +855,55 @@ class Episode:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read a provenance file, skipping the lines that cannot be read.
+
+    A partial write is missing evidence, not a crash. A record written up to the moment a process
+    was killed ends in half a line, which is exactly the shape ``--allow-unfinished`` exists to
+    look at, and raising there would refuse to report on the run it was asked about. How many
+    lines were lost is counted separately and lands in the notes.
+    """
     if not path.exists():
         return []
     rows = []
     for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = line.strip()
-        if line:
+        if not line:
+            continue
+        try:
             rows.append(json.loads(line))
+        except (json.JSONDecodeError, ValueError):
+            continue
     return rows
+
+
+def unreadable_provenance(run_dir: Path) -> int:
+    """How many provenance lines in this run could not be read.
+
+    The stream's own record, which is dispenses and results: what the runner wrote down about
+    which task went out and what came back. A transcript is not provenance and is read with a
+    parser that already tolerates a line it cannot decode.
+
+    Counted over the record rather than accumulated while reading it, so the number is the same
+    whatever order the phases were walked in and whichever files a particular run happens to
+    have.
+    """
+    damaged = 0
+    files = [
+        path
+        for pattern in ("*/dispenses.jsonl", "*/results.jsonl",
+                        "*/task-*/dispenses.jsonl", "*/task-*/results.jsonl")
+        for path in run_dir.glob(pattern)
+    ]
+    for path in sorted(files):
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                damaged += 1
+    return damaged
 
 
 def _feedback(record: dict[str, Any], name: str) -> Any:
@@ -1421,6 +1462,13 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         inheritance_notes, unresolved_inheritance = _inherited_artifacts(run_dir, manifest)
 
     notes = _capture_notes(capture, finished) + _coverage_notes(legs, episodes)
+    damaged = unreadable_provenance(run_dir)
+    if damaged:
+        word, it = ("line", "it") if damaged == 1 else ("lines", "they")
+        notes.append(
+            f"{damaged} provenance {word} could not be read, so what {it} recorded is not in "
+            "this report and the counts here are over what the record could give up"
+        )
     notes += inheritance_notes
     if source is None:
         notes.append(
@@ -1772,6 +1820,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not targets:
         print("no run directories given", file=sys.stderr)
         return 1
+    inside = _inside_a_run(args.out, targets)
+    if inside is not None:
+        # This command reads run directories and writes none of them. A report that can land on
+        # a manifest, a capture or a provenance file can destroy the evidence it was made from,
+        # and it would do it after exiting zero.
+        print(
+            f"refusing to write {args.out} inside the run directory {inside}: this command "
+            "reads a run's record and never writes to it. Choose a path outside every run "
+            "directory it was given.",
+            file=sys.stderr,
+        )
+        return 1
     refused = [d for d in targets if not _finished(d)]
     if refused and not args.allow_unfinished:
         for run_dir in refused:
@@ -1799,6 +1859,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print(text)
     return 1 if refused and not args.allow_unfinished else 0
+
+
+def _inside_a_run(out: Path | None, targets: Sequence[Path]) -> Path | None:
+    """The run directory an output path would land in, if it would land in one.
+
+    Symlinks are resolved on both sides before comparing, so a path that only reaches a run
+    through a link is caught with the ones that name it outright.
+    """
+    if out is None:
+        return None
+    destination = out.expanduser().resolve()
+    for run_dir in targets:
+        root = run_dir.expanduser().resolve()
+        if destination == root or root in destination.parents:
+            return run_dir
+    return None
 
 
 def _finished(run_dir: Path) -> bool:
