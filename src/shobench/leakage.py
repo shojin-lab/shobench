@@ -1,10 +1,4 @@
-"""Per-episode leakage classification for a completed run directory.
-
-Some v0 cells answer questions whose answers are published. The agent has an unsandboxed shell
-and open egress by design, and the runner observes rather than gates, so an episode can be won
-by reasoning or by reading the answer key, and the reward is the same number either way. A
-blended correct-rate over both is not a measurement of anything. This grades every episode so
-the rate can be reported per bucket instead.
+"""Per-episode leakage classification for a completed run directory, graded on egress alone.
 
 The ranks, weakest first:
 
@@ -13,33 +7,23 @@ The ranks, weakest first:
     attempted_leakage       the cell reached the answer source; no evidence a body moved
     unresolved_leakage      evidence consistent with a body having moved, not established
 
-There is no bucket above those, and that is the point of this half. **This grades on what the
-observer produced and on nothing else.** The record is ``egress.tsv``, one row per outbound DNS
-question or TLS client hello seen in the cell's network namespace, written outside the container
-by an observer the agent holds no mount of. It sees hostnames and times. It never sees a method,
-a status, a body or a byte count, and the Hub's file CDN serves the whole platform rather than
-one dataset, so a client hello to it is a connection to a CDN and not a download of an answer
-key. So this can say a cell reached the answer source and can never say the answers arrived.
+Egress sees hostnames and times, never a method, a status, a body or a byte count, and the file
+CDN serves a whole platform rather than one dataset. It can therefore say a cell reached the
+answer source and can never say the answers arrived, so there is no bucket above those four.
+What a command asked for and what came back are read from the transcript and live in the trace
+layer, along with the achieved bucket they support.
 
-What the agent asked for and what came back are evidence of a different kind, read out of the
-transcript rather than off the wire, and they live in the trace layer. Requests, downloads,
-content and the achieved bucket they support are all there and none of them are here.
+``unclassified`` is not on the ladder: it is what an episode gets when evidence is missing
+rather than empty, and it is why an episode whose capture does not cover its window is never
+computed_locally.
 
-``unclassified`` is not on the ladder. It is what an episode gets when the evidence is missing
-rather than empty, and it is why this command cannot quietly clear anything: an episode whose
-capture does not cover its window is unclassified, never computed_locally.
+A transcript is opened for two things and neither is what a command said: where a lease first
+appears, and where it seals, which is the only thing that can bound a rollout window. Eval
+transcripts are not opened, since a task's own start and end are in the leg record.
 
-**A transcript is opened for two things, and neither of them is what a command said.** Where a
-lease first appears, which is where its episode starts in the order, and where it seals, which
-is the only thing that can bound a rollout window. An eval phase's transcripts are not opened at
-all, since a task's own start and end are written down in the leg record.
-
-**A disk that has reached the answer source cannot be cleared afterwards.** Whatever a container
-fetched may be on it from that moment, and a local read leaves nothing for the observer to see,
-so every later episode reading the same disk is unresolved at best. That carries across a
-rollout's legs, into the eval tasks seeded from its HOME, and into a bookend over it.
-
-Nothing the agent wrote about itself lowers a bucket.
+A disk that has reached the answer source is not cleared afterwards, because a local read of
+whatever it fetched leaves the observer nothing to see. That carries across a rollout's legs,
+into the eval tasks seeded from its HOME, and into a bookend over it.
 
 Usage::
 
@@ -73,8 +57,7 @@ UNCLASSIFIED = "unclassified"
 
 PHASES = ("eval_before", "rollout", "eval_after")
 
-# Hosts a cell talks to because of how it is run rather than because of what it is answering:
-# the harness's model API and telemetry, and the package registries a tool install goes through.
+# Traffic a cell makes because of how it is run rather than what it is answering.
 INFRASTRUCTURE = (
     "chatgpt.com",
     "ab.chatgpt.com",
@@ -102,16 +85,11 @@ INFRASTRUCTURE = (
 
 @dataclass(frozen=True)
 class AnswerSource:
-    """Where one environment's answers live, and what its answers look like when they arrive.
+    """Where one environment's answers live, split by what a hostname can prove.
 
-    ``index`` hosts serve listings, metadata and payloads over one name. ``content`` hosts are
-    the file CDN: they move bodies, but for the whole platform, so reaching one narrows what
-    happened without settling it. ``rows`` names the query API over the dataset itself.
-
-    ``answer_field`` and ``corroborating_fields`` are the dataset's own columns. A result that
-    carries the answer field beside one of its neighbours is a row of the answer key; the
-    agent's own submission carries the answer field alone, which is why the corroboration is
-    required rather than assumed.
+    ``index`` hosts serve listings, metadata and payloads over one name. ``content`` hosts are the
+    file CDN, which moves bodies for the whole platform, so reaching one narrows what happened
+    without settling it. ``rows`` names the query API over the dataset itself.
     """
 
     index: tuple[str, ...]
@@ -121,9 +99,7 @@ class AnswerSource:
     corroborating_fields: tuple[str, ...] = ()
 
 
-# Keyed by environment, because "the host that distributes the answers" is a fact about the
-# dataset, not about the runner. An environment with no entry gets no table at all and every
-# classification for it says so, rather than quietly reporting a clean run.
+# An environment with no entry here gets no table, and every classification for it says so.
 ANSWER_SOURCES: dict[str, AnswerSource] = {
     "hle": AnswerSource(
         index=(
@@ -166,8 +142,8 @@ def host_role(host: str, source: AnswerSource | None) -> str:
 class Connection:
     """One observed outbound name: a DNS question, or a TLS client hello carrying an SNI.
 
-    The kinds are not equivalent evidence. A resolution says a name was looked up; a client
-    hello says a connection to that name was opened. Neither says a body moved.
+    A resolution says a name was looked up; a client hello says a connection was opened. Neither
+    says a body moved.
     """
 
     epoch: float
@@ -188,9 +164,8 @@ class Segment:
     last: float
     rows: int
     malformed: int
-    # One interval per row that could not be read, bounding where in time it sat. The capture is
-    # written in order, so an unreadable row lies between the last readable row before it and
-    # the first after it. That is where the observer saw something this cannot account for.
+    # One interval per unreadable row. The capture is written in order, so such a row lies
+    # between the last readable row before it and the first after it.
     blind: tuple[tuple[float, float], ...] = ()
 
     def to_json(self) -> dict[str, Any]:
@@ -200,9 +175,7 @@ class Segment:
             "last": self.last,
             "rows": self.rows,
             "malformed": self.malformed,
-            # An open bound has no JSON number, and ``Infinity`` is not one: a bound that
-            # reaches past every readable row is published as null rather than as a token a
-            # strict reader refuses.
+            # ``Infinity`` is not a JSON number, so an open bound is published as null.
             "blind": [
                 [None if low == float("-inf") else low, None if high == float("inf") else high]
                 for low, high in self.blind
@@ -212,18 +185,12 @@ class Segment:
 
 @dataclass(frozen=True)
 class Capture:
-    """A run's whole egress record, and how far it can be trusted to have been watching.
+    """A run's egress record, and the intervals over which its observers demonstrably ran.
 
-    Coverage is per segment and is the interval between its first and last observed row. Inside
-    that interval the observer was demonstrably running, so silence there is real silence.
-    Outside every interval nothing is established: a window in the gap between two segments, or
-    past the last row of the last one, could be a quiet cell or an observer that stopped, and
-    those are not the same finding.
-
-    A row the reader could not parse puts a hole inside an otherwise covered interval. The
-    observer saw something there and this cannot say what, so a window overlapping that hole is
-    not covered either. Counting the unreadable row and then clearing the window around it would
-    be the same silent pass this refuses everywhere else.
+    Coverage is per segment, between its first and last observed row. Outside every interval nothing
+    is established: a window in the gap between two segments could be a quiet cell or an observer
+    that stopped. A row that could not be read puts a hole inside an otherwise covered interval, and
+    a window overlapping that hole is not covered either.
     """
 
     connections: tuple[Connection, ...]
@@ -249,9 +216,7 @@ class Capture:
         )
 
     def covers(self, start: float | None, end: float | None) -> bool:
-        # A window with no end is not a window: nothing finite can contain it, and reading the
-        # missing bound as "ends where it starts" would clear an episode over one instant of a
-        # capture that demonstrably stops.
+        # Nothing finite contains a window with no end.
         if start is None or end is None:
             return False
         if self.blinded(start, end):
@@ -276,16 +241,10 @@ def egress_segments(run_dir: Path) -> list[Path]:
 def capture_segments(run_dir: Path) -> list[tuple[str, list[str]]]:
     """One entry per observer process, with each stretch of the capture appearing once.
 
-    A continuation gets a file of its own, because the capture command truncates whatever file it
-    is pointed at. When that continuation's observer stops, the runner appends its file into
-    ``egress.tsv`` so the published record covers the whole cell, and leaves the numbered file
-    behind. Reading both counts that stretch twice.
-
-    Skipping the numbered file is not the fix either: the base then reads as one observer running
-    from its first row to its last, which papers over the interruption in the middle. The gap
-    between one observer stopping and the next starting is exactly where this cannot say the cell
-    was quiet, so the folded stretch is taken back out of the base and handed to the file it came
-    from, and the two intervals stay apart.
+    A continuation writes its own file and the runner appends it into ``egress.tsv`` when that
+    observer stops, leaving the numbered file behind. Reading both counts the stretch twice; reading
+    only the base makes one observer out of two and hides the interruption between them. The folded
+    stretch is taken back out of the base and handed to the file it came from.
     """
     first = run_dir / "egress.tsv"
     numbered = [p for p in egress_segments(run_dir) if p != first]
@@ -294,8 +253,7 @@ def capture_segments(run_dir: Path) -> list[tuple[str, list[str]]]:
                 for p in numbered]
     base = first.read_text(encoding="utf-8", errors="ignore").splitlines()
     tail = [(p, p.read_text(encoding="utf-8", errors="ignore").splitlines()) for p in numbered]
-    # Backwards, because the runner appends them in order, so the last one folded is the last
-    # stretch of the base.
+    # Backwards: the runner appends in order, so the last folded is the last stretch of the base.
     for _, rows in reversed(tail):
         if rows and len(rows) <= len(base) and base[-len(rows):] == rows:
             base = base[: -len(rows)]
@@ -326,10 +284,8 @@ def read_capture(run_dir: Path) -> Capture:
                 epoch = float(fields[0])
             except ValueError:
                 epoch = None
-            # The display filter emits a row only for an outbound DNS question or a TLS client
-            # hello, so a row carrying neither name is a torn one however well its timestamp
-            # parses. Counting it as a readable observation would let a truncated line extend
-            # the stretch this claims to have been watching.
+            # The display filter emits a row only for a DNS question or a TLS client hello, so
+            # a row carrying neither name is torn however well its timestamp parses.
             if epoch is None or not hosts:
                 malformed += 1
                 pending_blind += 1
@@ -363,13 +319,7 @@ def read_capture(run_dir: Path) -> Capture:
 
 @dataclass(frozen=True)
 class Trace:
-    """A transcript read for two things: where each episode starts, and where it seals.
-
-    A lease is the join key because the stream hands one to the agent with the task, so its id
-    appears at the moment an episode starts and again in the ``submit_answer`` that ends it. The
-    three harness shapes this reads are the three the runner launches, and a shape it does not
-    recognise contributes nothing rather than contributing guesses.
-    """
+    """A transcript read for two things: where each episode starts, and where it seals."""
 
     path: Path
     first_seen: dict[str, int] = field(default_factory=dict)
@@ -379,9 +329,8 @@ class Trace:
 def _stream_terminated(text: str) -> bool:
     """Did the stream answer this call by ending the episode?
 
-    The corroboration is the stream's own reply, not the agent's text: a submit it accepted comes
-    back saying the task is over. That is what separates a call that ran from a call that was
-    written down, and it is not something the transcript's author can put there.
+    The corroboration is the stream's own reply, which the transcript's author cannot write beside a
+    call that never ran.
     """
     if not text:
         return False
@@ -405,29 +354,22 @@ def _text_of(blocks: Any) -> str:
 
 
 def read_trace(path: Path, leases: Iterable[str]) -> Trace:
-    """Read one transcript for the two things the floor takes from a transcript.
+    """Read one transcript for where each lease first appears and where it seals.
 
-    Where each lease first appears, which is where its episode starts in the order, and where it
-    seals, which is the only thing that can bound its window. Nothing else here is read: what a
-    command asked for and what came back are evidence of a different kind, and they are read
-    somewhere else.
+    A seal is a call that ran and was accepted. Naming the terminal call is not enough: a comment, a
+    string, a branch that never ran and a cell that raised before reaching it all name it. So every
+    seal needs the stream's own reply saying the task is over, and a call answered with an error is
+    not a seal.
 
-    A seal is a call that ran and was accepted. Naming the terminal call is not enough: a comment,
-    a string, a branch that never ran and a cell that raised before reaching it all name it, and
-    reading any of those as a seal ends an episode early and hands the traffic that follows to
-    somebody else. So every harness's seal needs the stream's own reply saying the task is over,
-    and a call that came back an error is not a seal either.
-
-    The three harnesses put the call in three places. codex and claude_code invoke it as a tool
-    and name the lease in the arguments; prime-agent runs it inside an ipython cell, so the lease
-    is in the code, and that is the only shape where text is read at all.
+    codex and claude_code invoke the call as a tool and name the lease in its arguments;
+    prime-agent runs it inside an ipython cell, so the lease is in the code.
     """
     wanted = set(leases)
     first_seen: dict[str, int] = {}
     sealed_at: dict[str, int] = {}
-    # claude answers a tool_use in a later event, so the call waits here for its reply.
+    # claude answers a tool_use in a later event, and prime splits a cell's code from its
+    # result across two, so both wait here.
     pending: dict[str, tuple[str, int]] = {}
-    # prime puts the cell's code on the start event and its result on the end event.
     cells: dict[str, str] = {}
 
     def seal(lease: object, offset: int, result: str) -> None:
@@ -448,7 +390,7 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
             continue
         kind = event.get("type")
 
-        # codex: an MCP tool call carrying the lease in its arguments and the reply in its result.
+        # codex.
         if kind == "item.completed" and isinstance(event.get("item"), dict):
             item = event["item"]
             if item.get("type") == "mcp_tool_call" and item.get("tool") == "submit_answer":
@@ -474,8 +416,7 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
                     if waiting is not None and not block.get("is_error"):
                         seal(waiting[0], waiting[1], _text_of(block.get("content")))
 
-        # prime-agent: the call is inside the cell, so the code says which lease and the cell's
-        # own result says whether it ran.
+        # prime-agent: the code says which lease, the cell's result says whether it ran.
         elif kind == "tool_execution_start":
             cells[str(event.get("toolCallId"))] = json.dumps(event.get("args") or {})
         elif kind == "tool_execution_end":
@@ -526,14 +467,10 @@ class Episode:
     def domain(self) -> str:
         """The disk this episode's container reads and writes, which is what carries.
 
-        A rollout continuation is a new container over the same mounted HOME and the same
-        ``/work``, so a rollout is one domain however many legs it took: what it fetched before
-        an interruption is still there afterwards. An eval task gets a private copy of HOME and a
-        fresh ``/work``, both discarded when it ends, so each task is a domain of its own.
-
-        A leg number is neither of those. Legs are numbered per run and reused across phases, so
-        a rollout leg and an eval task's leg can carry the same label for two filesystems that
-        share nothing, and a continuation changes the label of a filesystem that did not change.
+        A rollout continuation is a new container over the same mounted HOME and ``/work``, so
+        a rollout is one domain however many legs it took. An eval task gets a private copy of
+        HOME and a fresh ``/work``, both discarded when it ends. A leg number is neither: legs
+        are numbered per run and reused across phases.
         """
         if self.phase == "rollout":
             return "rollout"
@@ -546,10 +483,8 @@ class Episode:
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     """Read a provenance file, skipping the lines that cannot be read.
 
-    A partial write is missing evidence, not a crash. A record written up to the moment a process
-    was killed ends in half a line, which is exactly the shape ``--allow-unfinished`` exists to
-    look at, and raising there would refuse to report on the run it was asked about. How many
-    lines were lost is counted separately and lands in the notes.
+    A partial write is missing evidence rather than a crash, which is the shape a record killed
+    mid-line has. How many lines were lost is counted separately.
     """
     if not path.exists():
         return []
@@ -568,13 +503,8 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 def unreadable_provenance(run_dir: Path) -> int:
     """How many provenance lines in this run could not be read.
 
-    The stream's own record, which is dispenses and results: what the runner wrote down about
-    which task went out and what came back. A transcript is not provenance and is read with a
-    parser that already tolerates a line it cannot decode.
-
-    Counted over the record rather than accumulated while reading it, so the number is the same
-    whatever order the phases were walked in and whichever files a particular run happens to
-    have.
+    Dispenses and results only. A transcript is not provenance and is read with a parser that
+    already tolerates a line it cannot decode.
     """
     damaged = 0
     files = [
@@ -628,23 +558,15 @@ def _rollout_episodes(
     traces: dict[str, Trace],
     run_end: float | None = None,
 ) -> list[Episode]:
-    """Windows that run from a dispense to a bound on the seal, not to the next dispense.
+    """Windows running from a dispense to a bound on the seal, not to the next dispense.
 
-    The stream records when a task was handed out and not when it was sealed, and above one
-    lease in flight the agent can still be working an older task when the next is pulled. Only
-    the transcript can say when a lease ended: the ``submit_answer`` that ends an episode sits
-    at a definite place in the order, so the seal happened no later than the dispense of the
-    first task pulled at or after it. For a strictly sequential agent that lands on the next
-    dispense; for one that interleaves it lands later and the windows overlap, which is the
-    point.
+    Only the transcript can say when a lease ended: the seal happened no later than the dispense of
+    the first task pulled at or after it. With no seal in the transcript the bound is the leg.
 
     Capacity is deliberately not a bound. ``get_task`` force-drains only when a pull finds every
     slot occupied, so a newer lease that submits frees a slot and lets the next dispense through
-    with an older lease still live: at capacity three, dispense A B C, submit B, dispense D,
-    submit C, dispense E leaves A open past two later dispenses. Ending A at
-    ``index + max_in_flight`` would invent a seal the stream never performed and hand A's later
-    traffic to somebody else. With no seal in the transcript the only sound bound is the leg,
-    which is where the container that could have opened the connection stops existing.
+    with an older lease still live, and ending it at ``index + max_in_flight`` would invent a seal
+    the stream never performed.
     """
     phase_dir = run_dir / "rollout"
     dispenses = sorted(_read_jsonl(phase_dir / "dispenses.jsonl"), key=lambda d: d["dispensed_at"])
@@ -659,12 +581,10 @@ def _rollout_episodes(
         for started, ended, name in spans:
             if started <= when and (ended is None or when <= ended):
                 return name, ended
-        # No leg record covers this dispense, which a lost or mismatched legs.json looks like.
-        # The run's own end is the last moment anything in it could have happened, and where
-        # even that is missing the episode has no upper bound and cannot be cleared.
+        # No leg record covers this dispense. The run's own end is the last moment anything in
+        # it could have happened; without that the episode has no upper bound.
         return "rollout", run_end
 
-    # Where each lease starts and seals in the transcripts, merged across this phase's legs.
     first_seen: dict[str, tuple[str, int]] = {}
     sealed_at: dict[str, tuple[str, int]] = {}
     for name, trace in traces.items():
@@ -683,10 +603,8 @@ def _rollout_episodes(
         bounds = []
         kind = "leg_bound"
 
-        # The transcript's bound, when this lease's seal can be placed in the order. The seal
-        # happened no later than the dispense of the first task pulled at or after it. At or
-        # after, because a harness that submits and pulls again inside one action puts both on
-        # the same line, and the lease it pulls there was dispensed after this one sealed.
+        # At or after, not after: a harness that submits and pulls again inside one action puts
+        # both on the same line, and the lease it pulls there was dispensed after this one sealed.
         seal = sealed_at.get(lease)
         if seal is not None:
             trace_name, offset = seal
@@ -726,8 +644,8 @@ def _eval_episodes(
 ) -> list[Episode]:
     """Windows straight off the leg record, because an eval task is its own container.
 
-    When the leg record is missing, which is what an unfinished run looks like, the window falls
-    back to the dispense plus the configured per-task timeout: an upper bound, labelled as one.
+    With no leg record the window is the dispense plus the configured per-task timeout: an upper
+    bound, labelled as one.
     """
     phase_dir = run_dir / phase
     by_task = {
@@ -947,18 +865,15 @@ def _window_evidence(
 def _accounts_for_its_home(source: RunLeakage) -> tuple[bool, str]:
     """Can this run say the HOME a bookend would inherit holds no answer file?
 
-    Only its rollout matters, since that is the phase whose writes land in the mounted HOME. On
-    the egress floor the answer is yes only when that rollout was fully observed and never
-    reached the answer source at all. An episode this could not classify is one where anything
-    may have happened; an episode that did reach the answer source may have saved what it found,
-    and where a fetched file landed is content evidence this half does not carry.
+    Only its rollout matters, since that is the phase whose writes land in the mounted HOME, and
+    the answer is yes only when that rollout was observed end to end and never reached the answer
+    source. Where a fetched file landed is content evidence this half does not carry.
     """
     rollout = [e for e in source.episodes if e.episode.phase == "rollout"]
     if not rollout:
         return False, "has no rollout record to account for that HOME"
-    # Read off the coverage bit, never off the bucket. An episode nobody was watching that
-    # happened to show one general-web connection is bucketed for that connection and is still
-    # an episode nobody was watching.
+    # Off the coverage bit, never the bucket: an unwatched episode that showed one connection is
+    # bucketed for it and is still unwatched.
     blind = sum(1 for e in rollout if not e.observed)
     if blind:
         return False, f"could not observe {blind} of its {len(rollout)} rollout episodes end to end"
@@ -974,14 +889,9 @@ def _accounts_for_its_home(source: RunLeakage) -> tuple[bool, str]:
 def _inherited_artifacts(run_dir: Path, manifest: dict[str, Any]) -> tuple[list[str], bool]:
     """Whether a bookend can be cleared against the HOME it inherited.
 
-    A rebookend runs a new eval against the run it names, and the runner seeds it from that
-    run's accumulated HOME, which every eval task then gets a copy of. So a file the source's
-    rollout saved under HOME is on disk in this run before its first episode begins.
-
-    The floor can only answer this one way. It can say the source was fully observed and never
-    reached the answer source, in which case there is nothing to have inherited; it cannot say
-    what a source that did reach the answer source put where. Tracking that file is content
-    evidence and lives in the follow-up, so short of a clean source this run is not cleared.
+    The runner seeds a bookend from its source's accumulated HOME, which every eval task then gets a
+    copy of. This can say the source was fully observed and never reached the answer source; it
+    cannot say what a source that did reach it put where.
     """
     rebookend = manifest.get("rebookend") or {}
     source_id = rebookend.get("rebookend_of")
@@ -1032,9 +942,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         episodes += _rollout_episodes(run_dir, legs, traces["rollout"], run_end)
     for phase in ("eval_before", "eval_after"):
         if (run_dir / phase).is_dir():
-            # No transcript is opened for an eval phase. Its windows come from the leg record,
-            # which is where a task's own start and end are written down, so there is nothing a
-            # transcript could add that this half reads.
+            # No transcript for an eval phase: its windows come from the leg record.
             episodes += _eval_episodes(run_dir, phase, legs, timeout)
 
     inheritance_notes: list[str] = []
@@ -1057,10 +965,8 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             "distinguished from general web reference in this run"
         )
 
-    # What the rollout's disk saw over its whole life, not only inside an episode's window. A
-    # container is up from the moment its leg starts, and an answer-source connection made before
-    # the first task was pulled, or between two legs, reached the same disk every later episode
-    # reads. Charging it to nobody was leaving that disk clear.
+    # Over the whole life of the rollout's legs, not only inside an episode's window: a container
+    # is up before its first task and between legs, and what it fetched then is on the same disk.
     disk_contact, orphans = _disk_contact(capture, legs, source, episodes)
     if disk_contact is not None:
         notes.append(
@@ -1072,17 +978,10 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
     starts = [c.epoch for c in capture.connections]
     ordered = sorted(episodes, key=lambda e: (e.started_at if e.started_at is not None else 0.0))
     graded: list[EpisodeLeakage] = []
-    # When each persistence domain first reached the answer source, so a later episode reading
-    # the same disk is not cleared over a file that may have been sitting on it since. Keyed by
-    # the domain rather than by the leg, because a continuation relabels a filesystem it did not
-    # change and eval tasks reuse leg numbers for filesystems that share nothing. The time comes
-    # from
-    # the observed connection where there is one, because an episode's window is not when its
-    # traffic happened: charging contact to the window's start taints episodes that had already
-    # ended when the connection was made. A request seen only in the transcript has no epoch, so
-    # that one falls back to the window's start, which taints the most and claims the least.
+    # When each persistence domain first reached the answer source. Keyed by domain rather than
+    # leg, and timed from the observed connection rather than from the owning episode's window,
+    # since a window is not when its traffic happened.
     contacted: dict[str, float] = {}
-    # What the rollout leaves in the HOME its eval_after tasks are copies of.
     seeded_home_contact = False
     seeded_home_blind = False
     if disk_contact is not None:
@@ -1094,11 +993,6 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         covered = capture.covers(episode.started_at, episode.ended_at)
         reasons: list[str] = []
 
-        # Whether this episode was watched from end to end, kept as its own bit. The bucket
-        # cannot stand in for it: positive evidence raises an unclassified episode out of
-        # unclassified, so an unwatched stretch that happened to show one connection would read
-        # as an accounted one, and everything downstream that asks "was this rollout observed"
-        # would be answered by the traffic it saw rather than by the watching.
         observed = False
         if not capture.available:
             bucket = UNCLASSIFIED
@@ -1119,8 +1013,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             bucket = "computed_locally"
             observed = True
 
-        # The egress floor. It tops out at unresolved: the observer sees a connection, never a
-        # body, and the file CDN is shared by the whole platform.
+        # Tops out at unresolved: the observer sees a connection, never a body.
         for connection in evidence:
             role = host_role(connection.host, source)
             if role == "infrastructure":
@@ -1135,10 +1028,8 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
                 bucket = _raise_to(bucket, "unresolved_leakage")
                 _note(reasons, "content_cdn_handshake")
 
-        # Answer-source contact earlier on this disk. Whatever reached it may still be there,
-        # and a local read is invisible to the observer, so a later episode reading the same
-        # disk cannot be cleared. What it
-        # actually did with such a file is content evidence, which this half does not carry.
+        # A local read of whatever reached this disk is invisible to the observer, so a later
+        # episode reading it is not cleared.
         contact = contacted.get(episode.domain)
         if (
             contact is not None
@@ -1149,9 +1040,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             bucket = _raise_to(bucket, "unresolved_leakage")
             _note(reasons, "answer_source_contact_earlier_on_this_disk")
 
-        # An eval_after task runs against a copy of the HOME the rollout accumulated, so a
-        # rollout that reached the answer source hands every one of them a disk this cannot
-        # clear, and a rollout this could not classify hands them one it cannot describe.
+        # An eval_after task runs against a copy of the HOME the rollout accumulated.
         if episode.phase == "eval_after" and bucket != UNCLASSIFIED:
             if seeded_home_blind:
                 bucket = UNCLASSIFIED
@@ -1219,15 +1108,10 @@ def _disk_contact(
 ) -> tuple[float | None, int]:
     """When the rollout's disk first reached the answer source, over the whole life of its legs.
 
-    An episode's window starts when its task was handed out, and a container is up before that
-    and between one leg and the next. A connection made in those gaps reached the same mounted
-    HOME and the same working directory that every later episode reads, so it belongs to the
-    disk even though it belongs to no episode.
-
-    It is deliberately not given an episode of its own. Inventing one would put a row in the
-    report for something the stream never dispensed; what it does instead is set the disk's
-    contact time, which is what the carry-forward and the HOME-inheritance rules read, and say so
-    in a note.
+    A container is up before its first task is handed out and between one leg and the next, and a
+    connection made then reached the same mounted HOME every later episode reads. Such an
+    observation is deliberately given no episode of its own, since the stream never dispensed one;
+    it sets the disk's contact time and is reported in a note.
     """
     spans = [
         (float(leg["started_at"]), float(leg["ended_at"]))
@@ -1308,16 +1192,11 @@ def _coverage_notes(legs: list[dict[str, Any]], episodes: Sequence[Episode]) -> 
 
 
 def _mark_shared_windows(graded: Sequence[EpisodeLeakage]) -> list[EpisodeLeakage]:
-    """Name, per episode, the other episodes that could equally own this episode's evidence.
+    """Name, per episode, the other episodes that could equally own its evidence.
 
     Overlapping episodes share one network namespace, so a connection inside two open windows
-    belongs to both as far as the observer is concerned. Rather than pick one, the connection is
-    charged to every window containing it and the rivals travel with the record by identity, so
-    a reader can go and look at them.
-
-    Rivals are named per connection rather than per window: two windows that overlap somewhere
-    the traffic is not create no ambiguity about that traffic, and an episode that lists rivals
-    it does not really have is as misleading as one that hides the rivals it does.
+    belongs to both. Rivals are named per connection rather than per window: two windows that
+    overlap where the traffic is not create no ambiguity about that traffic.
     """
     windows = [
         (
@@ -1413,8 +1292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     missing = [d for d in args.run_dirs if not d.is_dir()]
     if missing:
-        # Refusing the batch rather than reporting on the rest: a typo that silently removes a
-        # run from an audit is the one failure a report cannot show you.
+        # The batch, not the rest: a report silently missing a run cannot show you that.
         for run_dir in missing:
             print(f"no run directory at {run_dir}", file=sys.stderr)
         return 1
@@ -1424,9 +1302,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     inside = _inside_a_run(args.out, targets)
     if inside is not None:
-        # This command reads run directories and writes none of them. A report that can land on
-        # a manifest, a capture or a provenance file can destroy the evidence it was made from,
-        # and it would do it after exiting zero.
+        # A report landing on a manifest, a capture or a provenance file destroys the evidence
+        # it was made from.
         print(
             f"refusing to write {args.out} inside the run directory {inside}: this command "
             "reads a run's record and never writes to it. Choose a path outside every run "
@@ -1437,8 +1314,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     refused = [d for d in targets if not _finished(d)]
     if refused and not args.allow_unfinished:
         for run_dir in refused:
-            # On stderr, because stdout is the document this command advertises and a refusal
-            # printed into it makes the JSON unparseable for whatever reads it next.
+            # On stderr: stdout is the document this command advertises.
             print(
                 f"refusing {run_dir}: its manifest has no ended_at, so the run was still going "
                 "and the egress record cannot be complete. Pass --allow-unfinished to grade it "
@@ -1466,10 +1342,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 def runs_read(targets: Sequence[Path]) -> list[Path]:
     """Every run directory this command will open, not only the ones it was handed.
 
-    A bookend names the run it was made from, and classifying it opens that run's record too. So
-    the set to protect is the targets plus what they reach through
-    ``manifest.rebookend.rebookend_of``, followed transitively and with each directory visited
-    once, since a chain or a cycle is a shape the record can take.
+    A bookend names the run it was made from and classifying it opens that run's record too, so the
+    walk follows ``manifest.rebookend.rebookend_of`` transitively with each directory visited once.
     """
     found: list[Path] = []
     seen: set[Path] = set()
@@ -1500,12 +1374,8 @@ def runs_read(targets: Sequence[Path]) -> list[Path]:
 def _inside_a_run(out: Path | None, targets: Sequence[Path]) -> Path | None:
     """The run directory an output path would land in, if it would land in one.
 
-    Checked against every run the command will read rather than only the ones named on the
-    command line, because reading a bookend reads its source and a report landing there destroys
-    a record this promised only to open.
-
-    Symlinks are resolved on both sides before comparing, so a path that only reaches a run
-    through a link is caught with the ones that name it outright.
+    Checked against every run the command will read, not only those named on the command line.
+    Symlinks are resolved on both sides.
     """
     if out is None:
         return None

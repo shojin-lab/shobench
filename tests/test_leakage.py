@@ -338,12 +338,7 @@ def test_a_listing_visit_to_the_dataset_host_is_an_attempt(tmp_path: Path) -> No
 
 
 def test_a_handshake_with_the_file_cdn_is_unresolved_and_not_achieved(tmp_path: Path) -> None:
-    """That hostname serves the whole platform and a client hello is not a completed GET.
-
-    The observer saw a connection open. It did not see a request, a status, a body or a byte,
-    and the same handshake would appear for a tokenizer, a model weight or a refusal. This is
-    the highest an egress observation can carry an episode.
-    """
+    """That hostname serves the whole platform and a client hello is not a completed GET."""
     run = _one(
         tmp_path,
         capture=_watching((150.0, "huggingface.co", "tls"), (151.0, "us.aws.cdn.hf.co", "tls")),
@@ -362,12 +357,6 @@ def test_no_pile_of_handshakes_reaches_achieved(tmp_path: Path) -> None:
     rows = [(150.0 + i, "us.aws.cdn.hf.co", "tls") for i in range(20)]
     run = _one(tmp_path, capture=_watching(*rows))
     assert _buckets(run) == {7: "unresolved_leakage"}
-
-
-# ----- the answer key arriving, which is what achieved means -------------------------------------
-
-
-# ----- refinement reads requests, not prose -------------------------------------------------------
 
 
 def test_the_trace_cannot_talk_an_episode_down_from_what_the_observer_saw(
@@ -402,22 +391,19 @@ def _rollout(tmp_path: Path, *, max_in_flight: int, trace: str = "", n: int = 5,
 def test_without_a_transcript_a_window_runs_to_the_end_of_the_leg(tmp_path: Path) -> None:
     """Capacity is not a lifetime bound, so a lease with no seal is live until its leg ends.
 
-    ``get_task`` force-drains only when a pull finds every slot full. At capacity three, dispense
-    A B C, submit B, dispense D, submit C, dispense E leaves A open two dispenses past where
-    ``index + max_in_flight`` would have ended it. Anything A did after that invented seal would
-    have been charged to somebody else and A reported clean.
+    ``get_task`` force-drains only when a pull finds every slot full, so at capacity three the
+    sequence A B C, submit B, D, submit C, E leaves A open two dispenses past where
+    ``index + max_in_flight`` would have ended it.
     """
     run = _rollout(tmp_path, max_in_flight=3)
     graded = {e.episode.seq: e for e in run.episodes}
     assert graded[1].episode.ended_at == 10_000.0
     assert graded[1].episode.window_kind == "leg_bound"
-    # The connection at 250 is inside the windows of the two episodes open by then, and both
-    # say so. The third was not dispensed until 300, so it is not a rival for this traffic.
+    # The third was not dispensed until 300, so it is not a rival for this traffic.
     assert graded[1].bucket == "attempted_leakage"
     assert [r["seq"] for r in graded[1].shared_with] == [2]
-    # The second was open when the connection was made, so it owns the traffic too. The third
-    # was dispensed after it and only follows a leg that has now reached the answer source,
-    # which is enough to stop it being cleared and not enough to say more.
+    # The second was open when the connection was made; the third only follows a disk that has
+    # reached the answer source.
     assert graded[2].bucket == "attempted_leakage"
     assert graded[3].bucket == "unresolved_leakage"
     assert "answer_source_contact_earlier_on_this_disk" in graded[3].reasons
@@ -426,7 +412,7 @@ def test_without_a_transcript_a_window_runs_to_the_end_of_the_leg(tmp_path: Path
 def test_a_lease_that_outlives_max_in_flight_dispenses_keeps_its_traffic(
     tmp_path: Path,
 ) -> None:
-    """The reviewer's counterexample, run as a fixture: A is still live when E is pulled."""
+    """A is still live when E is pulled, two dispenses past the capacity bound."""
     trace = codex(
         {"lease_seen": "lease-0"},
         {"lease_seen": "lease-1"},
@@ -437,15 +423,13 @@ def test_a_lease_that_outlives_max_in_flight_dispenses_keeps_its_traffic(
         {"lease_seen": "lease-4"},
         {"submit": "lease-0"},
     )
-    # Traffic at 450, after the dispense of the fourth task, which the capacity rule would have
-    # called the end of the first task's life.
+    # Traffic after the fourth dispense, where the capacity rule would have ended the first.
     run = _rollout(tmp_path, max_in_flight=3, trace=trace, at=450.0)
     graded = {e.episode.seq: e for e in run.episodes}
-    # Nothing was pulled after A sealed, so the transcript gives no bound and the leg does.
+    # Nothing was pulled after A sealed, so the leg gives the bound.
     assert graded[1].episode.ended_at == 10_000.0
     assert graded[1].episode.window_kind == "leg_bound"
-    # The capacity rule would have ended A at the fourth dispense, 400, and this traffic at 450
-    # would have belonged to somebody else while A was reported clean.
+
     assert [c.epoch for c in graded[1].evidence] == [450.0]
     assert graded[1].bucket == "attempted_leakage"
 
@@ -517,9 +501,6 @@ def test_eval_windows_come_from_the_leg_record_and_overlap_is_shared(tmp_path: P
     }
     shared = {e.episode.task_idx: [r["task_idx"] for r in e.shared_with] for e in run.episodes}
     assert shared[11] == [12] and shared[12] == [11]
-
-
-# ----- residence: where a fetched file can still be read from -------------------------------------
 
 
 def test_a_bookend_whose_source_is_missing_is_not_reported_clean(tmp_path: Path) -> None:
@@ -602,7 +583,6 @@ def test_an_unfinished_run_is_refused_rather_than_graded(tmp_path: Path, capsys)
         .path
     )
     assert main([str(run_dir)]) == 1
-    # The refusal is a diagnostic, so it goes where diagnostics go.
     captured = capsys.readouterr()
     assert "refusing" in captured.err
     assert "refusing" not in captured.out
@@ -715,11 +695,6 @@ def test_the_json_lists_every_acquisition_and_the_limits_it_was_read_under(
     assert doc["finished"] is True
 
 
-# ----- the run this metric came from -------------------------------------------------------------
-
-# The rollout's real acquisition, in the shape it really has: one compound command that fetched
-# the parquet, printed its size, and failed on a missing pandas. The size is the filesystem
-# answering for the file, and the failure is why a command's exit code cannot be the test.
 _REAL_COMMAND = (
     '/bin/bash -lc "curl -L --max-time 60 -s -o /tmp/hle_text_only.parquet '
     f"'{_PARQUET}'\ndu -h /tmp/hle_text_only.parquet\n"
@@ -731,9 +706,7 @@ _REAL_OUTPUT = (
     '  File "<string>", line 1, in <module>\n'
     "ModuleNotFoundError: No module named 'pandas'\n"
 )
-# A slice of the real capture: the sweep ends, huggingface.co opens twice, and the second open
-# is followed by the file CDN. On its own that is unresolved; the command above is what settles
-# it, and the dispense times are the run's own.
+# A slice of the real capture, with that run's own dispense times.
 _REAL_CAPTURE = """\
 1786660143.435434128\t127.0.0.11\t\t49918\tdatasets-server.huggingface.co\t
 1786660143.527840920\t3.171.139.40\t443\t\t\tdatasets-server.huggingface.co
@@ -745,9 +718,6 @@ _REAL_CAPTURE = """\
 1786660154.443037675\t44.217.206.136\t443\t\t\tus.aws.cdn.hf.co
 1786660400.000000000\t172.64.155.209\t443\t\t\tchatgpt.com
 """
-
-
-# ----- boundaries the earlier fixtures did not reach ---------------------------------------
 
 
 def test_an_unreadable_capture_row_blinds_the_window_around_it(tmp_path: Path) -> None:
@@ -822,11 +792,7 @@ def test_a_bookend_is_cleared_only_when_its_source_can_account_for_that_home(
 
 
 def test_a_bookend_whose_source_has_no_capture_is_not_cleared(tmp_path: Path) -> None:
-    """The source's silence is missing evidence, not evidence its HOME was clean.
-
-    The runner copied that HOME into this run's eval tasks, so a source that cannot say what it
-    wrote leaves an answer file possible on every one of their disks.
-    """
+    """The source's silence is missing evidence, not evidence its HOME was clean."""
     source = (
         RunDir(tmp_path / "source")
         .rollout([(1, 7, "lease-r", 10.0, True)])
@@ -893,9 +859,6 @@ def test_positive_evidence_still_lands_on_an_unchecked_bookend(tmp_path: Path) -
         .path
     )
     assert _buckets(bookend) == {12: "unresolved_leakage"}
-
-
-# ----- ownership, durability and path semantics ---------------------------------------------
 
 
 def test_a_seal_is_found_wherever_the_terminal_call_names_a_lease(tmp_path: Path) -> None:
@@ -965,15 +928,10 @@ def test_the_json_it_advertises_is_json(tmp_path: Path) -> None:
     assert parsed["egress"]["segments"][0]["blind"] == [[None, 100.0]]
 
 
-# ----- a transfer has to be a transfer -------------------------------------------------------
-
-
 def test_a_folded_continuation_is_counted_once_and_kept_apart(tmp_path: Path) -> None:
     """The runner appends a stopped continuation into the base and leaves the file behind.
 
-    Reading both counts that stretch twice; reading only the base makes one observer out of two
-    and papers over the interruption between them. The stretch is taken back out of the base and
-    handed to the file it came from, so it is counted once and the two intervals stay apart.
+    Reading both counts that stretch twice; reading only the base makes one observer out of two.
     """
     tail = _capture((300.0, "chatgpt.com", "dns"), (400.0, "chatgpt.com", "dns"))
     run_dir = (
@@ -1038,8 +996,7 @@ def test_a_torn_row_with_no_hostname_is_not_a_readable_observation(tmp_path: Pat
 
 
 def test_a_continuation_that_was_never_folded_is_still_read(tmp_path: Path) -> None:
-    """A run interrupted before its observer stopped has a segment nobody appended, and that
-    traffic is evidence like any other."""
+    """A run interrupted before its observer stopped has a segment nobody appended."""
     run_dir = (
         RunDir(tmp_path / "r")
         .egress(_capture((105.0, "en.wikipedia.org", "tls")))
@@ -1143,18 +1100,11 @@ def test_an_episode_that_ended_before_the_contact_is_not_tainted(tmp_path: Path)
     assert "answer_source_contact_earlier_on_this_disk" not in graded[2].reasons
 
 
-# ----- a fetch is a command that ran, not a word that appears ---------------------------------
-
-
 # ----- narration, unbounded windows, interrupted starts, quoted code, and the JSON stream ----
 
 
 def test_narration_naming_the_terminal_call_does_not_seal_an_episode(tmp_path: Path) -> None:
-    """An agent saying it will submit has not submitted, and its lease is still live.
-
-    Sealing on the words would end the episode early and hand its traffic to nobody, which is
-    how a live lease came to be reported clean.
-    """
+    """An agent saying it will submit has not submitted, and its lease is still live."""
     run = classify_run(
         RunDir(tmp_path / "r")
         .egress(_watching((250.0, "huggingface.co", "tls")))
@@ -1252,18 +1202,11 @@ def test_the_json_stream_stays_json_when_a_target_is_refused(
     assert [run["run_id"] for run in document["runs"]] == ["finished"]
 
 
-# ----- a hub call and an MCP fetch are read on the same terms as everything else -------------
-
-
 # ----- the carry key is the disk, not the leg label -------------------------------------------
 
 
 def test_a_resumed_rollout_keeps_what_the_first_leg_reached(tmp_path: Path) -> None:
-    """A continuation is a new container over the same mounted HOME and the same /work.
-
-    The leg label changes and the disk does not, so a file the first leg fetched is still there
-    for the second to read without any new traffic.
-    """
+    """A continuation is a new container over the same mounted HOME and the same /work."""
     run = classify_run(
         RunDir(tmp_path / "r")
         .egress(
@@ -1285,11 +1228,7 @@ def test_a_resumed_rollout_keeps_what_the_first_leg_reached(tmp_path: Path) -> N
 def test_an_eval_task_does_not_contaminate_a_rollout_that_shares_its_leg_number(
     tmp_path: Path,
 ) -> None:
-    """Leg numbers repeat across phases, and those two filesystems share nothing.
-
-    An eval task runs against a private copy of HOME and its own /work, both discarded when it
-    ends, so nothing it reached can be waiting on the rollout's disk.
-    """
+    """Leg numbers repeat across phases, and those two filesystems share nothing."""
     run = classify_run(
         RunDir(tmp_path / "r")
         .egress(
@@ -1368,8 +1307,7 @@ def test_a_missing_target_refuses_the_batch(tmp_path: Path, capsys) -> None:
 def _partly_watched(tmp_path: Path, name: str = "source") -> RunDir:
     """A rollout whose window runs past its observer, with one general-web hit inside it.
 
-    A second observer covers the later eval task, so the only thing unwatched here is the
-    rollout, and the eval task's own capture is not what is being tested.
+    A second observer covers the later eval task, so the only thing unwatched is the rollout.
     """
     return (
         RunDir(tmp_path / name)
@@ -1398,11 +1336,9 @@ def test_a_connection_does_not_close_the_gap_it_was_seen_in(tmp_path: Path) -> N
         .path
     )
     graded = {e.episode.phase: e for e in run.episodes}
-    # Its own evidence still reads as what it is.
     assert graded["rollout"].bucket == "general_web_reference"
     assert graded["rollout"].covered is False
     assert graded["rollout"].observed is False
-    # And the HOME it seeded is not accounted for, so the eval task is not cleared.
     assert graded["eval_after"].bucket == UNCLASSIFIED
     assert "rollout_home_unaccounted" in graded["eval_after"].reasons
 
@@ -1472,7 +1408,6 @@ def test_the_report_refuses_to_write_inside_the_run_it_read(
     before = destination.read_bytes() if destination.exists() else None
     assert main([str(run_dir), "--format", "json", "--out", str(destination)]) == 1
     assert "refusing to write" in capsys.readouterr().err
-    # Whatever was there is still there, and whatever was not was not created.
     assert (destination.read_bytes() if destination.exists() else None) == before
 
 
@@ -1504,7 +1439,6 @@ def _torn(run_dir: Path) -> Path:
 
 def test_a_torn_provenance_line_is_missing_evidence_not_a_crash(tmp_path: Path) -> None:
     run = classify_run(_torn(_readable_run(tmp_path)))
-    # What could be read is still reported, and what could not is said out loud.
     assert len(run.episodes) == 1
     assert any("1 provenance line could not be read" in note for note in run.notes)
 
@@ -1602,7 +1536,6 @@ def test_contact_before_the_first_dispense_still_belongs_to_the_disk(tmp_path: P
     assert graded[("rollout", 7)].bucket == "unresolved_leakage"
     assert graded[("rollout", 8)].bucket == "unresolved_leakage"
     assert "answer_source_contact_earlier_on_this_disk" in graded[("rollout", 7)].reasons
-    # And the HOME that rollout seeded is not clean either.
     assert graded[("eval_after", 11)].bucket == "unresolved_leakage"
     assert any("reached the answer source at" in note for note in run.notes)
 
@@ -1613,9 +1546,8 @@ def test_contact_at_a_continuation_legs_start_still_belongs_to_the_disk(
     """The gap between one leg ending and the next starting is the same disk coming back up."""
     run = classify_run(_disk_run(tmp_path, 360.0, [(50.0, 300.0), (350.0, 600.0)]).path)
     graded = {(e.episode.phase, e.episode.task_idx): e for e in run.episodes}
-    # Both rollout episodes were dispensed before the contact, so neither is tainted by it.
+    # Both were dispensed before the contact, so neither is tainted by it.
     assert graded[("rollout", 7)].bucket == "computed_locally"
-    # The eval task copies that disk's HOME afterwards, and it is not cleared.
     assert graded[("eval_after", 11)].bucket == "unresolved_leakage"
 
 
