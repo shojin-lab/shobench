@@ -77,7 +77,7 @@ Counts measured against the shōgym registry (2026-08-07). Excluded by decision:
 | `automationbench` | 600 | pure end-state rubric, offline | none | low (simulated world) | **yes** |
 | `yc_bench` | 16 | deterministic sim | none | low (simulated) | v1 |
 | `tau2_telecom` | ~114 (needs data fetch) | tau2 evaluator + user simulator | OPENAI_API_KEY | low (simulated) | **yes** |
-| `tau2_banking_knowledge` | TBD (needs data fetch) | tau2 evaluator | OPENAI_API_KEY | low | v1 |
+| `tau2_banking_knowledge` | 97, 87 of them servable offline (needs data fetch) | tau2 evaluator | OPENAI_API_KEY | low | **yes (amended in 2026-08-14)** |
 | `frontier_bench` | 5 | container end-state verifier | Docker | low | no: 5 tasks cannot give a held-out split with power |
 | `hle` | 1726 | exact match + model judge | OPENAI_API_KEY + gated HF | **high**: public dataset, answers on the web | **yes (leakage observed, not gated)** |
 | `browsecomp_plus` | 664 | model judge + retrieval metrics | OPENAI_API_KEY + Java 21 + gated | medium | deferred until network policy |
@@ -131,12 +131,15 @@ Known per-harness hazards from prior runs:
   and record the chosen settings per harness in the runner configuration; no cell may
   depend on a human approving anything mid-run.
 
-## v0 = 3 envs x 4 harness-model pairs = 12 cells
+## v0 = 4 envs x 4 harness-model pairs = 16 cells
 
-- **Envs:** `automationbench`, `tau2_telecom`, `hle` (yc_bench moves to v1; hle swapped in by owner decision).
+- **Envs:** `automationbench`, `tau2_telecom`, `hle` (yc_bench moves to v1; hle swapped in by owner decision),
+  and `tau2_banking_knowledge`, **amended in 2026-08-14 by owner decision** as the offline-eval
+  variant of that domain (`bm25_grep` retrieval, `evaluation_type = "env"`) over a split
+  restricted to the bases that evaluator honors.
 - **Harness-model pairs:** claude_code+Opus 5, codex+GPT-5.6-terra, prime_agent+Opus 5,
   prime_agent+GPT-5.6-terra (the 4-way above).
-- **Splits.** Two of the three are not ours to invent, which also answers where the numbers
+- **Splits.** Two of the four are not ours to invent, which also answers where the numbers
   come from:
   - automationbench: reuse the published conversation-not-memories split exactly: the same
     **120 held-out tasks** recorded in shōrep, improvement pool drawn from the remaining 480.
@@ -153,6 +156,12 @@ Known per-harness hazards from prior runs:
     single-turn tasks make the before/after evals cheap relative to the multi-turn envs.
     With yc_bench in v1, the rollout-phase stopping metrics carry the charter's
     when-do-they-stop question in v0.
+  - tau2_banking_knowledge: no canonical split exists upstream either, so ours: seeded,
+    disjoint, published: **40 held-out / 47 improvement**, drawn over the 87 of 97 tasks whose
+    reward basis the offline `env` evaluator scores in full. 40 matches tau2_telecom's held-out
+    size. The nine ACTION-only tasks and the one carrying an NL assertion are out of the
+    population because that evaluator does not score them, not because they are hard; serving
+    them means the keyed full-fidelity cell, which is a v1 follow-up.
 - **Pool sizes are ceilings, not quotas.** The improvement pool is the maximum the runner
   will serve; the agent may stop on its own long before exhausting it. That early stop is a
   primary reported outcome (tasks attempted before stopping, and how the stop happened), not

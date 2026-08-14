@@ -167,6 +167,49 @@ def test_tau2_banking_manifest_ids_resolve_to_the_labels_it_records() -> None:
         assert resolved == list(side.labels)
 
 
+def test_tau2_banking_split_serves_only_tasks_the_env_evaluator_scores() -> None:
+    """Every served banking task declares a basis tau2's ``env`` evaluator actually scores.
+
+    The cells run ``evaluation_type = "env"``, and that evaluator starts a reward at 1.0 and
+    multiplies it only for DB and ENV_ASSERTION. A task whose basis holds anything else is not
+    scored down, it is not scored at all: an ACTION-only task returns 1.0 for any run that
+    terminates normally. Such a task on either side would publish a free success as a
+    measurement, so the split excludes it, and this holds that exclusion to the data rather than
+    to a count. A domain bump that adds tasks, or a pin that moves, fails here instead of
+    quietly reintroducing one.
+    """
+    if not tau2_data.is_present():
+        pytest.skip(f"tau2 data not provisioned; run {tau2_data.PROVISION_COMMAND}")
+    os.environ["TAU2_DATA_DIR"] = str(tau2_data.resolve_data_dir())
+    from shogym.envs.tau2 import mcp_server
+
+    honored = {"DB", "ENV_ASSERTION"}
+    tasks = mcp_server.load_tasks("banking_knowledge")
+    basis_by_id = {
+        str(task.id): {
+            getattr(member, "value", member)
+            for member in (getattr(task.evaluation_criteria, "reward_basis", None) or ())
+        }
+        for task in tasks
+    }
+    split = load_split_by_name("tau2_banking_knowledge")
+    served = list(split.heldout.labels) + list(split.pool.labels)
+    unscored = {
+        label: sorted(basis_by_id[label])
+        for label in served
+        if not basis_by_id[label] or not basis_by_id[label] <= honored
+    }
+    assert not unscored, f"served tasks the env evaluator does not score in full: {unscored}"
+
+    # The other half of the claim: everything excluded was excluded for that reason alone, so
+    # the draw is over the whole eligible population rather than an arbitrary subset of it.
+    eligible = {
+        label for label, basis in basis_by_id.items() if basis and basis <= honored
+    }
+    assert set(served) == eligible
+    assert split.provenance["excluded_tasks"].keys() == basis_by_id.keys() - eligible
+
+
 def test_automationbench_manifest_covers_the_env_exactly() -> None:
     split = load_split_by_name("automationbench")
     env = _env("automationbench", split.heldout.env_kwargs)

@@ -26,14 +26,14 @@ credential_mode = "subscription"
 # ~730 MB tau2 data into shogym's cache and points TAU2_DATA_DIR at it, rather than requiring
 # the operator to export it. `uv run python tools/provision_tau2_data.py`.
 required_env = ["OPENAI_API_KEY"]
-note = "Our seeded 40/57 draw: banking declares no split, and 40 held-out matches telecom's so the two tau2 envs are read against the same held-out N. Served offline (bm25_grep retrieval, env-only evaluation), so these numbers are not comparable to published tau2-bench banking results."
+note = "Our seeded 40/47 draw over the 87 of 97 tasks the env evaluator scores in full: banking declares no split, and 40 held-out matches telecom's so the two tau2 envs are read against the same held-out N. Served offline (bm25_grep retrieval, env-only evaluation), so these numbers are not comparable to published tau2-bench banking results."
 
 [budget]
 # Wall-clock parity, decided in the scope: identical across harnesses within an env, no token
 # ceiling, because the cells run on subscription billing.
 rollout_wall_clock_s = 28800
 # The pool is a serving ceiling, not a quota. Stopping short of it is a reported outcome.
-pool_ceiling = 57
+pool_ceiling = 47
 eval_task_timeout_s = 1800
 
 [env_kwargs]
@@ -42,10 +42,11 @@ eval_task_timeout_s = 1800
 # each other, but none of them is comparable to published tau2-bench results.
 user_llm = "gpt-5.6-luna"
 
-# tau2's evaluator restricted to its offline half. The domain's own default scores one task's
-# NL assertions through a judge LLM; env scores DB state and env assertions alone, so a served
-# run needs no judge. The nine action-basis tasks are then scored on DB state rather than on
-# action match, which is the price of serving the domain offline.
+# tau2's evaluator restricted to its offline half: env scores DB state and env assertions, so a
+# served run needs no judge LLM. It does not fall back to something weaker for a task whose
+# basis it does not cover, it declines to score it, starting the reward at 1.0 and multiplying
+# only for DB and ENV_ASSERTION. An ACTION-only task would therefore pass unconditionally. The
+# split answers that by drawing only over the 87 tasks this evaluator scores in full.
 evaluation_type = "env"
 
 # Naming this table replaces tau2's DEFAULT_LLM_ARGS_USER wholesale, so both arguments have to

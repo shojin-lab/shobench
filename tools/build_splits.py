@@ -245,8 +245,23 @@ def build_hle(out: Path) -> Path:
 # ----- tau2_banking_knowledge ------------------------------------------------------------
 
 BANKING_HELDOUT_N = 40
-BANKING_POOL_N = 57
+BANKING_POOL_N = 47
 BANKING_TOTAL = 97
+BANKING_ELIGIBLE_N = 87
+
+# The reward bases tau2's ``env`` evaluator actually scores. It starts a task's reward at 1.0 and
+# multiplies it only for these two, so a task whose basis holds anything else is scored on less
+# than it declares: an ACTION-only task returns 1.0 for any run that terminates normally, and a
+# DB + NL_ASSERTION task keeps only its DB half. The offline cells serve this evaluator, so the
+# population is the tasks it scores in full and the rest are excluded rather than reported.
+BANKING_HONORED_BASES = frozenset({"DB", "ENV_ASSERTION"})
+
+
+def _banking_basis(task: Any) -> frozenset[str]:
+    """One task's reward basis as plain strings, empty when it declares none."""
+    criteria = getattr(task, "evaluation_criteria", None)
+    basis = getattr(criteria, "reward_basis", None) or ()
+    return frozenset(getattr(member, "value", member) for member in basis)
 
 
 def build_tau2_banking_knowledge(out: Path) -> Path:
@@ -254,7 +269,7 @@ def build_tau2_banking_knowledge(out: Path) -> Path:
 
     telecom's sizes are upstream's; these are chosen. Held-out is 40, the size upstream declares
     for telecom, so the two tau2 envs are read against the same held-out N, and the pool is the
-    remaining 57.
+    87-task eligible population's remaining 47.
     """
     import os
 
@@ -266,7 +281,8 @@ def build_tau2_banking_knowledge(out: Path) -> Path:
     os.environ["TAU2_DATA_DIR"] = str(tau2_data.require())
     from shogym.envs.tau2 import mcp_server
 
-    task_ids = [str(task.id) for task in mcp_server.load_tasks("banking_knowledge")]
+    tasks = mcp_server.load_tasks("banking_knowledge")
+    task_ids = [str(task.id) for task in tasks]
     n = len(task_ids)
     if n != BANKING_TOTAL:
         raise SystemExit(
@@ -274,7 +290,22 @@ def build_tau2_banking_knowledge(out: Path) -> Path:
             "the domain drifted"
         )
 
-    order = list(range(n))
+    # Eligible positions, in the env's own task order. A task with no declared basis is excluded
+    # too: the evaluator hands those a free 1.0 by the same arithmetic.
+    bases = [_banking_basis(task) for task in tasks]
+    eligible = [i for i, basis in enumerate(bases) if basis and basis <= BANKING_HONORED_BASES]
+    excluded = {
+        task_ids[i]: sorted(basis)
+        for i, basis in enumerate(bases)
+        if i not in set(eligible)
+    }
+    if len(eligible) != BANKING_ELIGIBLE_N:
+        raise SystemExit(
+            f"banking_knowledge has {len(eligible)} tasks the env evaluator scores in full and "
+            f"the manifest expects {BANKING_ELIGIBLE_N}: the domain drifted"
+        )
+
+    order = list(eligible)
     random.Random(SEED).shuffle(order)
     heldout_idx = sorted(order[:BANKING_HELDOUT_N])
     pool_idx = sorted(order[BANKING_HELDOUT_N : BANKING_HELDOUT_N + BANKING_POOL_N])
@@ -293,25 +324,40 @@ def build_tau2_banking_knowledge(out: Path) -> Path:
             "upstream": "sierra-research/tau2-bench",
             "upstream_sha": TAU2_UPSTREAM_SHA,
             "source": "data/tau2/domains/banking_knowledge/tasks",
-            "population": "all 97 banking_knowledge tasks, which upstream ships undivided",
+            "population": (
+                "the 87 of 97 banking_knowledge tasks whose reward_basis tau2's env evaluator "
+                "scores in full, which is a basis drawn from DB and ENV_ASSERTION alone"
+            ),
             "authority": (
                 "banking_knowledge ships no split_tasks.json, so there is no declared split to "
                 "honor the way telecom's is honored, and no prior published run over these "
                 "tasks to adopt. This repo draws one and publishes it."
             ),
+            "excluded": (
+                "The cells serve tau2's env evaluator, which starts a reward at 1.0 and "
+                "multiplies it only for the DB and ENV_ASSERTION bases. Nine ACTION-only tasks "
+                "are therefore not scored at all under it: every normally terminated run returns "
+                "1.0 whatever the agent did. One DB + NL_ASSERTION task would be scored on its "
+                "DB half alone. Both would be published as measurements of something they do "
+                "not measure, so they are out of the population rather than in it with a "
+                "caveat. Serving them honestly needs the keyed evaluator, which is a different "
+                "cell."
+            ),
+            "excluded_tasks": excluded,
             "procedure": (
-                "Shuffle the population's positions once with the recorded seed, take the first "
-                "40 as held-out and the remaining 57 as the improvement pool, then sort each "
-                "side ascending so serving order is stable and reviewable. Held-out is 40 "
-                "because upstream declares 40 for telecom, so the two tau2 envs are read "
-                "against the same held-out N. The pool is a ceiling on what the rollout may "
-                "serve, not a quota."
+                "Shuffle the eligible positions once with the recorded seed, take the first 40 "
+                "as held-out and the remaining 47 as the improvement pool, then sort each side "
+                "ascending so serving order is stable and reviewable. Held-out is 40 because "
+                "upstream declares 40 for telecom, so the two tau2 envs are read against the "
+                "same held-out N. The pool is a ceiling on what the rollout may serve, not a "
+                "quota."
             ),
             "id_meaning": (
                 "A shogym tau2 task_id is the stringified index into the env's task list. "
                 "banking_knowledge declares no train/test split, so both sides index the same "
-                "97-task list and disjointness is checked on the ids themselves; labels carry "
-                "upstream's own task ids."
+                "97-task list, positions the split does not draw are served by neither side, "
+                "and disjointness is checked on the ids themselves; labels carry upstream's own "
+                "task ids."
             ),
             "shogym_rev": SHOGYM_REV,
         },

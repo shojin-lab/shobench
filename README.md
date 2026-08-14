@@ -55,11 +55,11 @@ shogym provisions each env's upstream *source* at runtime but does not carry tau
 `data/`, so that one subtree is provisioned separately by the command above (idempotent: a tree
 that already is the pinned data is verified and skipped, and `--force` re-fetches and replaces
 what is there). What "is the pinned data" means is settled by a committed digest manifest, not by
-a file list: every file a tau2_telecom run reads has to match the size and sha256 the pinned
-commit has, so a stale checkout handed in through `TAU2_DATA_DIR`, or an edited policy or DB, is
-refused by name instead of quietly moving the numbers. The manifest names telecom's files, so
-banking's tasks and documents sit in the ungated bulk that `--force` rather than the digest gate
-answers for. A refused tree that the operator named
+a file list: every file a tau2 run reads has to match the size and sha256 the pinned commit has,
+so a stale checkout handed in through `TAU2_DATA_DIR`, or an edited policy or DB, is refused by
+name instead of quietly moving the numbers. Both served domains are covered in full, banking's 97
+task files and its whole 698-document retrieval corpus included, which is 806 files and 17 MB and
+verifies in about 60 ms. A refused tree that the operator named
 through `TAU2_DATA_DIR` is then left exactly as it was, along with everything else living in it:
 only `--force` replaces that one, and a tree that passes is only read, not even annotated, so a
 read-only checkout works. The runner sets `TAU2_DATA_DIR` itself and refuses a tau2 cell
