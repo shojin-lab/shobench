@@ -24,7 +24,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import subprocess
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -104,6 +106,16 @@ async def _fake_served(stream: object, port: int):
     yield
 
 
+def _gone_within(path: Path, seconds: float) -> bool:
+    """Did this file disappear inside the window, polled the way the CLI polls for it?"""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not path.exists():
+            return True
+        time.sleep(0.02)
+    return not path.exists()
+
+
 def _offline_rollout(monkeypatch) -> None:
     """Everything a rollout phase reaches outside this process, stood in for."""
     monkeypatch.setattr(runner, "build_stream", lambda *a, **k: _FakeStream())
@@ -147,29 +159,82 @@ def _supervising(monkeypatch, proc: object, removed: list[str]) -> None:
     monkeypatch.setattr(runner, "docker", lambda *args, **kw: removed.append(args[-1]))
 
 
-def _stopped_run(tmp_path: Path, monkeypatch, *, reason: str = "wedged on a negamax cell") -> Path:
-    """One rollout an operator's ask ended, through the real phase tail. Returns the run dir."""
+def _stopped_run(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    reason: str = "wedged on a negamax cell",
+    transcript: bool = True,
+) -> Path:
+    """One rollout an operator's ask ended, through the real ownership and the real phase tail.
+
+    Ownership is taken for real rather than faked, because the watcher that consumes the ask
+    belongs to it: a run driven through ``_run_phases`` alone has no watcher at all, which is the
+    state every already-running process is in and exactly what the CLI must refuse.
+
+    ``transcript`` decides whether the leg got far enough to leave a resumable conversation
+    behind, which is what separates a stop that can be bookended from one that cannot.
+    """
     ctx = _ctx(tmp_path)
+    # A short clock, so a regression that stops consuming the ask fails in seconds rather than
+    # hanging the suite for the cell's real wall clock.
+    budget = replace(ctx.cell.budget, rollout_wall_clock_s=30)
+    ctx = replace(ctx, cell=replace(ctx.cell, budget=budget))
     _offline_rollout(monkeypatch)
     removed: list[str] = []
     # Built before the supervisor's fakes go in: standing in for Popen stands in for the one
     # `subprocess.run` uses too, and the manifest reads this checkout's revision through it.
     manifest = build_manifest(ctx, probes={"version": "test"})
-    _supervising(monkeypatch, _AsksToStopMidLeg(ctx.run_dir, reason), removed)
-    asyncio.run(
-        runner._run_phases(
-            ctx,
-            manifest=manifest,
-            # Both phases, so the record also says what the stop kept from starting.
-            phases=("rollout", "eval_after"),
-            results_dir=tmp_path / "results",
-            observer=runner._Egress(None, ctx.run_dir),
+    with runner.owning_run(ctx.run_dir) as stop:
+        ctx = replace(ctx, operator_stop=stop)
+        if transcript:
+            _seed_claude_transcript(ctx, monkeypatch)
+        _supervising(monkeypatch, _AsksToStopMidLeg(ctx.run_dir, reason), removed)
+        asyncio.run(
+            runner._run_phases(
+                ctx,
+                manifest=manifest,
+                # Both phases, so the record also says what the stop kept from starting.
+                phases=("rollout", "eval_after"),
+                results_dir=tmp_path / "results",
+                observer=runner._Egress(None, ctx.run_dir),
+            )
         )
-    )
     # The container was removed by name, not merely orphaned: one that outlived its leg would keep
     # spending and keep holding whatever it was handed.
     assert removed
     return ctx.run_dir
+
+
+_PINNED_SESSION = "11111111-2222-3333-4444-555555555555"
+
+
+def _seed_claude_transcript(ctx: RunContext, monkeypatch) -> None:
+    """Put a resumable transcript where a leg that got that far would have left one.
+
+    The leg is stood in for at the supervisor, so nothing writes the conversation a real one
+    would. What the harness requires to reopen a session is the harness's own rule, and the file
+    written here is one that rule accepts rather than an empty one wearing the right name: that is
+    the whole difference between a terminus a bookend can fork and an id in a record.
+
+    The session id is pinned so the seeded file and the leg agree on it; claude lets the runner
+    choose one, which is exactly why an id alone proves nothing about a transcript existing.
+    """
+    monkeypatch.setattr(runner, "_fresh_session_id", lambda ctx_arg: _PINNED_SESSION)
+    root = ctx.sandbox.home / ".claude" / "projects" / "-work"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"{_PINNED_SESSION}.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": _PINNED_SESSION,
+                "timestamp": "2026-08-14T00:00:00.000Z",
+                "message": {"role": "user", "content": "Get Better"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 # ----- an operator's stop, and the records it leaves ------------------------------------------
@@ -216,16 +281,22 @@ def test_a_stop_between_phases_keeps_the_next_phase_from_starting(
 def test_the_stopped_run_carries_the_terminus_a_rebookend_requires(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The refusal this entry exists to remove, checked against its own two predicates.
+    """The refusal this entry exists to remove, checked against the predicates rebookend uses.
 
-    ``rebookend`` blocks on exactly these: a rollout terminus on disk, and a terminal session in
-    it to fork. An operator-ended rollout has both, because the agent's state at the moment it was
-    stopped is a real ending; a killed run has neither, because nothing got to write them.
+    All three of them, not the easy two. A record naming a session is not a terminus a bookend can
+    fork: the plan also resolves the transcript through the harness's own validation, and a
+    stopped leg is exactly where an id can exist with no conversation behind it.
     """
     run_dir = _stopped_run(tmp_path, monkeypatch)
+    session = runner.terminal_session_in(run_dir)
 
     assert (run_dir / runner.ROLLOUT_STOPPING_FILE).is_file()
-    assert runner.terminal_session_in(run_dir) is not None
+    assert session is not None
+    # The predicate the rebookend plan actually blocks on.
+    assert harness_for("claude_code").session_transcript(run_dir / "home", session) is not None
+    stopping = json.loads((run_dir / runner.ROLLOUT_STOPPING_FILE).read_text())
+    assert stopping["terminus_rebookendable"] is True
+    assert stopping["terminus_not_rebookendable_because"] == ""
 
 
 def test_a_run_with_no_terminus_is_still_refused(tmp_path: Path) -> None:
@@ -293,22 +364,22 @@ def test_a_stop_during_an_eval_phase_admits_no_further_tasks(tmp_path: Path, mon
 
 
 def test_the_watcher_fires_on_an_ask_and_leaves_a_quiet_run_alone(tmp_path: Path) -> None:
-    """The two halves of the poller, without a phase around them."""
-    ctx = _ctx(tmp_path)
-    ctx.run_dir.mkdir(parents=True, exist_ok=True)
+    """The two halves of the poller that ownership runs, without a phase around them."""
+    quiet = tmp_path / "quiet"
+    with runner.owning_run(quiet) as stop:
+        assert not stop.fired.wait(timeout=0.2)
 
-    with runner._watching_for_stop(ctx):
-        assert not ctx.operator_stop.fired.wait(timeout=0.2)
-
-    ctx = _ctx(tmp_path / "second")
-    ctx.run_dir.mkdir(parents=True, exist_ok=True)
-    runner.write_stop_request(ctx.run_dir, reason="by hand")
-    with runner._watching_for_stop(ctx):
-        assert ctx.operator_stop.fired.wait(timeout=5.0)
-
-    assert ctx.operator_stop.verdict is not None
-    assert ctx.operator_stop.verdict.kind is StopKind.OPERATOR
-    assert not (ctx.run_dir / STOP_REQUEST_FILE).exists()
+    asked = tmp_path / "asked"
+    asked.mkdir(parents=True)
+    (asked / runner.RUN_LOCK_FILE).write_text("{}", encoding="utf-8")
+    runner.write_stop_request(asked, reason="by hand")
+    with runner.owning_run(asked) as stop:
+        assert stop.fired.wait(timeout=5.0)
+        assert stop.verdict is not None
+        assert stop.verdict.kind is StopKind.OPERATOR
+        # The unlink is the acknowledgment, and the CLI waits on exactly this. It follows the
+        # fire rather than preceding it, so this waits for it the way the CLI does.
+        assert _gone_within(asked / STOP_REQUEST_FILE, 5.0)
 
 
 def test_every_harness_reports_an_operator_stop_the_same_way() -> None:
@@ -343,19 +414,110 @@ def test_stopping_a_finished_run_is_a_clean_no_op(tmp_path: Path, capsys) -> Non
     assert "not owned by a live process" in capsys.readouterr().err
 
 
-def test_stopping_a_live_run_writes_the_ask(tmp_path: Path) -> None:
-    """Liveness is proven by the same shared flock a rebookend proves it with, never by a pid: the
-    lock file is never unlinked, so a finished run names a pid the system may have reissued."""
+def test_stopping_a_watching_owner_writes_the_ask_and_waits_to_be_acknowledged(
+    tmp_path: Path,
+) -> None:
+    """The whole protocol on the happy path: the owner advertises, the ask is written, the owner
+    consumes it, and only then does the command report success.
+
+    Liveness is proven by the same shared flock a rebookend proves it with, never by a pid: the
+    lock file is never unlinked, so a finished run names a pid the system may have reissued.
+    """
     run_dir = tmp_path / "live"
+    seen: list[dict] = []
+    with runner.owning_run(run_dir) as stop:
+        assert main(["stop", "--run", str(run_dir), "--reason", "needed the machine"]) == 0
+        seen.append(dict(stop.verdict.evidence)) if stop.verdict else None
+
+    # Reported success only because the owner consumed it, which is also what leaves nothing
+    # behind for a later reopening to latch.
+    assert not (run_dir / STOP_REQUEST_FILE).exists()
+    assert seen and seen[0]["reason"] == "needed the machine"
+    assert seen[0]["requested_at"] > 0
+
+
+def test_a_stop_against_an_owner_that_cannot_consume_it_is_refused(
+    tmp_path: Path, capsys
+) -> None:
+    """The case that matters most in practice, and the one a busy lock alone gets wrong.
+
+    A process started before the stop path existed holds its directory exactly as a current one
+    does, and reads nothing. Writing an ask there does not stop it, reports success, and leaves a
+    file for the next resume or rerun-eval to act on. So support is advertised in the lock and an
+    owner that does not advertise is refused with nothing written.
+    """
+    run_dir = tmp_path / "older-build"
+    # Ownership taken the way every entry took it before the watcher existed.
     lock_fd = runner._acquire_run_lock(run_dir)
     try:
-        assert main(["stop", "--run", str(run_dir), "--reason", "needed the machine"]) == 0
+        assert main(["stop", "--run", str(run_dir), "--reason", "wedged"]) == 1
     finally:
         runner._release_run_lock(lock_fd)
 
-    request = json.loads((run_dir / STOP_REQUEST_FILE).read_text())
-    assert request["reason"] == "needed the machine"
-    assert request["requested_at"] > 0
+    assert not (run_dir / STOP_REQUEST_FILE).exists()
+    err = capsys.readouterr().err
+    assert "advertises no stop protocol" in err
+    assert "would never be read" in err
+
+
+def test_only_an_owner_that_watches_advertises_that_it_does(tmp_path: Path) -> None:
+    """The advertisement is written by the one entry that starts the watcher, so it cannot claim
+    support a directory does not have."""
+    watching = tmp_path / "watching"
+    with runner.owning_run(watching):
+        assert runner.read_lock_holder(watching)["stop_protocol"] == runner.STOP_PROTOCOL
+
+    bare = tmp_path / "bare"
+    lock_fd = runner._acquire_run_lock(bare)
+    try:
+        assert "stop_protocol" not in runner.read_lock_holder(bare)
+    finally:
+        runner._release_run_lock(lock_fd)
+
+
+def test_an_owner_that_leaves_without_reading_the_ask_has_it_withdrawn(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The window between the liveness probe and the write, where the owner can finish in between.
+
+    An owner that goes away with the request still on disk never saw it, so the command takes the
+    ask back under the now-free shared lock and says nothing was stopped. Leaving it would be the
+    same landmine the advertisement check exists to prevent, reached by a race instead of by an
+    old build.
+    """
+    run_dir = tmp_path / "finishes-mid-write"
+    run_dir.mkdir()
+    holder = {"pid": 1, "at": 1.0, "stop_protocol": runner.STOP_PROTOCOL}
+    (run_dir / runner.RUN_LOCK_FILE).write_text(json.dumps(holder), encoding="utf-8")
+
+    from shobench import cli
+
+    answers = iter([True])  # live for the probe, gone by the time the ask is written
+
+    monkeypatch.setattr(cli, "_owner_is_live", lambda d: next(answers, False))
+
+    assert main(["stop", "--run", str(run_dir), "--reason", "too late"]) == 1
+
+    assert not (run_dir / STOP_REQUEST_FILE).exists()
+    err = capsys.readouterr().err
+    assert "released it without reading the stop" in err
+    assert "was withdrawn" in err
+
+
+def test_an_ask_outside_the_phases_is_still_consumed(tmp_path: Path) -> None:
+    """The watcher's lifetime is the LOCK's lifetime, not the phase loop's.
+
+    An owner holds its directory through setup, between phases, and through publication and
+    teardown. A watcher scoped to the phases left every ask outside that window accepted and
+    unread, which is the state this asserts against: no phase runs here at all.
+    """
+    run_dir = tmp_path / "between-phases"
+    with runner.owning_run(run_dir) as stop:
+        runner.write_stop_request(run_dir, reason="while nothing is running")
+        assert stop.fired.wait(timeout=5.0)
+        assert _gone_within(run_dir / STOP_REQUEST_FILE, 5.0)
+    assert stop.verdict is not None
+    assert stop.verdict.kind is StopKind.OPERATOR
 
 
 def test_stopping_a_directory_no_run_ever_owned_is_refused(tmp_path: Path, capsys) -> None:
@@ -646,3 +808,149 @@ def test_a_recorded_bound_is_inherited_rather_than_reread_from_the_checkout() ->
 
     assert runner.bookend_cell(cell, manifest).budget.rollout_no_progress_s == 999
     assert runner.reopened_cell(cell, manifest).budget.rollout_no_progress_s == 999
+
+
+# ----- what a reading of a tree the host cannot see must never say -----------------------------
+
+
+def test_an_unreadable_subtree_reads_as_progress_rather_than_as_silence(tmp_path: Path) -> None:
+    """``os.walk`` swallows a directory whose listing fails and carries on as though it were not
+    there, so a mode-000 subtree used to produce a perfectly stable ``(0, 0, 0)`` on every reading
+    while the container went on writing inside it.
+
+    The container runs as root and the watcher does not, so this is the ordinary case and not an
+    exotic one: an agent that chmods a working directory would have had its rollout ended for
+    silence while it was busy. A partial walk must never be reported as a complete one.
+    """
+    root = tmp_path / "work"
+    locked = root / "locked"
+    locked.mkdir(parents=True)
+    (locked / "growing.txt").write_text("one\n", encoding="utf-8")
+    os.chmod(locked, 0o000)
+    try:
+        readings = [runner._tree_pulse(root) for _ in range(3)]
+    finally:
+        os.chmod(locked, 0o700)
+
+    assert len(set(readings)) == len(readings), readings
+    assert all(reading[:2] == (-1, -1) for reading in readings)
+
+
+def test_an_unreadable_root_reads_as_progress_too(tmp_path: Path) -> None:
+    """The sibling: the tree the walk is pointed AT can be the unreadable one, and a check that
+    only handled unreadable children would call that one empty."""
+    root = tmp_path / "sealed"
+    root.mkdir()
+    (root / "inside.txt").write_text("x", encoding="utf-8")
+    os.chmod(root, 0o000)
+    try:
+        assert runner._tree_pulse(root) != runner._tree_pulse(root)
+    finally:
+        os.chmod(root, 0o700)
+
+
+def test_a_tree_that_does_not_exist_yet_reads_as_stable_emptiness(tmp_path: Path) -> None:
+    """The regression the obvious fix introduces, held down.
+
+    Making every unreadable tree reset the clock is only correct if ABSENCE is not unreadable.
+    prime's session-artifact tree appears the first time a child session runs, so a reading that
+    called absence unknowable would disable the detector for every prime cell until then, which is
+    precisely the cell the detector was written for.
+    """
+    absent = tmp_path / "home" / ".prime" / "agent" / "session-artifacts"
+
+    assert runner._tree_pulse(absent) == runner._tree_pulse(absent) == (0, 0, 0)
+
+
+def test_a_leg_writing_under_an_unreadable_subtree_is_not_stalled(tmp_path: Path) -> None:
+    """The whole point of the reading, end to end: work the host cannot see is still work."""
+    ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
+    locked = ctx.sandbox.workdir / "locked"
+    locked.mkdir(parents=True)
+    write = _appender(locked / "solver.py")
+    write()
+    os.chmod(locked, 0o000)
+    try:
+        ending = EarlyEnding()
+
+        async def drive() -> None:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(
+                    _watching(ctx, bound_s=0.2, poll_s=0.02, ending=ending), timeout=0.8
+                )
+
+        asyncio.run(drive())
+    finally:
+        os.chmod(locked, 0o700)
+
+    assert not ending.fired.is_set()
+
+
+# ----- which of two endings a leg reports ------------------------------------------------------
+
+
+def test_the_ending_reported_is_the_one_that_fired_first(tmp_path: Path) -> None:
+    """Not the one the caller listed first. ``run_leg`` appends the run's operator handle after the
+    leg's own, so tuple order always preferred the stall or the drain; an operator who got there
+    first was then recorded as a stall in the leg while the manifest recorded the ask, which is one
+    run described two ways.
+    """
+    harness = harness_for("prime_agent")
+
+    operator, stalled = EarlyEnding(), EarlyEnding()
+    operator.fire(harness.operator_verdict(request={"reason": "needed the machine"}))
+    stalled.fire(harness.no_progress_verdict(bound_s=7200, silent_s=7201.0))
+    # The order run_leg builds: the leg's own handle first, the run's operator handle last.
+    assert runner._fired_verdict((stalled, operator)).kind is StopKind.OPERATOR
+
+    operator, stalled = EarlyEnding(), EarlyEnding()
+    stalled.fire(harness.no_progress_verdict(bound_s=7200, silent_s=7201.0))
+    operator.fire(harness.operator_verdict(request={"reason": "too late"}))
+    assert runner._fired_verdict((stalled, operator)).kind is StopKind.STALLED
+
+
+def test_a_handle_that_already_fired_keeps_its_first_verdict(tmp_path: Path) -> None:
+    """First writer wins within one handle as well as between them."""
+    harness = harness_for("prime_agent")
+    ending = EarlyEnding()
+
+    assert ending.fire(harness.operator_verdict(request={"reason": "first"})) is True
+    assert ending.fire(harness.no_progress_verdict(bound_s=1, silent_s=2)) is False
+    assert ending.verdict is not None
+    assert ending.verdict.kind is StopKind.OPERATOR
+
+
+# ----- whether the ending it reached can be bookended -------------------------------------------
+
+
+def test_a_stop_before_a_transcript_lands_says_it_cannot_be_bookended(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The promise the command used to make unconditionally, and could not keep.
+
+    A stop can end a leg before a resumable conversation exists. claude runs under an id the
+    RUNNER pinned, so the record names a session whatever the leg wrote, and an operator told the
+    terminus was bookendable would find out otherwise only when `rebookend` refused it. So the run
+    checks the predicate `rebookend` checks, and says which of the two endings it got.
+    """
+    run_dir = _stopped_run(tmp_path, monkeypatch, transcript=False)
+    stopping = json.loads((run_dir / runner.ROLLOUT_STOPPING_FILE).read_text())
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+
+    # The record names a session, and that is exactly what is not sufficient.
+    assert runner.terminal_session_in(run_dir) is not None
+    assert stopping["terminus_rebookendable"] is False
+    assert "no resumable transcript" in stopping["terminus_not_rebookendable_because"]
+    assert manifest["operator_stop"]["terminus_rebookendable"] is False
+    assert "NOT resumable" in capsys.readouterr().err
+
+
+def test_a_stop_after_a_transcript_lands_says_it_can_be(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The sibling assertion, so the check above is not simply always false."""
+    _stopped_run(tmp_path, monkeypatch, transcript=True)
+
+    err = capsys.readouterr().err
+    assert "terminus is resumable" in err
+    assert "rebookend --run" in err

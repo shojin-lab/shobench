@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -37,6 +38,14 @@ from shobench.serving import DEFAULT_PORT
 from shobench.splits import load_split_by_name
 
 DOCKER_DIR = "docker"
+
+# How long `stop` waits for the run's owner to acknowledge its ask by consuming the request, and
+# how often it looks. A supported owner polls at the runner's own STOP_POLL_S, so acknowledgment
+# normally lands in a couple of seconds; the generous ceiling is for an owner busy in a long
+# filesystem walk or a slow teardown, and expiring it reports a run that is still live and still
+# holding an unread request rather than pretending either way.
+STOP_ACK_TIMEOUT_S = 60.0
+STOP_ACK_POLL_S = 0.2
 
 
 def _cmd_cells(args: argparse.Namespace) -> int:
@@ -639,6 +648,56 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     return 0
 
 
+def _owner_is_live(run_dir: Path) -> bool:
+    """Does a live process hold this run's directory?
+
+    Proven rather than assumed, and proven the way `rebookend` proves it: a SHARED flock on the
+    run's own lock file, which every mutating owner holds EXCLUSIVE. Taking it means nothing owns
+    the directory; failing to take it means an owner is there. The run's pid is never consulted,
+    because the lock file is never unlinked and a finished run therefore names a pid the system
+    may since have reissued.
+    """
+    import fcntl
+
+    fd = os.open(run_dir / runner.RUN_LOCK_FILE, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _withdraw_stop_request(run_dir: Path) -> bool:
+    """Take back an ask no owner consumed, under a shared lock so no new owner can be reading it.
+
+    The lock is what makes this safe rather than a second race. A mutating owner takes the run
+    lock EXCLUSIVE, so holding it SHARED here means no owner exists for the duration, and the
+    request cannot be latched by anyone between the check and the removal.
+    """
+    import fcntl
+
+    fd = os.open(run_dir / runner.RUN_LOCK_FILE, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            # An owner appeared after all, so the ask is theirs to read and must stay.
+            return False
+        try:
+            path = run_dir / runner.STOP_REQUEST_FILE
+            existed = path.is_file()
+            path.unlink(missing_ok=True)
+            return existed
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _cmd_stop(args: argparse.Namespace) -> int:
     """Ask a live run to end through its normal ending, so its records get written.
 
@@ -649,35 +708,30 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     burn its whole clock preserves it. This inverts that. It spends nothing, so it takes no
     ``--go``, and it is safe to call twice and safe to call on a run that has already finished.
 
-    Liveness is proven rather than assumed, and it is proven the same way `rebookend` proves it:
-    a SHARED flock on the run's own lock file, which every mutating owner holds EXCLUSIVE. Taking
-    it means nothing owns the directory, so there is nothing to stop; failing to take it means a
-    live owner is there to read the ask. The run's pid is not consulted at all, because the lock
-    file is never unlinked and a finished run therefore names a pid the system may have reissued.
-    """
-    import fcntl
+    A busy lock is not enough to write an ask on, and this is the whole shape of the command. A
+    live owner may be one that never reads a request: every process started before the stop path
+    existed is exactly that, and the runs in flight on any machine mid-upgrade are exactly those
+    processes. So the owner has to ADVERTISE that it is watching (``stop_protocol`` in the lock it
+    holds, written by the same entry that starts the watcher), and an owner that does not is
+    refused with nothing written, because the one unacceptable outcome is an ask that is accepted,
+    never consumed, and left on disk for the next resume or rerun to latch.
 
+    Advertising is a promise, so the ask is not reported as delivered until it is KEPT. The runner
+    unlinks the request when it latches it, and that unlink is the acknowledgment this waits for.
+    Waiting is also what closes the window between the liveness probe and the write, where the
+    owner can finish in between: an owner that goes away with the request still on disk is one
+    that never saw it, and this takes the ask back under the now-free shared lock rather than
+    leaving the landmine the check above exists to prevent.
+    """
     run_dir = Path(args.run)
-    lock_path = run_dir / runner.RUN_LOCK_FILE
-    if not lock_path.is_file():
+    if not (run_dir / runner.RUN_LOCK_FILE).is_file():
         print(
             f"{run_dir} has no {runner.RUN_LOCK_FILE}, so no shobench process ever owned it: "
             "this is not a live run directory and there is nothing to stop.",
             file=sys.stderr,
         )
         return 1
-    fd = os.open(lock_path, os.O_RDONLY)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except OSError:
-            live = True
-        else:
-            live = False
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-    if not live:
+    if not _owner_is_live(run_dir):
         # A no-op, and deliberately not a written request: a run nobody owns will not read one,
         # and a file left behind would end the next process to reopen the directory.
         print(
@@ -686,16 +740,52 @@ def _cmd_stop(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 0
+    holder = runner.read_lock_holder(run_dir)
+    if not holder.get("stop_protocol"):
+        print(
+            f"BLOCKED: {run_dir} is owned by a live process that does not watch for a stop "
+            f"(its {runner.RUN_LOCK_FILE} advertises no stop protocol), so an ask written here "
+            "would never be read and would be left behind for the next resume or rerun-eval to "
+            "act on. Nothing was written and nothing was stopped.\n\n"
+            "A process started before this command existed is the usual cause. Let it finish, or "
+            "end it by hand and accept that it will leave no rollout terminus and so cannot be "
+            "bookended.",
+            file=sys.stderr,
+        )
+        return 1
     request = runner.write_stop_request(run_dir, reason=args.reason)
     print(json.dumps(request, indent=2))
-    print(
-        f"\n[shobench] stop requested for {run_dir}. The runner will end its current leg through "
-        "the normal path, write legs.json and rollout_stopping.json, and publish what it has. "
-        "An operator-ended rollout keeps a real terminus, so `shobench rebookend` can still give "
-        "it an eval_after.",
-        file=sys.stderr,
-    )
-    return 0
+    deadline = time.monotonic() + STOP_ACK_TIMEOUT_S
+    while True:
+        if not (run_dir / runner.STOP_REQUEST_FILE).is_file():
+            print(
+                f"\n[shobench] stop acknowledged by the owner of {run_dir}. It ends its current "
+                "leg through the normal path, writes the run's records, and publishes what it "
+                "has; the run's own output says whether the terminus it reached can be "
+                "bookended.",
+                file=sys.stderr,
+            )
+            return 0
+        if not _owner_is_live(run_dir):
+            withdrawn = _withdraw_stop_request(run_dir)
+            print(
+                f"\nBLOCKED: the owner of {run_dir} released it without reading the stop, so "
+                "nothing was stopped: it had already finished, or it ended some other way. The "
+                + ("request was withdrawn" if withdrawn else "request was already gone")
+                + ", so nothing is left behind for a later resume or rerun-eval to act on.",
+                file=sys.stderr,
+            )
+            return 1
+        if time.monotonic() >= deadline:
+            print(
+                f"\nBLOCKED: the owner of {run_dir} has not acknowledged the stop within "
+                f"{STOP_ACK_TIMEOUT_S:.0f}s. It is still live and still advertises the stop "
+                "protocol, so the request is left in place for it to read; re-run this to wait "
+                "again, and check that the process is not itself wedged.",
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(STOP_ACK_POLL_S)
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
