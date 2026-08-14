@@ -137,17 +137,21 @@ earn the same reward, so `shobench leakage` grades every episode before either n
 computed locally, general web reference, attempted leakage, unresolved leakage, with the
 correct-rate reported per bucket and never blended.
 
-**This is the deterministic egress-derived floor, and its ceiling is unresolved.** The capture is
-what the agent has no mount of, which is why it is the floor; it sees hostnames and times, never
-a method, a status or a body, and the Hub's file CDN serves the whole platform, so a client hello
-to it is a connection to a CDN and not a download of an answer key. Nothing here establishes that
-answer content arrived, so there is no achieved bucket: reaching the answer source tops out at
-unresolved, and once a leg has reached it none of that container's later episodes can be cleared,
-because a local read of a fetched file leaves the observer nothing to see. The evidence that
-would settle those episodes is the transcript read for content, which is a follow-up change.
+**This is the deterministic egress floor, and it grades on the observer's record alone.** The
+capture is what the agent has no mount of, which is why it is the floor; it sees hostnames and
+times, never a method, a status or a body, and the Hub's file CDN serves the whole platform, so a
+client hello to it is a connection to a CDN and not a download of an answer key. Nothing here
+establishes that answer content arrived, so there is no achieved bucket: reaching the answer
+source tops out at unresolved, and once a disk has reached it none of the episodes reading that
+disk can be cleared, because a local read of a fetched file leaves the observer nothing to see.
 
-The transcript is read here for two things and neither is content: a lease's terminal call, which
-bounds an episode's window, and the text of a command, which says what was asked for.
+What a command asked for and what came back are evidence of a different kind, read out of the
+transcript rather than off the wire. Requests, downloads, content evidence and the achieved
+bucket they support live in the trace layer, which is a separate change stacked on this one.
+
+A transcript is opened here for two things and neither is what a command said: where a lease
+first appears, and where it seals, which is what bounds a rollout window. An eval phase's
+transcripts are not opened at all.
 
 An episode whose capture does not cover its window is `unclassified`, never clean, and the
 command refuses a run whose manifest has no `ended_at` unless asked twice. `--format json`

@@ -13,33 +13,31 @@ The ranks, weakest first:
     attempted_leakage       the cell reached the answer source; no evidence a body moved
     unresolved_leakage      evidence consistent with a body having moved, not established
 
-There is no bucket above those, and that is the point of this half. Egress sees hostnames and
-times, never a method, a status or a body, so it can say a cell reached the answer source and it
-can never say the answers arrived. Establishing that needs the transcript read for content, which
-is a separate change; here the ceiling is unresolved.
+There is no bucket above those, and that is the point of this half. **This grades on what the
+observer produced and on nothing else.** The record is ``egress.tsv``, one row per outbound DNS
+question or TLS client hello seen in the cell's network namespace, written outside the container
+by an observer the agent holds no mount of. It sees hostnames and times. It never sees a method,
+a status, a body or a byte count, and the Hub's file CDN serves the whole platform rather than
+one dataset, so a client hello to it is a connection to a CDN and not a download of an answer
+key. So this can say a cell reached the answer source and can never say the answers arrived.
 
-``unclassified`` is not on that ladder. It is what an episode gets when the evidence is missing
-rather than empty, and it is the reason this command cannot quietly clear anything: an episode
-whose capture does not cover its window is unclassified, never computed_locally.
+What the agent asked for and what came back are evidence of a different kind, read out of the
+transcript rather than off the wire, and they live in the trace layer. Requests, downloads,
+content and the achieved bucket they support are all there and none of them are here.
 
-**Egress is the floor and cannot reach achieved.** The record is ``egress.tsv``, one row per
-outbound DNS question or TLS client hello observed in the cell's network namespace, written
-outside the container by an observer the agent holds no mount of. It sees hostnames and times.
-It never sees a method, a status, a body or a byte count, and the Hub's file CDN serves the
-whole platform rather than one dataset, so a client hello to it establishes a connection to a
-CDN and not a download of an answer key. The highest an egress observation can carry an episode
-is ``unresolved_leakage``.
+``unclassified`` is not on the ladder. It is what an episode gets when the evidence is missing
+rather than empty, and it is why this command cannot quietly clear anything: an episode whose
+capture does not cover its window is unclassified, never computed_locally.
 
-**The transcript is read for two things, and neither of them is content.** A lease's terminal
-call says where an episode ended, which is what bounds its window; and the text of a command
-says what the agent asked for, which can raise an episode to attempted or unresolved. A URL the
-agent only mentioned in prose is not a request, and no reading of the transcript here reaches
-past unresolved.
+**A transcript is opened for two things, and neither of them is what a command said.** Where a
+lease first appears, which is where its episode starts in the order, and where it seals, which
+is the only thing that can bound a rollout window. An eval phase's transcripts are not opened at
+all, since a task's own start and end are written down in the leg record.
 
-**A leg that has reached the answer source cannot be cleared afterwards.** Whatever a container
-fetched may be on its disk from that moment, and a local read leaves nothing for the observer to
-see, so every later episode in that container is unresolved at best. What such an episode
-actually did with such a file is content evidence, which this half does not carry.
+**A disk that has reached the answer source cannot be cleared afterwards.** Whatever a container
+fetched may be on it from that moment, and a local read leaves nothing for the observer to see,
+so every later episode reading the same disk is unresolved at best. That carries across a
+rollout's legs, into the eval tasks seeded from its HOME, and into a bookend over it.
 
 Nothing the agent wrote about itself lowers a bucket.
 
@@ -53,7 +51,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from bisect import bisect_left
 from collections.abc import Iterable, Sequence
@@ -61,7 +58,6 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 SCHEMA = "shobench.leakage/1"
 
@@ -144,219 +140,6 @@ ANSWER_SOURCES: dict[str, AnswerSource] = {
     ),
 }
 
-# Endpoints on the row API that return rows rather than a description of rows.
-_ROW_ENDPOINTS = ("/rows", "/search", "/filter", "/first-rows")
-# Extensions a dataset ships as. A URL ending in one is a file body whatever route served it.
-_ARTIFACT_SUFFIXES = (".parquet", ".csv", ".tsv", ".jsonl", ".arrow", ".zip", ".gz")
-# Library calls whose only purpose is pulling a dataset or a repo file off the Hub.
-_HUB_CALLS = ("load_dataset(", "hf_hub_download(", "snapshot_download(")
-
-_URL = re.compile(r"https?://[^\s\"'\\<>)\]}]+")
-# A comment runs to the end of its line. The ``#`` has to follow whitespace or start the text,
-# so a URL fragment stays part of its URL. What an agent wrote a note about is not what it ran.
-_COMMENT = re.compile(r"(?:(?<=\s)|^)#[^\n]*")
-# What separates one command from the next, recognised only outside quotes.
-_BOUNDARIES = ("&&", "||", "$(", ";", "|", "&", "\n", "`")
-# Shells, because their ``-c`` argument is a script and has to be split as one.
-_SHELL_NAMES = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
-_DASH_C = re.compile(r"(?:^|\s)-[A-Za-z]*c[A-Za-z]*(?=\s)")
-# Programs that go out and get something, and the calls that do it from inside a program.
-_FETCH_COMMANDS = ("curl", "wget", "aria2c", "axel", "lftp", "scp", "rsync")
-_FETCH_CALLS = (
-    "urlretrieve", "urlopen", "urllib.request", "requests.get", "requests.post", "httpx.get",
-    "wget.download", *_HUB_CALLS,
-)
-# Words that stand in front of the command actually being run, rather than being it.
-_WRAPPERS = frozenset(
-    {
-        "bash", "sh", "zsh", "dash", "ksh", "env", "timeout", "nohup", "sudo", "nice", "time",
-        "command", "exec", "xargs", "stdbuf", "setsid", "do", "then", "else", "elif", "while",
-        "until", "if", "eval",
-    }
-)
-# Interpreters, because a fetch written as a library call is only a fetch when one is running.
-_INTERPRETERS = ("python", "ipython", "node", "ruby", "perl", "php", "deno", "bun")
-_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
-# Tool names whose input is the request rather than a shell line.
-_FETCH_TOOLS = frozenset({"webfetch", "websearch"})
-_SHELL_TOOLS = frozenset({"bash", "shell", "sh", "run_command", "execute"})
-
-
-def invoked_command(invocation: str) -> str | None:
-    """The program this fragment actually runs, or None if it runs nothing recognisable.
-
-    A fetch is a command that was invoked, not a word that appears. ``printf "%s" "curl <url>"``
-    contains ``curl`` and runs ``printf``, and reading the first as a request would let an agent
-    quoting a snippet look like an agent downloading a dataset. So the tokens are walked from
-    the left, past environment assignments and past the wrappers that stand in front of a real
-    command, and what is left at the front is what ran.
-    """
-    tokens = invocation.split()
-    index = 0
-    while index < len(tokens):
-        token = tokens[index].strip("\"'`(){}").lstrip("$")
-        if not token:
-            index += 1
-            continue
-        if _ASSIGNMENT.match(token):
-            index += 1
-            continue
-        base = token.rsplit("/", 1)[-1]
-        if base in _WRAPPERS:
-            index += 1
-            while index < len(tokens):
-                following = tokens[index].strip("\"'`")
-                if following.startswith("-") or (base == "timeout" and _DURATION.match(following)):
-                    index += 1
-                    continue
-                break
-            continue
-        return base
-    return None
-
-
-def _invokes_a_fetch(invocation: str) -> bool:
-    command = invoked_command(invocation)
-    if command is None:
-        return False
-    if command in _FETCH_COMMANDS:
-        return True
-    return command.startswith(_INTERPRETERS) and any(c in invocation for c in _FETCH_CALLS)
-
-
-def _fetches(action: Action, invocation: str) -> bool:
-    """Did this fragment of this action ask a remote host for something?
-
-    A shell line is read for the command at its front. A tool whose whole job is fetching is a
-    fetch whatever its input looks like. And a tool whose input is code rather than a command
-    line has no command position to read, so there the call itself is the signal.
-    """
-    tool = action.kind.split(":", 1)[-1].lower()
-    if tool in _FETCH_TOOLS:
-        return True
-    if action.kind == "command" or tool in _SHELL_TOOLS:
-        return _invokes_a_fetch(invocation)
-    return any(call in invocation for call in _FETCH_CALLS)
-
-
-# A heredoc's body is an argument, not a sequence of commands: ``python3 - <<PY`` hands
-# everything up to the delimiter to the interpreter on its left.
-_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
-
-
-def _split_unquoted(text: str) -> list[str]:
-    """Split on shell separators, but only where a shell would see them.
-
-    A separator inside quotes is data. ``python3 -c "import requests; requests.get(...)"`` is one
-    command whose argument happens to contain a semicolon, and splitting there hands the
-    interpreter to one fragment and the call to another, so neither looks like a fetch.
-
-    A heredoc body is the same thing spread over lines. Splitting on the newlines inside
-    ``python3 - <<PY ... PY`` separates the interpreter from the code it was handed, which is the
-    common shape for a script long enough to be worth writing that way.
-    """
-    parts: list[str] = []
-    current: list[str] = []
-    quote = ""
-    pending = ""
-    delimiter = ""
-    line_start = 0
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if delimiter:
-            current.append(char)
-            if char == "\n":
-                if "".join(current[line_start:]).strip() == delimiter:
-                    # The body ends at its delimiter, and so does the command that owned it.
-                    delimiter = ""
-                    parts.append("".join(current))
-                    current = []
-                    line_start = 0
-                else:
-                    line_start = len(current)
-            index += 1
-            continue
-        if quote:
-            current.append(char)
-            if char == quote:
-                quote = ""
-            index += 1
-            continue
-        if char in "\"'":
-            quote = char
-            current.append(char)
-            index += 1
-            continue
-        if char == "<" and text.startswith("<<", index):
-            opener = _HEREDOC.match(text, index)
-            if opener is not None:
-                pending = opener.group(2)
-                current.append(text[index : opener.end()])
-                index = opener.end()
-                continue
-        if char == "\n" and pending:
-            delimiter, pending = pending, ""
-            current.append(char)
-            line_start = len(current)
-            index += 1
-            continue
-        hit = next((b for b in _BOUNDARIES if text.startswith(b, index)), None)
-        if hit is not None:
-            parts.append("".join(current))
-            current = []
-            line_start = 0
-            index += len(hit)
-            continue
-        current.append(char)
-        index += 1
-    parts.append("".join(current))
-    return parts
-
-
-def _shell_script(fragment: str) -> str | None:
-    """The script a shell was handed with ``-c``, when this fragment is such a call.
-
-    The harnesses wrap almost everything in ``/bin/bash -lc "..."``, so the real commands live
-    inside one quoted argument. Keeping quotes intact means that argument arrives whole, and it
-    then has to be split as the shell text it is, or a compound script reads as whatever its
-    first command happens to be.
-    """
-    tokens = fragment.split()
-    index = 0
-    while index < len(tokens) and _ASSIGNMENT.match(tokens[index]):
-        index += 1
-    if index >= len(tokens):
-        return None
-    if tokens[index].strip("\"'").rsplit("/", 1)[-1] not in _SHELL_NAMES:
-        return None
-    rest = fragment.split(tokens[index], 1)[1]
-    flag = _DASH_C.search(rest)
-    if flag is None:
-        return None
-    tail = rest[flag.end() :].lstrip()
-    if tail[:1] in ("\"", "'"):
-        closing = tail.find(tail[0], 1)
-        return tail[1:closing] if closing > 0 else tail[1:]
-    return tail or None
-
-
-def _invocations(command: str, depth: int = 0) -> list[str]:
-    """One command per entry, with comments removed and shell arguments opened up."""
-    out: list[str] = []
-    for fragment in _split_unquoted(_COMMENT.sub("", command)):
-        fragment = fragment.strip()
-        if not fragment:
-            continue
-        script = _shell_script(fragment) if depth < 4 else None
-        if script:
-            out.extend(_invocations(script, depth + 1))
-        else:
-            out.append(fragment)
-    return out
-
-
 def _matches(host: str, patterns: Iterable[str]) -> bool:
     host = host.lower().rstrip(".")
     return any(fnmatchcase(host, pattern) for pattern in patterns)
@@ -374,29 +157,6 @@ def host_role(host: str, source: AnswerSource | None) -> str:
         if _matches(host, source.index):
             return "answer_source_index"
     return "general"
-
-
-def content_url_kind(url: str, source: AnswerSource | None) -> str | None:
-    """What a URL asks the answer source for, when it asks for data rather than a listing.
-
-    ``file_download`` is the Hub's ``resolve`` route or any URL ending in a dataset artifact
-    extension. ``row_query`` is the row API's data endpoints, which return rows themselves
-    rather than a description of them.
-
-    A blob route renders a file inside a page rather than serving it, so a data extension under
-    one is a link someone was reading. Query strings are not required: ``curl -G`` puts the
-    query in ``--data-urlencode`` parameters and leaves the URL bare.
-    """
-    parts = urlsplit(url)
-    path = parts.path.rstrip("/")
-    host = (parts.hostname or "").lower()
-    if "/resolve/" in parts.path:
-        return "file_download"
-    if "/blob/" not in parts.path and path.lower().endswith(_ARTIFACT_SUFFIXES):
-        return "file_download"
-    if source is not None and _matches(host, source.rows) and path in _ROW_ENDPOINTS:
-        return "row_query"
-    return None
 
 
 # ----- the capture ----------------------------------------------------------------------------
@@ -602,32 +362,8 @@ def read_capture(run_dir: Path) -> Capture:
 
 
 @dataclass(frozen=True)
-class Action:
-    """One thing the agent ran, what came back, and whether it worked.
-
-    ``offset`` is the line the action completed on, which is the transcript's own order and the
-    only ordering a trace reliably carries; several harnesses timestamp nothing.
-
-    ``ok`` is the harness's own verdict, not a reading of the output: codex records a status and
-    an exit code, claude_code marks a tool result ``is_error``, prime-agent marks it ``isError``.
-    It matters because a command that failed did not read a file, and inferring that from the
-    text of a traceback is guesswork where the harness has already said so. A harness that says
-    nothing is taken at its word that nothing went wrong, which is the direction that leaves a
-    failed read able to confirm a download; the confirmations that matter here come from
-    harnesses that do report.
-    """
-
-    offset: int
-    kind: str
-    request: str
-    result: str
-    ok: bool = True
-    trace: str = ""
-
-
-@dataclass(frozen=True)
 class Trace:
-    """A transcript read for three things: what ran, where each episode starts, where it seals.
+    """A transcript read for two things: where each episode starts, and where it seals.
 
     A lease is the join key because the stream hands one to the agent with the task, so its id
     appears at the moment an episode starts and again in the ``submit_answer`` that ends it. The
@@ -636,49 +372,30 @@ class Trace:
     """
 
     path: Path
-    actions: tuple[Action, ...]
     first_seen: dict[str, int] = field(default_factory=dict)
     sealed_at: dict[str, int] = field(default_factory=dict)
 
 
-def _request_text(arguments: Any) -> str:
-    """A tool's input as the text that was run, where there is one.
-
-    A shell tool carries its command in a field, and the command is what has a program at its
-    front. Handing the JSON envelope to a tokeniser looking for that program finds the field
-    name instead, so the field is unwrapped and everything else keeps its envelope.
-    """
-    if isinstance(arguments, dict):
-        for field in ("command", "cmd", "script", "code"):
-            value = arguments.get(field)
-            if isinstance(value, str):
-                return value
-    return json.dumps(arguments)
-
-
-def _blocks_text(blocks: Any) -> str:
-    if isinstance(blocks, str):
-        return blocks
-    if isinstance(blocks, list):
-        return "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
-    if isinstance(blocks, dict):
-        return _blocks_text(blocks.get("content"))
-    return ""
-
-
 def read_trace(path: Path, leases: Iterable[str]) -> Trace:
-    """Read one transcript into actions and lease marks."""
+    """Read one transcript for the two things the floor takes from a transcript.
+
+    Where each lease first appears, which is where its episode starts in the order, and where it
+    seals, which is the only thing that can bound its window. Nothing else here is read: what a
+    command asked for and what came back are evidence of a different kind, and they are read
+    somewhere else.
+
+    The three harnesses put the terminal call in three places. codex and claude_code invoke it as
+    a tool and name the lease in the arguments. prime-agent runs it inside an ipython cell, so
+    the lease is in the code, and that is the only shape where text is read for a seal: a line of
+    prose naming the call is narration.
+    """
     wanted = set(leases)
-    # The transcript's identity, in a name of its own. It travels on every action and is what
-    # keeps one eval task's evidence out of another's, since those are separate containers with
-    # separate filesystems, so nothing else in this loop may reuse the variable.
-    transcript = str(path)
-    actions: list[Action] = []
     first_seen: dict[str, int] = {}
     sealed_at: dict[str, int] = {}
-    pending: dict[str, tuple[str, str, int]] = {}
-    prime_args: dict[str, tuple[str, int]] = {}
-    started: dict[str, tuple[str, int]] = {}
+
+    def seal(lease: object, offset: int) -> None:
+        if isinstance(lease, str) and lease in wanted and lease not in sealed_at:
+            sealed_at[lease] = offset
 
     for offset, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines()):
         for lease in wanted:
@@ -692,116 +409,28 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
             continue
         kind = event.get("type")
 
-        # codex: completed items carry the command and its aggregated output, or an MCP call
-        # with its arguments and its result.
-        if kind == "item.started" and isinstance(event.get("item"), dict):
+        # codex: the terminal call is an MCP tool call carrying the lease in its arguments.
+        if kind == "item.completed" and isinstance(event.get("item"), dict):
             item = event["item"]
-            if item.get("type") == "command_execution":
-                started[str(item.get("id"))] = (item.get("command") or "", offset)
-        elif kind == "item.completed" and isinstance(event.get("item"), dict):
-            item = event["item"]
-            started.pop(str(item.get("id")), None)
-            if item.get("type") == "command_execution":
-                exit_code = item.get("exit_code")
-                actions.append(
-                    Action(
-                        offset,
-                        "command",
-                        item.get("command") or "",
-                        item.get("aggregated_output") or "",
-                        ok=item.get("status") != "failed" and exit_code in (0, None),
-                        trace=transcript,
-                    )
-                )
-            elif item.get("type") == "mcp_tool_call":
-                arguments = item.get("arguments") or {}
-                request = json.dumps(arguments)
-                actions.append(
-                    Action(
-                        offset,
-                        f"mcp:{item.get('tool')}",
-                        request,
-                        _blocks_text(item.get("result")),
-                        ok=item.get("error") is None,
-                        trace=transcript,
-                    )
-                )
-                if item.get("tool") == "submit_answer" and arguments.get("lease") in wanted:
-                    sealed_at[str(arguments["lease"])] = offset
+            if item.get("type") == "mcp_tool_call" and item.get("tool") == "submit_answer":
+                seal((item.get("arguments") or {}).get("lease"), offset)
 
-        # claude_code: a tool_use on the assistant side, its tool_result on the user side.
+        # claude_code: the same call, as a tool_use on the assistant side.
         elif kind == "assistant" and isinstance(event.get("message"), dict):
             for block in event["message"].get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
-                    name = str(block.get("name"))
-                    arguments = block.get("input") or {}
-                    pending[str(block.get("id"))] = (name, _request_text(arguments), offset)
-                    if name.endswith("submit_answer") and arguments.get("lease") in wanted:
-                        sealed_at[str(arguments["lease"])] = offset
-        elif kind == "user" and isinstance(event.get("message"), dict):
-            for block in event["message"].get("content") or []:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    tool, request, _ = pending.pop(
-                        str(block.get("tool_use_id")), ("tool", "", offset)
-                    )
-                    actions.append(
-                        Action(
-                            offset,
-                            f"tool:{tool}",
-                            request,
-                            _blocks_text(block.get("content")),
-                            ok=not block.get("is_error"),
-                            trace=transcript,
-                        )
-                    )
+                    if str(block.get("name")).endswith("submit_answer"):
+                        seal((block.get("input") or {}).get("lease"), offset)
 
-        # prime-agent: the arguments arrive when execution starts and the result when it ends.
-        elif kind == "tool_execution_start":
-            prime_args[str(event.get("toolCallId"))] = (
-                _request_text(event.get("args") or {}),
-                offset,
-            )
-        elif kind == "tool_execution_end":
-            request, _ = prime_args.pop(str(event.get("toolCallId")), ("", offset))
-            request = request or _request_text(event.get("args") or {})
-            # prime-agent runs the terminal call inside the cell it executes, so its seal is in
-            # that code. Only here: a line of prose naming the call is narration, and the other
-            # two harnesses expose the call itself as a structured tool invocation.
-            if "submit_answer" in request:
+        # prime-agent: the call is inside the cell it runs, so the code is where the lease is.
+        elif kind in ("tool_execution_start", "tool_execution_end"):
+            code = json.dumps(event.get("args") or {})
+            if "submit_answer" in code:
                 for lease in wanted:
-                    if lease not in sealed_at and lease in request:
-                        sealed_at[lease] = offset
-            result = event.get("result")
-            failed = event.get("isError") or (
-                isinstance(result, dict) and result.get("isError")
-            )
-            actions.append(
-                Action(
-                    offset,
-                    f"tool:{event.get('toolName')}",
-                    request,
-                    _blocks_text(result),
-                    ok=not failed,
-                    trace=transcript,
-                )
-            )
+                    if lease in code:
+                        seal(lease, offset)
 
-    # An invocation whose result never arrived: a timeout, a kill, or a transcript that ends
-    # mid-turn. What it asked for is the evidence this phase reads, and dropping the record
-    # because nothing answered would lose a known request and report the episode lower than the
-    # ceiling. It is kept with no result and marked failed, since nothing says it succeeded.
-    for tool, request, offset in pending.values():
-        actions.append(Action(offset, f"tool:{tool}", request, "", ok=False, trace=transcript))
-    for request, offset in prime_args.values():
-        actions.append(Action(offset, "tool:ipython", request, "", ok=False, trace=transcript))
-        if "submit_answer" in request:
-            for lease in wanted:
-                if lease not in sealed_at and lease in request:
-                    sealed_at[lease] = offset
-    for request, offset in started.values():
-        actions.append(Action(offset, "command", request, "", ok=False, trace=transcript))
-    actions.sort(key=lambda a: a.offset)
-    return Trace(path, tuple(actions), first_seen, sealed_at)
+    return Trace(path, first_seen, sealed_at)
 
 
 def _trace_files(run_dir: Path, phase: str) -> list[Path]:
@@ -1094,14 +723,11 @@ class EpisodeLeakage:
     bucket: str
     reasons: tuple[str, ...]
     evidence: tuple[Connection, ...]
-    requested: tuple[str, ...]
     covered: bool
     # Whether the whole window was watched, which is what every HOME-inheritance question reads.
     # Separate from the bucket, because evidence raises a bucket and does not close a gap.
     observed: bool
     shared_with: tuple[dict[str, Any], ...]
-    # Leases whose live region overlaps this episode's, so its commands are not exclusively its.
-    action_rivals: tuple[str, ...]
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1118,11 +744,9 @@ class EpisodeLeakage:
                 "observed": self.observed,
                 "shared_with": list(self.shared_with),
             },
-            "action_rivals": list(self.action_rivals),
             "bucket": self.bucket,
             "reasons": list(self.reasons),
             "evidence": [c.to_json() for c in self.evidence],
-            "requested": list(self.requested),
             "correct": self.episode.correct,
             "success": self.episode.success,
             "reward": self.episode.reward,
@@ -1260,107 +884,6 @@ def _window_evidence(
     return out
 
 
-def _lease_regions(trace: Trace) -> dict[str, tuple[int, int]]:
-    """Where each lease is live in one transcript: first appearance to seal.
-
-    A lease with no seal in the transcript is live to the end of it. That is the honest end for
-    a harness whose terminal call cannot be found, and it is why a missing seal shows up as
-    wide, shared ownership rather than as a confident slice of somebody's commands.
-    """
-    end_of_trace = max((a.offset for a in trace.actions), default=0) + 1
-    return {
-        lease: (start, trace.sealed_at.get(lease, end_of_trace))
-        for lease, start in trace.first_seen.items()
-    }
-
-
-def _actions_for(episode: Episode, traces: dict[str, Trace]) -> tuple[list[Action], list[str]]:
-    """The actions this episode could have run, and the leases that could equally own them.
-
-    An eval task's trace is named for its task, so the whole file is one episode. A rollout is
-    one transcript for hundreds, and the lease ids cut it: an episode's actions run from where
-    its lease first appears to where that lease seals.
-
-    Those cuts overlap when the agent holds more than one lease, and an action inside an overlap
-    has no owner the transcript can name. Giving it to whichever lease was pulled most recently
-    is a guess that goes wrong in both directions at once: it clears the lease that really ran
-    the command and charges the one that did not. So an overlapping action belongs to every
-    lease live at that point and the rivals travel with the record, which is what the egress
-    side already does with a connection inside two open windows.
-    """
-    out: list[Action] = []
-    rivals: set[str] = set()
-    for name, trace in traces.items():
-        named = _TASK_TRACE.match(Path(name).name)
-        if named is not None:
-            if int(named.group(1)) == episode.task_idx:
-                out.extend(trace.actions)
-            continue
-        regions = _lease_regions(trace)
-        if episode.lease not in regions:
-            continue
-        for action in trace.actions:
-            live = [
-                lease for lease, (start, end) in regions.items() if start <= action.offset <= end
-            ]
-            if episode.lease not in live:
-                continue
-            out.append(action)
-            rivals.update(lease for lease in live if lease != episode.lease)
-    return out, sorted(rivals)
-
-
-_TASK_TRACE = re.compile(r"^task-(\d+)-leg-")
-
-
-def _reads_as_a_request(action: Action) -> bool:
-    """Is this action's own input worth reading as something the agent asked for?
-
-    The stream's terminal call is not: its arguments carry the answer being submitted, not a
-    request for anything. Every other tool is, including the ones reached over MCP, because a
-    fetch tool's arguments are where its URL is and dropping the whole envelope would hide the
-    one field that says what was asked for.
-    """
-    return not action.kind.endswith("submit_answer")
-
-
-def _requested_urls(actions: Sequence[Action]) -> list[str]:
-    """URLs the agent asked for, taken from command text and never from prose or output."""
-    urls: list[str] = []
-    for action in actions:
-        if not _reads_as_a_request(action):
-            continue
-        # Only from an invocation that fetches. A URL the agent printed, grepped for or wrote
-        # into a file is data it handled, and nothing there asked the remote host for a body.
-        for invocation in _invocations(action.request):
-            if not _fetches(action, invocation):
-                continue
-            for match in _URL.finditer(invocation):
-                urls.append(_tidy_url(match.group(0)))
-    return list(dict.fromkeys(urls))
-
-
-def _answer_source_urls(actions: Sequence[Action], source: AnswerSource | None) -> list[str]:
-    """The answer-source URLs these actions asked for, in the order they were asked."""
-    urls = []
-    for action in actions:
-        for match in _URL.finditer(action.request):
-            url = _tidy_url(match.group(0))
-            host = (urlsplit(url).hostname or "").lower()
-            if host_role(host, source).startswith("answer_source"):
-                urls.append(url)
-    return list(dict.fromkeys(urls))
-
-
-def _tidy_url(url: str) -> str:
-    """Cut a URL out of the shell it was quoted in, so a template still names its route."""
-    for marker in ("${", "$(", "`"):
-        cut = url.find(marker)
-        if cut > 0:
-            url = url[:cut]
-    return url.rstrip(".,;:!?")
-
-
 def _accounts_for_its_home(source: RunLeakage) -> tuple[bool, str]:
     """Can this run say the HOME a bookend would inherit holds no answer file?
 
@@ -1449,12 +972,10 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         episodes += _rollout_episodes(run_dir, legs, traces["rollout"], run_end)
     for phase in ("eval_before", "eval_after"):
         if (run_dir / phase).is_dir():
-            phase_episodes = _eval_episodes(run_dir, phase, legs, timeout)
-            leases = [e.lease for e in phase_episodes]
-            traces[phase] = {
-                str(p): read_trace(p, leases) for p in _trace_files(run_dir, phase)
-            }
-            episodes += phase_episodes
+            # No transcript is opened for an eval phase. Its windows come from the leg record,
+            # which is where a task's own start and end are written down, so there is nothing a
+            # transcript could add that this half reads.
+            episodes += _eval_episodes(run_dir, phase, legs, timeout)
 
     inheritance_notes: list[str] = []
     unresolved_inheritance = False
@@ -1495,8 +1016,6 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
 
     for episode in ordered:
         evidence = _window_evidence(episode, capture.connections, starts)
-        actions, action_rivals = _actions_for(episode, traces.get(episode.phase, {}))
-        requested = _requested_urls(actions)
         covered = capture.covers(episode.started_at, episode.ended_at)
         reasons: list[str] = []
 
@@ -1540,39 +1059,6 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             if role == "answer_source_content" and connection.kind == "tls":
                 bucket = _raise_to(bucket, "unresolved_leakage")
                 _note(reasons, "content_cdn_handshake")
-
-        # What the agent asked for, read off its commands.
-        for url in requested:
-            host = (urlsplit(url).hostname or "").lower()
-            if not host_role(host, source).startswith("answer_source"):
-                continue
-            bucket = _raise_to(bucket, "attempted_leakage")
-            _note(reasons, "answer_source_request")
-            kind = content_url_kind(url, source)
-            if kind == "row_query":
-                _note(reasons, "answer_rows_requested")
-            elif kind == "file_download":
-                # A command that asked the answer source for a file body. Whether one came back
-                # is in the response, which this half does not read, so the episode sits at the
-                # ceiling rather than at either answer.
-                bucket = _raise_to(bucket, "unresolved_leakage")
-                _note(reasons, "file_download_requested")
-        # Only where the environment has an answer source at all. Without one this cannot tell a
-        # dataset pull from any other, and bucketing it as leakage while the run's own note says
-        # the two cannot be distinguished would be the metadata contradicting the number.
-        # Behind the same gate the URLs are read through. A Hub call is a request when an
-        # interpreter runs it and a string when something prints it, and the substring is the
-        # same either way.
-        if source is not None and any(
-            call in invocation
-            for a in actions
-            if _reads_as_a_request(a)
-            for invocation in _invocations(a.request)
-            if _fetches(a, invocation)
-            for call in _HUB_CALLS
-        ):
-            bucket = _raise_to(bucket, "attempted_leakage")
-            _note(reasons, "hub_download_call")
 
         # Answer-source contact earlier on this disk. Whatever reached it may still be there,
         # and a local read is invisible to the observer, so a later episode reading the same
@@ -1622,11 +1108,9 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
                 bucket=bucket,
                 reasons=tuple(reasons),
                 evidence=tuple(evidence),
-                requested=tuple(requested),
                 covered=covered,
                 observed=observed,
                 shared_with=(),
-                action_rivals=tuple(action_rivals),
             )
         )
 
@@ -1743,11 +1227,9 @@ def _mark_shared_windows(graded: Sequence[EpisodeLeakage]) -> list[EpisodeLeakag
                 bucket=row.bucket,
                 reasons=row.reasons,
                 evidence=row.evidence,
-                requested=row.requested,
                 covered=row.covered,
                 observed=row.observed,
                 shared_with=rivals,
-                action_rivals=row.action_rivals,
             )
         )
     return out
@@ -1895,7 +1377,6 @@ __all__ = [
     "LIMITS",
     "SCHEMA",
     "UNCLASSIFIED",
-    "Action",
     "AnswerSource",
     "Capture",
     "Connection",
@@ -1905,7 +1386,6 @@ __all__ = [
     "Segment",
     "Trace",
     "classify_run",
-    "content_url_kind",
     "host_role",
     "main",
     "read_capture",

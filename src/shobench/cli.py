@@ -892,8 +892,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     leak = sub.add_parser(
         "leakage",
         help=(
-            "the per-episode leakage floor, read off a run's egress record; it stops at "
-            "unresolved leakage because egress cannot establish that content arrived"
+            "the per-episode leakage floor, graded on the egress record alone; it stops at "
+            "unresolved leakage, since what a command asked for and what came back are read "
+            "from the transcript and live in the trace layer"
         ),
     )
     leak.add_argument("run_dirs", nargs="+", help="completed run directories")

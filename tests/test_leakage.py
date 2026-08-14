@@ -23,10 +23,7 @@ from shobench.leakage import (
     BUCKETS,
     UNCLASSIFIED,
     Episode,
-    _invocations,
-    _invokes_a_fetch,
     classify_run,
-    content_url_kind,
     egress_segments,
     host_role,
     main,
@@ -360,41 +357,6 @@ def test_no_pile_of_handshakes_reaches_achieved(tmp_path: Path) -> None:
 # ----- refinement reads requests, not prose -------------------------------------------------------
 
 
-def test_a_url_the_agent_only_talked_about_does_not_move_an_episode(tmp_path: Path) -> None:
-    """Task text, reasoning and command output all mention URLs. Only a command is a request."""
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "en.wikipedia.org", "tls")),
-        trace=codex(
-            {"lease_seen": "lease-a"},
-            {
-                "command": "curl -s https://en.wikipedia.org/wiki/Thing",
-                "output": f"see also {_PARQUET} for the dataset",
-            },
-        ),
-    )
-    assert _buckets(run) == {7: "general_web_reference"}
-    assert "answer_source_request" not in run.episodes[0].reasons
-
-
-def test_prose_beside_a_cdn_handshake_still_cannot_reach_achieved(tmp_path: Path) -> None:
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "us.aws.cdn.hf.co", "tls")),
-        trace=codex(
-            {"lease_seen": "lease-a"},
-            {"command": "echo thinking", "output": f"I could fetch {_PARQUET}"},
-        ),
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-
-
-def test_a_row_request_built_with_data_urlencode_is_still_a_row_request() -> None:
-    """``curl -G`` leaves the query in parameters, so the URL alone is the bare endpoint."""
-    assert content_url_kind("https://datasets-server.huggingface.co/rows", _HLE) == "row_query"
-    assert content_url_kind("https://datasets-server.huggingface.co/splits", _HLE) is None
-
-
 def test_the_trace_cannot_talk_an_episode_down_from_what_the_observer_saw(
     tmp_path: Path,
 ) -> None:
@@ -701,22 +663,6 @@ def test_a_hostname_is_read_for_what_it_serves(host: str, role: str) -> None:
     assert host_role(host, _HLE) == role
 
 
-@pytest.mark.parametrize(
-    ("url", "expected"),
-    [
-        (_PARQUET, "file_download"),
-        ("https://huggingface.co/datasets/x/y/raw/main/data.csv", "file_download"),
-        ("https://huggingface.co/datasets/x/y/blob/main/data.tsv", None),
-        ("https://huggingface.co/datasets/x/y/tree/main", None),
-        ("https://huggingface.co/api/datasets/x/y", None),
-        (_ROWS, "row_query"),
-        ("https://datasets-server.huggingface.co/splits?dataset=x", None),
-    ],
-)
-def test_a_url_is_read_for_the_route_it_asks_for(url: str, expected: str | None) -> None:
-    assert content_url_kind(url, _HLE) == expected
-
-
 # ----- output ---
 
 
@@ -789,20 +735,6 @@ _REAL_CAPTURE = """\
 
 
 # ----- boundaries the earlier fixtures did not reach ---------------------------------------
-
-
-def test_every_action_carries_the_transcript_it_came_from(tmp_path: Path) -> None:
-    """A tool name is not a transcript identity, and two eval tasks are two containers."""
-    path = tmp_path / "leg-0000.stream.jsonl"
-    path.write_text(
-        claude(
-            {"tool": "Bash", "input": {"command": "echo one"}, "output": "one"},
-            {"tool": "WebFetch", "input": {"url": "https://example.com"}, "output": "page"},
-        ),
-        encoding="utf-8",
-    )
-    trace = read_trace(path, [])
-    assert {a.trace for a in trace.actions} == {str(path)}
 
 
 def test_an_unreadable_capture_row_blinds_the_window_around_it(tmp_path: Path) -> None:
@@ -1105,59 +1037,6 @@ def test_a_continuation_that_was_never_folded_is_still_read(tmp_path: Path) -> N
     assert len(read_capture(run_dir).connections) == 2
 
 
-def test_a_link_the_agent_only_wrote_a_note_about_is_not_a_request(tmp_path: Path) -> None:
-    """A comment names a dataset; it does not ask for one, at any bucket."""
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace=codex(
-            {"lease_seen": "lease-a"},
-            {"command": f"echo thinking  # could try {_PARQUET}", "output": "thinking"},
-        ),
-    )
-    assert _buckets(run) == {7: "computed_locally"}
-
-
-def test_a_link_in_a_command_still_is_a_request(tmp_path: Path) -> None:
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace=codex(
-            {"lease_seen": "lease-a"},
-            {"command": f"curl -sL -o /tmp/k.parquet '{_PARQUET}'", "output": ""},
-        ),
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-    assert "file_download_requested" in run.episodes[0].reasons
-
-
-def test_a_url_printed_as_data_is_not_a_request_for_its_body(tmp_path: Path) -> None:
-    """Nothing in a ``printf`` asks the remote host for anything."""
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace=codex(
-            {"lease_seen": "lease-a"},
-            {"command": f"printf '%s\\n' '{_PARQUET}'", "output": _PARQUET},
-        ),
-    )
-    assert _buckets(run) == {7: "computed_locally"}
-    assert run.episodes[0].requested == ()
-
-
-def test_a_url_a_fetch_asked_for_is_a_request(tmp_path: Path) -> None:
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace=codex(
-            {"lease_seen": "lease-a"},
-            {"command": f"curl -sL -o /tmp/k.parquet '{_PARQUET}'", "output": ""},
-        ),
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-    assert "file_download_requested" in run.episodes[0].reasons
-
-
 def test_an_eval_after_task_inherits_the_rollouts_home(tmp_path: Path) -> None:
     """Every eval_after task runs against a copy of the HOME the rollout accumulated."""
     run = classify_run(
@@ -1252,103 +1131,6 @@ def test_an_episode_that_ended_before_the_contact_is_not_tainted(tmp_path: Path)
 # ----- a fetch is a command that ran, not a word that appears ---------------------------------
 
 
-@pytest.mark.parametrize(
-    ("command", "fetches"),
-    [
-        # Quoting a snippet is not running it.
-        ('printf "%s\\n" "curl https://h/x/resolve/main/d.parquet"', False),
-        ('echo "wget https://h/x/resolve/main/d.parquet" > note.txt', False),
-        ("grep -r 'curl' .", False),
-        ("cat /tmp/k.parquet", False),
-        # The wrappers a real command hides behind.
-        ("curl -sL -o /tmp/k.parquet 'https://h/x'", True),
-        ('/bin/bash -lc "curl -L -s -o /tmp/k.parquet \'https://h/x\'"', True),
-        ("env HTTPS_PROXY= curl -s https://h/x", True),
-        ("timeout 20 curl -s https://h/x", True),
-        ("do curl -L --max-time 20 -s 'https://h/x'", True),
-        ("xargs curl -O", True),
-        ("sudo /usr/bin/wget -O /tmp/k https://h/x", True),
-        ("python3 -c \"urlretrieve('https://h/x', '/tmp/k')\"", True),
-    ],
-)
-def test_only_an_invoked_fetch_counts(command: str, fetches: bool) -> None:
-    assert _invokes_a_fetch(command) is fetches
-
-
-def test_a_fetch_word_inside_quoted_data_does_not_raise_an_episode(tmp_path: Path) -> None:
-    """Printing a snippet that contains ``curl`` asks nobody for anything."""
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace=codex(
-            {"lease_seen": "lease-a"},
-            {"command": f'printf "%s\\n" "curl {_PARQUET}"', "output": f"curl {_PARQUET}"},
-        ),
-    )
-    assert _buckets(run) == {7: "computed_locally"}
-    assert run.episodes[0].requested == ()
-
-
-def test_a_fetch_behind_a_wrapper_still_raises_it(tmp_path: Path) -> None:
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace=codex(
-            {"lease_seen": "lease-a"},
-            {"command": f"env FOO=1 timeout 30 curl -sL -o /tmp/k.parquet '{_PARQUET}'",
-             "output": ""},
-        ),
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-    assert "file_download_requested" in run.episodes[0].reasons
-
-
-def test_an_interrupted_invocation_keeps_its_request(tmp_path: Path) -> None:
-    """A tool_use whose result never arrived still says what was asked for."""
-    interrupted = json.dumps(
-        {
-            "type": "assistant",
-            "message": {
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": "t1",
-                        "name": "Bash",
-                        "input": {"command": f"curl -sL -o /tmp/k.parquet '{_PARQUET}'"},
-                    }
-                ]
-            },
-        }
-    )
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace='{"lease":"lease-a"}\n' + interrupted + "\n",
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-    assert "file_download_requested" in run.episodes[0].reasons
-
-
-def test_an_answered_and_an_unanswered_invocation_reach_the_same_bucket(
-    tmp_path: Path,
-) -> None:
-    """The request is the evidence, so a failed result and no result read the same."""
-    answered = claude(
-        {
-            "tool": "Bash",
-            "input": {"command": f"curl -sL -o /tmp/k.parquet '{_PARQUET}'"},
-            "output": "curl: (28) Operation timed out",
-            "failed": True,
-        }
-    )
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace='{"lease":"lease-a"}\n' + answered,
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-
-
 # ----- narration, unbounded windows, interrupted starts, quoted code, and the JSON stream ----
 
 
@@ -1430,100 +1212,6 @@ def test_a_missing_leg_record_falls_back_to_the_runs_own_end(tmp_path: Path) -> 
     assert _buckets(run) == {7: "computed_locally"}
 
 
-def test_an_interrupted_prime_cell_keeps_its_request(tmp_path: Path) -> None:
-    """A trace ending after a prime start still says what the cell was going to fetch."""
-    started = json.dumps(
-        {
-            "type": "tool_execution_start",
-            "toolCallId": "c1",
-            "args": {"code": f"requests.get('{_PARQUET}')"},
-        }
-    )
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace='{"lease":"lease-a"}\n' + started + "\n",
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-    assert "file_download_requested" in run.episodes[0].reasons
-
-
-def test_an_interrupted_codex_command_keeps_its_request(tmp_path: Path) -> None:
-    started = json.dumps(
-        {
-            "type": "item.started",
-            "item": {
-                "id": "item_1",
-                "type": "command_execution",
-                "command": f"curl -sL -o /tmp/k.parquet '{_PARQUET}'",
-                "status": "in_progress",
-            },
-        }
-    )
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace='{"lease":"lease-a"}\n' + started + "\n",
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-
-
-def test_a_completed_codex_command_is_not_counted_twice(tmp_path: Path) -> None:
-    """The started record is dropped when its completion arrives."""
-    trace = "\n".join(
-        [
-            '{"lease":"lease-a"}',
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {"id": "item_1", "type": "command_execution",
-                             "command": "echo hi", "status": "in_progress"},
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {"id": "item_1", "type": "command_execution",
-                             "command": "echo hi", "aggregated_output": "hi",
-                             "exit_code": 0, "status": "completed"},
-                }
-            ),
-        ]
-    )
-    path = tmp_path / "leg.stream.jsonl"
-    path.write_text(trace + "\n", encoding="utf-8")
-    assert len(read_trace(path, []).actions) == 1
-
-
-@pytest.mark.parametrize(
-    ("command", "expected"),
-    [
-        # A separator inside quotes is data, so the interpreter keeps its source.
-        ('python3 -c "import requests; requests.get(\'https://h/x/resolve/main/d.parquet\')"', 1),
-        # And a real sequence of shell commands still splits.
-        ("echo one; echo two", 2),
-        # The wrapper the harnesses use is opened up and its script split.
-        ('/bin/bash -lc "printf hi; curl -s https://h/x"', 2),
-    ],
-)
-def test_command_splitting_respects_quoting(command: str, expected: int) -> None:
-    assert len(_invocations(command)) == expected
-
-
-def test_a_semicolon_inside_interpreter_source_keeps_the_fetch(tmp_path: Path) -> None:
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace=codex(
-            {"lease_seen": "lease-a"},
-            {"command": f"python3 -c \"import requests; requests.get('{_PARQUET}')\"",
-             "output": ""},
-        ),
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-    assert run.episodes[0].requested == (_PARQUET,)
-
-
 def test_the_json_stream_stays_json_when_a_target_is_refused(
     tmp_path: Path, capsys
 ) -> None:
@@ -1550,113 +1238,6 @@ def test_the_json_stream_stays_json_when_a_target_is_refused(
 
 
 # ----- a hub call and an MCP fetch are read on the same terms as everything else -------------
-
-
-def test_a_hub_call_in_quoted_data_does_not_raise_an_episode(tmp_path: Path) -> None:
-    """Printing a snippet that names a Hub call asks the Hub for nothing.
-
-    It raised the episode through a separate substring check that the invoked-command rule never
-    saw, and the leg rule then carried that into everything after it.
-    """
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_watching((150.0, "chatgpt.com", "tls")))
-        .rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 300.0, True)])
-        .leg("rollout", 0, 50.0, 900.0)
-        .trace(
-            "rollout",
-            "leg-0000.stream.jsonl",
-            codex(
-                {"lease_seen": "lease-a"},
-                {"command": "printf '%s\\n' 'load_dataset(\"hle\")'",
-                 "output": 'load_dataset("hle")'},
-                {"submit": "lease-a"},
-                {"lease_seen": "lease-b"},
-            ),
-        )
-        .path
-    )
-    graded = {e.episode.seq: e for e in run.episodes}
-    assert graded[1].bucket == "computed_locally"
-    assert "hub_download_call" not in graded[1].reasons
-    # And nothing downstream inherits a contact that never happened.
-    assert graded[2].bucket == "computed_locally"
-
-
-def test_a_hub_call_an_interpreter_ran_still_raises_it(tmp_path: Path) -> None:
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace=codex(
-            {"lease_seen": "lease-a"},
-            {"command": "python3 -c \"load_dataset('cais/hle')\"", "output": "ok"},
-        ),
-    )
-    assert _buckets(run) == {7: "attempted_leakage"}
-    assert "hub_download_call" in run.episodes[0].reasons
-
-
-def test_a_fetch_tool_reached_over_mcp_is_a_request(tmp_path: Path) -> None:
-    """A fetch tool's arguments are where its URL is, whatever transport carried the call."""
-    call = json.dumps(
-        {
-            "type": "item.completed",
-            "item": {
-                "type": "mcp_tool_call",
-                "server": "web",
-                "tool": "WebFetch",
-                "arguments": {"url": _PARQUET},
-                "result": {"content": [{"type": "text", "text": "ok"}]},
-            },
-        }
-    )
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace='{"lease":"lease-a"}\n' + call + "\n",
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-    assert run.episodes[0].requested == (_PARQUET,)
-
-
-def test_the_streams_own_calls_are_not_read_as_requests(tmp_path: Path) -> None:
-    """``get_task`` asks for a task and ``submit_answer`` carries an answer, not a request."""
-    calls = "\n".join(
-        [
-            '{"lease":"lease-a"}',
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "type": "mcp_tool_call",
-                        "server": "shogym",
-                        "tool": "get_task",
-                        "arguments": {},
-                        "result": {"content": [{"type": "text", "text": f"see {_PARQUET}"}]},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "type": "mcp_tool_call",
-                        "server": "shogym",
-                        "tool": "submit_answer",
-                        "arguments": {"lease": "lease-a", "answer": _PARQUET},
-                        "result": {"content": []},
-                    },
-                }
-            ),
-        ]
-    )
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace=calls + "\n",
-    )
-    assert _buckets(run) == {7: "computed_locally"}
-    assert run.episodes[0].requested == ()
 
 
 # ----- the carry key is the disk, not the leg label -------------------------------------------
@@ -1749,29 +1330,6 @@ def test_the_domain_is_the_disk(phase: str, task: int, domain: str) -> None:
 
 
 # ----- heredocs and missing targets -----------------------------------------------------------
-
-
-def test_a_heredoc_body_stays_with_the_interpreter_that_was_handed_it(
-    tmp_path: Path,
-) -> None:
-    """``python3 - <<PY`` hands everything up to the delimiter to the interpreter on its left."""
-    script = f"python3 - <<'PY'\nimport requests\nrequests.get('{_PARQUET}')\nPY"
-    run = _one(
-        tmp_path,
-        capture=_watching((150.0, "chatgpt.com", "tls")),
-        trace=codex({"lease_seen": "lease-a"}, {"command": f'/bin/bash -lc "{script}"',
-                                                "output": ""}),
-    )
-    assert _buckets(run) == {7: "unresolved_leakage"}
-    assert run.episodes[0].requested == (_PARQUET,)
-    assert "file_download_requested" in run.episodes[0].reasons
-
-
-def test_a_command_after_a_heredoc_is_its_own_invocation(tmp_path: Path) -> None:
-    """The body ends at its delimiter, and so does the command that owned it."""
-    assert len(_invocations("python3 - <<PY\nprint(1)\nPY\necho after")) == 2
-    assert len(_invocations("cat <<EOF > /tmp/f\nhello\nEOF\nls /tmp/f")) == 2
-    assert len(_invocations("echo one\necho two")) == 2
 
 
 def test_a_missing_target_refuses_the_batch(tmp_path: Path, capsys) -> None:
