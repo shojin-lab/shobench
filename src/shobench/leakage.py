@@ -376,6 +376,34 @@ class Trace:
     sealed_at: dict[str, int] = field(default_factory=dict)
 
 
+def _stream_terminated(text: str) -> bool:
+    """Did the stream answer this call by ending the episode?
+
+    The corroboration is the stream's own reply, not the agent's text: a submit it accepted comes
+    back saying the task is over. That is what separates a call that ran from a call that was
+    written down, and it is not something the transcript's author can put there.
+    """
+    if not text:
+        return False
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and payload.get("terminated") is True:
+        return True
+    return '"terminated": true' in text or '"terminated":true' in text
+
+
+def _text_of(blocks: Any) -> str:
+    if isinstance(blocks, str):
+        return blocks
+    if isinstance(blocks, list):
+        return "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+    if isinstance(blocks, dict):
+        return _text_of(blocks.get("content"))
+    return ""
+
+
 def read_trace(path: Path, leases: Iterable[str]) -> Trace:
     """Read one transcript for the two things the floor takes from a transcript.
 
@@ -384,17 +412,28 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
     command asked for and what came back are evidence of a different kind, and they are read
     somewhere else.
 
-    The three harnesses put the terminal call in three places. codex and claude_code invoke it as
-    a tool and name the lease in the arguments. prime-agent runs it inside an ipython cell, so
-    the lease is in the code, and that is the only shape where text is read for a seal: a line of
-    prose naming the call is narration.
+    A seal is a call that ran and was accepted. Naming the terminal call is not enough: a comment,
+    a string, a branch that never ran and a cell that raised before reaching it all name it, and
+    reading any of those as a seal ends an episode early and hands the traffic that follows to
+    somebody else. So every harness's seal needs the stream's own reply saying the task is over,
+    and a call that came back an error is not a seal either.
+
+    The three harnesses put the call in three places. codex and claude_code invoke it as a tool
+    and name the lease in the arguments; prime-agent runs it inside an ipython cell, so the lease
+    is in the code, and that is the only shape where text is read at all.
     """
     wanted = set(leases)
     first_seen: dict[str, int] = {}
     sealed_at: dict[str, int] = {}
+    # claude answers a tool_use in a later event, so the call waits here for its reply.
+    pending: dict[str, tuple[str, int]] = {}
+    # prime puts the cell's code on the start event and its result on the end event.
+    cells: dict[str, str] = {}
 
-    def seal(lease: object, offset: int) -> None:
-        if isinstance(lease, str) and lease in wanted and lease not in sealed_at:
+    def seal(lease: object, offset: int, result: str) -> None:
+        if not isinstance(lease, str) or lease not in wanted or lease in sealed_at:
+            return
+        if _stream_terminated(result):
             sealed_at[lease] = offset
 
     for offset, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines()):
@@ -409,26 +448,47 @@ def read_trace(path: Path, leases: Iterable[str]) -> Trace:
             continue
         kind = event.get("type")
 
-        # codex: the terminal call is an MCP tool call carrying the lease in its arguments.
+        # codex: an MCP tool call carrying the lease in its arguments and the reply in its result.
         if kind == "item.completed" and isinstance(event.get("item"), dict):
             item = event["item"]
             if item.get("type") == "mcp_tool_call" and item.get("tool") == "submit_answer":
-                seal((item.get("arguments") or {}).get("lease"), offset)
+                if item.get("error") is None and item.get("status") != "failed":
+                    seal(
+                        (item.get("arguments") or {}).get("lease"),
+                        offset,
+                        _text_of(item.get("result")),
+                    )
 
-        # claude_code: the same call, as a tool_use on the assistant side.
+        # claude_code: the call on the assistant side, its reply on the user side.
         elif kind == "assistant" and isinstance(event.get("message"), dict):
             for block in event["message"].get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     if str(block.get("name")).endswith("submit_answer"):
-                        seal((block.get("input") or {}).get("lease"), offset)
+                        lease = (block.get("input") or {}).get("lease")
+                        if isinstance(lease, str):
+                            pending[str(block.get("id"))] = (lease, offset)
+        elif kind == "user" and isinstance(event.get("message"), dict):
+            for block in event["message"].get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    waiting = pending.pop(str(block.get("tool_use_id")), None)
+                    if waiting is not None and not block.get("is_error"):
+                        seal(waiting[0], waiting[1], _text_of(block.get("content")))
 
-        # prime-agent: the call is inside the cell it runs, so the code is where the lease is.
-        elif kind in ("tool_execution_start", "tool_execution_end"):
-            code = json.dumps(event.get("args") or {})
-            if "submit_answer" in code:
+        # prime-agent: the call is inside the cell, so the code says which lease and the cell's
+        # own result says whether it ran.
+        elif kind == "tool_execution_start":
+            cells[str(event.get("toolCallId"))] = json.dumps(event.get("args") or {})
+        elif kind == "tool_execution_end":
+            code = cells.pop(str(event.get("toolCallId")), "") or json.dumps(
+                event.get("args") or {}
+            )
+            result = event.get("result")
+            failed = event.get("isError") or (isinstance(result, dict) and result.get("isError"))
+            if "submit_answer" in code and not failed:
+                text = _text_of(result)
                 for lease in wanted:
                     if lease in code:
-                        seal(lease, offset)
+                        seal(lease, offset, text)
 
     return Trace(path, first_seen, sealed_at)
 
@@ -997,6 +1057,18 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             "distinguished from general web reference in this run"
         )
 
+    # What the rollout's disk saw over its whole life, not only inside an episode's window. A
+    # container is up from the moment its leg starts, and an answer-source connection made before
+    # the first task was pulled, or between two legs, reached the same disk every later episode
+    # reads. Charging it to nobody was leaving that disk clear.
+    disk_contact, orphans = _disk_contact(capture, legs, source, episodes)
+    if disk_contact is not None:
+        notes.append(
+            f"the rollout's containers reached the answer source at {disk_contact:.3f}, "
+            f"{orphans} of those observations outside any episode's window; the disk carries "
+            "that from then on and no episode reading it is cleared"
+        )
+
     starts = [c.epoch for c in capture.connections]
     ordered = sorted(episodes, key=lambda e: (e.started_at if e.started_at is not None else 0.0))
     graded: list[EpisodeLeakage] = []
@@ -1013,6 +1085,9 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
     # What the rollout leaves in the HOME its eval_after tasks are copies of.
     seeded_home_contact = False
     seeded_home_blind = False
+    if disk_contact is not None:
+        contacted["rollout"] = disk_contact
+        seeded_home_contact = True
 
     for episode in ordered:
         evidence = _window_evidence(episode, capture.connections, starts)
@@ -1134,6 +1209,51 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         episodes=tuple(graded),
         notes=tuple(notes),
     )
+
+
+def _disk_contact(
+    capture: Capture,
+    legs: list[dict[str, Any]],
+    source: AnswerSource | None,
+    episodes: Sequence[Episode] = (),
+) -> tuple[float | None, int]:
+    """When the rollout's disk first reached the answer source, over the whole life of its legs.
+
+    An episode's window starts when its task was handed out, and a container is up before that
+    and between one leg and the next. A connection made in those gaps reached the same mounted
+    HOME and the same working directory that every later episode reads, so it belongs to the
+    disk even though it belongs to no episode.
+
+    It is deliberately not given an episode of its own. Inventing one would put a row in the
+    report for something the stream never dispensed; what it does instead is set the disk's
+    contact time, which is what the carry-forward and the HOME-inheritance rules read, and say so
+    in a note.
+    """
+    spans = [
+        (float(leg["started_at"]), float(leg["ended_at"]))
+        for leg in legs
+        if leg.get("phase") == "rollout"
+        and leg.get("started_at") is not None
+        and leg.get("ended_at") is not None
+    ]
+    if not spans:
+        return None, 0
+    windows = [
+        (e.started_at, e.ended_at if e.ended_at is not None else float("inf"))
+        for e in episodes
+        if e.phase == "rollout" and e.started_at is not None
+    ]
+    earliest: float | None = None
+    orphans = 0
+    for connection in capture.connections:
+        if not host_role(connection.host, source).startswith("answer_source"):
+            continue
+        if not any(start <= connection.epoch <= end for start, end in spans):
+            continue
+        earliest = connection.epoch if earliest is None else min(earliest, connection.epoch)
+        if not any(start <= connection.epoch < end for start, end in windows):
+            orphans += 1
+    return earliest, orphans
 
 
 def _capture_notes(capture: Capture, finished: bool) -> list[str]:

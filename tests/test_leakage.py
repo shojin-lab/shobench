@@ -94,7 +94,19 @@ def codex(*items: dict) -> str:
                                 "lease": item["submit"],
                                 "answer": item.get("answer", "x"),
                             },
-                            "result": {"content": [{"type": "text", "text": "ok"}]},
+                            # The stream's own reply to a submit it accepted, which is what
+                            # corroborates that the call ran rather than being written down.
+                            "result": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": item.get(
+                                            "reply",
+                                            '{"content": "<task ended>", "terminated": true}',
+                                        ),
+                                    }
+                                ]
+                            },
                         },
                     }
                 )
@@ -895,7 +907,8 @@ def test_a_seal_is_found_wherever_the_terminal_call_names_a_lease(tmp_path: Path
              "output": '{"lease":"lease-A","env":"hle"}'},
             {"input": {"code": "await shogym_stream.submit_answer(answer='B', lease='lease-A')\n"
                                "r = await shogym_stream.get_task(); print(r)"},
-             "output": '{"lease":"lease-B","env":"hle"}'},
+             "output": '{"content": "<task ended>", "terminated": true}\n'
+                       '{"lease":"lease-B","env":"hle"}'},
         ),
         encoding="utf-8",
     )
@@ -920,7 +933,8 @@ def test_a_prime_run_that_seals_inside_one_action_gets_a_bounded_window(
                  "output": '{"lease":"lease-A"}'},
                 {"input": {"code": "await shogym_stream.submit_answer(lease='lease-A')\n"
                                    "await shogym_stream.get_task()"},
-                 "output": '{"lease":"lease-B"}'},
+                 "output": '{"content": "<task ended>", "terminated": true}\n'
+                           '{"lease":"lease-B"}'},
             ),
         )
         .path
@@ -1563,3 +1577,149 @@ def test_the_protected_set_follows_a_chain_and_survives_a_cycle(tmp_path: Path) 
     RunDir(tmp_path / "x", rebookend_of="y").egress(_watching((150.0, "chatgpt.com", "tls")))
     RunDir(tmp_path / "y", rebookend_of="x").egress(_watching((150.0, "chatgpt.com", "tls")))
     assert {p.name for p in runs_read([tmp_path / "x"])} == {"x", "y"}
+
+
+# ----- the disk is up before the first task, and a seal is a call that ran ---------------------
+
+
+def _disk_run(tmp_path: Path, contact: float, legs: list[tuple[float, float]]) -> RunDir:
+    """A rollout whose disk sees the answer source at ``contact``, and a later eval task."""
+    run = RunDir(tmp_path / "r").egress(
+        _watching((contact, "us.aws.cdn.hf.co", "tls"), until=1000.0)
+    )
+    run.rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 200.0, True)])
+    for index, (start, end) in enumerate(legs):
+        run.leg("rollout", index, start, end)
+    run.eval_task("eval_after", 11, "lease-e", 700.0)
+    run.leg("eval_after", 9, 700.0, 750.0, task=11)
+    return run
+
+
+def test_contact_before_the_first_dispense_still_belongs_to_the_disk(tmp_path: Path) -> None:
+    """A container is up before its first task, and what it fetched then is on the same disk."""
+    run = classify_run(_disk_run(tmp_path, 75.0, [(50.0, 300.0)]).path)
+    graded = {(e.episode.phase, e.episode.task_idx): e for e in run.episodes}
+    assert graded[("rollout", 7)].bucket == "unresolved_leakage"
+    assert graded[("rollout", 8)].bucket == "unresolved_leakage"
+    assert "answer_source_contact_earlier_on_this_disk" in graded[("rollout", 7)].reasons
+    # And the HOME that rollout seeded is not clean either.
+    assert graded[("eval_after", 11)].bucket == "unresolved_leakage"
+    assert any("reached the answer source at" in note for note in run.notes)
+
+
+def test_contact_at_a_continuation_legs_start_still_belongs_to_the_disk(
+    tmp_path: Path,
+) -> None:
+    """The gap between one leg ending and the next starting is the same disk coming back up."""
+    run = classify_run(_disk_run(tmp_path, 360.0, [(50.0, 300.0), (350.0, 600.0)]).path)
+    graded = {(e.episode.phase, e.episode.task_idx): e for e in run.episodes}
+    # Both rollout episodes were dispensed before the contact, so neither is tainted by it.
+    assert graded[("rollout", 7)].bucket == "computed_locally"
+    # The eval task copies that disk's HOME afterwards, and it is not cleared.
+    assert graded[("eval_after", 11)].bucket == "unresolved_leakage"
+
+
+def test_a_bookend_over_a_disk_that_reached_the_answer_source_is_not_cleared(
+    tmp_path: Path,
+) -> None:
+    source = _disk_run(tmp_path, 75.0, [(50.0, 300.0)])
+    bookend = classify_run(
+        RunDir(tmp_path / "bookend", rebookend_of="r")
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .eval_task("eval_after", 12, "lease-c", 150.0)
+        .leg("eval_after", 1, 150.0, 190.0, task=12)
+        .path
+    )
+    assert source.path.exists()
+    assert _buckets(bookend) == {12: UNCLASSIFIED}
+
+
+def test_an_orphan_observation_gets_a_note_and_not_an_episode(tmp_path: Path) -> None:
+    """It belongs to no episode, so it is reported as what it is rather than given a row."""
+    run = classify_run(_disk_run(tmp_path, 75.0, [(50.0, 300.0)]).path)
+    assert len(run.episodes) == 3
+    assert any("outside any episode's window" in note for note in run.notes)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "# next up: submit_answer(lease='lease-a')",
+        "plan = \"submit_answer(lease='lease-a')\"",
+    ],
+)
+def test_a_cell_that_only_names_the_terminal_call_does_not_seal(
+    tmp_path: Path, code: str
+) -> None:
+    """A comment and a string both name the call and neither one ran it."""
+    trace = prime(
+        {"input": {"code": "await shogym_stream.get_task()"}, "output": '{"lease":"lease-a"}'},
+        {"input": {"code": code}, "output": "ok"},
+        {"input": {"code": "await shogym_stream.get_task()"}, "output": '{"lease":"lease-b"}'},
+    )
+    path = tmp_path / "leg.stream.jsonl"
+    path.write_text(trace, encoding="utf-8")
+    assert read_trace(path, ["lease-a", "lease-b"]).sealed_at == {}
+
+
+def test_a_cell_that_ran_the_call_and_was_answered_does_seal(tmp_path: Path) -> None:
+    trace = prime(
+        {"input": {"code": "await shogym_stream.get_task()"}, "output": '{"lease":"lease-a"}'},
+        {
+            "input": {"code": "await shogym_stream.submit_answer(lease='lease-a')"},
+            "output": '{"content": "<task ended>", "terminated": true}',
+        },
+    )
+    path = tmp_path / "leg.stream.jsonl"
+    path.write_text(trace, encoding="utf-8")
+    assert set(read_trace(path, ["lease-a"]).sealed_at) == {"lease-a"}
+
+
+def test_a_terminal_call_the_stream_refused_is_not_a_seal(tmp_path: Path) -> None:
+    """An ``unknown_lease`` reply is the stream saying it did not end anything."""
+    refused = '{"error": "unknown_lease", "message": "no task was dispensed under this lease"}'
+    path = tmp_path / "leg.stream.jsonl"
+    path.write_text(
+        codex(
+            {"lease_seen": "lease-a"},
+            {"submit": "lease-a", "reply": refused},
+        ),
+        encoding="utf-8",
+    )
+    assert read_trace(path, ["lease-a"]).sealed_at == {}
+
+
+def test_an_errored_terminal_call_is_not_a_seal(tmp_path: Path) -> None:
+    path = tmp_path / "leg.stream.jsonl"
+    path.write_text(
+        claude(
+            {
+                "tool": "mcp__shogym__submit_answer",
+                "input": {"lease": "lease-a", "answer": "x"},
+                "output": "tool call failed",
+                "failed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert read_trace(path, ["lease-a"]).sealed_at == {}
+
+
+def test_a_seal_that_shortened_a_window_wrongly_no_longer_does(tmp_path: Path) -> None:
+    """The reproduction end to end: narration in a cell used to hand traffic to the next task."""
+    trace = prime(
+        {"input": {"code": "await shogym_stream.get_task()"}, "output": '{"lease":"lease-a"}'},
+        {"input": {"code": "# then submit_answer(lease='lease-a')"}, "output": "ok"},
+        {"input": {"code": "await shogym_stream.get_task()"}, "output": '{"lease":"lease-b"}'},
+    )
+    run = classify_run(
+        RunDir(tmp_path / "r")
+        .egress(_watching((250.0, "huggingface.co", "tls")))
+        .rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 200.0, True)])
+        .leg("rollout", 0, 50.0, 400.0)
+        .trace("rollout", "leg-0000.stream.jsonl", trace)
+        .path
+    )
+    graded = {e.episode.seq: e for e in run.episodes}
+    assert graded[1].episode.ended_at == 400.0
+    assert graded[1].bucket == "attempted_leakage"
