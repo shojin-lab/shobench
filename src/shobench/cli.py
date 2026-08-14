@@ -5,13 +5,15 @@
     shobench creds --cell <name>            # the negative-control protocol for one cell
     shobench build                          # build the three images
     shobench run --cell <name> --go         # run one cell (real spend without --go: a plan)
+    shobench stop --run <run-dir>           # end a live run through its normal ending
     shobench resume --run <run-dir> --go    # continue a cell a usage limit suspended
     shobench rerun-eval --run <run-dir> --go # finish an eval_after that lost tasks
     shobench rebookend --run <run-dir> --go # a resumed eval_after for an existing run, as a new run
     shobench report [results/]              # the summary table
 
 ``--go`` is the whole safety story: every command that spends prints its plan and exits unless
-it is present. Nothing here launches the matrix; a cell is run one at a time by name.
+it is present. Nothing here launches the matrix; a cell is run one at a time by name. ``stop``
+carries no ``--go`` because it is the one command that can only reduce what a run spends.
 """
 
 from __future__ import annotations
@@ -637,6 +639,65 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_stop(args: argparse.Namespace) -> int:
+    """Ask a live run to end through its normal ending, so its records get written.
+
+    The alternative an operator has without this is `pkill` plus `docker rm -f`, which ends the
+    runner before it can write ``legs.json`` and ``rollout_stopping.json``. A run stopped that way
+    has no terminus, so `rebookend` refuses it forever and the cell can never produce an
+    eval_after: the cheap way to stop a wedged run destroys the measurement, while leaving it to
+    burn its whole clock preserves it. This inverts that. It spends nothing, so it takes no
+    ``--go``, and it is safe to call twice and safe to call on a run that has already finished.
+
+    Liveness is proven rather than assumed, and it is proven the same way `rebookend` proves it:
+    a SHARED flock on the run's own lock file, which every mutating owner holds EXCLUSIVE. Taking
+    it means nothing owns the directory, so there is nothing to stop; failing to take it means a
+    live owner is there to read the ask. The run's pid is not consulted at all, because the lock
+    file is never unlinked and a finished run therefore names a pid the system may have reissued.
+    """
+    import fcntl
+
+    run_dir = Path(args.run)
+    lock_path = run_dir / runner.RUN_LOCK_FILE
+    if not lock_path.is_file():
+        print(
+            f"{run_dir} has no {runner.RUN_LOCK_FILE}, so no shobench process ever owned it: "
+            "this is not a live run directory and there is nothing to stop.",
+            file=sys.stderr,
+        )
+        return 1
+    fd = os.open(lock_path, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            live = True
+        else:
+            live = False
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    if not live:
+        # A no-op, and deliberately not a written request: a run nobody owns will not read one,
+        # and a file left behind would end the next process to reopen the directory.
+        print(
+            f"{run_dir} is not owned by a live process, so it has already finished or was "
+            "killed. Nothing was written and nothing was stopped.",
+            file=sys.stderr,
+        )
+        return 0
+    request = runner.write_stop_request(run_dir, reason=args.reason)
+    print(json.dumps(request, indent=2))
+    print(
+        f"\n[shobench] stop requested for {run_dir}. The runner will end its current leg through "
+        "the normal path, write legs.json and rollout_stopping.json, and publish what it has. "
+        "An operator-ended rollout keeps a real terminus, so `shobench rebookend` can still give "
+        "it an eval_after.",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def _cmd_resume(args: argparse.Namespace) -> int:
     """Continue a cell a provider usage limit suspended, and let it finish.
 
@@ -826,6 +887,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="skip the negative control; never appropriate for a reported cell",
     )
     run.set_defaults(func=_cmd_run)
+
+    stop = sub.add_parser(
+        "stop", help="end a live run through its normal ending, so its records are written"
+    )
+    stop.add_argument("--run", required=True, help="the live run directory to end")
+    stop.add_argument(
+        "--reason",
+        default="",
+        help="what to record about why, carried into the leg's stop verdict",
+    )
+    stop.set_defaults(func=_cmd_stop)
 
     res = sub.add_parser("resume", help="continue a cell a usage limit suspended")
     res.add_argument("--run", required=True, help="the run directory holding suspended.json")

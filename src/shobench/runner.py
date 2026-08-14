@@ -25,6 +25,16 @@ agent's, so the cell keeps everything it has, writes what a continuation needs, 
 process without unwinding the stream. :func:`resume_cell` picks it up when the window resets
 and finishes through the same ending an uninterrupted run reaches, so the eval that follows the
 rollout still follows a real rollout terminus.
+
+**Every ending a person or the runner imposes goes through the leg's normal ending.** Killing the
+process ends the run before it can write ``legs.json`` and ``rollout_stopping.json``, and a run
+without those has no terminus, so its rollout can never be bookended and the cell produces no
+paired delta at all: the cheap way to stop a wedged run destroyed the measurement while letting it
+burn its full clock preserved it. So an operator asks through a file the run polls
+(:const:`STOP_REQUEST_FILE`) and the runner ends the current leg the way a budget does, and a
+rollout leg that has shown no evidence of progress anywhere for the cell's own bound is ended the
+same way. Each records its own stop kind, because an operator's decision, a wedged leg, the
+agent's own stop, a timeout and a usage limit mean five different things to whoever reads the run.
 """
 
 from __future__ import annotations
@@ -183,6 +193,39 @@ def durable_filter(harness: Harness) -> Callable[[str], bool]:
 
 
 @dataclass
+class EarlyEnding:
+    """A leg's handle for being ended before its budget, and the verdict that ending carries.
+
+    Every ending the runner imposes short of the leg budget goes through one of these: an eval leg
+    whose held-out task is already sealed, any leg an operator asked to end, and a rollout leg
+    that stopped showing evidence of progress. ``fired`` is set from wherever the decision is made
+    (an event loop watching a stream, a thread watching a directory) and read by the thread
+    supervising the container, so the two halves of every one of them stay where each belongs.
+
+    The verdict travels WITH the decision rather than being re-derived by the supervisor from a
+    boolean it was handed. Three endings now share one seam, and a supervisor that reported only
+    "the runner ended it" would leave the leg to guess which of the three happened, which is
+    exactly the distinction each of these kinds exists to keep.
+
+    First writer wins. Two watchers can reach one leg inside a single poll interval, and the
+    ending that happened is the one that got there first.
+    """
+
+    fired: threading.Event = field(default_factory=threading.Event)
+    verdict: StopVerdict | None = None
+    lock: Any = field(default_factory=threading.Lock, repr=False)
+
+    def fire(self, verdict: StopVerdict) -> bool:
+        """End the leg with this verdict, unless another watcher already ended it."""
+        with self.lock:
+            if self.verdict is not None:
+                return False
+            self.verdict = verdict
+        self.fired.set()
+        return True
+
+
+@dataclass
 class LegRecord:
     """One harness invocation inside a phase.
 
@@ -266,6 +309,11 @@ class RunContext:
     # Eval tasks run their legs from several threads at once, and each of them may learn a new
     # credential value at the same moment. The swap below is what they serialize on.
     redactor_lock: Any = field(default_factory=threading.Lock, repr=False)
+    # The run's operator-stop handle, shared by every leg this process runs. One handle rather
+    # than one per leg because the ask is about the RUN: a stop requested while four eval legs are
+    # in flight ends all four, and a stop requested between legs is still set when the next one
+    # starts. :func:`_watching_for_stop` is what fires it.
+    operator_stop: EarlyEnding = field(default_factory=EarlyEnding)
 
     def watch_credentials(self, home: Path) -> None:
         """Fold whatever the credential files hold *now* into the redactor, keeping what it had.
@@ -576,25 +624,9 @@ def _watching_credentials(ctx: RunContext, home: Path):
         watcher.join(timeout=CREDENTIAL_POLL_S * 5)
 
 
-@dataclass(frozen=True)
-class DrainWatchdog:
-    """An eval leg's handle for being ended once its held-out task is finished.
-
-    ``fired`` is set from the phase's event loop by :func:`_watch_for_drain` and read by the
-    thread supervising the container, so the two halves of the decision (watching the stream,
-    ending the process) stay where each belongs. ``grace_s`` rides along because the verdict has
-    to say how long the leg was given after there was nothing left for it to do; a reader of the
-    record should not have to go looking up a constant to know what the ending means. ``None`` is
-    that answer for a harness that is given nothing: the first reading that finds the leg
-    finished ends it.
-    """
-
-    fired: threading.Event
-    grace_s: float | None
-
-
-# How often the leg supervisor looks up from waiting on the container. It only matters for a leg
-# that carries a watchdog, so a rollout leg waits once for its whole budget and wakes for nothing.
+# How often the leg supervisor looks up from waiting on the container. Every leg now carries at
+# least the run's operator-stop handle, so every leg polls; one wake a second over an eight hour
+# rollout is what buys an operator an ending that writes the run's records.
 LEG_POLL_S = 1.0
 
 
@@ -621,17 +653,19 @@ def _supervise(
     stdin_data: str | None,
     timeout_s: int,
     container: str,
-    watchdog: DrainWatchdog | None,
+    endings: Sequence[EarlyEnding] = (),
 ) -> tuple[int, bool, bool]:
     """Run one container to its end and say how that end came about.
 
-    Returns ``(returncode, timed_out, drained)``, at most one of the two flags set. A leg that
-    ended by itself sets neither, and its return code is the harness's own.
+    Returns ``(returncode, timed_out, ended_early)``, at most one of the two flags set. A leg that
+    ended by itself sets neither, and its return code is the harness's own. WHICH early ending
+    fired is not this function's to say: the caller reads it off the handle that fired, because
+    the watcher that decided is the one that knows what the decision means.
 
-    Both endings the runner imposes are the same two steps, and the order is what makes them
-    work: the docker client is killed first, then the container is removed by name. Killing the
-    client alone leaves the container running, and a container that outlives its leg keeps
-    spending and keeps holding the task it was handed.
+    Every ending the runner imposes is the same two steps, and the order is what makes them work:
+    the docker client is killed first, then the container is removed by name. Killing the client
+    alone leaves the container running, and a container that outlives its leg keeps spending and
+    keeps holding the task it was handed.
     """
     proc = subprocess.Popen(
         argv,
@@ -654,8 +688,9 @@ def _supervise(
         return -1
 
     deadline = time.monotonic() + timeout_s
-    # No watchdog means nothing can end this leg early, so it waits once rather than spinning.
-    if watchdog is None:
+    # Nothing can end this leg early, so it waits once rather than spinning. Reachable only from a
+    # caller that passes no handles at all, which the runner itself never does.
+    if not endings:
         try:
             return proc.wait(timeout=timeout_s), False, False
         except subprocess.TimeoutExpired:
@@ -668,8 +703,36 @@ def _supervise(
             return proc.wait(timeout=min(LEG_POLL_S, remaining)), False, False
         except subprocess.TimeoutExpired:
             pass
-        if watchdog.fired.is_set():
+        if any(ending.fired.is_set() for ending in endings):
             return end_it(), False, True
+
+
+def _fired_verdict(endings: Sequence[EarlyEnding]) -> StopVerdict | None:
+    """The verdict of the first fired handle, in the order the caller preferred them.
+
+    ``None`` where the supervisor said a leg ended early and no handle carries a verdict, which
+    a caller reads as "classify it normally". That is a fail-safe rather than a case: the only
+    way to reach it is a handle fired without one, and inventing a kind here would publish an
+    ending nobody decided.
+    """
+    for ending in endings:
+        if ending.fired.is_set() and ending.verdict is not None:
+            return ending.verdict
+    return None
+
+
+def leg_stem(leg: int, task_idx: int | None) -> str:
+    """What one leg's artifacts are named after: its number, and its task where it has one."""
+    return f"leg-{leg:04d}" if task_idx is None else f"task-{task_idx:05d}-leg-{leg:04d}"
+
+
+def leg_trace_path(run_dir: Path, phase: str, leg: int, task_idx: int | None = None) -> Path:
+    """Where a leg's structured trace is written, computed rather than remembered.
+
+    :func:`run_leg` opens this file and the rollout's progress watcher stats it while the leg is
+    still running, so the two agree by construction rather than by a constant copied twice.
+    """
+    return run_dir / phase / "traces" / f"{leg_stem(leg, task_idx)}.stream.jsonl"
 
 
 def run_leg(
@@ -689,7 +752,7 @@ def run_leg(
     home: Path | None = None,
     workdir: Path | None = None,
     container_name: str | None = None,
-    watchdog: DrainWatchdog | None = None,
+    endings: Sequence[EarlyEnding] = (),
 ) -> LegRecord:
     """Run one harness invocation to completion and classify how it ended.
 
@@ -699,10 +762,14 @@ def run_leg(
     mounts its own throwaway home and its own throwaway ``/work``, and names its own container,
     which is what lets many tasks run at once without sharing any of that mutable state.
 
-    ``watchdog`` is an eval task's handle for ending a leg whose work is already done (see
-    :class:`DrainWatchdog`). The rollout passes none, and must not: a rollout leg with an empty
-    queue in front of it is the charter's own question, and a runner that ended it would answer
-    that question for the agent.
+    ``endings`` are the handles a caller may end this leg through, in the order their verdicts
+    are preferred where two fired inside one poll (see :class:`EarlyEnding`). The run's own
+    operator-stop handle is appended here rather than passed by each caller: every leg is
+    stoppable, and a caller that forgot would leave a phase an operator could not end.
+
+    What no caller may hand the rollout is a drain handle. A rollout leg with an empty queue in
+    front of it is the charter's own question, and a runner that ended it would answer that
+    question for the agent.
     """
     if resume and not session_id:
         raise RuntimeError("cannot resume without a session id; the previous leg wrote none")
@@ -711,9 +778,10 @@ def run_leg(
     home = ctx.sandbox.home if home is None else home
     trace_dir = ctx.run_dir / phase / "traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"leg-{leg:04d}" if task_idx is None else f"task-{task_idx:05d}-leg-{leg:04d}"
+    stem = leg_stem(leg, task_idx)
     stdout_path = trace_dir / f"{stem}.stream.jsonl"
     stderr_path = trace_dir / f"{stem}.err.txt"
+    endings = (*endings, ctx.operator_stop)
 
     spec = ctx.harness.launch(
         mcp_url=mcp_url,
@@ -759,14 +827,14 @@ def run_leg(
     ):
         # Every harness in v0 either hangs on an open stdin or reads its prompt from it, so
         # stdin is always explicit and never inherited.
-        returncode, timed_out, drained = _supervise(
+        returncode, timed_out, ended_early = _supervise(
             argv,
             out=out,
             err=err,
             stdin_data=spec.stdin,
             timeout_s=timeout_s,
             container=container,
-            watchdog=watchdog,
+            endings=endings,
         )
 
     # The generation the harness left behind, taken before a byte of its output is read. The
@@ -789,13 +857,16 @@ def run_leg(
     ctx.redactor.file(stdout_path)
     ctx.redactor.file(stderr_path)
 
-    # A leg the drain watchdog ended is classified by the runner rather than by the harness's own
+    # A leg the runner ended early is classified by the runner rather than by the harness's own
     # rules, exactly as a timeout is: what ended it was a decision here, and reading the trace for
     # it would find whatever the harness happened to be saying when the container was removed. A
-    # usage limit in that trace is not read either, and must not be: the held-out row is already
-    # sealed and scored, so there is nothing for a suspension to re-run.
-    if watchdog is not None and drained:
-        verdict = ctx.harness.drained_verdict(grace_s=watchdog.grace_s)
+    # usage limit in that trace is not read either, and must not be. For a drained eval leg the
+    # held-out row is already sealed and scored, so there is nothing for a suspension to re-run;
+    # for an operator stop and for a stalled rollout the run is over by a decision no window
+    # reopening would undo, and a resume that read the trace would continue a run someone ended.
+    early = _fired_verdict(endings) if ended_early else None
+    if early is not None:
+        verdict = early
     else:
         verdict = ctx.harness.classify(
             returncode=returncode,
@@ -1018,16 +1089,23 @@ async def _watch_for_drain(
     stream: Any,
     prov_dir: Path,
     idx: int,
-    watchdog: DrainWatchdog,
+    ending: EarlyEnding,
     *,
+    grace_s: float | None,
+    harness: Harness,
     poll_s: float = EVAL_DRAIN_POLL_S,
 ) -> bool:
-    """Set the watchdog once this task has been finished for the harness's whole grace period, or
+    """Fire ``ending`` once this task has been finished for the harness's whole grace period, or
     on the first reading that finds it finished when the harness declares no grace.
 
     Runs on the phase's event loop, which is where the stream mutates, so reading the queue here
     cannot catch it mid-change. The leg itself is on a worker thread and is told through the
-    event rather than by this coroutine, which touches no container.
+    handle rather than by this coroutine, which touches no container.
+
+    ``grace_s`` is the harness's own, because what it covers is that harness's wrap-up after the
+    seal, and it goes into the verdict as well: a reader of the record should not have to look up
+    a constant to know how long a leg was given after there was nothing left for it to do.
+    ``None`` is the answer for a harness given nothing, whose leg the first finished reading ends.
 
     The grace timer restarts if the condition stops holding. That cannot happen to a single-task
     eval stream, and the reset is here anyway: it makes this a statement about the condition
@@ -1048,16 +1126,16 @@ async def _watch_for_drain(
         if not finished:
             finished_since = None
             continue
-        if watchdog.grace_s is None:
+        if grace_s is None:
             # No grace: this reading is the ending. Written as its own branch rather than as a
             # zero-length timer, because a zero would still be compared on the NEXT poll and the
             # leg would live a poll interval longer, which is the whole of what this is for.
-            watchdog.fired.set()
+            ending.fire(harness.drained_verdict(grace_s=grace_s))
             return True
         if finished_since is None:
             finished_since = time.monotonic()
-        elif time.monotonic() - finished_since >= watchdog.grace_s:
-            watchdog.fired.set()
+        elif time.monotonic() - finished_since >= grace_s:
+            ending.fire(harness.drained_verdict(grace_s=grace_s))
             return True
 
 
@@ -1319,15 +1397,22 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                     prov_dir,
                     deadline=float(ctx.cell.budget.eval_task_timeout_s),
                 )
-                # The watchdog and the leg run side by side: the leg holds a worker thread, and
-                # the loop is free to keep reading this task's stream while it does. Cancelled in
-                # the `finally` so a leg that ended on its own leaves nothing watching a stream
+                # The drain watcher and the leg run side by side: the leg holds a worker thread,
+                # and the loop is free to keep reading this task's stream while it does. Cancelled
+                # in the `finally` so a leg that ended on its own leaves nothing watching a stream
                 # that is about to close. The grace it waits out belongs to the harness, since
                 # what the grace covers is that harness's own wrap-up after the seal.
-                watchdog = DrainWatchdog(threading.Event(), ctx.harness.eval_drain_grace_s)
+                drained = EarlyEnding()
                 async with stream, _served(stream, port):
                     watching = asyncio.create_task(
-                        _watch_for_drain(stream, prov_dir, idx, watchdog)
+                        _watch_for_drain(
+                            stream,
+                            prov_dir,
+                            idx,
+                            drained,
+                            grace_s=ctx.harness.eval_drain_grace_s,
+                            harness=ctx.harness,
+                        )
                     )
                     try:
                         record = await asyncio.to_thread(
@@ -1363,7 +1448,7 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                             home=task_home,
                             workdir=task_work,
                             container_name=container,
-                            watchdog=watchdog,
+                            endings=(drained,),
                         )
                     finally:
                         watching.cancel()
@@ -1467,6 +1552,23 @@ BASELINE_BEFORE_FILE = "baseline_before.json"
 # results file unwritten, and its resume republishes the rollout from provenance plus this file,
 # so the stop reason survives an interruption that happens after the rollout is already paid for.
 ROLLOUT_STOPPING_FILE = "rollout_stopping.json"
+# An operator's ask that this run end through its normal path, written into the live run
+# directory by `shobench stop` and read by the runner that owns it.
+#
+# A file the runner polls rather than a signal it handles, for three reasons that all point the
+# same way. The run directory is the run's identity and a process is not: a rollout a usage limit
+# suspends leaves and is continued by a DIFFERENT process against the same directory, so an ask
+# addressed to a pid would be addressed to something the run outlives, while one written here is
+# still there when the continuation reads it. The only pid a run records is in run.lock, which is
+# never unlinked, so a finished run names a pid the operating system may since have handed to
+# something else, and a stop that signals it would signal a stranger. And the supervision loop is
+# already a poll (LEG_POLL_S), while the wait a signal would have to interrupt is
+# `subprocess.wait`, which Python retries across EINTR by design: a signal would need the poll
+# built for it anyway, so it would buy the pid hazards and nothing else.
+STOP_REQUEST_FILE = "stop.request.json"
+# How often a run looks for that ask. Two seconds is far below the cost of anything it ends and
+# far above the cost of a stat of one small file.
+STOP_POLL_S = 2.0
 # The run's whole egress capture. One process writes it and any continuation appends to it, so
 # the published summary covers the cell rather than only its last stretch.
 EGRESS_LOG = "egress.tsv"
@@ -1475,6 +1577,81 @@ EGRESS_LOG = "egress.tsv"
 # cell that is waiting for a window from one that failed. 75 is the conventional "temporary
 # failure, try the same thing again later", which is exactly what this is.
 SUSPENDED_EXIT_CODE = 75
+
+
+def write_stop_request(run_dir: Path, *, reason: str = "") -> dict[str, Any]:
+    """Record an operator's ask that this run end, and return what was written.
+
+    Written by the CLI rather than by a runner, so nothing here assumes a live process or reads
+    one's state. What it holds is only what the leg verdict will carry: when it was asked for, and
+    the operator's own words about why. The reason is free text and reaches a published artifact
+    through the verdict, so it goes through the same redaction every other durable file does, at
+    the point it is published rather than here.
+    """
+    request = {
+        "schema": "shobench.stop_request/1",
+        "requested_at": time.time(),
+        "reason": reason,
+    }
+    write_json(run_dir / STOP_REQUEST_FILE, request)
+    return request
+
+
+def read_stop_request(run_dir: Path) -> dict[str, Any] | None:
+    """The operator's ask, or ``None`` where there is none or it cannot be read.
+
+    An unreadable request reads as no request, which is the fail-safe direction: a half-written
+    file is one a writer is still finishing, and the next poll a couple of seconds later reads the
+    finished one. Failing the other way would end a run on a partial line.
+    """
+    path = run_dir / STOP_REQUEST_FILE
+    try:
+        request = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return request if isinstance(request, dict) else None
+
+
+@contextlib.contextmanager
+def _watching_for_stop(ctx: RunContext):
+    """Fire the run's operator-stop handle as soon as an operator asks for one, for this block.
+
+    A thread rather than a coroutine, because the ask has to be noticed while the event loop is
+    parked on a leg that owns a worker thread, and because it has to be noticed BETWEEN phases as
+    well, where no stream and no loop task exists to hang a watcher off. It runs for the whole of
+    the phases, so a stop asked for at any moment of a run reaches whatever is running then.
+
+    Firing the handle is all it does. What that means for a leg is the supervisor's (it ends the
+    container the way a timeout does), and what it means for the run is the phase loop's (no
+    further phase starts). Nothing here writes a record or ends a process: an operator stop that
+    left the normal ending path is the exact failure this whole entry exists to remove.
+    """
+    done = threading.Event()
+
+    def poll() -> None:
+        while True:
+            request = read_stop_request(ctx.run_dir)
+            if request is not None:
+                ctx.operator_stop.fire(ctx.harness.operator_verdict(request=request))
+                # Consumed the moment it is latched, because it is a one-shot ask and the leg
+                # verdict is where it becomes durable. Left on disk it would end the next process
+                # to open this directory, so an operator who stopped a run and later reopened it
+                # to repair an eval hole would watch the repair stop itself.
+                with contextlib.suppress(OSError):
+                    (ctx.run_dir / STOP_REQUEST_FILE).unlink()
+                return
+            if done.wait(STOP_POLL_S):
+                return
+
+    watcher = threading.Thread(target=poll, name="shobench-stop", daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        done.set()
+        # Bounded, and a daemon thread besides: a watcher that somehow wedged on a read must not
+        # be what keeps a finished run from publishing.
+        watcher.join(timeout=STOP_POLL_S * 2)
 
 
 @dataclass(frozen=True)
@@ -1678,6 +1855,7 @@ ROLLOUT_ONLY_CELL_FIELDS = (
     "max_in_flight",
     "budget.rollout_wall_clock_s",
     "budget.pool_ceiling",
+    "budget.rollout_no_progress_s",
 )
 
 # The digests a bookend rests on once it has given up the whole-cell one: the only remaining proof
@@ -1798,9 +1976,14 @@ _MISSING = object()
 
 # The only absences read as values rather than as differences, because each is a versioned axis
 # whose pre-axis meaning is known: never was the only rollout posture before the feedback arm
-# existed, and cold the only eval posture before the eval context did. Nothing else is
+# existed, cold the only eval posture before the eval context did, and a rollout ran under no
+# no-progress bound at all before that bound existed, which is what 0 spells. Nothing else is
 # normalized. A field this list does not name is missing, not defaulted, and missing refuses.
-LEGACY_AXIS_DEFAULTS = {"rollout_feedback": "never", "eval_context": "cold"}
+LEGACY_AXIS_DEFAULTS: dict[str, Any] = {
+    "rollout_feedback": "never",
+    "eval_context": "cold",
+    "budget.rollout_no_progress_s": 0,
+}
 
 
 def _flat_cell(cell_manifest: dict[str, Any]) -> dict[str, Any]:
@@ -1830,8 +2013,8 @@ def _cell_differences(
 
     The union is what makes it fail closed. A field added to the cell after a run was recorded
     exists on one side only, and so does one since removed, so presence is compared before values
-    and a field missing on one side differs from one present with any value at all. The two
-    legacy axes are the exception, and only because their pre-axis meaning is known.
+    and a field missing on one side differs from one present with any value at all. The versioned
+    axes are the exception, and only because their pre-axis meaning is known.
 
     ``_MISSING`` is kept in the result rather than rendered, so each caller can say absence its
     own way: unambiguously in a refusal line, and as the published string in the record.
@@ -1881,15 +2064,29 @@ def cell_field_drift(
     }
 
 
+def recorded_no_progress_bound(manifest: dict[str, Any]) -> int:
+    """The no-progress bound the recorded rollout actually ran under.
+
+    Absence is a value here rather than a gap, which is what separates it from the eval runtime
+    below: every rollout before the bound existed ran with none, so a record without the field
+    states an unbounded rollout as surely as a record with a zero does. A reopening recovers that
+    unboundedness instead of quietly labelling an eight hour rollout with a bound nobody applied
+    to it.
+    """
+    budget = manifest.get("cell", {}).get("budget", {})
+    return int(budget.get("rollout_no_progress_s") or 0)
+
+
 def bookend_cell(cell: Cell, source_manifest: dict[str, Any]) -> Cell:
     """The cell a rebookend actually runs: the source's recorded arm and eval runtime, resumed.
 
-    Three fields come from the record rather than from the checkout, each for its own reason. The
+    Four fields come from the record rather than from the checkout, each for its own reason. The
     feedback arm is what the source's rollout served, so a never-arm source publishes honestly as
     never plus resumed. The eval runtime is the stopping rule the before side was scored under,
     and a paired delta whose two sides ran under different rules is two measurements rather than
     one. The eval context is the single axis a rebookend exists to change, so it is pinned rather
-    than inherited.
+    than inherited. The rollout's no-progress bound is a fact about the rollout the bookend
+    inherits a home from and never re-runs, so the checkout's current value would relabel it.
 
     The runner and the plan both build the cell here, so the plan's verdict is the runner's.
     Where the record carries no eval runtime to inherit, the checkout's value stands and the
@@ -1900,7 +2097,11 @@ def bookend_cell(cell: Cell, source_manifest: dict[str, Any]) -> Cell:
         cell,
         rollout_feedback=recorded_rollout_feedback(source_manifest),
         eval_context="resumed",
-        budget=replace(cell.budget, **_inheritable_eval_runtime(source_manifest)),
+        budget=replace(
+            cell.budget,
+            rollout_no_progress_s=recorded_no_progress_bound(source_manifest),
+            **_inheritable_eval_runtime(source_manifest),
+        ),
     )
 
 
@@ -1924,10 +2125,17 @@ def reopened_cell(cell: Cell, manifest: dict[str, Any]) -> Cell:
         cell,
         rollout_feedback=recorded_rollout_feedback(manifest),
         eval_context=recorded_eval_context(manifest),
+        # The rollout this run recorded ran under the bound its record names, and a run recorded
+        # before the bound existed ran under none. A reopening runs no rollout, so this changes
+        # nothing it does; it keeps the reconstructed cell from describing the finished rollout
+        # by today's number.
+        budget=replace(
+            cell.budget, rollout_no_progress_s=recorded_no_progress_bound(manifest)
+        ),
     )
     if "rebookend" not in manifest:
         # Every other run recorded the checkout's own budget, and the digest check that follows
-        # refuses if the file moved since, so there is nothing here to reconstruct.
+        # refuses if the file moved since, so there is nothing more here to reconstruct.
         return cell
     return replace(cell, budget=replace(cell.budget, **_inheritable_eval_runtime(manifest)))
 
@@ -2491,6 +2699,150 @@ def _suspend_eval_and_exit(ctx: RunContext, *, phase: str, verdict: StopVerdict)
     )
 
 
+# How much of a leg's tree the progress reading will walk before it gives up on answering.
+#
+# An agent that npm-installs into /work makes the walk arbitrarily large, and a reading that took
+# a measurable share of the poll interval would be a cost the measurement pays for a guard rail.
+# Hitting the cap is reported as progress rather than as silence, which is the fail-safe
+# direction: the worst it produces is a rollout with no stall detection, which is what every
+# rollout had before this existed, while the other direction would end a working leg because its
+# working directory got big.
+PROGRESS_WALK_LIMIT = 20_000
+
+# How often the rollout's progress reading is taken, as a share of the bound it is measuring
+# against, and the ceiling on that. A tenth of the bound puts at most a tenth of it between the
+# real moment of silence and the reading that notices, and the ceiling keeps a long bound from
+# turning into a long blind spot: at the default bound this is a minute.
+PROGRESS_POLL_FRACTION = 0.1
+PROGRESS_POLL_CEILING_S = 60.0
+
+
+def _tree_pulse(root: Path, *, limit: int = PROGRESS_WALK_LIMIT) -> tuple[int, int, int]:
+    """A cheap fingerprint of a directory tree: how many files, how many bytes, newest write.
+
+    Any write anywhere under ``root`` moves at least one of the three, and none of them moves on
+    its own, which is the whole requirement: this is asked only whether the tree CHANGED between
+    two readings, never what it holds.
+
+    A tree that cannot be read, or one past the walk limit, answers with a value that can never
+    equal another reading, so the caller records progress and the clock resets. Both are the
+    fail-safe direction: an unreadable or enormous tree makes the check inert rather than making
+    it fire.
+    """
+    files = 0
+    total = 0
+    newest = 0
+    try:
+        for parent, _dirs, names in os.walk(root):
+            for name in names:
+                files += 1
+                if files > limit:
+                    raise RuntimeError("tree past the walk limit")
+                stat = os.stat(Path(parent) / name, follow_symlinks=False)
+                total += stat.st_size
+                newest = max(newest, stat.st_mtime_ns)
+    except (OSError, RuntimeError):
+        return (-1, -1, time.monotonic_ns())
+    return (files, total, newest)
+
+
+def _file_pulse(path: Path) -> tuple[int, int]:
+    """The same fingerprint for one file: its size and its last write.
+
+    Size alone would miss a rewrite of equal length, and mtime alone can be coarse on a filesystem
+    that stores it in seconds; together they move on any append, which is all a trace ever does.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return (-1, -1)
+    return (stat.st_size, stat.st_mtime_ns)
+
+
+def rollout_progress(ctx: RunContext, *, trace_path: Path, prov_dir: Path) -> tuple[Any, ...]:
+    """Every source that says the rollout leg is getting somewhere, read as one value.
+
+    Silence in the TRACE is not evidence of a stall, and keying on it alone would end exactly the
+    legs worth keeping. A task can legitimately take an hour inside one tool call, so any bound
+    short enough to catch a non-terminating call is short enough to kill real computation. And an
+    agent that delegates goes quiet in its own trace by design while the work happens elsewhere:
+    prime's RLM children and claude's subagents are both this shape, and a parent trace that has
+    stopped growing is indistinguishable from a hang if growth is the only thing being read.
+
+    So the reading is over four sources, and any one of them moving resets the clock:
+
+    - the leg's own trace, which grows on every record the harness emits;
+    - the rollout's provenance, which gains a file on every dispense and every sealed row;
+    - the harness's session state under the cell HOME, which is where a delegating agent's
+      children are written (prime keeps its RLM children under ``session-artifacts/<id>/sub-*``,
+      claude and codex append their sidechains into the session transcripts);
+    - the cell's ``/work``, which is the writable directory every harness runs in, so an agent
+      building something has to touch it.
+
+    A stall is the ABSENCE of all four while the container is alive, which is what the observed
+    wedge produced: pure in-memory recursion, holding a core at 100 percent, writing nothing
+    anywhere for half an hour.
+    """
+    return (
+        _file_pulse(trace_path),
+        _tree_pulse(prov_dir),
+        tuple(_tree_pulse(ctx.sandbox.home / rel) for rel in ctx.harness.session_state_dirs),
+        _tree_pulse(ctx.sandbox.workdir),
+    )
+
+
+def _progress_poll_s(bound_s: float) -> float:
+    """How often to take the reading, given the bound it is measuring against."""
+    return max(1.0, min(PROGRESS_POLL_CEILING_S, bound_s * PROGRESS_POLL_FRACTION))
+
+
+async def _watch_for_no_progress(
+    ctx: RunContext,
+    ending: EarlyEnding,
+    *,
+    trace_path: Path,
+    prov_dir: Path,
+    bound_s: float,
+    poll_s: float | None = None,
+) -> bool:
+    """Fire ``ending`` once nothing in :func:`rollout_progress` has moved for ``bound_s``.
+
+    Runs on the rollout's event loop beside the leg, which holds a worker thread, and is
+    cancelled when the leg ends. That is also what scopes the check to a LIVE container: this
+    coroutine exists exactly as long as the leg does, so there is no reading of a leg that already
+    finished and no clock running against one that never started.
+
+    Scoped to the rollout, and only the rollout. Every eval leg is already bounded by the cell's
+    ``eval_task_timeout_s``, and where that bound is legitimately an hour a second guard adds
+    little; the rollout is one long session with nothing bounding a single tool call, which is
+    where this bit.
+
+    The clock is over the CONDITION rather than over the first time it was seen: any reading that
+    differs from the last resets it, so a leg that goes quiet, writes one line, and goes quiet
+    again gets the whole bound again from the line.
+    """
+    poll_s = _progress_poll_s(bound_s) if poll_s is None else poll_s
+    pulse = rollout_progress(ctx, trace_path=trace_path, prov_dir=prov_dir)
+    since = time.monotonic()
+    while True:
+        await asyncio.sleep(poll_s)
+        try:
+            reading = rollout_progress(ctx, trace_path=trace_path, prov_dir=prov_dir)
+        except Exception:
+            # A watcher that cannot read the state never ends a leg on that failure. It reads
+            # files another party is writing, and the cost of guessing wrong in this direction is
+            # a rollout bounded by its wall clock exactly as it was before this existed.
+            pulse, since = None, time.monotonic()
+            continue
+        if reading != pulse:
+            pulse, since = reading, time.monotonic()
+            continue
+        silent = time.monotonic() - since
+        if silent >= bound_s:
+            ending.fire(ctx.harness.no_progress_verdict(bound_s=bound_s, silent_s=round(silent, 3)))
+            return True
+
+
 async def run_rollout_phase(
     ctx: RunContext, *, suspended: Suspension | None = None
 ) -> tuple[list[TaskResult], dict[str, Any]]:
@@ -2557,25 +2909,52 @@ async def run_rollout_phase(
     clock_s = suspended.rollout_wall_clock_s if resuming else budget.rollout_wall_clock_s
     remaining_s = suspended.remaining_rollout_s if resuming else clock_s
     ctx.port = free_port()
+    leg = suspended.legs_before if resuming else 0
+    # The rollout's own early ending, and the one leg in the run that can carry it. A leg with an
+    # empty queue in front of it is the charter's question and gets no drain handle; a leg that
+    # has stopped producing anything at all is not that, and the cell's bound is what says how
+    # long "at all" runs for. A bound of zero is a cell that asked for no such ending.
+    stalled = EarlyEnding()
+    bound_s = float(ctx.cell.budget.rollout_no_progress_s)
     async with stream, _served(stream, ctx.port):
         consumed_before = stream.queue_info().consumed
-        record = await asyncio.to_thread(
-            run_leg,
-            ctx,
-            phase="rollout",
-            leg=suspended.legs_before if resuming else 0,
-            system_prompt=ctx.instruction.rollout_system,
-            # A resumed rollout is continued, not begun. The arm defines two user turns for
-            # exactly this: kickoff opens a fresh run, continuation resumes one. Sending the
-            # opener again would run a suspended cell under a different intervention than the
-            # one its record names.
-            user_prompt=ctx.instruction.continuation if resuming else ctx.instruction.kickoff,
-            session_id=session_id,
-            resume=resuming,
-            timeout_s=remaining_s,
-            task_idx=None,
-            consumed_before=consumed_before,
+        watching = (
+            asyncio.create_task(
+                _watch_for_no_progress(
+                    ctx,
+                    stalled,
+                    trace_path=leg_trace_path(ctx.run_dir, "rollout", leg),
+                    prov_dir=prov_dir,
+                    bound_s=bound_s,
+                )
+            )
+            if bound_s > 0
+            else None
         )
+        try:
+            record = await asyncio.to_thread(
+                run_leg,
+                ctx,
+                phase="rollout",
+                leg=leg,
+                system_prompt=ctx.instruction.rollout_system,
+                # A resumed rollout is continued, not begun. The arm defines two user turns for
+                # exactly this: kickoff opens a fresh run, continuation resumes one. Sending the
+                # opener again would run a suspended cell under a different intervention than the
+                # one its record names.
+                user_prompt=ctx.instruction.continuation if resuming else ctx.instruction.kickoff,
+                session_id=session_id,
+                resume=resuming,
+                timeout_s=remaining_s,
+                task_idx=None,
+                consumed_before=consumed_before,
+                endings=(stalled,),
+            )
+        finally:
+            if watching is not None:
+                watching.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watching
         record.tasks_consumed_after = stream.queue_info().consumed
         stopping["legs"].append(record.to_json())
         if record.session_id:
@@ -2610,6 +2989,13 @@ async def run_rollout_phase(
             stopping["stop_reason"] = "agent_stopped_early"
         elif record.verdict.kind is StopKind.LEG_TIMEOUT:
             stopping["stop_reason"] = "timed_out"
+        elif record.verdict.kind is StopKind.OPERATOR:
+            # A person ended it, so the treatment is shorter than the cell intended and the
+            # artifact says so here. It is still a terminus: the agent's state at the moment it
+            # was stopped is real, and an eval_after belongs on the far side of it.
+            stopping["stop_reason"] = "operator_stopped"
+        elif record.verdict.kind is StopKind.STALLED:
+            stopping["stop_reason"] = "stalled"
         else:
             stopping["stop_reason"] = "harness_error"
         stopping["stop_evidence"] = record.verdict.to_json()
@@ -2732,6 +3118,8 @@ async def _run_phases(
         for phase in recorded_phases
     }
     stopping: dict[str, Any] = {}
+    # Phases an operator's stop kept from starting at all, named for the record.
+    stopped_before: list[str] = []
     if "rollout" in recorded_phases:
         # The rollout's stop classification is not in provenance, so it was persisted when the
         # rollout ended and is read back here. This is the path an eval_after resume takes: it
@@ -2739,21 +3127,40 @@ async def _run_phases(
         stopping = json.loads(
             (ctx.run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
         )
-    for phase in phases:
-        if phase == "rollout":
-            phase_rows[phase], stopping = await run_rollout_phase(ctx, suspended=suspended)
-            # Persist the stop classification the moment the rollout ends, so an eval_after
-            # suspension that follows can republish it: only the runner saw how the leg ended.
-            ctx.publish_json(ctx.run_dir / ROLLOUT_STOPPING_FILE, stopping)
-            # The durable measurement is taken here, at the rollout's terminus, and written into
-            # the manifest before eval_after runs. That is the whole boundary: what the rollout
-            # left, read at the moment the rollout ended, and never again afterwards. Taken at
-            # the end of the cell instead, anything an eval phase managed to write into the base
-            # home would be attributed to the rollout, and the reader would have no way to tell.
-            _snapshot_durable_state(ctx, manifest)
-        else:
-            phase_rows[phase] = await run_eval_phase(ctx, phase)
-        ctx.publish_json(ctx.run_dir / "legs.json", ctx.leg_records())
+    # Watched for the whole of the phases, so an operator's ask reaches a leg that is running now
+    # and a phase that has not started yet alike. The handle it fires is on the context, which is
+    # what every leg this process launches already carries.
+    with _watching_for_stop(ctx):
+        for phase in phases:
+            if ctx.operator_stop.fired.is_set():
+                # Asked for between phases. Nothing is running to end, so the ending is simply
+                # that no further phase begins; the run publishes what it has below, which is the
+                # whole point of stopping this way rather than by killing the process.
+                stopped_before.append(phase)
+                continue
+            if phase == "rollout":
+                phase_rows[phase], stopping = await run_rollout_phase(ctx, suspended=suspended)
+                # Persist the stop classification the moment the rollout ends, so an eval_after
+                # suspension that follows can republish it: only the runner saw how the leg ended.
+                ctx.publish_json(ctx.run_dir / ROLLOUT_STOPPING_FILE, stopping)
+                # The durable measurement is taken here, at the rollout's terminus, and written
+                # into the manifest before eval_after runs. That is the whole boundary: what the
+                # rollout left, read at the moment the rollout ended, and never again afterwards.
+                # Taken at the end of the cell instead, anything an eval phase managed to write
+                # into the base home would be attributed to the rollout, and the reader would
+                # have no way to tell.
+                _snapshot_durable_state(ctx, manifest)
+            else:
+                phase_rows[phase] = await run_eval_phase(ctx, phase)
+            ctx.publish_json(ctx.run_dir / "legs.json", ctx.leg_records())
+    if ctx.operator_stop.fired.is_set():
+        # Said in the manifest as well as in the leg that carries the verdict, because a reader of
+        # the published cell needs to know the treatment was cut short by a person before they read
+        # anything else about it. `phases_not_run` is what an operator recovers with: an
+        # operator-ended rollout leaves a real terminus, so `shobench rebookend` can still give the
+        # run its eval_after.
+        request = ctx.operator_stop.verdict.evidence if ctx.operator_stop.verdict else {}
+        manifest["operator_stop"] = {**request, "phases_not_run": stopped_before}
 
     # How many times a provider limit suspended and resumed this cell, counted off the one
     # place that record lives: a resumption entry is appended per continuation. Set whenever the
@@ -2832,6 +3239,16 @@ async def _run_phases(
                 "a finished measurement.",
                 file=sys.stderr,
             )
+    if "operator_stop" in manifest:
+        # The one thing an operator who stopped a run needs to be told: the records they stopped
+        # for are written, and what to do next with the terminus they preserved.
+        print(
+            f"[shobench] {ctx.cell.name}: STOPPED by an operator. The run's records are written "
+            f"({', '.join(sorted(stopped_before)) or 'no phase was skipped'} did not run); "
+            f"published as {results_path.name}. An operator-ended rollout has a real terminus, "
+            f"so `uv run shobench rebookend --run {ctx.run_dir}` can still give it an eval_after.",
+            file=sys.stderr,
+        )
     return results_path
 
 
@@ -4217,9 +4634,11 @@ __all__ = [
     "NOISE_FILES",
     "free_port",
     "is_noise",
+    "EarlyEnding",
     "LegRecord",
     "RunContext",
     "ROLLOUT_STOPPING_FILE",
+    "STOP_REQUEST_FILE",
     "SUSPENDED_EXIT_CODE",
     "SUSPENSION_FILE",
     "EvalSuspension",
@@ -4228,12 +4647,15 @@ __all__ = [
     "durable_filter",
     "cleanup",
     "read_eval_phase",
+    "read_stop_request",
     "rebookend_run",
     "resume_cell",
+    "rollout_progress",
     "run_cell",
     "terminal_session_in",
     "run_eval_phase",
     "run_leg",
     "run_rollout_phase",
     "write_home_files",
+    "write_stop_request",
 ]

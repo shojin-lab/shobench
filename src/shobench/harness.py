@@ -49,6 +49,16 @@ class StopKind(StrEnum):
     # the bare word `drained`, which shogym already uses for a row a stream close cut off in
     # flight; these are different events and a reader joining the two records must not merge them.
     DRAINED = "stream_drained"
+    # An operator asked for the run to end, and the runner ended the leg through its normal path
+    # so the records got written. Its own kind because what it says about the measurement is
+    # unlike any of the others: the treatment was cut short by a person, for a reason outside the
+    # experiment, and how far the agent had got when that happened is still a real terminus.
+    OPERATOR = "operator_stop"
+    # The runner ended a rollout leg that had shown no evidence of progress anywhere for the
+    # cell's bound. Its own kind because it is a statement about the leg rather than about the
+    # operator or the budget: the container was alive and something was still being paid for,
+    # and nothing the agent could be observed doing had moved.
+    STALLED = "no_progress"
     # The harness failed for a reason that is neither of the above.
     ERROR = "error"
     # No rule matched. Treated as an error, reported as itself.
@@ -316,6 +326,53 @@ class Harness:
             StopKind.DRAINED,
             "the task was sealed and the stream drained; the runner ended a leg that did not end",
             {"grace_s": grace_s},
+        )
+
+    def operator_verdict(self, *, request: dict[str, Any]) -> StopVerdict:
+        """The verdict for a leg an operator asked the runner to end.
+
+        Identical for every harness, and never overridden, for the same reason the timeout and
+        drain verdicts are: the decision was neither the agent's nor the harness's. It is its own
+        kind rather than any of the three it sits between, and each exclusion carries a fact a
+        reader needs. It is not a chosen stop, because the agent chose nothing and the stopping
+        metrics must not count it. It is not a leg timeout, because the budget did not run out and
+        reading it as one would say the harness sustained the whole clock. It is not a usage-limit
+        suspension, because nothing is waiting for a window to reopen: the run is over, and what a
+        continuation would resume is a treatment the operator deliberately ended.
+
+        What it leaves true is the thing the ending exists for. An operator-ended rollout has a
+        real terminus, being the agent's state at the moment it was stopped, so the run stays
+        bookendable and the shorter treatment is a fact the artifact states rather than a record
+        nobody can produce.
+
+        ``request`` is the operator's own record of the ask, carried through so the leg says who
+        ended it and why in the same place it says how.
+        """
+        return StopVerdict(
+            StopKind.OPERATOR,
+            "an operator asked for this run to end; the runner ended the leg through its "
+            "normal path so the run's records were written",
+            dict(request),
+        )
+
+    def no_progress_verdict(self, *, bound_s: float, silent_s: float) -> StopVerdict:
+        """The verdict for a rollout leg the runner ended for showing no progress anywhere.
+
+        Identical for every harness, and its own kind, because what it records is neither the
+        agent's decision nor the budget's arrival. The condition is an absence across every source
+        a working leg writes to (see :func:`shobench.runner.rollout_progress`), held for the
+        cell's own bound while the container was alive, which is why it is not read as a chosen
+        stop and not read as a timeout.
+
+        Both numbers are here rather than only the bound, because the bound is the rule and the
+        silence is what actually happened: a leg ended a second past its bound and a leg that had
+        been silent for twice it are different observations about the same rule.
+        """
+        return StopVerdict(
+            StopKind.STALLED,
+            "no trace record, sealed row, session artifact or /work change for the cell's "
+            "no-progress bound; the runner ended a leg that was producing nothing",
+            {"bound_s": bound_s, "silent_s": silent_s},
         )
 
     def _match_usage_limit(self, texts: dict[str, str]) -> StopVerdict | None:

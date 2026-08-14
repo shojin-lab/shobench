@@ -150,6 +150,23 @@ class Budget:
     # clock without touching the one-session-per-task guarantee. The rollout is unaffected: it
     # is a single sustained run, never a fan-out.
     eval_concurrency: int = 4
+    # How long the ROLLOUT leg may show no evidence of progress from any source before the runner
+    # ends it. 0 disables the check, which is also what a run recorded before this existed ran
+    # under.
+    #
+    # A bound rather than an expected task duration, because what is being bounded is silence and
+    # not work. The two are not a fixed ratio of each other: a yc_bench task runs an hour inside a
+    # single tool call, so its expected duration and the longest legitimate silence inside it are
+    # the same number, while an hle task takes minutes and can still be quiet for a long stretch
+    # behind a delegating agent. A knob whose value IS the bound needs no multiplier for a reader
+    # to know what a cell was measured under.
+    #
+    # The default is deliberately far above anything observed to be legitimate work. The longest
+    # single tool call in the archives is a yc_bench hour, so two hours refuses to fire on it
+    # twice over, while a rollout wedged on a non-terminating call loses two hours of an eight
+    # hour clock instead of all eight. A cell whose tasks are longer than that raises it; the
+    # eval phases are untouched either way, being bounded per task by eval_task_timeout_s.
+    rollout_no_progress_s: int = 7200
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -157,6 +174,7 @@ class Budget:
             "pool_ceiling": self.pool_ceiling,
             "eval_task_timeout_s": self.eval_task_timeout_s,
             "eval_concurrency": self.eval_concurrency,
+            "rollout_no_progress_s": self.rollout_no_progress_s,
         }
 
 
@@ -267,6 +285,7 @@ def load_cell(path: Path) -> Cell:
         pool_ceiling=budget_table.get("pool_ceiling"),
         eval_task_timeout_s=int(budget_table.get("eval_task_timeout_s", 3600)),
         eval_concurrency=int(budget_table.get("eval_concurrency", 4)),
+        rollout_no_progress_s=int(budget_table.get("rollout_no_progress_s", 7200)),
     )
     return Cell(
         name=_require(cell, "name", path),
