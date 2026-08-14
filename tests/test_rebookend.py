@@ -1575,6 +1575,62 @@ def test_rebookend_refuses_a_baseline_that_has_not_finished_its_eval_before(
     assert not (tmp_path / "results").exists()
 
 
+def test_the_cli_plan_names_a_partial_baseline_and_blocks_before_minting_a_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The front door, not only the backstop. The runner's refusal fires after ``owning_run``
+    has minted the new directory and its lock, so a plan that could not see a mid-repair
+    baseline sent an operator to a refusal that left an orphan run directory behind. The plan
+    names the ids, the --go blocks on them having created nothing, and the override is what
+    turns the block into the recorded choice the runner carries into the manifest."""
+    from shobench.cli import main as cli_main
+
+    cell = load_cell_by_name("smoke-automationbench-claude-code")
+    split = load_split_by_name(cell.split)
+    unsealed, absent = (int(task_id) for task_id in split.heldout.task_ids)
+    source_dir = _real_cell_source(tmp_path / "source")
+    baseline_dir = _real_cell_source(tmp_path / "baseline")
+    for idx in (unsealed, absent):
+        (baseline_dir / "eval_before" / f"task-{idx:05d}").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        runner,
+        "read_phase",
+        lambda prov_dir: (
+            [_drained(unsealed)]
+            if prov_dir.name == f"task-{unsealed:05d}" and prov_dir.parent.name == "eval_before"
+            else []
+        ),
+    )
+    reached: dict[str, object] = {}
+
+    async def fake_rebookend(source_run_dir, **kw):
+        reached.update(kw)
+        return tmp_path / "results" / "x.json"
+
+    monkeypatch.setattr(runner, "rebookend_run", fake_rebookend)
+    invocation = [
+        "rebookend", "--run", str(source_dir), "--baseline", str(baseline_dir),
+        "--runs", str(tmp_path / "runs"), "--results", str(tmp_path / "results"),
+    ]
+
+    assert cli_main(invocation) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["refusals"]["baseline_missing_task_ids"] == [absent]
+    assert plan["refusals"]["baseline_unsealed_task_ids"] == [unsealed]
+    assert plan["allow_partial_baseline"] is False
+
+    assert cli_main([*invocation, "--go"]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "--allow-partial-baseline" in err
+    assert str(absent) in err and str(unsealed) in err
+    # Nothing was minted: no run directory, no lock, and the runner was never entered.
+    assert not (tmp_path / "runs").exists()
+    assert reached == {}
+
+    assert cli_main([*invocation, "--allow-partial-baseline", "--go"]) == 0
+    assert reached["allow_partial_baseline"] is True
+
+
 def test_allow_partial_baseline_carries_the_gaps_and_records_them(
     tmp_path: Path, monkeypatch
 ) -> None:

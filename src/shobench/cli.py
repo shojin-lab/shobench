@@ -464,9 +464,13 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         "baseline_required": not source_has_before and baseline_dir is None,
     }
     baseline_run_id = manifest.get("run_id") if source_has_before else None
+    # The run whose rows the bookend will carry, which is the source itself when it measured
+    # its own before-side. Resolved here because the carry's completeness is read off it.
+    carried_from: Path | None = None
     if baseline_dir is not None:
         baseline_manifest_path = baseline_dir / "manifest.json"
         if baseline_manifest_path.is_file():
+            carried_from = baseline_dir
             baseline_manifest = json.loads(baseline_manifest_path.read_text(encoding="utf-8"))
             baseline_run_id = baseline_manifest.get("run_id")
             baseline_states.update(
@@ -498,10 +502,25 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         # Self-paired: the before rows are the source's own, so the pairing is a record against
         # itself and every fact it states matches. What it does NOT state is still evidence the
         # plan owes an operator, and the manifest carries it either way.
+        carried_from = source_dir
         baseline_states["baseline_pairing_drift"] = runner.pairing_drift(manifest, manifest)
         baseline_states["baseline_pairing_unproven"] = runner.pairing_unproven(
             manifest, manifest
         )
+    if carried_from is not None:
+        # What the carry would freeze, read off the baseline's own provenance by the function
+        # the creation path reads it with. A baseline mid-repair is the one refusal state a
+        # plan could not see, and the run it named went on to seal the rest minutes later.
+        heldout_ids = [int(task_id) for task_id in split.heldout.task_ids]
+        try:
+            gaps = runner.baseline_carry_gaps(
+                runner.read_baseline_before(carried_from, heldout_ids), task_ids=heldout_ids
+            )
+        except RuntimeError as exc:
+            baseline_states["baseline_rows_unreadable"] = str(exc)
+        else:
+            baseline_states["baseline_missing_task_ids"] = gaps["missing"]
+            baseline_states["baseline_unsealed_task_ids"] = gaps["unsealed"]
     # The third comparison, at the only stage a plan can make it. The facts that exist only
     # after a container and a credential are checked by the runner at the moment they become
     # knowable, still before any row.
@@ -563,6 +582,9 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         # Every held-out task, because a rebookend is a fresh bookend rather than a repair:
         # nothing is already complete in a run directory that does not exist yet.
         "heldout_tasks_to_run": len(split.heldout),
+        # Whether an operator has decided to carry a baseline that cannot account for every
+        # held-out id, which is what turns the refusal below into a recorded choice.
+        "allow_partial_baseline": args.allow_partial_baseline,
         # The artifact is SELF-CONTAINED: it carries the baseline run's eval_before rows
         # as its own before block, labeled eval_before.source_run_id, so the paired delta
         # lives inside the artifact and survives the baseline's cell-stem artifact being
@@ -622,6 +644,22 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         blockers.append(
             "the named baseline was not measured by the same definition as the source: "
             + "; ".join(refusals["baseline_pairing_drift"])
+        )
+    if refusals.get("baseline_rows_unreadable"):
+        blockers.append(
+            "the baseline's eval_before rows cannot be read: "
+            f"{refusals['baseline_rows_unreadable']}"
+        )
+    partial = bool(
+        refusals.get("baseline_missing_task_ids") or refusals.get("baseline_unsealed_task_ids")
+    )
+    if partial and not args.allow_partial_baseline:
+        blockers.append(
+            "the baseline has not finished its eval_before (no rows for held-out "
+            f"{refusals['baseline_missing_task_ids']}, no settled row for "
+            f"{refusals['baseline_unsealed_task_ids']}), so the carry would freeze those ids "
+            "into this bookend's artifact; finish it with `rerun-eval --phase eval_before` or "
+            "pass --allow-partial-baseline"
         )
     if refusals["suspension_present"]:
         blockers.append("the source holds a suspension record; finish it with `shobench resume`")
