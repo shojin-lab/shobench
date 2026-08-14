@@ -9,7 +9,7 @@
     shobench rerun-eval --run <run-dir> --go # finish an eval_after that lost tasks
     shobench rebookend --run <run-dir> --go # a resumed eval_after for an existing run, as a new run
     shobench report [results/]              # the summary table
-    shobench leakage <run-dir> ...          # per-episode leakage, from the run's egress record
+    shobench leakage <run-dir> ...          # the per-episode leakage floor, from egress
 
 ``--go`` is the whole safety story: every command that spends prints its plan and exits unless
 it is present. Nothing here launches the matrix; a cell is run one at a time by name.
@@ -890,7 +890,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     rep.set_defaults(func=lambda a: report.main([str(a.results), "--format", a.format]))
 
     leak = sub.add_parser(
-        "leakage", help="per-episode leakage buckets, read off a run's egress record"
+        "leakage",
+        help=(
+            "the per-episode leakage floor, read off a run's egress record; it stops at "
+            "unresolved leakage because egress cannot establish that content arrived"
+        ),
     )
     leak.add_argument("run_dirs", nargs="+", help="completed run directories")
     leak.add_argument("--format", choices=["table", "json"], default="table")

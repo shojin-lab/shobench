@@ -33,7 +33,7 @@ measurement isolates the durable-artifact channel.
     uv run shobench run --cell <name>           # a plan, no spend
     uv run shobench run --cell <name> --go      # the cell, for real
     uv run shobench report results/             # the summary table
-    uv run shobench leakage runs/<run-id>       # per-episode leakage, off the egress record
+    uv run shobench leakage runs/<run-id>       # per-episode leakage floor, off the egress record
 
 `--go` is the safety story. Every command that spends prints its plan and exits without it,
 and cells are run one at a time by name; nothing here launches the matrix.
@@ -77,7 +77,7 @@ it is only needed on a cold cache.
 | credentials | `src/shobench/credentials.py` | isolated HOME plus the negative control |
 | egress | `src/shobench/egress.py` | passive per-cell capture that restricts nothing |
 | reporting | `src/shobench/report.py` | the paired bootstrap and the summary table |
-| leakage | `src/shobench/leakage.py` | the egress record read as a per-episode leakage bucket |
+| leakage | `src/shobench/leakage.py` | the egress record read as a per-episode leakage floor |
 
 ### A few things worth knowing before reading the code
 
@@ -134,18 +134,21 @@ harness announces a usage limit, and where each rule came from.
 and answers are a public dataset, the cell has open egress by design, and the runner observes
 rather than gates. An episode won by reasoning and an episode won by downloading the answer key
 earn the same reward, so `shobench leakage` grades every episode before either number is read:
-computed locally, general web reference, attempted leakage, unresolved leakage, achieved
-leakage, with the correct-rate reported per bucket and never blended.
+computed locally, general web reference, attempted leakage, unresolved leakage, with the
+correct-rate reported per bucket and never blended.
 
-The egress capture is the floor because the agent has no mount of it, and it cannot reach the
-top of that ladder: it sees hostnames and times, never a method, a status or a body, and the
-Hub's file CDN serves the whole platform, so a client hello to it is a connection to a CDN and
-not a download of an answer key. Achieved needs content, and content is in the transcript: a
-result carrying the dataset's own answer columns, or a download whose destination the filesystem
-then answered for. Refinement reads commands rather than prose, so a URL the agent only talked
-about moves nothing.
+**This is the deterministic egress-derived floor, and its ceiling is unresolved.** The capture is
+what the agent has no mount of, which is why it is the floor; it sees hostnames and times, never
+a method, a status or a body, and the Hub's file CDN serves the whole platform, so a client hello
+to it is a connection to a CDN and not a download of an answer key. Nothing here establishes that
+answer content arrived, so there is no achieved bucket: reaching the answer source tops out at
+unresolved, and once a leg has reached it none of that container's later episodes can be cleared,
+because a local read of a fetched file leaves the observer nothing to see. The evidence that
+would settle those episodes is the transcript read for content, which is a follow-up change.
+
+The transcript is read here for two things and neither is content: a lease's terminal call, which
+bounds an episode's window, and the text of a command, which says what was asked for.
 
 An episode whose capture does not cover its window is `unclassified`, never clean, and the
 command refuses a run whose manifest has no `ended_at` unless asked twice. `--format json`
-carries every acquisition, the rivals a shared window was charged to, and the limits the
-numbers were read under.
+carries the rivals a shared window was charged to and the limits the numbers were read under.

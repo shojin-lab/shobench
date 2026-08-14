@@ -12,7 +12,11 @@ The ranks, weakest first:
     general_web_reference   the cell went out, but not to a host that distributes the answers
     attempted_leakage       the cell reached the answer source; no evidence a body moved
     unresolved_leakage      evidence consistent with a body having moved, not established
-    achieved_leakage        answer content demonstrably reached the episode
+
+There is no bucket above those, and that is the point of this half. Egress sees hostnames and
+times, never a method, a status or a body, so it can say a cell reached the answer source and it
+can never say the answers arrived. Establishing that needs the transcript read for content, which
+is a separate change; here the ceiling is unresolved.
 
 ``unclassified`` is not on that ladder. It is what an episode gets when the evidence is missing
 rather than empty, and it is the reason this command cannot quietly clear anything: an episode
@@ -26,21 +30,18 @@ whole platform rather than one dataset, so a client hello to it establishes a co
 CDN and not a download of an answer key. The highest an egress observation can carry an episode
 is ``unresolved_leakage``.
 
-**Achieved needs content, and content is in the transcript.** The trace records what the agent
-ran and what came back, and both halves are durable. Two things reach achieved:
+**The transcript is read for two things, and neither of them is content.** A lease's terminal
+call says where an episode ended, which is what bounds its window; and the text of a command
+says what the agent asked for, which can raise an episode to attempted or unresolved. A URL the
+agent only mentioned in prose is not a request, and no reading of the transcript here reaches
+past unresolved.
 
-- a result carrying the answer source's own answer fields, which is what a dataset row API
-  returns when it is not refusing;
-- a download whose destination the filesystem then answered for, and any later episode that
-  reads that destination.
+**A leg that has reached the answer source cannot be cleared afterwards.** Whatever a container
+fetched may be on its disk from that moment, and a local read leaves nothing for the observer to
+see, so every later episode in that container is unresolved at best. What such an episode
+actually did with such a file is content evidence, which this half does not carry.
 
-Refinement reads requests, not prose. Only the text of a command or tool call counts as a
-request, so a URL the agent merely mentioned in its reasoning cannot raise an episode, and a
-result is only read as answer content when it carries the corroborating fields the dataset ships
-alongside its answers, so the agent's own submission cannot be mistaken for a leak.
-
-Nothing the agent wrote about itself lowers a bucket, and no combination of trace text alone
-reaches achieved without content in a result.
+Nothing the agent wrote about itself lowers a bucket.
 
 Usage::
 
@@ -52,7 +53,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import posixpath
 import re
 from bisect import bisect_left
 from collections.abc import Iterable, Sequence
@@ -69,21 +69,12 @@ BUCKETS = (
     "general_web_reference",
     "attempted_leakage",
     "unresolved_leakage",
-    "achieved_leakage",
 )
 
 # Not a bucket: the label for an episode whose evidence is missing rather than empty.
 UNCLASSIFIED = "unclassified"
 
 PHASES = ("eval_before", "rollout", "eval_after")
-
-# The only two paths inside an agent container that are not thrown away with it. The runner
-# mounts the cell's HOME at ``/root`` and a working directory at ``/work``, and starts the
-# harness in the second, so a command with a relative destination writes to ``/work`` and not to
-# HOME. Everything outside those two mounts is the container's own layer, which is removed with
-# the container, which is why there is no "unknown" here: an unrecognised path is scratch.
-AGENT_HOME = "/root"
-AGENT_WORK = "/work"
 
 # Hosts a cell talks to because of how it is run rather than because of what it is answering:
 # the harness's model API and telemetry, and the package registries a tool install goes through.
@@ -161,13 +152,6 @@ _HUB_CALLS = ("load_dataset(", "hf_hub_download(", "snapshot_download(")
 
 _SUBMIT = re.compile(r"submit_answer")
 _URL = re.compile(r"https?://[^\s\"'\\<>)\]}]+")
-# Where a shell command says to put what it fetches.
-_DESTINATION = re.compile(
-    r"(?:(?<=\s)|^)(?:-o|-O|--output|--output-document)[=\s]+([^\s'\";|&)]+)"
-    r"|>\s*([^\s'\";|&)]+)"
-)
-
-
 def _matches(host: str, patterns: Iterable[str]) -> bool:
     host = host.lower().rstrip(".")
     return any(fnmatchcase(host, pattern) for pattern in patterns)
@@ -208,80 +192,6 @@ def content_url_kind(url: str, source: AnswerSource | None) -> str | None:
     if source is not None and _matches(host, source.rows) and path in _ROW_ENDPOINTS:
         return "row_query"
     return None
-
-
-def carries_answer_content(text: str, source: AnswerSource | None) -> bool:
-    """Does this result carry rows of the answer key, as opposed to naming one?
-
-    The answer field beside one of the columns the dataset ships next to it. The pairing is what
-    separates a fetched row from the agent's own ``submit_answer`` arguments, which carry an
-    answer and nothing that travels with one.
-    """
-    if source is None or not source.corroborating_fields:
-        return False
-    if not re.search(rf'"{re.escape(source.answer_field)}"\s*:', text):
-        return False
-    alternatives = "|".join(re.escape(f) for f in source.corroborating_fields)
-    return bool(re.search(rf'"(?:{alternatives})"\s*:', text))
-
-
-def download_destinations(command: str) -> list[str]:
-    """Where a command says to save what it fetches.
-
-    Only paths: a bare word after ``-o`` is as likely to be ``find``'s or operator as a file, so
-    a destination has to look like one.
-    """
-    out = []
-    for match in _DESTINATION.finditer(command):
-        candidate = (match.group(1) or match.group(2) or "").strip()
-        if not candidate or candidate.startswith("-"):
-            continue
-        if "/" in candidate or candidate.lower().endswith(_ARTIFACT_SUFFIXES):
-            out.append(candidate)
-    return list(dict.fromkeys(out))
-
-
-def destination_persistence(path: str) -> str:
-    """Which of the container's three storage classes a saved file lands in.
-
-    ``home`` is the ``/root`` mount, ``work`` is the ``/work`` mount, and ``container`` is
-    everything else, which the container layer holds and ``docker run --rm`` deletes.
-
-    A relative path is resolved against ``/work``, because that is the working directory the
-    harness is started in. Reading a bare ``curl -o key.parquet`` as a HOME file would claim a
-    durability the file does not have.
-    """
-    expanded = path.strip()
-    if expanded == "~" or expanded.startswith("~/"):
-        expanded = AGENT_HOME + expanded[1:]
-    elif expanded.startswith("$HOME"):
-        expanded = AGENT_HOME + expanded[len("$HOME") :]
-    if not expanded.startswith("/"):
-        expanded = f"{AGENT_WORK}/{expanded}"
-    # Dot segments are resolved before the mounts are tested, because a prefix is not a path:
-    # ``/work/../root/key.parquet`` is a HOME file and reads as a working-directory one to
-    # anything comparing the first characters.
-    expanded = posixpath.normpath(expanded)
-    for root, label in ((AGENT_HOME, "home"), (AGENT_WORK, "work")):
-        if expanded == root or expanded.startswith(f"{root}/"):
-            return label
-    return "container"
-
-
-# How far a saved file can still be read from, given where it landed and which phase saved it.
-#
-# The rollout runs in one container per leg against the cell's mounted HOME and one mounted
-# ``/work``, and the runner copies that HOME into every eval task and into a bookend's tasks. So
-# a rollout HOME file reaches the whole run and its bookends, and a rollout ``/work`` file
-# reaches the rest of the rollout but no eval task, which is given a fresh empty one.
-#
-# An eval task is its own container with a private copy of HOME and its own ``/work``, both
-# discarded when the task ends. Nothing it saves anywhere reaches any other episode, which is
-# what makes ``episode`` the only honest reach for an acquisition made during an eval.
-def reach_of(persistence: str, phase: str) -> str:
-    if phase != "rollout":
-        return "episode"
-    return {"home": "run", "work": "phase"}.get(persistence, "leg")
 
 
 # ----- the capture ----------------------------------------------------------------------------
@@ -866,13 +776,8 @@ class EpisodeLeakage:
     requested: tuple[str, ...]
     covered: bool
     shared_with: tuple[dict[str, Any], ...]
-    # Every confirmed landing, not only the one the headline acquisition names. An episode that
-    # fetched twice put two files on disk, and the second is as durable as the first.
-    landings: tuple[dict[str, Any], ...]
     # Leases whose live region overlaps this episode's, so its commands are not exclusively its.
     action_rivals: tuple[str, ...]
-    acquisition: dict[str, Any] | None
-    inherited_from: dict[str, Any] | None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -888,14 +793,11 @@ class EpisodeLeakage:
                 "capture_covers": self.covered,
                 "shared_with": list(self.shared_with),
             },
-            "landings": [dict(landing) for landing in self.landings],
             "action_rivals": list(self.action_rivals),
             "bucket": self.bucket,
             "reasons": list(self.reasons),
             "evidence": [c.to_json() for c in self.evidence],
             "requested": list(self.requested),
-            "acquisition": self.acquisition,
-            "inherited_from": self.inherited_from,
             "correct": self.episode.correct,
             "success": self.episode.success,
             "reward": self.episode.reward,
@@ -903,23 +805,21 @@ class EpisodeLeakage:
 
 
 LIMITS = [
-    "egress observes hostnames and times, never a method, a status or a body, so no egress "
-    "observation on its own can reach achieved leakage",
+    "egress observes hostnames and times, never a method, a status or a body, so nothing here "
+    "can establish that answer content arrived; this half stops at unresolved leakage and the "
+    "content evidence that would settle it is a separate change",
     "the file CDN serves the whole platform, so a client hello to it is a connection to a CDN "
     "and not a download of an answer key",
     "hostname granularity cannot separate a listing endpoint from a data endpoint on a host "
     "that serves both",
-    "a local read of an already-downloaded file is invisible to the observer, so a resident "
-    "answer artifact is only charged to an episode whose own commands name it",
+    "a local read of an already-downloaded file is invisible to the observer, so once a leg has "
+    "reached the answer source none of its later episodes can be cleared",
     "egress cannot show intent, so a dataset host reached for a tokenizer and one reached for "
     "an answer key are the same observation",
     "episodes that overlap in time share one network namespace, so a connection inside more "
     "than one open window is charged to all of them and each record names its rivals",
     "a trace carries what the agent ran, so a harness whose transcript summarises rather than "
     "quotes contributes no request evidence and its episodes rest on egress alone",
-    "answer content is recognised by the dataset's own columns arriving in a result, so an "
-    "episode that fetched a mirror and printed a projection of it rather than its rows reads "
-    "as unresolved; observed in this corpus and left for the judge rather than guessed at",
 ]
 
 
@@ -966,9 +866,6 @@ class RunLeakage:
         ]
         return sum(1 for e in rows if e.episode.correct), len(rows)
 
-    def acquisitions(self) -> list[EpisodeLeakage]:
-        return [e for e in self.episodes if e.acquisition is not None]
-
     def to_json(self) -> dict[str, Any]:
         return {
             "schema": SCHEMA,
@@ -1004,7 +901,6 @@ class RunLeakage:
                 }
                 for phase in self.phases()
             ],
-            "acquisitions": [e.to_json() for e in self.acquisitions()],
             "notes": list(self.notes),
             "limits": LIMITS,
             "episodes": [e.to_json() for e in self.episodes],
@@ -1103,71 +999,6 @@ def _requested_urls(actions: Sequence[Action]) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
-def _answers_read_from_a_download(
-    actions: Sequence[Action], source: AnswerSource | None
-) -> list[dict[str, Any]]:
-    """Files fetched from anywhere, then read back as rows of the answer key.
-
-    The host table can never be complete. The answers are mirrored on the Hub, and they are also
-    mirrored in git repositories, on personal sites, and inside PDFs, so an episode that fetched
-    one of those and read the answers out of it would be invisible to a rule that starts from a
-    hostname. This one starts from the content instead: something was fetched from the network
-    to a named path, a later command read that path, and what came back carries the dataset's
-    own answer columns. The fetch is what separates this from an agent printing its own
-    reasoning as JSON, which has an answer and a rationale in it like any row does.
-    """
-    fetched: list[dict[str, Any]] = []
-    for action in actions:
-        if action.kind.startswith("mcp:") or not _URL.search(action.request):
-            continue
-        # A URL beside a destination is not a transfer. ``echo x > /tmp/key.json`` with a link in
-        # a trailing comment names both and fetches nothing, and the file it leaves behind is the
-        # agent's own writing however much the later read looks like a dataset.
-        if not _is_network_fetch(action.request):
-            continue
-        url = _tidy_url(_URL.search(action.request).group(0))
-        for destination in download_destinations(action.request):
-            fetched.append({"destination": destination, "url": url, "offset": action.offset})
-    found = []
-    seen: set[str] = set()
-    for download in fetched:
-        destination = download["destination"]
-        if destination in seen:
-            continue
-        for action in actions:
-            if (
-                action.offset >= download["offset"]
-                and action.ok
-                and _reads_the_file(action, destination)
-                and carries_answer_content(action.result, source)
-            ):
-                seen.add(destination)
-                found.append(
-                    {**download, "persistence": destination_persistence(destination)}
-                )
-                break
-    return found
-
-
-def _still_reachable(artifact: dict[str, Any], episode: Episode) -> bool:
-    """Can this episode's container still open that file?
-
-    The reach was fixed when the file landed, by where it went and which phase put it there.
-    ``run`` is the rollout's HOME, which every later episode of the run runs against a copy of;
-    ``phase`` is the rollout's ``/work``, shared by the rollout's legs and by nothing else;
-    ``leg`` is that container's own scratch; and ``episode`` is anything an eval task saved,
-    since its HOME copy and its ``/work`` are thrown away when the task ends.
-    """
-    reach = artifact.get("reach", "leg")
-    if reach == "run":
-        return True
-    if reach == "phase":
-        return artifact.get("phase") == episode.phase
-    if reach == "leg":
-        return artifact.get("phase") == episode.phase and artifact.get("leg") == episode.leg
-    return False
-
-
 def _answer_source_urls(actions: Sequence[Action], source: AnswerSource | None) -> list[str]:
     """The answer-source URLs these actions asked for, in the order they were asked."""
     urls = []
@@ -1180,18 +1011,6 @@ def _answer_source_urls(actions: Sequence[Action], source: AnswerSource | None) 
     return list(dict.fromkeys(urls))
 
 
-def _asks_the_answer_source(action: Action, source: AnswerSource | None) -> bool:
-    """Did this action's own command go to the answer source?
-
-    A result is only the answer key arriving if something went and asked the answer source for
-    it. The question is asked of the request, never of the result, so text that came back from
-    somewhere else cannot make an episode look like it fetched a dataset.
-    """
-    if _answer_source_urls([action], source):
-        return True
-    return any(call in action.request for call in _HUB_CALLS)
-
-
 def _tidy_url(url: str) -> str:
     """Cut a URL out of the shell it was quoted in, so a template still names its route."""
     for marker in ("${", "$(", "`"):
@@ -1202,13 +1021,13 @@ def _tidy_url(url: str) -> str:
 
 
 def _accounts_for_its_home(source: RunLeakage) -> tuple[bool, str]:
-    """Can this run say what its rollout left in the HOME a bookend would inherit?
+    """Can this run say the HOME a bookend would inherit holds no answer file?
 
-    Only its rollout matters, since that is the phase whose writes land in the mounted HOME. It
-    accounts for that HOME when every rollout episode could be classified and every transfer in
-    it was located. An episode this could not classify is one where anything may have happened,
-    and an episode where a body may have moved with no destination found is one where the answer
-    key may be sitting in HOME now; neither is a record another run can be cleared against.
+    Only its rollout matters, since that is the phase whose writes land in the mounted HOME. On
+    the egress floor the answer is yes only when that rollout was fully observed and never
+    reached the answer source at all. An episode this could not classify is one where anything
+    may have happened; an episode that did reach the answer source may have saved what it found,
+    and where a fetched file landed is content evidence this half does not carry.
     """
     rollout = [e for e in source.episodes if e.episode.phase == "rollout"]
     if not rollout:
@@ -1216,93 +1035,45 @@ def _accounts_for_its_home(source: RunLeakage) -> tuple[bool, str]:
     blind = sum(1 for e in rollout if e.bucket == UNCLASSIFIED)
     if blind:
         return False, f"could not classify {blind} of its {len(rollout)} rollout episodes"
-    unlocated = sum(
-        1
-        for e in rollout
-        if e.acquisition is None
-        and ("content_cdn_handshake" in e.reasons or "file_download_unconfirmed" in e.reasons)
-    )
-    if unlocated:
+    contacted = sum(1 for e in rollout if _rank(e.bucket) >= _rank("attempted_leakage"))
+    if contacted:
         return False, (
-            f"has {unlocated} rollout episodes where a body may have moved with no destination "
-            "found for it"
+            f"reached the answer source in {contacted} of its {len(rollout)} rollout episodes, "
+            "and where anything it fetched landed is not on this record"
         )
     return True, ""
 
 
-def _inherited_artifacts(
-    run_dir: Path, manifest: dict[str, Any]
-) -> tuple[list[dict], list[str], bool]:
-    """What a bookend starts with, because it starts with its source's HOME.
+def _inherited_artifacts(run_dir: Path, manifest: dict[str, Any]) -> tuple[list[str], bool]:
+    """Whether a bookend can be cleared against the HOME it inherited.
 
     A rebookend runs a new eval against the run it names, and the runner seeds it from that
-    run's accumulated HOME, which every eval task then gets a copy of. So an answer file the
-    source saved under HOME is on disk in this run before its first episode begins. An artifact
-    the source left somewhere ephemeral is not: that path died with the source's containers.
+    run's accumulated HOME, which every eval task then gets a copy of. So a file the source's
+    rollout saved under HOME is on disk in this run before its first episode begins.
 
-    Finding no such artifact is only worth something when the source could have shown one. A
-    source with no capture, with windows its observer was not watching, or with a record still
-    being written produces no acquisitions for the same reason it produces no classifications,
-    and reading that silence as a clean HOME would clear this run on the strength of another
-    run's missing evidence. So the answer is three-valued: what crossed, and whether the
-    question could be answered at all.
+    The floor can only answer this one way. It can say the source was fully observed and never
+    reached the answer source, in which case there is nothing to have inherited; it cannot say
+    what a source that did reach the answer source put where. Tracking that file is content
+    evidence and lives in the follow-up, so short of a clean source this run is not cleared.
     """
     rebookend = manifest.get("rebookend") or {}
     source_id = rebookend.get("rebookend_of")
     if not source_id:
-        return [], [], False
+        return [], False
     source_dir = run_dir.parent / str(source_id)
     if not source_dir.is_dir():
-        return (
-            [],
-            [
-                f"this run is a bookend of {source_id}, whose directory is not beside it, so "
-                "whether the source left an answer file in the HOME this run inherited cannot "
-                "be checked; no episode here is cleared"
-            ],
-            True,
-        )
-    source = classify_run(source_dir, _inherit=False)
-    # Only what the source's ROLLOUT put in HOME crosses. Its ``/work`` is not copied, its
-    # scratch died with its containers, and a file one of its own eval tasks saved lived in that
-    # task's private copy of HOME, which the runner discards; none of those are in the HOME this
-    # bookend was seeded from.
-    carried = [
-        {
-            "destination": landing["destination"],
-            "persistence": "home",
-            "reach": "run",
-            "phase": None,
-            "leg": None,
-            "acquisition": {
-                **e.episode.identity(),
-                "run_id": source.run_id,
-                "destination": landing["destination"],
-                "persistence": "home",
-                "reach": "run",
-            },
-        }
-        # Every landing, not only the headline one. An episode that saved to scratch and then to
-        # HOME left a durable file behind either way, and reading only the first acquisition
-        # would hand this bookend a clean bill on the strength of the scratch copy.
-        for e in source.episodes
-        if e.episode.phase == "rollout"
-        for landing in e.landings
-        if landing.get("destination") and landing.get("persistence") == "home"
-    ]
-    notes = []
-    if carried:
-        notes.append(
-            f"inherited {len(carried)} durable answer artifacts from {source_id}'s rollout HOME, "
-            "which this run's eval tasks are copies of"
-        )
-    accounted, why = _accounts_for_its_home(source)
-    if not accounted:
-        notes.append(
-            f"this run is a bookend of {source_id}, which {why}. Whether the HOME it inherited "
-            "holds an answer file cannot be established, so no episode here is cleared"
-        )
-    return carried, notes, not accounted
+        return [
+            f"this run is a bookend of {source_id}, whose directory is not beside it, so "
+            "whether the source left an answer file in the HOME this run inherited cannot be "
+            "checked; no episode here is cleared"
+        ], True
+    accounted, why = _accounts_for_its_home(classify_run(source_dir, _inherit=False))
+    if accounted:
+        return [], False
+    return [
+        f"this run is a bookend of {source_id}, which {why}. Whether the HOME it inherited "
+        "holds an answer file cannot be established, so no episode here is cleared"
+    ], True
 
 
 def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
@@ -1339,13 +1110,10 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             }
             episodes += phase_episodes
 
-    inherited_artifacts: list[dict[str, Any]] = []
     inheritance_notes: list[str] = []
     unresolved_inheritance = False
     if _inherit:
-        inherited_artifacts, inheritance_notes, unresolved_inheritance = _inherited_artifacts(
-            run_dir, manifest
-        )
+        inheritance_notes, unresolved_inheritance = _inherited_artifacts(run_dir, manifest)
 
     notes = _capture_notes(capture, finished) + _coverage_notes(legs, episodes)
     notes += inheritance_notes
@@ -1358,11 +1126,9 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
     starts = [c.epoch for c in capture.connections]
     ordered = sorted(episodes, key=lambda e: (e.started_at if e.started_at is not None else 0.0))
     graded: list[EpisodeLeakage] = []
-    # Artifacts already on disk, and where each can still be read from: an ephemeral path only
-    # inside the leg that fetched it, a HOME path anywhere later in the run because the runner
-    # copies HOME into every eval task, and an unknown path anywhere later because unknown is
-    # not the same as gone.
-    resident: list[dict[str, Any]] = list(inherited_artifacts)
+    # When each leg first reached the answer source, so a later episode in the same container is
+    # not cleared over a file that may have been sitting on its disk since.
+    contacted: dict[str, float] = {}
 
     for episode in ordered:
         evidence = _window_evidence(episode, capture.connections, starts)
@@ -1370,8 +1136,6 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         requested = _requested_urls(actions)
         covered = capture.covers(episode.started_at, episode.ended_at)
         reasons: list[str] = []
-        acquisition: dict[str, Any] | None = None
-        inherited: dict[str, Any] | None = None
 
         if not capture.available:
             bucket = UNCLASSIFIED
@@ -1426,111 +1190,21 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             bucket = _raise_to(bucket, "attempted_leakage")
             _note(reasons, "hub_download_call")
 
-        # What came back, from the command that went and asked for it. The answer columns have
-        # to arrive in the result of an action whose own request reached the answer source:
-        # otherwise an agent printing its own reasoning as JSON, which has an answer and a
-        # rationale in it like any row does, would read as the answer key arriving.
-        fetched_answers = [
-            a
-            for a in actions
-            if not a.kind.startswith("mcp:")
-            and _asks_the_answer_source(a, source)
-            and carries_answer_content(a.result, source)
-        ]
-        if fetched_answers:
-            bucket = _raise_to(bucket, "achieved_leakage")
-            _note(reasons, "answer_content_in_result")
-            acquisition = {
-                "kind": "answer_content_in_result",
-                "episode": episode.identity(),
-                "epoch": evidence[0].epoch if evidence else episode.started_at,
-                "destination": None,
-                "persistence": "response",
-                "requested": _answer_source_urls(fetched_answers, source),
-            }
-
-        # A download the filesystem then answered for. The destination has to come back in a
-        # result, because a command naming a path is a request and not a file.
-        session = [
-            a for trace in traces.get(episode.phase, {}).values() for a in trace.actions
-        ]
-        landed = _completed_downloads(actions, session, source)
-        if landed:
-            bucket = _raise_to(bucket, "achieved_leakage")
-            _note(reasons, "file_download_landed")
-            if acquisition is None:
-                acquisition = {
-                    "kind": "file_download_landed",
-                    "episode": episode.identity(),
-                    "epoch": evidence[0].epoch if evidence else episode.started_at,
-                    "destination": landed[0]["destination"],
-                    "persistence": landed[0]["persistence"],
-                    "reach": reach_of(landed[0]["persistence"], episode.phase),
-                    "requested": [d["url"] for d in landed],
-                }
-        elif "file_download_requested" in reasons:
+        # Answer-source contact earlier in this leg. The container that made it may have a
+        # copy of the answers on its disk from that moment on, and a local read is invisible to
+        # the observer, so a later episode in the same container cannot be cleared. What it
+        # actually did with such a file is content evidence, which this half does not carry.
+        contact = contacted.get(episode.leg)
+        if (
+            contact is not None
+            and episode.started_at is not None
+            and episode.started_at >= contact
+            and bucket != UNCLASSIFIED
+        ):
             bucket = _raise_to(bucket, "unresolved_leakage")
-            _note(reasons, "file_download_unconfirmed")
-
-        # A file fetched from anywhere at all, read back, and carrying the answer columns. This
-        # is the one rule that does not begin with the host table, because the answers are
-        # mirrored in more places than a table can name.
-        read_back = _answers_read_from_a_download(actions, source)
-        if read_back:
-            bucket = _raise_to(bucket, "achieved_leakage")
-            _note(reasons, "answer_content_read_from_download")
-            if acquisition is None:
-                persistence = destination_persistence(read_back[0]["destination"])
-                acquisition = {
-                    "kind": "answer_content_read_from_download",
-                    "episode": episode.identity(),
-                    "epoch": evidence[0].epoch if evidence else episode.started_at,
-                    "destination": read_back[0]["destination"],
-                    "persistence": persistence,
-                    "reach": reach_of(persistence, episode.phase),
-                    "requested": [d["url"] for d in read_back],
-                }
-            landed = landed or read_back
-
-        # An artifact fetched earlier and still reachable here. Reading it is achieved; having
-        # it within reach and no command naming it is unresolved, because a local read leaves
-        # no trace the observer can see and this instrument will not guess either way.
-        reachable = [r for r in resident if _still_reachable(r, episode)]
-        if reachable and acquisition is None:
-            # The same standard a download confirmation has to meet. Deleting a file, moving
-            # it, or printing its name are all things an episode does with a path it never
-            # opened, and none of them is the answer key being consulted.
-            read = [
-                r
-                for r in reachable
-                if any(a.ok and _reads_the_file(a, r["destination"]) for a in actions)
-            ]
-            if read:
-                bucket = _raise_to(bucket, "achieved_leakage")
-                _note(reasons, "resident_artifact_read")
-                inherited = read[0]["acquisition"]
-            else:
-                bucket = _raise_to(bucket, "unresolved_leakage")
-                _note(reasons, "resident_artifact_available")
-                inherited = reachable[0]["acquisition"]
-
-        for landing in landed:
-            reach = reach_of(landing["persistence"], episode.phase)
-            resident.append(
-                {
-                    "destination": landing["destination"],
-                    "persistence": landing["persistence"],
-                    "reach": reach,
-                    "phase": episode.phase,
-                    "leg": episode.leg,
-                    "acquisition": {
-                        **episode.identity(),
-                        "destination": landing["destination"],
-                        "persistence": landing["persistence"],
-                        "reach": reach,
-                    },
-                }
-            )
+            _note(reasons, "answer_source_contact_earlier_in_leg")
+        if _rank(bucket) >= _rank("attempted_leakage") and episode.started_at is not None:
+            contacted.setdefault(episode.leg, episode.started_at)
 
         graded.append(
             EpisodeLeakage(
@@ -1541,10 +1215,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
                 requested=tuple(requested),
                 covered=covered,
                 shared_with=(),
-                landings=tuple(landed),
                 action_rivals=tuple(action_rivals),
-                acquisition=acquisition,
-                inherited_from=inherited,
             )
         )
 
@@ -1568,151 +1239,6 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         episodes=tuple(graded),
         notes=tuple(notes),
     )
-
-
-# Phrases a shell prints when the file is not there. They only ever withhold a confirmation,
-# never grant one, so an unrecognised failure leaves the download resting on the later-read rule
-# rather than being waved through by this list.
-_MISSING_FILE = ("no such file", "not found", "cannot access", "cannot open", "does not exist")
-
-
-def _missing_file(text: str) -> bool:
-    lowered = text.lower()
-    return any(phrase in lowered for phrase in _MISSING_FILE)
-
-
-# Commands that answer for a file by reading it or by asking the filesystem about it. The list
-# grants confirmation and nothing else does, so an operation nobody thought of leaves a download
-# unresolved rather than promoting it. That is the direction to be wrong in: the alternative is
-# a blacklist, under which ``rm -f`` and ``echo`` both prove a file exists by naming it.
-_READ_COMMANDS = (
-    "cat", "head", "tail", "less", "more", "od", "xxd", "strings", "file", "du", "ls", "stat",
-    "wc", "md5sum", "sha1sum", "sha256sum", "cksum", "grep", "rg", "zgrep", "zcat", "gunzip",
-    "unzip", "tar", "jq", "awk", "sed", "sort", "uniq", "python", "python3", "duckdb", "sqlite3",
-)
-# The same, for calls inside a program rather than words in a shell.
-_READ_CALLS = (
-    "read_parquet", "read_table", "read_csv", "read_json", "ParquetFile", "load_dataset",
-    "np.load", "json.load", "open(", "Path(", "readlines", "getsize", "st_size",
-)
-_READ_WORD = re.compile(r"\b(?:" + "|".join(_READ_COMMANDS) + r")\b")
-# A size beside a path is the filesystem answering: du, ls -l, stat and wc all print one.
-_SIZE = re.compile(r"(?:^|\s)\d+(?:[.,]\d+)?\s?[KMGT]?i?B?(?=\s|$)")
-
-
-def _reads_the_file(action: Action, destination: str) -> bool:
-    """Does this action ask the filesystem for that file, rather than merely mention it?"""
-    if destination not in action.request:
-        return False
-    return bool(_READ_WORD.search(action.request)) or any(
-        call in action.request for call in _READ_CALLS
-    )
-
-
-# Programs that go and get something over the network, and the library calls that do the same
-# from inside a program. A URL in the text is not one of these: an agent can write a local file
-# and mention a URL in the same line, and the file it wrote is its own work rather than
-# anybody's dataset.
-_FETCH_COMMANDS = ("curl", "wget", "aria2c", "axel", "lftp", "scp", "rsync")
-_FETCH_CALLS = (
-    "urlretrieve", "urlopen", "urllib.request", "requests.get", "requests.post", "httpx.get",
-    "wget.download", *_HUB_CALLS,
-)
-# The name has to sit where a command sits. A word preceded by a slash, a dot or a dash is part
-# of a path, an identifier or a URL, which is exactly how ``https://example.test/curl/doc`` would
-# otherwise look like a download.
-_FETCH_WORD = re.compile(r"(?<![\w./-])(?:" + "|".join(_FETCH_COMMANDS) + r")\b")
-
-
-def _is_network_fetch(request: str) -> bool:
-    """Does this command actually go out and get something?
-
-    Achieved leakage means content arrived, so the step that brings it in has to be recognisable
-    as a transfer rather than inferred from a URL sitting somewhere in the text. Anything this
-    does not recognise leaves the episode where it was, which for a file that cannot be shown to
-    have come from the network is short of achieved.
-    """
-    return bool(_FETCH_WORD.search(request)) or any(call in request for call in _FETCH_CALLS)
-
-
-def _filesystem_answered(text: str, destination: str) -> bool:
-    """Does this output carry the file's own size beside its path, as ``du`` and ``ls`` do?"""
-    if _missing_file(text):
-        return False
-    return any(destination in line and _SIZE.search(line) for line in text.splitlines())
-
-
-def _completed_downloads(
-    actions: Sequence[Action], later: Sequence[Action], source: AnswerSource | None
-) -> list[dict[str, Any]]:
-    """Downloads of an answer-source file that the filesystem afterwards answered for.
-
-    A command naming a destination says where the agent meant to put a body; it does not say one
-    arrived. What says so is a later action that succeeded and names that path: a size, a
-    listing, a checksum, or a parser reading it. Success is the harness's own verdict, so a read
-    that raised is not a read, and a download whose file never appeared cannot borrow the
-    traceback that proves it never appeared.
-
-    ``later`` is the whole transcript this episode's actions came from, because the read that
-    confirms a download can land in a following episode of the same session.
-    """
-    downloads = []
-    for action in actions:
-        # The same gate the anywhere-mirror rule needs, for the same reason: a local write with
-        # an answer-source URL in a comment would otherwise be a download that a later ``du``
-        # could confirm.
-        if action.kind.startswith("mcp:") or not _is_network_fetch(action.request):
-            continue
-        urls = [
-            url
-            for url in (_tidy_url(m.group(0)) for m in _URL.finditer(action.request))
-            if content_url_kind(url, source) == "file_download"
-            and host_role((urlsplit(url).hostname or "").lower(), source).startswith(
-                "answer_source"
-            )
-        ]
-        if not urls:
-            continue
-        for destination in download_destinations(action.request):
-            downloads.append(
-                {
-                    "destination": destination,
-                    "url": urls[0],
-                    "offset": action.offset,
-                    "trace": action.trace,
-                }
-            )
-
-    landed = []
-    seen: set[str] = set()
-    for download in downloads:
-        destination = download["destination"]
-        if destination in seen:
-            continue
-        # Same transcript only: offsets are per file, and one eval task's read says nothing
-        # about another task's container.
-        session = [a for a in later if a.trace == download["trace"]]
-        # The filesystem reporting the file's size, from any action including the download's
-        # own compound command, which is where a ``du`` on the next line lands.
-        confirmed = any(
-            a.offset >= download["offset"] and _filesystem_answered(a.result, destination)
-            for a in session
-        )
-        # Or a later command that reads the file and got something back. Succeeding while
-        # naming the path is not enough: ``rm -f`` and ``echo`` both do that, and a file that
-        # was never written is exactly what a cleanup names.
-        confirmed = confirmed or any(
-            a.ok
-            and a.offset > download["offset"]
-            and a.result.strip()
-            and _reads_the_file(a, destination)
-            and not _missing_file(a.result)
-            for a in session
-        )
-        if confirmed:
-            seen.add(destination)
-            landed.append({**download, "persistence": destination_persistence(destination)})
-    return landed
 
 
 def _capture_notes(capture: Capture, finished: bool) -> list[str]:
@@ -1809,10 +1335,7 @@ def _mark_shared_windows(graded: Sequence[EpisodeLeakage]) -> list[EpisodeLeakag
                 requested=row.requested,
                 covered=row.covered,
                 shared_with=rivals,
-                landings=row.landings,
                 action_rivals=row.action_rivals,
-                acquisition=row.acquisition,
-                inherited_from=row.inherited_from,
             )
         )
     return out
@@ -1850,21 +1373,6 @@ def render_table(runs: Sequence[RunLeakage]) -> str:
         "  ".join("-" * w for w in widths),
     ]
     lines += ["  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)) for row in rows]
-
-    citations = [(run, e) for run in runs for e in run.acquisitions()]
-    if citations:
-        lines += ["", "achieved-leakage acquisitions, all of them"]
-        for run, row in citations:
-            acquisition = row.acquisition or {}
-            rivals = len(row.shared_with)
-            lines.append(
-                f"  {run.label}  {row.episode.label}  {acquisition.get('kind')}  "
-                f"dest={acquisition.get('destination')} "
-                f"({acquisition.get('persistence')})"
-                + (f"  window shared with {rivals}" if rivals else "")
-            )
-            for url in acquisition.get("requested") or []:
-                lines.append(f"      {url}")
 
     for run in runs:
         for note in run.notes:
@@ -1946,11 +1454,8 @@ __all__ = [
     "RunLeakage",
     "Segment",
     "Trace",
-    "carries_answer_content",
     "classify_run",
     "content_url_kind",
-    "destination_persistence",
-    "download_destinations",
     "host_role",
     "main",
     "read_capture",
