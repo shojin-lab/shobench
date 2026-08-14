@@ -1,46 +1,46 @@
-"""Per-episode leakage classification, derived from the run's egress record.
+"""Per-episode leakage classification for a completed run directory.
 
 Some v0 cells answer questions whose answers are published. The agent has an unsandboxed shell
 and open egress by design, and the runner observes rather than gates, so an episode can be won
-by reasoning or by downloading the answer key, and the reward is the same number either way. A
-blended correct-rate over both is not a measurement of anything. This grades every episode into
-one of four buckets so the rate can be reported per bucket instead:
+by reasoning or by reading the answer key, and the reward is the same number either way. A
+blended correct-rate over both is not a measurement of anything. This grades every episode so
+the rate can be reported per bucket instead.
+
+The ranks, weakest first:
 
     computed_locally        nothing left the cell but the harness's own infrastructure
     general_web_reference   the cell went out, but not to a host that distributes the answers
-    attempted_leakage       the cell reached the answer source and content is not established
-    achieved_leakage        answer content was obtained
+    attempted_leakage       the cell reached the answer source; no evidence a body moved
+    unresolved_leakage      evidence consistent with a body having moved, not established
+    achieved_leakage        answer content demonstrably reached the episode
 
-The evidence of record is ``egress.tsv``: one row per outbound DNS question or TLS client hello
-observed in the cell's network namespace, written outside the container by an observer the agent
-holds no mount of and cannot edit. That is the floor, and nothing the agent wrote about itself
-moves it down.
+``unclassified`` is not on that ladder. It is what an episode gets when the evidence is missing
+rather than empty, and it is the reason this command cannot quietly clear anything: an episode
+whose capture does not cover its window is unclassified, never computed_locally.
 
-What egress can and cannot establish, stated plainly because the buckets are only as good as
-this:
+**Egress is the floor and cannot reach achieved.** The record is ``egress.tsv``, one row per
+outbound DNS question or TLS client hello observed in the cell's network namespace, written
+outside the container by an observer the agent holds no mount of. It sees hostnames and times.
+It never sees a method, a status, a body or a byte count, and the Hub's file CDN serves the
+whole platform rather than one dataset, so a client hello to it establishes a connection to a
+CDN and not a download of an answer key. The highest an egress observation can carry an episode
+is ``unresolved_leakage``.
 
-- It sees hostnames and times. It never sees payloads, because TLS is not decrypted. "Connected
-  to a host that distributes the answers" is therefore not by itself proof that answers were
-  obtained, which is exactly why ``attempted_leakage`` exists as a bucket rather than being
-  rounded up.
-- Hostname granularity blurs endpoints. ``huggingface.co`` serves listings, metadata and file
-  redirects over one name, and ``datasets-server.huggingface.co`` serves both ``/splits``
-  metadata and ``/rows`` payloads. Only the file CDN (``*.cdn.hf.co``, ``cdn-lfs*``) is a
-  hostname that exists to move file content and nothing else, so only that hostname carries
-  achieved leakage on egress alone.
-- It cannot see a local read. Once a dataset file is on the container's disk, every later
-  episode in that same container can consult it silently, so achieved leakage propagates
-  forward within a leg (see ``answer_source_resident``) rather than being charged to one
-  episode.
-- It cannot show intent. Reaching a dataset host to pull a tokenizer and reaching it to pull an
-  answer key look identical. The bucket says what the reward can be trusted to mean, not what
-  the agent meant.
+**Achieved needs content, and content is in the transcript.** The trace records what the agent
+ran and what came back, and both halves are durable. Two things reach achieved:
 
-The trace refines but never overrides. An agent's own transcript shows the endpoint it asked
-for, which egress cannot; the two together are stronger than either. So a trace URL can raise an
-episode's bucket and can never lower it, and the one refinement that reaches ``achieved_leakage``
-requires both halves: the trace naming a content endpoint, and egress showing a TLS connection to
-that endpoint's host inside the episode's window.
+- a result carrying the answer source's own answer fields, which is what a dataset row API
+  returns when it is not refusing;
+- a download whose destination the filesystem then answered for, and any later episode that
+  reads that destination.
+
+Refinement reads requests, not prose. Only the text of a command or tool call counts as a
+request, so a URL the agent merely mentioned in its reasoning cannot raise an episode, and a
+result is only read as answer content when it carries the corroborating fields the dataset ships
+alongside its answers, so the agent's own submission cannot be mistaken for a leak.
+
+Nothing the agent wrote about itself lowers a bucket, and no combination of trace text alone
+reaches achieved without content in a result.
 
 Usage::
 
@@ -53,9 +53,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
@@ -63,25 +63,28 @@ from urllib.parse import urlsplit
 
 SCHEMA = "shobench.leakage/1"
 
-# The four buckets, weakest evidence first. Refinement only ever moves an episode later in this
-# tuple, which is what "the egress floor is a floor" means in code.
 BUCKETS = (
     "computed_locally",
     "general_web_reference",
     "attempted_leakage",
+    "unresolved_leakage",
     "achieved_leakage",
 )
 
-# Not a bucket: the label for an episode whose evidence is missing rather than empty. An episode
-# with no egress record and no window is not a clean episode, and calling it computed_locally
-# would be the same silent pass a fail-closed judge refuses to give.
+# Not a bucket: the label for an episode whose evidence is missing rather than empty.
 UNCLASSIFIED = "unclassified"
 
 PHASES = ("eval_before", "rollout", "eval_after")
 
+# Where the agent's HOME is mounted, and the directories that do not survive its container. The
+# runner mounts the cell's accumulated HOME at ``/root`` and copies it into every eval task's
+# home, so a file saved there outlives the leg that fetched it and reaches every later episode
+# of the run. ``/work`` is fresh per leg and the rest of these are per-container scratch.
+AGENT_HOME = "/root"
+EPHEMERAL_ROOTS = ("/tmp", "/var/tmp", "/dev/shm", "/run", "/work")
+
 # Hosts a cell talks to because of how it is run rather than because of what it is answering:
 # the harness's model API and telemetry, and the package registries a tool install goes through.
-# Traffic here is evidence of neither honesty nor leakage, so it is recorded and set aside.
 INFRASTRUCTURE = (
     "chatgpt.com",
     "ab.chatgpt.com",
@@ -109,27 +112,28 @@ INFRASTRUCTURE = (
 
 @dataclass(frozen=True)
 class AnswerSource:
-    """Where one environment's answers live, split by what a hostname can prove.
+    """Where one environment's answers live, and what its answers look like when they arrive.
 
-    ``index`` hosts serve listings, metadata and payloads over the same name, so reaching one
-    proves the cell went to the answer source and proves nothing about content. ``content``
-    hosts exist to move file bodies and serve nothing else, so a TLS connection to one is the
-    hard signal. ``rows`` names the hosts running a query API over the dataset itself, whose
-    answers-bearing endpoints share a hostname with its metadata endpoints and whose refusals
-    look exactly like its successes from outside the TLS session.
+    ``index`` hosts serve listings, metadata and payloads over one name. ``content`` hosts are
+    the file CDN: they move bodies, but for the whole platform, so reaching one narrows what
+    happened without settling it. ``rows`` names the query API over the dataset itself.
+
+    ``answer_field`` and ``corroborating_fields`` are the dataset's own columns. A result that
+    carries the answer field beside one of its neighbours is a row of the answer key; the
+    agent's own submission carries the answer field alone, which is why the corroboration is
+    required rather than assumed.
     """
 
     index: tuple[str, ...]
     content: tuple[str, ...]
     rows: tuple[str, ...] = ()
+    answer_field: str = "answer"
+    corroborating_fields: tuple[str, ...] = ()
 
 
 # Keyed by environment, because "the host that distributes the answers" is a fact about the
-# dataset, not about the runner. An environment with no entry gets no answer-source table at all
-# and every classification for it says so, rather than quietly reporting a clean run.
-#
-# hle's questions and answers are the `cais/hle` HuggingFace dataset and the unofficial mirrors
-# of it that live on the same Hub, so the Hub's families are the table.
+# dataset, not about the runner. An environment with no entry gets no table at all and every
+# classification for it says so, rather than quietly reporting a clean run.
 ANSWER_SOURCES: dict[str, AnswerSource] = {
     "hle": AnswerSource(
         index=(
@@ -137,39 +141,28 @@ ANSWER_SOURCES: dict[str, AnswerSource] = {
             "www.huggingface.co",
             "hf.co",
             "www.hf.co",
-            "datasets-server.huggingface.co",
             "hf-mirror.com",
             "*.hf-mirror.com",
         ),
-        content=(
-            "*.cdn.hf.co",
-            "cdn-lfs*.hf.co",
-            "cdn-lfs*.huggingface.co",
-        ),
+        content=("*.cdn.hf.co", "cdn-lfs*.hf.co", "cdn-lfs*.huggingface.co"),
         rows=("datasets-server.huggingface.co",),
+        corroborating_fields=("answer_type", "rationale", "raw_subject", "row_idx"),
     ),
 }
 
-# Endpoints on the dataset host that return rows rather than a description of rows.
+# Endpoints on the row API that return rows rather than a description of rows.
 _ROW_ENDPOINTS = ("/rows", "/search", "/filter", "/first-rows")
-# Extensions a dataset is shipped as. A URL ending in one of these is a file body by definition.
+# Extensions a dataset ships as. A URL ending in one is a file body whatever route served it.
 _ARTIFACT_SUFFIXES = (".parquet", ".csv", ".tsv", ".jsonl", ".arrow", ".zip", ".gz")
+# Library calls whose only purpose is pulling a dataset or a repo file off the Hub.
+_HUB_CALLS = ("load_dataset(", "hf_hub_download(", "snapshot_download(")
 
 _URL = re.compile(r"https?://[^\s\"'\\<>)\]}]+")
-
-
-def _tidy_url(url: str) -> str:
-    """Cut a URL out of the prose and the shell it was quoted in.
-
-    A transcript quotes URLs inside sentences and inside heredocs, so what the pattern matches
-    can end in a sentence's punctuation or carry an unexpanded shell variable. Both are trimmed:
-    the trimmed form still names the host and the route, which is all the classification reads.
-    """
-    for marker in ("${", "$(", "`"):
-        cut = url.find(marker)
-        if cut > 0:
-            url = url[:cut]
-    return url.rstrip(".,;:!?")
+# Where a shell command says to put what it fetches.
+_DESTINATION = re.compile(
+    r"(?:(?<=\s)|^)(?:-o|-O|--output|--output-document)[=\s]+([^\s'\";|&)]+)"
+    r"|>\s*([^\s'\";|&)]+)"
+)
 
 
 def _matches(host: str, patterns: Iterable[str]) -> bool:
@@ -184,39 +177,83 @@ def host_role(host: str, source: AnswerSource | None) -> str:
     if source is not None:
         if _matches(host, source.content):
             return "answer_source_content"
+        if _matches(host, source.rows):
+            return "answer_source_rows"
         if _matches(host, source.index):
             return "answer_source_index"
     return "general"
 
 
 def content_url_kind(url: str, source: AnswerSource | None) -> str | None:
-    """What a URL asks the answer source for, when it asks for the data rather than a listing.
+    """What a URL asks the answer source for, when it asks for data rather than a listing.
 
     ``file_download`` is the Hub's ``resolve`` route or any URL ending in a dataset artifact
-    extension: a request for a file body, which on this Hub is served by a redirect to a CDN
-    hostname that does nothing else, so the observer can corroborate whether the body moved.
+    extension. ``row_query`` is the row API's data endpoints, which return rows themselves
+    rather than a description of them.
 
-    ``row_query`` is the dataset server's row endpoints, which return the rows themselves rather
-    than a description of them. It gets a name of its own because it cannot be corroborated: the
-    request and the refusal ride the same hostname and the same TLS session, and the run that
-    prompted all this queried the gated ``cais/hle`` this way and was turned down. Confirming a
-    row query means reading the response, which is the model-judge half of the problem and not
-    this half.
+    A blob route renders a file inside a page rather than serving it, so a data extension under
+    one is a link someone was reading. Query strings are not required: ``curl -G`` puts the
+    query in ``--data-urlencode`` parameters and leaves the URL bare.
     """
     parts = urlsplit(url)
     path = parts.path.rstrip("/")
     host = (parts.hostname or "").lower()
     if "/resolve/" in parts.path:
         return "file_download"
-    # A blob route renders the file in a page rather than serving it, so a data extension under
-    # one is a link someone was reading, not a download. Every other route that ends in a data
-    # extension is the file itself.
     if "/blob/" not in parts.path and path.lower().endswith(_ARTIFACT_SUFFIXES):
         return "file_download"
-    rows = source.rows if source is not None else ()
-    if _matches(host, rows) and path in _ROW_ENDPOINTS and parts.query:
+    if source is not None and _matches(host, source.rows) and path in _ROW_ENDPOINTS:
         return "row_query"
     return None
+
+
+def carries_answer_content(text: str, source: AnswerSource | None) -> bool:
+    """Does this result carry rows of the answer key, as opposed to naming one?
+
+    The answer field beside one of the columns the dataset ships next to it. The pairing is what
+    separates a fetched row from the agent's own ``submit_answer`` arguments, which carry an
+    answer and nothing that travels with one.
+    """
+    if source is None or not source.corroborating_fields:
+        return False
+    if not re.search(rf'"{re.escape(source.answer_field)}"\s*:', text):
+        return False
+    alternatives = "|".join(re.escape(f) for f in source.corroborating_fields)
+    return bool(re.search(rf'"(?:{alternatives})"\s*:', text))
+
+
+def download_destinations(command: str) -> list[str]:
+    """Where a command says to save what it fetches.
+
+    Only paths: a bare word after ``-o`` is as likely to be ``find``'s or operator as a file, so
+    a destination has to look like one.
+    """
+    out = []
+    for match in _DESTINATION.finditer(command):
+        candidate = (match.group(1) or match.group(2) or "").strip()
+        if not candidate or candidate.startswith("-"):
+            continue
+        if "/" in candidate or candidate.lower().endswith(_ARTIFACT_SUFFIXES):
+            out.append(candidate)
+    return list(dict.fromkeys(out))
+
+
+def destination_persistence(path: str) -> str:
+    """Does a saved file outlive the container that fetched it?
+
+    HOME is mounted from the run directory and copied into every eval task's home, so a file
+    under it reaches every later episode of the run. The scratch directories do not survive
+    their container. Anything else is unknown, and unknown is not clean.
+    """
+    normalized = path if path.startswith("/") else f"{AGENT_HOME}/{path.lstrip('./')}"
+    if normalized == AGENT_HOME or normalized.startswith(f"{AGENT_HOME}/"):
+        return "home"
+    if any(normalized == root or normalized.startswith(f"{root}/") for root in EPHEMERAL_ROOTS):
+        return "ephemeral"
+    return "unknown"
+
+
+# ----- the capture ----------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -224,8 +261,7 @@ class Connection:
     """One observed outbound name: a DNS question, or a TLS client hello carrying an SNI.
 
     The kinds are not equivalent evidence. A resolution says a name was looked up; a client
-    hello says a connection to that name was opened and bytes moved. Achieved leakage needs the
-    second.
+    hello says a connection to that name was opened. Neither says a body moved.
     """
 
     epoch: float
@@ -235,6 +271,269 @@ class Connection:
 
     def to_json(self) -> dict[str, Any]:
         return {"epoch": self.epoch, "host": self.host, "kind": self.kind, "segment": self.segment}
+
+
+@dataclass(frozen=True)
+class Segment:
+    """One observer process's file, and the interval over which it demonstrably ran."""
+
+    name: str
+    first: float
+    last: float
+    rows: int
+    malformed: int
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "first": self.first,
+            "last": self.last,
+            "rows": self.rows,
+            "malformed": self.malformed,
+        }
+
+
+@dataclass(frozen=True)
+class Capture:
+    """A run's whole egress record, and how far it can be trusted to have been watching.
+
+    Coverage is per segment and is the interval between its first and last observed row. Inside
+    that interval the observer was demonstrably running, so silence there is real silence.
+    Outside every interval nothing is established: a window in the gap between two segments, or
+    past the last row of the last one, could be a quiet cell or an observer that stopped, and
+    those are not the same finding.
+    """
+
+    connections: tuple[Connection, ...]
+    segments: tuple[Segment, ...]
+
+    @property
+    def available(self) -> bool:
+        return any(segment.rows for segment in self.segments)
+
+    @property
+    def malformed(self) -> int:
+        return sum(segment.malformed for segment in self.segments)
+
+    def covers(self, start: float | None, end: float | None) -> bool:
+        if start is None:
+            return False
+        finish = start if end is None else end
+        return any(
+            segment.rows and segment.first <= start and finish <= segment.last
+            for segment in self.segments
+        )
+
+
+def egress_segments(run_dir: Path) -> list[Path]:
+    """The capture's segment files in the order they were written.
+
+    A continuation gets a segment of its own rather than truncating the first, so the record of
+    a run that was suspended and resumed is several files and reading only the first would drop
+    everything after the interruption.
+    """
+    first = run_dir / "egress.tsv"
+    numbered = sorted(
+        (p for p in run_dir.glob("egress.*.tsv") if p.stem.split(".")[-1].isdigit()),
+        key=lambda p: int(p.stem.split(".")[-1]),
+    )
+    return ([first] if first.exists() else []) + numbered
+
+
+def read_capture(run_dir: Path) -> Capture:
+    """Read every segment, counting the rows that could not be read rather than dropping them."""
+    connections: list[Connection] = []
+    segments: list[Segment] = []
+    for path in egress_segments(run_dir):
+        rows = malformed = 0
+        first = last = None
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.strip():
+                continue
+            fields = line.split("\t")
+            fields += [""] * (6 - len(fields))
+            try:
+                epoch = float(fields[0])
+            except ValueError:
+                malformed += 1
+                continue
+            rows += 1
+            first = epoch if first is None else min(first, epoch)
+            last = epoch if last is None else max(last, epoch)
+            for column, kind in ((4, "dns"), (5, "tls")):
+                for host in fields[column].split(","):
+                    host = host.strip().rstrip(".").lower()
+                    if host:
+                        connections.append(Connection(epoch, host, kind, path.name))
+        segments.append(
+            Segment(path.name, first or 0.0, last or 0.0, rows, malformed)
+        )
+    connections.sort(key=lambda c: (c.epoch, c.host, c.kind))
+    return Capture(tuple(connections), tuple(segments))
+
+
+# ----- the trace ------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Action:
+    """One thing the agent ran, what came back, and whether it worked.
+
+    ``offset`` is the line the action completed on, which is the transcript's own order and the
+    only ordering a trace reliably carries; several harnesses timestamp nothing.
+
+    ``ok`` is the harness's own verdict, not a reading of the output: codex records a status and
+    an exit code, claude_code marks a tool result ``is_error``, prime-agent marks it ``isError``.
+    It matters because a command that failed did not read a file, and inferring that from the
+    text of a traceback is guesswork where the harness has already said so. A harness that says
+    nothing is taken at its word that nothing went wrong, which is the direction that leaves a
+    failed read able to confirm a download; the confirmations that matter here come from
+    harnesses that do report.
+    """
+
+    offset: int
+    kind: str
+    request: str
+    result: str
+    ok: bool = True
+    trace: str = ""
+
+
+@dataclass(frozen=True)
+class Trace:
+    """A transcript read for three things: what ran, where each episode starts, where it seals.
+
+    A lease is the join key because the stream hands one to the agent with the task, so its id
+    appears at the moment an episode starts and again in the ``submit_answer`` that ends it. The
+    three harness shapes this reads are the three the runner launches, and a shape it does not
+    recognise contributes nothing rather than contributing guesses.
+    """
+
+    path: Path
+    actions: tuple[Action, ...]
+    first_seen: dict[str, int] = field(default_factory=dict)
+    sealed_at: dict[str, int] = field(default_factory=dict)
+
+
+def _blocks_text(blocks: Any) -> str:
+    if isinstance(blocks, str):
+        return blocks
+    if isinstance(blocks, list):
+        return "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+    if isinstance(blocks, dict):
+        return _blocks_text(blocks.get("content"))
+    return ""
+
+
+def read_trace(path: Path, leases: Iterable[str]) -> Trace:
+    """Read one transcript into actions and lease marks."""
+    wanted = set(leases)
+    name = str(path)
+    actions: list[Action] = []
+    first_seen: dict[str, int] = {}
+    sealed_at: dict[str, int] = {}
+    pending: dict[str, tuple[str, str]] = {}
+    prime_args: dict[str, str] = {}
+
+    for offset, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines()):
+        for lease in wanted:
+            if lease not in first_seen and lease in line:
+                first_seen[lease] = offset
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+
+        # codex: completed items carry the command and its aggregated output, or an MCP call
+        # with its arguments and its result.
+        if kind == "item.completed" and isinstance(event.get("item"), dict):
+            item = event["item"]
+            if item.get("type") == "command_execution":
+                exit_code = item.get("exit_code")
+                actions.append(
+                    Action(
+                        offset,
+                        "command",
+                        item.get("command") or "",
+                        item.get("aggregated_output") or "",
+                        ok=item.get("status") != "failed" and exit_code in (0, None),
+                        trace=name,
+                    )
+                )
+            elif item.get("type") == "mcp_tool_call":
+                arguments = item.get("arguments") or {}
+                request = json.dumps(arguments)
+                actions.append(
+                    Action(
+                        offset,
+                        f"mcp:{item.get('tool')}",
+                        request,
+                        _blocks_text(item.get("result")),
+                        ok=item.get("error") is None,
+                        trace=name,
+                    )
+                )
+                if item.get("tool") == "submit_answer" and arguments.get("lease") in wanted:
+                    sealed_at[str(arguments["lease"])] = offset
+
+        # claude_code: a tool_use on the assistant side, its tool_result on the user side.
+        elif kind == "assistant" and isinstance(event.get("message"), dict):
+            for block in event["message"].get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    name = str(block.get("name"))
+                    arguments = block.get("input") or {}
+                    pending[str(block.get("id"))] = (name, json.dumps(arguments))
+                    if name.endswith("submit_answer") and arguments.get("lease") in wanted:
+                        sealed_at[str(arguments["lease"])] = offset
+        elif kind == "user" and isinstance(event.get("message"), dict):
+            for block in event["message"].get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool, request = pending.pop(str(block.get("tool_use_id")), ("tool", ""))
+                    actions.append(
+                        Action(
+                            offset,
+                            f"tool:{tool}",
+                            request,
+                            _blocks_text(block.get("content")),
+                            ok=not block.get("is_error"),
+                            trace=name,
+                        )
+                    )
+
+        # prime-agent: the arguments arrive when execution starts and the result when it ends.
+        elif kind == "tool_execution_start":
+            prime_args[str(event.get("toolCallId"))] = json.dumps(event.get("args") or {})
+        elif kind == "tool_execution_end":
+            request = prime_args.pop(str(event.get("toolCallId")), "") or json.dumps(
+                event.get("args") or {}
+            )
+            result = event.get("result")
+            failed = event.get("isError") or (
+                isinstance(result, dict) and result.get("isError")
+            )
+            actions.append(
+                Action(
+                    offset,
+                    f"tool:{event.get('toolName')}",
+                    request,
+                    _blocks_text(result),
+                    ok=not failed,
+                    trace=name,
+                )
+            )
+
+    return Trace(path, tuple(actions), first_seen, sealed_at)
+
+
+def _trace_files(run_dir: Path, phase: str) -> list[Path]:
+    traces = run_dir / phase / "traces"
+    return sorted(traces.glob("*.stream.jsonl")) if traces.is_dir() else []
+
+
+# ----- episodes -------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -256,171 +555,10 @@ class Episode:
     @property
     def label(self) -> str:
         seq = "" if self.seq is None else f"seq {self.seq} "
-        return f"{seq}task {self.task_idx}"
+        return f"{self.phase} {seq}task {self.task_idx}"
 
-
-@dataclass(frozen=True)
-class EpisodeLeakage:
-    """One episode's bucket, and every fact that put it there."""
-
-    episode: Episode
-    bucket: str
-    reasons: tuple[str, ...]
-    evidence: tuple[Connection, ...]
-    trace_urls: tuple[str, ...]
-    shared_window_with: int
-    acquisition: dict[str, Any] | None
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "phase": self.episode.phase,
-            "task_idx": self.episode.task_idx,
-            "seq": self.episode.seq,
-            "lease": self.episode.lease,
-            "leg": self.episode.leg,
-            "window": {
-                "started_at": self.episode.started_at,
-                "ended_at": self.episode.ended_at,
-                "kind": self.episode.window_kind,
-                "shared_with": self.shared_window_with,
-            },
-            "bucket": self.bucket,
-            "reasons": list(self.reasons),
-            "evidence": [c.to_json() for c in self.evidence],
-            "trace_urls": list(self.trace_urls),
-            "acquisition": self.acquisition,
-            "correct": self.episode.correct,
-            "success": self.episode.success,
-            "reward": self.episode.reward,
-        }
-
-
-@dataclass(frozen=True)
-class RunLeakage:
-    """One run directory's episodes, the counts a reader wants, and the caveats they need."""
-
-    run_dir: Path
-    run_id: str
-    cell: str
-    env: str
-    harness: str
-    model: str
-    egress_available: bool
-    egress_segments: tuple[str, ...]
-    observations: int
-    answer_source_configured: bool
-    episodes: tuple[EpisodeLeakage, ...]
-    notes: tuple[str, ...]
-
-    @property
-    def label(self) -> str:
-        """The directory, not the run id.
-
-        A repair or a hand copy of a run directory carries the original's manifest, so two
-        directories can answer to one run id and a table keyed on the id prints them as one row
-        twice. The path is what the reader passed in and what they can go back to.
-        """
-        return self.run_dir.name
-
-    def phases(self) -> list[str]:
-        seen = [e.episode.phase for e in self.episodes]
-        return [p for p in PHASES if p in seen] + sorted({p for p in seen if p not in PHASES})
-
-    def counts(self, phase: str | None = None) -> dict[str, int]:
-        rows = [e for e in self.episodes if phase is None or e.episode.phase == phase]
-        counts = {bucket: 0 for bucket in (*BUCKETS, UNCLASSIFIED)}
-        for row in rows:
-            counts[row.bucket] += 1
-        return counts
-
-    def correct_rate(self, bucket: str, phase: str | None = None) -> tuple[int, int]:
-        """Graded episodes in this bucket, and how many were correct.
-
-        Two numbers rather than a rate, because a bucket with three episodes in it and a bucket
-        with three hundred should not print the same way.
-        """
-        rows = [
-            e
-            for e in self.episodes
-            if e.bucket == bucket
-            and (phase is None or e.episode.phase == phase)
-            and e.episode.correct is not None
-        ]
-        return sum(1 for e in rows if e.episode.correct), len(rows)
-
-    def acquisitions(self) -> list[EpisodeLeakage]:
-        return [e for e in self.episodes if e.acquisition is not None]
-
-    def unresolved(self, phase: str | None = None) -> list[EpisodeLeakage]:
-        """Episodes this half cannot finish, which the deferred model judge would take.
-
-        An episode that queried the dataset's row API asked for answers over a hostname whose
-        refusals are indistinguishable from its successes. Only the response settles it, and
-        reading responses is the judge's job, so these are named rather than guessed at.
-        """
-        return [
-            e
-            for e in self.episodes
-            if "answer_rows_requested" in e.reasons
-            and e.bucket != "achieved_leakage"
-            and (phase is None or e.episode.phase == phase)
-        ]
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "schema": SCHEMA,
-            "run_dir": str(self.run_dir),
-            "run_id": self.run_id,
-            "cell": self.cell,
-            "env": self.env,
-            "harness": self.harness,
-            "model": self.model,
-            "egress": {
-                "available": self.egress_available,
-                "segments": list(self.egress_segments),
-                "observations": self.observations,
-            },
-            "answer_source_configured": self.answer_source_configured,
-            "buckets": self.counts(),
-            "phases": [
-                {
-                    "phase": phase,
-                    "buckets": self.counts(phase),
-                    "correct": {
-                        bucket: dict(
-                            zip(
-                                ("correct", "graded"),
-                                self.correct_rate(bucket, phase),
-                                strict=True,
-                            )
-                        )
-                        for bucket in (*BUCKETS, UNCLASSIFIED)
-                    },
-                    "unresolved_by_egress": len(self.unresolved(phase)),
-                }
-                for phase in self.phases()
-            ],
-            "acquisitions": [e.to_json() for e in self.acquisitions()],
-            "notes": list(self.notes),
-            "limits": LIMITS,
-            "episodes": [e.to_json() for e in self.episodes],
-        }
-
-
-LIMITS = [
-    "egress observes hostnames and times, never payloads, so a connection to a host that "
-    "distributes the answers is not by itself proof that answers were obtained",
-    "hostname granularity cannot separate a listing endpoint from a content endpoint on a host "
-    "that serves both, so only the file CDN carries achieved leakage on egress alone",
-    "a read of an already-downloaded file is invisible to egress, so achieved leakage carries "
-    "forward to later episodes in the same container rather than being charged to one episode",
-    "egress cannot show intent, so a dataset host reached for a tokenizer and one reached for "
-    "an answer key are the same observation",
-    "episodes that overlap in time share one network namespace, so a connection inside more "
-    "than one open window is charged to all of them and flagged as shared",
-    "a URL in a transcript is a mention, which may be a plan the agent never ran, so trace "
-    "evidence alone never reaches achieved leakage and only ever raises an episode to attempted",
-]
+    def identity(self) -> dict[str, Any]:
+        return {"phase": self.phase, "seq": self.seq, "task_idx": self.task_idx}
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -432,43 +570,6 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         if line:
             rows.append(json.loads(line))
     return rows
-
-
-def egress_segments(run_dir: Path) -> list[Path]:
-    """The capture's segments in the order they were written.
-
-    A continuation gets a segment of its own rather than truncating the first, so the record of
-    a run that was suspended and resumed is several files and reading only the first would drop
-    everything after the interruption.
-    """
-    first = run_dir / "egress.tsv"
-    numbered = sorted(
-        (p for p in run_dir.glob("egress.*.tsv") if p.stem.split(".")[-1].isdigit()),
-        key=lambda p: int(p.stem.split(".")[-1]),
-    )
-    return ([first] if first.exists() else []) + numbered
-
-
-def read_egress(run_dir: Path) -> list[Connection]:
-    """Fold every segment into one time-ordered list of observed names."""
-    out: list[Connection] = []
-    for path in egress_segments(run_dir):
-        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if not line.strip():
-                continue
-            fields = line.split("\t")
-            fields += [""] * (6 - len(fields))
-            try:
-                epoch = float(fields[0])
-            except ValueError:
-                continue
-            for column, kind in ((4, "dns"), (5, "tls")):
-                for host in fields[column].split(","):
-                    host = host.strip().rstrip(".").lower()
-                    if host:
-                        out.append(Connection(epoch, host, kind, path.name))
-    out.sort(key=lambda c: (c.epoch, c.host, c.kind))
-    return out
 
 
 def _feedback(record: dict[str, Any], name: str) -> Any:
@@ -498,15 +599,28 @@ def _legs(run_dir: Path) -> list[dict[str, Any]]:
     return legs if isinstance(legs, list) else []
 
 
-def _rollout_episodes(run_dir: Path, legs: list[dict[str, Any]]) -> list[Episode]:
-    """Windows from the dispense record, since a rollout's episodes are not separately timed.
+def _rollout_episodes(
+    run_dir: Path,
+    legs: list[dict[str, Any]],
+    max_in_flight: int,
+    traces: dict[str, Trace],
+) -> list[Episode]:
+    """Windows that run from a dispense to a bound on the seal, not to the next dispense.
 
-    The stream records when each task was handed out and not when it was sealed, so an episode's
-    window runs from its own dispense to the next one, which charges a connection to the most
-    recently pulled task. A harness holding several leases at once can still be working an older
-    task when the next is pulled, and the window model will charge that traffic to the newer
-    one; the run's ``max_in_flight`` is the size of that error and the shared-window count is
-    where it shows up in the output.
+    The stream records when a task was handed out and not when it was sealed, and above one
+    lease in flight the agent can still be working an older task when the next is pulled. Two
+    things bound the seal, and the tighter one wins.
+
+    The stream itself bounds it. At capacity ``get_task`` force-seals the oldest live episode
+    before dispensing, so a task is certainly sealed by the time ``max_in_flight`` further tasks
+    have been handed out. That bound needs nothing but the dispense record and holds whatever
+    the agent did.
+
+    The transcript bounds it better when it can be read. The ``submit_answer`` that ends an
+    episode appears in the trace at a definite place in the order, so the seal happened before
+    the dispense of the first task pulled after it. For a strictly sequential agent that lands
+    exactly on the next dispense; for one that interleaves it lands later, and the windows
+    overlap, which is the point.
     """
     phase_dir = run_dir / "rollout"
     dispenses = sorted(_read_jsonl(phase_dir / "dispenses.jsonl"), key=lambda d: d["dispensed_at"])
@@ -523,24 +637,56 @@ def _rollout_episodes(run_dir: Path, legs: list[dict[str, Any]]) -> list[Episode
                 return name, ended
         return "rollout", None
 
+    # Where each lease starts and seals in the transcripts, merged across this phase's legs.
+    first_seen: dict[str, tuple[str, int]] = {}
+    sealed_at: dict[str, tuple[str, int]] = {}
+    for name, trace in traces.items():
+        for lease, offset in trace.first_seen.items():
+            first_seen.setdefault(lease, (name, offset))
+        for lease, offset in trace.sealed_at.items():
+            sealed_at.setdefault(lease, (name, offset))
+
+    times = {str(d["lease"]): float(d["dispensed_at"]) for d in dispenses}
     episodes = []
     for index, dispense in enumerate(dispenses):
+        lease = str(dispense["lease"])
         started = float(dispense["dispensed_at"])
         leg, leg_end = leg_of(started)
-        following = dispenses[index + 1]["dispensed_at"] if index + 1 < len(dispenses) else None
-        candidates = [x for x in (following, leg_end) if x is not None]
-        ended = min(candidates) if candidates else None
-        correct, success, reward = _outcome(results.get(dispense["lease"]))
+
+        # The stream's own bound, from the capacity rule.
+        ahead = index + max(int(max_in_flight), 1)
+        bounds = [dispenses[ahead]["dispensed_at"]] if ahead < len(dispenses) else []
+        kind = "capacity_bound"
+
+        # The transcript's bound, when this lease's seal can be placed in the order.
+        seal = sealed_at.get(lease)
+        if seal is not None:
+            trace_name, offset = seal
+            after = [
+                times[other]
+                for other, (name, where) in first_seen.items()
+                if name == trace_name and where > offset and other in times
+            ]
+            if after:
+                bounds.append(min(after))
+                kind = "trace_seal_bound"
+        if leg_end is not None:
+            bounds.append(leg_end)
+        ended = min(bounds) if bounds else None
+        if ended is not None and leg_end is not None and ended >= leg_end:
+            kind = kind if kind == "trace_seal_bound" else "leg_bound"
+
+        correct, success, reward = _outcome(results.get(lease))
         episodes.append(
             Episode(
                 phase="rollout",
                 task_idx=int(dispense["task_idx"]),
                 seq=int(dispense["seq"]),
-                lease=str(dispense["lease"]),
+                lease=lease,
                 leg=leg,
                 started_at=started,
                 ended_at=ended,
-                window_kind="dispense_interval",
+                window_kind=kind,
                 correct=correct,
                 success=success,
                 reward=reward,
@@ -554,10 +700,8 @@ def _eval_episodes(
 ) -> list[Episode]:
     """Windows straight off the leg record, because an eval task is its own container.
 
-    Each held-out task runs in a leg of its own with a recorded start and end, so the window is
-    exact. When the leg record is missing, which is what an unfinished run looks like, the
-    window falls back to the dispense plus the configured per-task timeout: an upper bound, and
-    labelled as one.
+    When the leg record is missing, which is what an unfinished run looks like, the window falls
+    back to the dispense plus the configured per-task timeout: an upper bound, labelled as one.
     """
     phase_dir = run_dir / phase
     by_task = {
@@ -602,75 +746,606 @@ def _eval_episodes(
     return episodes
 
 
-def read_episodes(run_dir: Path, task_timeout_s: float = 900.0) -> list[Episode]:
-    legs = _legs(run_dir)
-    episodes: list[Episode] = []
-    if (run_dir / "rollout" / "dispenses.jsonl").exists():
-        episodes += _rollout_episodes(run_dir, legs)
-    for phase in ("eval_before", "eval_after"):
-        if (run_dir / phase).is_dir():
-            episodes += _eval_episodes(run_dir, phase, legs, task_timeout_s)
-    return episodes
+# ----- classification ---------------------------------------------------------------------------
 
 
-def _trace_files(run_dir: Path, phase: str) -> list[Path]:
-    traces = run_dir / phase / "traces"
-    return sorted(traces.glob("*.stream.jsonl")) if traces.is_dir() else []
+@dataclass(frozen=True)
+class EpisodeLeakage:
+    """One episode's bucket, and every fact that put it there."""
+
+    episode: Episode
+    bucket: str
+    reasons: tuple[str, ...]
+    evidence: tuple[Connection, ...]
+    requested: tuple[str, ...]
+    covered: bool
+    shared_with: tuple[dict[str, Any], ...]
+    acquisition: dict[str, Any] | None
+    inherited_from: dict[str, Any] | None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "phase": self.episode.phase,
+            "task_idx": self.episode.task_idx,
+            "seq": self.episode.seq,
+            "lease": self.episode.lease,
+            "leg": self.episode.leg,
+            "window": {
+                "started_at": self.episode.started_at,
+                "ended_at": self.episode.ended_at,
+                "kind": self.episode.window_kind,
+                "capture_covers": self.covered,
+                "shared_with": list(self.shared_with),
+            },
+            "bucket": self.bucket,
+            "reasons": list(self.reasons),
+            "evidence": [c.to_json() for c in self.evidence],
+            "requested": list(self.requested),
+            "acquisition": self.acquisition,
+            "inherited_from": self.inherited_from,
+            "correct": self.episode.correct,
+            "success": self.episode.success,
+            "reward": self.episode.reward,
+        }
+
+
+LIMITS = [
+    "egress observes hostnames and times, never a method, a status or a body, so no egress "
+    "observation on its own can reach achieved leakage",
+    "the file CDN serves the whole platform, so a client hello to it is a connection to a CDN "
+    "and not a download of an answer key",
+    "hostname granularity cannot separate a listing endpoint from a data endpoint on a host "
+    "that serves both",
+    "a local read of an already-downloaded file is invisible to the observer, so a resident "
+    "answer artifact is only charged to an episode whose own commands name it",
+    "egress cannot show intent, so a dataset host reached for a tokenizer and one reached for "
+    "an answer key are the same observation",
+    "episodes that overlap in time share one network namespace, so a connection inside more "
+    "than one open window is charged to all of them and each record names its rivals",
+    "a trace carries what the agent ran, so a harness whose transcript summarises rather than "
+    "quotes contributes no request evidence and its episodes rest on egress alone",
+]
+
+
+@dataclass(frozen=True)
+class RunLeakage:
+    """One run directory's episodes, the counts a reader wants, and the caveats they need."""
+
+    run_dir: Path
+    run_id: str
+    cell: str
+    env: str
+    harness: str
+    model: str
+    finished: bool
+    capture: Capture
+    answer_source_configured: bool
+    episodes: tuple[EpisodeLeakage, ...]
+    notes: tuple[str, ...]
+
+    @property
+    def label(self) -> str:
+        """The directory, not the run id: a repair carries the original's manifest."""
+        return self.run_dir.name
+
+    def phases(self) -> list[str]:
+        seen = [e.episode.phase for e in self.episodes]
+        return [p for p in PHASES if p in seen] + sorted({p for p in seen if p not in PHASES})
+
+    def counts(self, phase: str | None = None) -> dict[str, int]:
+        counts = {bucket: 0 for bucket in (*BUCKETS, UNCLASSIFIED)}
+        for row in self.episodes:
+            if phase is None or row.episode.phase == phase:
+                counts[row.bucket] += 1
+        return counts
+
+    def correct_rate(self, bucket: str, phase: str | None = None) -> tuple[int, int]:
+        """Graded episodes in this bucket, and how many were correct."""
+        rows = [
+            e
+            for e in self.episodes
+            if e.bucket == bucket
+            and (phase is None or e.episode.phase == phase)
+            and e.episode.correct is not None
+        ]
+        return sum(1 for e in rows if e.episode.correct), len(rows)
+
+    def acquisitions(self) -> list[EpisodeLeakage]:
+        return [e for e in self.episodes if e.acquisition is not None]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "schema": SCHEMA,
+            "run_dir": str(self.run_dir),
+            "run_id": self.run_id,
+            "cell": self.cell,
+            "env": self.env,
+            "harness": self.harness,
+            "model": self.model,
+            "finished": self.finished,
+            "egress": {
+                "available": self.capture.available,
+                "malformed_rows": self.capture.malformed,
+                "segments": [s.to_json() for s in self.capture.segments],
+                "observations": len(self.capture.connections),
+            },
+            "answer_source_configured": self.answer_source_configured,
+            "buckets": self.counts(),
+            "phases": [
+                {
+                    "phase": phase,
+                    "buckets": self.counts(phase),
+                    "correct": {
+                        bucket: dict(
+                            zip(
+                                ("correct", "graded"),
+                                self.correct_rate(bucket, phase),
+                                strict=True,
+                            )
+                        )
+                        for bucket in (*BUCKETS, UNCLASSIFIED)
+                    },
+                }
+                for phase in self.phases()
+            ],
+            "acquisitions": [e.to_json() for e in self.acquisitions()],
+            "notes": list(self.notes),
+            "limits": LIMITS,
+            "episodes": [e.to_json() for e in self.episodes],
+        }
+
+
+def _rank(bucket: str) -> int:
+    return BUCKETS.index(bucket) if bucket in BUCKETS else -1
+
+
+def _raise_to(current: str, candidate: str) -> str:
+    return candidate if _rank(candidate) > _rank(current) else current
+
+
+def _note(reasons: list[str], reason: str) -> None:
+    if reason not in reasons:
+        reasons.append(reason)
+
+
+def _window_evidence(
+    episode: Episode, connections: Sequence[Connection], starts: Sequence[float]
+) -> list[Connection]:
+    """Every connection inside this episode's window, which is half-open at the end."""
+    if episode.started_at is None:
+        return []
+    end = episode.ended_at if episode.ended_at is not None else float("inf")
+    out = []
+    for connection in connections[bisect_left(starts, episode.started_at) :]:
+        if connection.epoch >= end:
+            break
+        out.append(connection)
+    return out
+
+
+def _actions_for(
+    episode: Episode, traces: dict[str, Trace], phase_dir_name: str
+) -> list[Action]:
+    """The actions this episode ran, cut out of its phase's transcripts by lease.
+
+    An eval task's trace is named for its task, so the whole file is one episode. A rollout is
+    one transcript for hundreds, and the lease ids cut it: an episode's actions are the ones
+    between where its lease first appears and where the next lease does.
+    """
+    out: list[Action] = []
+    for name, trace in traces.items():
+        named = _TASK_TRACE.match(Path(name).name)
+        if named is not None:
+            if int(named.group(1)) == episode.task_idx:
+                out.extend(trace.actions)
+            continue
+        start = trace.first_seen.get(episode.lease)
+        if start is None:
+            continue
+        later = [o for o in trace.first_seen.values() if o > start]
+        end = min(later) if later else None
+        out.extend(
+            a for a in trace.actions if a.offset >= start and (end is None or a.offset < end)
+        )
+    return out
 
 
 _TASK_TRACE = re.compile(r"^task-(\d+)-leg-")
 
 
-def trace_urls_by_lease(run_dir: Path, episodes: Sequence[Episode]) -> dict[str, list[str]]:
-    """Collect the URLs each episode's slice of the transcript names, keyed by lease.
+def _requested_urls(actions: Sequence[Action]) -> list[str]:
+    """URLs the agent asked for, taken from command text and never from prose or output."""
+    urls: list[str] = []
+    for action in actions:
+        if action.kind.startswith("mcp:"):
+            continue
+        for match in _URL.finditer(action.request):
+            urls.append(_tidy_url(match.group(0)))
+    return list(dict.fromkeys(urls))
 
-    An eval task runs in a leg of its own and its trace file says which task in its name, so
-    that whole file is one episode and no splitting is needed. A rollout is one transcript for
-    hundreds of episodes, and the lease is what splits it: the stream hands the agent a lease
-    with the task, so the id appears in the transcript at the moment that episode starts and the
-    next id marks where it ends. That is ordering rather than timing, and it is exact, which is
-    what a trace is good for. A harness that summarises its transcript instead of quoting it
-    will not carry every lease, and the leases that cannot be found contribute no trace evidence
-    rather than borrowing another episode's.
+
+def _tidy_url(url: str) -> str:
+    """Cut a URL out of the shell it was quoted in, so a template still names its route."""
+    for marker in ("${", "$(", "`"):
+        cut = url.find(marker)
+        if cut > 0:
+            url = url[:cut]
+    return url.rstrip(".,;:!?")
+
+
+def _inherited_artifacts(run_dir: Path, manifest: dict[str, Any]) -> tuple[list[dict], list[str]]:
+    """What a bookend starts with, because it starts with its source's HOME.
+
+    A rebookend runs a new eval against the run it names, and the runner seeds it from that
+    run's accumulated HOME, which every eval task then gets a copy of. So an answer file the
+    source saved under HOME is on disk in this run before its first episode begins. An artifact
+    the source left somewhere ephemeral is not: that path died with the source's containers.
+
+    When the source directory is not beside this one the question cannot be answered, and the
+    honest answer to a question about durable answer files is not "there were none". The caller
+    floors the run at unclassified and says so.
     """
-    found: dict[str, list[str]] = {}
-    by_phase: dict[str, list[Episode]] = {}
-    for episode in episodes:
-        by_phase.setdefault(episode.phase, []).append(episode)
-    for phase, phase_episodes in by_phase.items():
-        leases = {e.lease for e in phase_episodes}
-        by_task = {e.task_idx: e.lease for e in phase_episodes}
-        for path in _trace_files(run_dir, phase):
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            named = _TASK_TRACE.match(path.name)
-            if named is not None and int(named.group(1)) in by_task:
-                lease = by_task[int(named.group(1))]
-                found.setdefault(lease, []).extend(
-                    _tidy_url(m.group(0)) for m in _URL.finditer(text)
+    rebookend = manifest.get("rebookend") or {}
+    source_id = rebookend.get("rebookend_of")
+    if not source_id:
+        return [], []
+    source_dir = run_dir.parent / str(source_id)
+    if not source_dir.is_dir():
+        return [], [
+            f"this run is a bookend of {source_id}, whose directory is not beside it, so "
+            "whether the source left an answer file in the HOME this run inherited cannot be "
+            "checked; no episode here is cleared"
+        ]
+    source = classify_run(source_dir, _inherit=False)
+    carried = [
+        {
+            "destination": e.acquisition["destination"],
+            "persistence": e.acquisition["persistence"],
+            "leg": None,
+            "acquisition": {**e.acquisition["episode"], "run_id": source.run_id,
+                            "destination": e.acquisition["destination"],
+                            "persistence": e.acquisition["persistence"]},
+        }
+        for e in source.acquisitions()
+        if e.acquisition.get("destination")
+        and e.acquisition.get("persistence") in ("home", "unknown")
+    ]
+    note = [
+        f"inherited {len(carried)} durable answer artifacts from {source_id}, whose HOME this "
+        "run's eval tasks are copies of"
+    ] if carried else []
+    return carried, note
+
+
+def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
+    """Grade every episode in a run directory. Reads only; writes nothing back."""
+    run_dir = Path(run_dir)
+    manifest_path = run_dir / "manifest.json"
+    manifest: dict[str, Any] = {}
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cell = manifest.get("cell") or {}
+    env = str(cell.get("env") or "")
+    source = ANSWER_SOURCES.get(env)
+    budget = cell.get("budget") or {}
+    timeout = float(budget.get("eval_task_timeout_s") or 900)
+    max_in_flight = int(cell.get("max_in_flight") or 1)
+    finished = manifest.get("ended_at") is not None
+
+    capture = read_capture(run_dir)
+    legs = _legs(run_dir)
+    episodes: list[Episode] = []
+    traces: dict[str, dict[str, Trace]] = {}
+
+    if (run_dir / "rollout" / "dispenses.jsonl").exists():
+        leases = [str(d["lease"]) for d in _read_jsonl(run_dir / "rollout" / "dispenses.jsonl")]
+        traces["rollout"] = {
+            str(p): read_trace(p, leases) for p in _trace_files(run_dir, "rollout")
+        }
+        episodes += _rollout_episodes(run_dir, legs, max_in_flight, traces["rollout"])
+    for phase in ("eval_before", "eval_after"):
+        if (run_dir / phase).is_dir():
+            phase_episodes = _eval_episodes(run_dir, phase, legs, timeout)
+            leases = [e.lease for e in phase_episodes]
+            traces[phase] = {
+                str(p): read_trace(p, leases) for p in _trace_files(run_dir, phase)
+            }
+            episodes += phase_episodes
+
+    inherited_artifacts: list[dict[str, Any]] = []
+    inheritance_notes: list[str] = []
+    unresolved_inheritance = False
+    if _inherit:
+        inherited_artifacts, inheritance_notes = _inherited_artifacts(run_dir, manifest)
+        unresolved_inheritance = bool(inheritance_notes) and not inherited_artifacts
+
+    notes = _capture_notes(capture, finished) + _coverage_notes(legs, episodes)
+    notes += inheritance_notes
+    if source is None:
+        notes.append(
+            f"no answer-source hosts are configured for env {env!r}, so leakage cannot be "
+            "distinguished from general web reference in this run"
+        )
+
+    starts = [c.epoch for c in capture.connections]
+    ordered = sorted(episodes, key=lambda e: (e.started_at if e.started_at is not None else 0.0))
+    graded: list[EpisodeLeakage] = []
+    # Artifacts already on disk, and where each can still be read from: an ephemeral path only
+    # inside the leg that fetched it, a HOME path anywhere later in the run because the runner
+    # copies HOME into every eval task, and an unknown path anywhere later because unknown is
+    # not the same as gone.
+    resident: list[dict[str, Any]] = list(inherited_artifacts)
+
+    for episode in ordered:
+        evidence = _window_evidence(episode, capture.connections, starts)
+        actions = _actions_for(episode, traces.get(episode.phase, {}), episode.phase)
+        requested = _requested_urls(actions)
+        covered = capture.covers(episode.started_at, episode.ended_at)
+        reasons: list[str] = []
+        acquisition: dict[str, Any] | None = None
+        inherited: dict[str, Any] | None = None
+
+        if not capture.available:
+            bucket = UNCLASSIFIED
+            _note(reasons, "capture_unavailable")
+        elif episode.started_at is None:
+            bucket = UNCLASSIFIED
+            _note(reasons, "no_window")
+        elif not finished:
+            bucket = UNCLASSIFIED
+            _note(reasons, "run_unfinished")
+        elif not covered:
+            bucket = UNCLASSIFIED
+            _note(reasons, "capture_not_covering_window")
+        elif unresolved_inheritance:
+            bucket = UNCLASSIFIED
+            _note(reasons, "inherited_home_unchecked")
+        else:
+            bucket = "computed_locally"
+
+        # The egress floor. It tops out at unresolved: the observer sees a connection, never a
+        # body, and the file CDN is shared by the whole platform.
+        for connection in evidence:
+            role = host_role(connection.host, source)
+            if role == "infrastructure":
+                continue
+            if role == "general":
+                bucket = _raise_to(bucket, "general_web_reference")
+                _note(reasons, "general_web_host")
+                continue
+            bucket = _raise_to(bucket, "attempted_leakage")
+            _note(reasons, "answer_source_host")
+            if role == "answer_source_content" and connection.kind == "tls":
+                bucket = _raise_to(bucket, "unresolved_leakage")
+                _note(reasons, "content_cdn_handshake")
+
+        # What the agent asked for, read off its commands.
+        for url in requested:
+            host = (urlsplit(url).hostname or "").lower()
+            if not host_role(host, source).startswith("answer_source"):
+                continue
+            bucket = _raise_to(bucket, "attempted_leakage")
+            _note(reasons, "answer_source_request")
+            kind = content_url_kind(url, source)
+            if kind == "row_query":
+                _note(reasons, "answer_rows_requested")
+            elif kind == "file_download":
+                _note(reasons, "file_download_requested")
+        if any(call in a.request for a in actions for call in _HUB_CALLS):
+            bucket = _raise_to(bucket, "attempted_leakage")
+            _note(reasons, "hub_download_call")
+
+        # What came back. A result carrying the dataset's answer columns is the answer key
+        # arriving, which is the one thing that settles an episode from the trace alone.
+        if any(
+            not a.kind.startswith("mcp:") and carries_answer_content(a.result, source)
+            for a in actions
+        ):
+            bucket = _raise_to(bucket, "achieved_leakage")
+            _note(reasons, "answer_content_in_result")
+            acquisition = {
+                "kind": "answer_content_in_result",
+                "episode": episode.identity(),
+                "epoch": evidence[0].epoch if evidence else episode.started_at,
+                "destination": None,
+                "persistence": "response",
+                "requested": [u for u in requested if content_url_kind(u, source) == "row_query"],
+            }
+
+        # A download the filesystem then answered for. The destination has to come back in a
+        # result, because a command naming a path is a request and not a file.
+        session = [
+            a for trace in traces.get(episode.phase, {}).values() for a in trace.actions
+        ]
+        landed = _completed_downloads(actions, session, source)
+        if landed:
+            bucket = _raise_to(bucket, "achieved_leakage")
+            _note(reasons, "file_download_landed")
+            if acquisition is None:
+                acquisition = {
+                    "kind": "file_download_landed",
+                    "episode": episode.identity(),
+                    "epoch": evidence[0].epoch if evidence else episode.started_at,
+                    "destination": landed[0]["destination"],
+                    "persistence": landed[0]["persistence"],
+                    "requested": [d["url"] for d in landed],
+                }
+        elif "file_download_requested" in reasons:
+            bucket = _raise_to(bucket, "unresolved_leakage")
+            _note(reasons, "file_download_unconfirmed")
+
+        # An artifact fetched earlier and still reachable here. Reading it is achieved; having
+        # it within reach and no command naming it is unresolved, because a local read leaves
+        # no trace the observer can see and this instrument will not guess either way.
+        reachable = [
+            r
+            for r in resident
+            if r["persistence"] != "ephemeral" or r["leg"] == episode.leg
+        ]
+        if reachable and acquisition is None:
+            read = [
+                r
+                for r in reachable
+                if any(
+                    a.ok and (r["destination"] in a.request or r["destination"] in a.result)
+                    for a in actions
                 )
-                continue
-            offsets = sorted(
-                (text.find(lease), lease) for lease in leases if text.find(lease) >= 0
+            ]
+            if read:
+                bucket = _raise_to(bucket, "achieved_leakage")
+                _note(reasons, "resident_artifact_read")
+                inherited = read[0]["acquisition"]
+            else:
+                bucket = _raise_to(bucket, "unresolved_leakage")
+                _note(reasons, "resident_artifact_available")
+                inherited = reachable[0]["acquisition"]
+
+        for landing in landed:
+            resident.append(
+                {
+                    "destination": landing["destination"],
+                    "persistence": landing["persistence"],
+                    "leg": episode.leg,
+                    "acquisition": {**episode.identity(), "destination": landing["destination"],
+                                    "persistence": landing["persistence"]},
+                }
             )
-            if not offsets:
-                continue
-            starts = [offset for offset, _ in offsets]
-            for match in _URL.finditer(text):
-                index = bisect_right(starts, match.start()) - 1
-                if index < 0:
-                    continue
-                found.setdefault(offsets[index][1], []).append(_tidy_url(match.group(0)))
-    return {lease: sorted(dict.fromkeys(urls)) for lease, urls in found.items()}
+
+        graded.append(
+            EpisodeLeakage(
+                episode=episode,
+                bucket=bucket,
+                reasons=tuple(reasons),
+                evidence=tuple(evidence),
+                requested=tuple(requested),
+                covered=covered,
+                shared_with=(),
+                acquisition=acquisition,
+                inherited_from=inherited,
+            )
+        )
+
+    graded = _mark_shared_windows(graded)
+    graded.sort(
+        key=lambda g: (
+            PHASES.index(g.episode.phase) if g.episode.phase in PHASES else 9,
+            g.episode.seq if g.episode.seq is not None else g.episode.task_idx,
+        )
+    )
+    return RunLeakage(
+        run_dir=run_dir,
+        run_id=str(manifest.get("run_id") or run_dir.name),
+        cell=str(cell.get("name") or ""),
+        env=env,
+        harness=str(cell.get("harness") or ""),
+        model=str(cell.get("model") or ""),
+        finished=finished,
+        capture=capture,
+        answer_source_configured=source is not None,
+        episodes=tuple(graded),
+        notes=tuple(notes),
+    )
+
+
+# Phrases a shell prints when the file is not there. They only ever withhold a confirmation,
+# never grant one, so an unrecognised failure leaves the download resting on the later-read rule
+# rather than being waved through by this list.
+_MISSING_FILE = ("no such file", "not found", "cannot access", "cannot open", "does not exist")
+
+
+def _missing_file(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _MISSING_FILE)
+
+
+def _completed_downloads(
+    actions: Sequence[Action], later: Sequence[Action], source: AnswerSource | None
+) -> list[dict[str, Any]]:
+    """Downloads of an answer-source file that the filesystem afterwards answered for.
+
+    A command naming a destination says where the agent meant to put a body; it does not say one
+    arrived. What says so is a later action that succeeded and names that path: a size, a
+    listing, a checksum, or a parser reading it. Success is the harness's own verdict, so a read
+    that raised is not a read, and a download whose file never appeared cannot borrow the
+    traceback that proves it never appeared.
+
+    ``later`` is the whole transcript this episode's actions came from, because the read that
+    confirms a download can land in a following episode of the same session.
+    """
+    downloads = []
+    for action in actions:
+        if action.kind.startswith("mcp:"):
+            continue
+        urls = [
+            url
+            for url in (_tidy_url(m.group(0)) for m in _URL.finditer(action.request))
+            if content_url_kind(url, source) == "file_download"
+            and host_role((urlsplit(url).hostname or "").lower(), source).startswith(
+                "answer_source"
+            )
+        ]
+        if not urls:
+            continue
+        for destination in download_destinations(action.request):
+            downloads.append(
+                {
+                    "destination": destination,
+                    "url": urls[0],
+                    "offset": action.offset,
+                    "trace": action.trace,
+                }
+            )
+
+    landed = []
+    seen: set[str] = set()
+    for download in downloads:
+        destination = download["destination"]
+        if destination in seen:
+            continue
+        # Same transcript only: offsets are per file, and one eval task's read says nothing
+        # about another task's container.
+        same = [
+            a
+            for a in later
+            if a.trace == download["trace"] and a.offset == download["offset"]
+        ]
+        confirmed = any(
+            destination in a.result and not _missing_file(a.result) for a in same
+        ) or any(
+            a.ok
+            and a.trace == download["trace"]
+            and a.offset > download["offset"]
+            and (destination in a.result or destination in a.request)
+            for a in later
+        )
+        if confirmed:
+            seen.add(destination)
+            landed.append({**download, "persistence": destination_persistence(destination)})
+    return landed
+
+
+def _capture_notes(capture: Capture, finished: bool) -> list[str]:
+    notes = []
+    if not finished:
+        notes.append(
+            "this run has no ended_at, so it was still going when the capture was read: the "
+            "observer's record cannot be complete and no episode here is cleared"
+        )
+    if not capture.available:
+        notes.append(
+            "no readable egress record in this run directory, so no episode can be cleared; "
+            "every episode is unclassified rather than clean"
+        )
+    if capture.malformed:
+        notes.append(
+            f"{capture.malformed} capture rows could not be read and are not evidence either "
+            "way; the windows around them are still cleared only where a segment covers them"
+        )
+    return notes
 
 
 def _coverage_notes(legs: list[dict[str, Any]], episodes: Sequence[Episode]) -> list[str]:
-    """What the run ran that this classification has no episode for, said out loud.
-
-    An eval leg that started but never got a task dispensed leaves an empty task directory, and
-    an episode list built from the dispense records will not mention it at all. That is the
-    silent gap a classifier should not have: a phase whose legs outnumber its episodes is
-    reported as unaccounted for rather than as a phase with fewer episodes.
-    """
+    """What the run ran that this classification has no episode for, said out loud."""
     notes = []
     seen: dict[str, set[int]] = {}
     bounded: dict[str, int] = {}
@@ -687,10 +1362,10 @@ def _coverage_notes(legs: list[dict[str, Any]], episodes: Sequence[Episode]) -> 
             and int(leg["task_idx"]) not in seen.get(phase, set())
         )
         if missing:
-            legs_word = "leg" if missing == 1 else "legs"
+            word = "leg" if missing == 1 else "legs"
             notes.append(
-                f"{phase} has {missing} {legs_word} whose task was never dispensed, so they have "
-                "no episode here and this phase's counts are over what it did dispense"
+                f"{phase} has {missing} {word} whose task was never dispensed, so they have no "
+                "episode here and this phase's counts are over what it did dispense"
             )
     for phase, count in sorted(bounded.items()):
         notes.append(
@@ -700,198 +1375,17 @@ def _coverage_notes(legs: list[dict[str, Any]], episodes: Sequence[Episode]) -> 
     return notes
 
 
-def _note(reasons: list[str], reason: str) -> None:
-    if reason not in reasons:
-        reasons.append(reason)
-
-
-def _rank(bucket: str) -> int:
-    return BUCKETS.index(bucket) if bucket in BUCKETS else -1
-
-
-def _raise_to(current: str, candidate: str) -> str:
-    return candidate if _rank(candidate) > _rank(current) else current
-
-
-def _window_evidence(
-    episode: Episode, connections: Sequence[Connection], starts: Sequence[float]
-) -> list[Connection]:
-    """Every connection observed inside this episode's window, which is half-open.
-
-    Half-open because consecutive rollout windows meet at a dispense: a connection landing on
-    that instant belongs to the episode being pulled, not to the one just finished.
-    """
-    if episode.started_at is None:
-        return []
-    end = episode.ended_at if episode.ended_at is not None else float("inf")
-    out = []
-    for connection in connections[bisect_left(starts, episode.started_at) :]:
-        if connection.epoch >= end:
-            break
-        out.append(connection)
-    return out
-
-
-def classify_run(run_dir: Path) -> RunLeakage:
-    """Grade every episode in a completed run directory."""
-    run_dir = Path(run_dir)
-    manifest_path = run_dir / "manifest.json"
-    manifest: dict[str, Any] = {}
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    cell = manifest.get("cell") or {}
-    env = str(cell.get("env") or "")
-    source = ANSWER_SOURCES.get(env)
-    budget = cell.get("budget") or {}
-    timeout = float(budget.get("eval_task_timeout_s") or 900)
-
-    connections = read_egress(run_dir)
-    segments = tuple(p.name for p in egress_segments(run_dir))
-    episodes = read_episodes(run_dir, task_timeout_s=timeout)
-    urls = trace_urls_by_lease(run_dir, episodes)
-
-    notes: list[str] = []
-    if not segments:
-        notes.append(
-            "no egress record in this run directory, so no episode can be cleared; every "
-            "episode is unclassified rather than clean"
-        )
-    if source is None:
-        notes.append(
-            f"no answer-source hosts are configured for env {env!r}, so leakage cannot be "
-            "distinguished from general web reference in this run"
-        )
-    notes += _coverage_notes(_legs(run_dir), episodes)
-
-    starts = [c.epoch for c in connections]
-    graded: list[EpisodeLeakage] = []
-    # Acquisitions carry forward inside a container and no further. A rollout is one container
-    # for all its episodes, so a file fetched at task 80 is on disk for tasks 81 onward; every
-    # eval task is a fresh container, so nothing carries between them.
-    acquired_at: dict[str, tuple[float, dict[str, Any]]] = {}
-    ordered = sorted(episodes, key=lambda e: (e.started_at if e.started_at is not None else 0.0))
-
-    for episode in ordered:
-        evidence = _window_evidence(episode, connections, starts)
-        episode_urls = tuple(urls.get(episode.lease, ()))
-        reasons: list[str] = []
-        acquisition: dict[str, Any] | None = None
-
-        if not segments or episode.started_at is None:
-            bucket = UNCLASSIFIED
-            reasons.append("no_egress_record" if not segments else "no_window")
-        else:
-            bucket = "computed_locally"
-            roles = [(c, host_role(c.host, source)) for c in evidence]
-            if any(role == "general" for _, role in roles):
-                bucket = _raise_to(bucket, "general_web_reference")
-                reasons.append("general_web_host")
-            if any(role.startswith("answer_source") for _, role in roles):
-                bucket = _raise_to(bucket, "attempted_leakage")
-                reasons.append("answer_source_host")
-            content = [
-                c for c, role in roles if role == "answer_source_content" and c.kind == "tls"
-            ]
-            if content:
-                bucket = _raise_to(bucket, "achieved_leakage")
-                reasons.append("answer_source_content_host")
-                acquisition = {
-                    "kind": "answer_source_content_host",
-                    "host": content[0].host,
-                    "epoch": content[0].epoch,
-                    "requested": [],
-                }
-
-        # The trace, which can only raise. An answer-source URL is a reach, and that alone is an
-        # attempt. A file-download URL beside a content-host connection in the same window is the
-        # two halves of an obtainment, the file named by the command and the transfer seen by the
-        # observer, and it is also where the citation for an acquisition comes from.
-        fetched = [
-            c
-            for c in evidence
-            if c.kind == "tls" and host_role(c.host, source) == "answer_source_content"
-        ]
-        for url in episode_urls:
-            host = (urlsplit(url).hostname or "").lower()
-            if not host_role(host, source).startswith("answer_source"):
-                continue
-            bucket = _raise_to(bucket, "attempted_leakage")
-            _note(reasons, "answer_source_url")
-            kind = content_url_kind(url, source)
-            if kind == "row_query":
-                _note(reasons, "answer_rows_requested")
-            elif kind == "file_download" and fetched:
-                bucket = _raise_to(bucket, "achieved_leakage")
-                _note(reasons, "file_download_confirmed_by_egress")
-                if acquisition is None:
-                    acquisition = {
-                        "kind": "file_download_confirmed_by_egress",
-                        "host": fetched[0].host,
-                        "epoch": fetched[0].epoch,
-                        "requested": [],
-                    }
-                acquisition["kind"] = "file_download_confirmed_by_egress"
-                # Every file this episode asked the answer source for, not one of them. The
-                # observer saw a body move and cannot say which request carried it, and an
-                # episode that asked for a gated file and an ungated mirror of it asked twice.
-                requested = acquisition["requested"]
-                if isinstance(requested, list) and url not in requested:
-                    requested.append(url)
-            elif kind == "file_download":
-                _note(reasons, "file_download_unconfirmed")
-
-        prior = acquired_at.get(episode.leg)
-        if (
-            acquisition is None
-            and prior is not None
-            and episode.started_at is not None
-            and episode.started_at >= prior[0]
-            and bucket != UNCLASSIFIED
-        ):
-            bucket = _raise_to(bucket, "achieved_leakage")
-            reasons.append("answer_source_resident")
-        if acquisition is not None:
-            existing = acquired_at.get(episode.leg)
-            if existing is None or acquisition["epoch"] < existing[0]:
-                acquired_at[episode.leg] = (float(acquisition["epoch"]), acquisition)
-
-        graded.append(
-            EpisodeLeakage(
-                episode=episode,
-                bucket=bucket,
-                reasons=tuple(reasons),
-                evidence=tuple(evidence),
-                trace_urls=episode_urls,
-                shared_window_with=0,
-                acquisition=acquisition,
-            )
-        )
-
-    graded = _mark_shared_windows(graded)
-    graded.sort(key=lambda g: (PHASES.index(g.episode.phase) if g.episode.phase in PHASES else 9,
-                               g.episode.seq if g.episode.seq is not None else g.episode.task_idx))
-    return RunLeakage(
-        run_dir=run_dir,
-        run_id=str(manifest.get("run_id") or run_dir.name),
-        cell=str(cell.get("name") or ""),
-        env=env,
-        harness=str(cell.get("harness") or ""),
-        model=str(cell.get("model") or ""),
-        egress_available=bool(segments),
-        egress_segments=segments,
-        observations=len(connections),
-        answer_source_configured=source is not None,
-        episodes=tuple(graded),
-        notes=tuple(notes),
-    )
-
-
 def _mark_shared_windows(graded: Sequence[EpisodeLeakage]) -> list[EpisodeLeakage]:
-    """Count, per episode, how many other episodes were open at the same time.
+    """Name, per episode, the other episodes that could equally own this episode's evidence.
 
     Overlapping episodes share one network namespace, so a connection inside two open windows
     belongs to both as far as the observer is concerned. Rather than pick one, the connection is
-    charged to every window that contains it and the count of rivals travels with the record.
+    charged to every window containing it and the rivals travel with the record by identity, so
+    a reader can go and look at them.
+
+    Rivals are named per connection rather than per window: two windows that overlap somewhere
+    the traffic is not create no ambiguity about that traffic, and an episode that lists rivals
+    it does not really have is as misleading as one that hides the rivals it does.
     """
     windows = [
         (
@@ -902,14 +1396,18 @@ def _mark_shared_windows(graded: Sequence[EpisodeLeakage]) -> list[EpisodeLeakag
     ]
     out = []
     for index, row in enumerate(graded):
-        start, end = windows[index]
+        start, _ = windows[index]
         if start is None or not row.evidence:
             out.append(row)
             continue
-        rivals = sum(
-            1
-            for other, (s, e) in enumerate(windows)
-            if other != index and s is not None and s < end and e > start
+        rivals = tuple(
+            other.episode.identity()
+            for position, other in enumerate(graded)
+            if position != index
+            and windows[position][0] is not None
+            and any(
+                windows[position][0] <= c.epoch < windows[position][1] for c in row.evidence
+            )
         )
         out.append(
             EpisodeLeakage(
@@ -917,34 +1415,30 @@ def _mark_shared_windows(graded: Sequence[EpisodeLeakage]) -> list[EpisodeLeakag
                 bucket=row.bucket,
                 reasons=row.reasons,
                 evidence=row.evidence,
-                trace_urls=row.trace_urls,
-                shared_window_with=rivals,
+                requested=row.requested,
+                covered=row.covered,
+                shared_with=rivals,
                 acquisition=row.acquisition,
+                inherited_from=row.inherited_from,
             )
         )
     return out
 
 
-MAX_CITATIONS = 10
+# ----- output -----------------------------------------------------------------------------------
 
 
 def render_table(runs: Sequence[RunLeakage]) -> str:
     """One row per run, phase and bucket, because a blended row is the thing being avoided."""
-    header = ("run", "phase", "bucket", "episodes", "correct", "rate", "judge")
+    header = ("run", "phase", "bucket", "episodes", "correct", "rate")
     rows: list[tuple[str, ...]] = []
     for run in runs:
         for phase in run.phases():
             counts = run.counts(phase)
-            unresolved = {id(e) for e in run.unresolved(phase)}
             for bucket in (*BUCKETS, UNCLASSIFIED):
                 if not counts[bucket]:
                     continue
                 correct, graded = run.correct_rate(bucket, phase)
-                waiting = sum(
-                    1
-                    for e in run.episodes
-                    if e.episode.phase == phase and e.bucket == bucket and id(e) in unresolved
-                )
                 rows.append(
                     (
                         run.label,
@@ -953,62 +1447,36 @@ def render_table(runs: Sequence[RunLeakage]) -> str:
                         str(counts[bucket]),
                         f"{correct}/{graded}",
                         f"{correct / graded:.3f}" if graded else "-",
-                        str(waiting) if waiting else "-",
                     )
                 )
         if not run.episodes:
-            rows.append((run.label, "-", "no episodes recorded", "0", "-", "-", "-"))
+            rows.append((run.label, "-", "no episodes recorded", "0", "-", "-"))
     widths = [max(len(str(c)) for c in column) for column in zip(header, *rows, strict=True)]
     lines = [
         "  ".join(str(c).ljust(w) for c, w in zip(header, widths, strict=True)),
         "  ".join("-" * w for w in widths),
     ]
-    lines += [
-        "  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)) for row in rows
-    ]
+    lines += ["  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)) for row in rows]
 
     citations = [(run, e) for run in runs for e in run.acquisitions()]
     if citations:
-        lines += ["", "achieved-leakage acquisitions"]
-        for run, row in citations[:MAX_CITATIONS]:
+        lines += ["", "achieved-leakage acquisitions, all of them"]
+        for run, row in citations:
             acquisition = row.acquisition or {}
-            rivals = row.shared_window_with
+            rivals = len(row.shared_with)
             lines.append(
-                f"  {run.label}  {row.episode.phase}  {row.episode.label}  "
-                f"{acquisition.get('epoch')}  {acquisition.get('host')}  "
-                f"{acquisition.get('kind')}"
-                + (f"  (window shared with {rivals})" if rivals else "")
+                f"  {run.label}  {row.episode.label}  {acquisition.get('kind')}  "
+                f"dest={acquisition.get('destination')} "
+                f"({acquisition.get('persistence')})"
+                + (f"  window shared with {rivals}" if rivals else "")
             )
             for url in acquisition.get("requested") or []:
                 lines.append(f"      {url}")
-        if len(citations) > MAX_CITATIONS:
-            lines.append(
-                f"  ... and {len(citations) - MAX_CITATIONS} more; --format json lists them all"
-            )
 
-    if any(run.unresolved() for run in runs):
-        lines += [
-            "",
-            "JUDGE: the judge column counts episodes that queried the answer source's row API. "
-            "That endpoint returns rows over the same hostname it returns refusals over, so "
-            "whether content came back is in the response and not in the egress record. They "
-            "are held at attempted rather than rounded either way.",
-        ]
-
-    shared = [run.label for run in runs if any(e.shared_window_with for e in run.episodes)]
-    if shared:
-        lines += [
-            "",
-            "SHARED WINDOWS: episodes in "
-            + ", ".join(sorted(set(shared)))
-            + " overlap in time and share one network namespace, so a connection inside more "
-            "than one open window is charged to all of them. Per-episode evidence in these runs "
-            "is a set the episode belongs to, not a fact about it alone.",
-        ]
     for run in runs:
         for note in run.notes:
             lines += ["", f"{run.label}: {note}"]
-    lines += ["", "what egress cannot establish"]
+    lines += ["", "what this cannot establish"]
     lines += [f"  - {limit}" for limit in LIMITS]
     return "\n".join(lines)
 
@@ -1018,14 +1486,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("run_dirs", type=Path, nargs="+", help="completed run directories")
     parser.add_argument("--format", choices=["table", "json"], default="table")
     parser.add_argument("--out", type=Path, default=None, help="write instead of printing")
+    parser.add_argument(
+        "--allow-unfinished",
+        action="store_true",
+        help=(
+            "grade runs whose manifest has no ended_at; their capture cannot be complete, so "
+            "every episode in them is unclassified unless positive evidence raises it"
+        ),
+    )
     args = parser.parse_args(argv)
 
-    targets = [d for d in args.run_dirs if (d / "manifest.json").exists() or d.is_dir()]
+    targets = [d for d in args.run_dirs if d.is_dir()]
     if not targets:
         print("no run directories given")
         return 1
+    refused = [d for d in targets if not _finished(d)]
+    if refused and not args.allow_unfinished:
+        for run_dir in refused:
+            print(
+                f"refusing {run_dir}: its manifest has no ended_at, so the run was still going "
+                "and the egress record cannot be complete. Pass --allow-unfinished to grade it "
+                "anyway, where every episode is unclassified rather than clean."
+            )
+        targets = [d for d in targets if d not in refused]
+        if not targets:
+            return 1
+
     runs = [classify_run(d) for d in targets]
-    runs.sort(key=lambda r: r.run_id)
+    runs.sort(key=lambda r: r.label)
     if args.format == "json":
         text = json.dumps({"schema": SCHEMA, "runs": [r.to_json() for r in runs]}, indent=2)
     else:
@@ -1035,7 +1523,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"leakage: {args.out}")
     else:
         print(text)
-    return 0
+    return 1 if refused and not args.allow_unfinished else 0
+
+
+def _finished(run_dir: Path) -> bool:
+    path = run_dir / "manifest.json"
+    if not path.exists():
+        return False
+    return json.loads(path.read_text(encoding="utf-8")).get("ended_at") is not None
 
 
 if __name__ == "__main__":
@@ -1049,17 +1544,23 @@ __all__ = [
     "LIMITS",
     "SCHEMA",
     "UNCLASSIFIED",
+    "Action",
     "AnswerSource",
+    "Capture",
     "Connection",
     "Episode",
     "EpisodeLeakage",
     "RunLeakage",
+    "Segment",
+    "Trace",
+    "carries_answer_content",
     "classify_run",
     "content_url_kind",
+    "destination_persistence",
+    "download_destinations",
     "host_role",
     "main",
-    "read_egress",
-    "read_episodes",
+    "read_capture",
+    "read_trace",
     "render_table",
-    "trace_urls_by_lease",
 ]

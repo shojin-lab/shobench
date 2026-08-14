@@ -1,9 +1,10 @@
-"""What the egress record can be made to say about an episode, and what it cannot.
+"""What the evidence can be made to say about an episode, and where it stops.
 
-The classifier's whole claim is that its floor is objective: a capture written outside the
-container decides the bucket, and the agent's own transcript can only raise it. These fixtures
-are synthetic captures in the shape the observer really writes, one per thing the floor has to
-get right, plus one slice of the real capture from the run that prompted the metric.
+The classifier makes two claims that have to hold in opposite directions. It must not call an
+episode achieved on evidence that only shows a connection, and it must not call an episode
+clean when the answer key demonstrably arrived. These fixtures are captures in the shape the
+observer really writes and transcripts in the shapes the three harnesses really emit, one per
+thing the rules have to get right in each direction.
 
 Nothing here reaches a provider, a container or a network. A run directory is a few small files
 and the classifier only reads.
@@ -17,27 +18,52 @@ from pathlib import Path
 import pytest
 
 from shobench.leakage import (
+    ANSWER_SOURCES,
     BUCKETS,
     UNCLASSIFIED,
+    carries_answer_content,
     classify_run,
     content_url_kind,
+    destination_persistence,
+    download_destinations,
     host_role,
-    read_egress,
+    main,
+    read_capture,
     render_table,
 )
+
+_HLE = ANSWER_SOURCES["hle"]
 
 # The capture's two row shapes, as tshark writes them: a DNS question resolved by Docker's
 # resolver, and a TLS client hello carrying the server name it opened.
 _DNS = "{epoch:.6f}\t127.0.0.11\t\t49918\t{host}\t"
 _TLS = "{epoch:.6f}\t3.168.73.111\t443\t\t\t{host}"
 
+_PARQUET = (
+    "https://huggingface.co/datasets/macabdul9/hle_text_only/resolve/main/"
+    "data/test-00000-of-00001.parquet"
+)
+_ROWS = "https://datasets-server.huggingface.co/rows?dataset=cais%2Fhle&split=test&offset=0"
+# One row as the dataset server returns it: the answer beside the columns that ship with it.
+_ANSWER_ROW = (
+    '{"rows":[{"row_idx":150,"row":{"question":"...","answer":"B",'
+    '"answer_type":"multipleChoice","rationale":"reverse hyperconjugation"}}]}'
+)
+
 
 def _capture(*rows: tuple[float, str, str]) -> str:
+    """A capture whose first and last rows bracket everything the fixtures place inside it."""
+    ordered = sorted(rows)
     lines = [
         (_DNS if kind == "dns" else _TLS).format(epoch=epoch, host=host)
-        for epoch, host, kind in rows
+        for epoch, host, kind in ordered
     ]
     return "".join(line + "\n" for line in lines)
+
+
+def _watching(*rows: tuple[float, str, str], since: float = 0.0, until: float = 10_000.0) -> str:
+    """The same, with infrastructure rows at each end so the observer demonstrably ran."""
+    return _capture((since, "chatgpt.com", "dns"), *rows, (until, "chatgpt.com", "dns"))
 
 
 def _jsonl(path: Path, records: list[dict]) -> None:
@@ -45,27 +71,148 @@ def _jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
 
 
+# ----- transcripts, in the three shapes the runner launches -------------------------------------
+
+
+def codex(*items: dict) -> str:
+    """A codex stream: completed items carrying a command and its aggregated output."""
+    lines = []
+    for item in items:
+        if "lease_seen" in item:
+            lines.append(json.dumps({"type": "agent_message", "text": item["lease_seen"]}))
+            continue
+        if "submit" in item:
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "mcp_tool_call",
+                            "tool": "submit_answer",
+                            "arguments": {
+                                "lease": item["submit"],
+                                "answer": item.get("answer", "x"),
+                            },
+                            "result": {"content": [{"type": "text", "text": "ok"}]},
+                        },
+                    }
+                )
+            )
+            continue
+        lines.append(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": item.get("command", ""),
+                        "aggregated_output": item.get("output", ""),
+                        "exit_code": item.get("exit_code", 0),
+                        "status": item.get("status", "completed"),
+                    },
+                }
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def claude(*items: dict) -> str:
+    """A claude_code stream: a tool_use on the assistant side, its tool_result on the user side."""
+    lines = []
+    for index, item in enumerate(items):
+        call = f"toolu_{index}"
+        lines.append(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": call,
+                                "name": item.get("tool", "Bash"),
+                                "input": item.get("input", {}),
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+        lines.append(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": call,
+                                "content": [{"type": "text", "text": item.get("output", "")}],
+                                **({"is_error": True} if item.get("failed") else {}),
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def prime(*items: dict) -> str:
+    """A prime-agent stream: arguments when execution starts, the result when it ends."""
+    lines = []
+    for index, item in enumerate(items):
+        call = f"call_{index}"
+        lines.append(
+            json.dumps(
+                {"type": "tool_execution_start", "toolCallId": call, "args": item.get("input", {})}
+            )
+        )
+        lines.append(
+            json.dumps(
+                {
+                    "type": "tool_execution_end",
+                    "toolCallId": call,
+                    "toolName": item.get("tool", "ipython"),
+                    "isError": bool(item.get("failed")),
+                    "result": {"content": [{"type": "text", "text": item.get("output", "")}]},
+                }
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
 class RunDir:
     """A run directory built one part at a time, in the layout the runner writes."""
 
-    def __init__(self, root: Path, *, env: str = "hle", timeout: float = 900.0) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        env: str = "hle",
+        timeout: float = 900.0,
+        max_in_flight: int = 1,
+        ended_at: float | None = 10_000.0,
+        rebookend_of: str | None = None,
+    ) -> None:
         self.path = root
         self.path.mkdir(parents=True, exist_ok=True)
-        (self.path / "manifest.json").write_text(
-            json.dumps(
-                {
-                    "run_id": root.name,
-                    "cell": {
-                        "name": f"{env}-cell",
-                        "env": env,
-                        "harness": "codex",
-                        "model": "a-model",
-                        "budget": {"eval_task_timeout_s": timeout},
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
+        manifest: dict = {
+            "run_id": root.name,
+            "started_at": 0.0,
+            "ended_at": ended_at,
+            "cell": {
+                "name": f"{env}-cell",
+                "env": env,
+                "harness": "codex",
+                "model": "a-model",
+                "max_in_flight": max_in_flight,
+                "budget": {"eval_task_timeout_s": timeout},
+            },
+        }
+        if rebookend_of:
+            manifest["rebookend"] = {"rebookend_of": rebookend_of}
+        (self.path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         self._legs: list[dict] = []
 
     def egress(self, text: str, *, name: str = "egress.tsv") -> RunDir:
@@ -76,17 +223,23 @@ class RunDir:
         _jsonl(
             self.path / "rollout" / "dispenses.jsonl",
             [
-                {"seq": seq, "lease": lease, "position": seq - 1, "env": "hle",
-                 "task_idx": task, "dispensed_at": at, "feedback_regime": "immediate"}
+                {"seq": seq, "lease": lease, "env": "hle", "task_idx": task, "dispensed_at": at}
                 for seq, task, lease, at, _ in episodes
             ],
         )
         _jsonl(
             self.path / "rollout" / "results.jsonl",
             [
-                {"seq": seq, "lease": lease, "task_idx": task, "closure": "sealed",
-                 "score": {"reward": None, "success": correct,
-                           "feedback": [{"name": "correct", "value": correct}]}}
+                {
+                    "seq": seq,
+                    "lease": lease,
+                    "task_idx": task,
+                    "closure": "sealed",
+                    "score": {
+                        "success": correct,
+                        "feedback": [{"name": "correct", "value": correct}],
+                    },
+                }
                 for seq, task, lease, _, correct in episodes
                 if correct is not None
             ],
@@ -94,12 +247,7 @@ class RunDir:
         return self
 
     def eval_task(
-        self,
-        phase: str,
-        task: int,
-        lease: str,
-        at: float,
-        correct: bool | None = True,
+        self, phase: str, task: int, lease: str, at: float, correct: bool | None = True
     ) -> RunDir:
         task_dir = self.path / phase / f"task-{task:05d}"
         _jsonl(
@@ -109,9 +257,18 @@ class RunDir:
         if correct is not None:
             _jsonl(
                 task_dir / "results.jsonl",
-                [{"seq": 1, "lease": lease, "task_idx": task, "closure": "sealed",
-                  "score": {"success": correct,
-                            "feedback": [{"name": "correct", "value": correct}]}}],
+                [
+                    {
+                        "seq": 1,
+                        "lease": lease,
+                        "task_idx": task,
+                        "closure": "sealed",
+                        "score": {
+                            "success": correct,
+                            "feedback": [{"name": "correct", "value": correct}],
+                        },
+                    }
+                ],
             )
         return self
 
@@ -119,8 +276,7 @@ class RunDir:
         self, phase: str, leg: int, started: float, ended: float, task: int | None = None
     ) -> RunDir:
         self._legs.append(
-            {"leg": leg, "phase": phase, "task_idx": task, "started_at": started,
-             "ended_at": ended, "trace_path": ""}
+            {"leg": leg, "phase": phase, "task_idx": task, "started_at": started, "ended_at": ended}
         )
         (self.path / "legs.json").write_text(json.dumps(self._legs), encoding="utf-8")
         return self
@@ -132,129 +288,336 @@ class RunDir:
         return self
 
 
+def _one(tmp_path: Path, *, capture: str, trace: str = "", **kwargs) -> object:
+    """The common fixture: one rollout episode, one leg, one transcript."""
+    run = (
+        RunDir(tmp_path / "r", **kwargs)
+        .egress(capture)
+        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .leg("rollout", 0, 99.0, 300.0)
+    )
+    if trace:
+        run.trace("rollout", "leg-0000.stream.jsonl", trace)
+    return classify_run(run.path)
+
+
 def _buckets(run) -> dict[int, str]:
     return {e.episode.task_idx: e.bucket for e in run.episodes}
 
 
-# ----- the floor: what a hostname alone decides ----------------------------------------------
+# ----- the egress floor, which cannot reach achieved ---------------------------------------------
 
 
 def test_a_cell_that_only_talked_to_its_own_harness_computed_locally(tmp_path: Path) -> None:
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_capture((100.0, "chatgpt.com", "dns"), (100.5, "chatgpt.com", "tls")))
-        .rollout([(1, 7, "lease-a", 100.0, True)])
-        .leg("rollout", 0, 99.0, 200.0)
-        .path
-    )
+    run = _one(tmp_path, capture=_watching((150.0, "chatgpt.com", "tls")))
     assert _buckets(run) == {7: "computed_locally"}
 
 
 def test_a_host_that_is_not_the_answer_source_is_a_reference_lookup(tmp_path: Path) -> None:
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_capture((101.0, "en.wikipedia.org", "dns"), (101.2, "en.wikipedia.org", "tls")))
-        .rollout([(1, 7, "lease-a", 100.0, True)])
-        .leg("rollout", 0, 99.0, 200.0)
-        .path
-    )
+    run = _one(tmp_path, capture=_watching((150.0, "en.wikipedia.org", "tls")))
     assert _buckets(run) == {7: "general_web_reference"}
-    assert "general_web_host" in run.episodes[0].reasons
 
 
-def test_a_listing_visit_to_the_dataset_host_is_an_attempt_not_an_obtainment(
-    tmp_path: Path,
-) -> None:
-    """The Hub's own hostname serves listings and redirects, so reaching it settles nothing."""
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_capture((101.0, "huggingface.co", "dns"), (101.2, "huggingface.co", "tls")))
-        .rollout([(1, 7, "lease-a", 100.0, True)])
-        .leg("rollout", 0, 99.0, 200.0)
-        .path
-    )
+def test_a_listing_visit_to_the_dataset_host_is_an_attempt(tmp_path: Path) -> None:
+    run = _one(tmp_path, capture=_watching((150.0, "huggingface.co", "tls")))
     assert _buckets(run) == {7: "attempted_leakage"}
     assert run.episodes[0].reasons == ("answer_source_host",)
 
 
-def test_a_connection_to_the_file_cdn_is_achieved_leakage(tmp_path: Path) -> None:
-    """That hostname moves file bodies and serves nothing else, which is the hard signal."""
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(
-            _capture(
-                (101.0, "huggingface.co", "tls"),
-                (101.5, "us.aws.cdn.hf.co", "dns"),
-                (101.9, "us.aws.cdn.hf.co", "tls"),
-            )
-        )
-        .rollout([(1, 7, "lease-a", 100.0, True)])
-        .leg("rollout", 0, 99.0, 200.0)
-        .path
+def test_a_handshake_with_the_file_cdn_is_unresolved_and_not_achieved(tmp_path: Path) -> None:
+    """That hostname serves the whole platform and a client hello is not a completed GET.
+
+    The observer saw a connection open. It did not see a request, a status, a body or a byte,
+    and the same handshake would appear for a tokenizer, a model weight or a refusal. This is
+    the highest an egress observation can carry an episode.
+    """
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "huggingface.co", "tls"), (151.0, "us.aws.cdn.hf.co", "tls")),
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+    assert "content_cdn_handshake" in run.episodes[0].reasons
+    assert run.acquisitions() == []
+
+
+def test_a_name_resolved_but_never_connected_to_is_only_an_attempt(tmp_path: Path) -> None:
+    run = _one(tmp_path, capture=_watching((150.0, "us.aws.cdn.hf.co", "dns")))
+    assert _buckets(run) == {7: "attempted_leakage"}
+
+
+def test_no_pile_of_handshakes_reaches_achieved(tmp_path: Path) -> None:
+    """Twenty connections to the CDN are twenty connections, not one download."""
+    rows = [(150.0 + i, "us.aws.cdn.hf.co", "tls") for i in range(20)]
+    run = _one(tmp_path, capture=_watching(*rows))
+    assert _buckets(run) == {7: "unresolved_leakage"}
+
+
+# ----- the answer key arriving, which is what achieved means -------------------------------------
+
+
+def test_a_row_response_carrying_answers_is_achieved(tmp_path: Path) -> None:
+    """The row API's answer is durable in the transcript, so this is settled now, not deferred."""
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "datasets-server.huggingface.co", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"}, {"command": f"curl -s '{_ROWS}'", "output": _ANSWER_ROW}
+        ),
     )
     assert _buckets(run) == {7: "achieved_leakage"}
-    assert run.acquisitions()[0].acquisition["host"] == "us.aws.cdn.hf.co"
+    assert run.acquisitions()[0].acquisition["kind"] == "answer_content_in_result"
 
 
-def test_a_name_resolved_but_never_connected_to_is_not_an_obtainment(tmp_path: Path) -> None:
-    """A DNS question says a name was looked up. Only a client hello says bytes moved."""
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_capture((101.0, "us.aws.cdn.hf.co", "dns")))
-        .rollout([(1, 7, "lease-a", 100.0, True)])
-        .leg("rollout", 0, 99.0, 200.0)
-        .path
+def test_a_row_request_that_was_refused_is_only_an_attempt(tmp_path: Path) -> None:
+    refusal = '{"error":"Access to dataset cais/hle is restricted."}'
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "datasets-server.huggingface.co", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"}, {"command": f"curl -s '{_ROWS}'", "output": refusal}
+        ),
     )
     assert _buckets(run) == {7: "attempted_leakage"}
-    assert not run.acquisitions()
+    assert "answer_rows_requested" in run.episodes[0].reasons
 
 
-# ----- attribution --------------------------------------------------------------------------
+def test_the_agents_own_submission_is_not_mistaken_for_a_leak(tmp_path: Path) -> None:
+    """``submit_answer`` carries an answer and nothing that travels with one in the dataset."""
+    assert not carries_answer_content('{"lease":"l","answer":"f4","confidence":99}', _HLE)
+    assert carries_answer_content(_ANSWER_ROW, _HLE)
 
 
-def test_a_connection_is_charged_to_the_episode_whose_window_holds_it(tmp_path: Path) -> None:
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(
-            _capture(
-                (105.0, "en.wikipedia.org", "tls"),
-                (215.0, "huggingface.co", "tls"),
-            )
-        )
-        .rollout(
-            [
-                (1, 7, "lease-a", 100.0, True),
-                (2, 8, "lease-b", 200.0, True),
-                (3, 9, "lease-c", 300.0, True),
-            ]
-        )
-        .leg("rollout", 0, 99.0, 400.0)
-        .path
+def test_a_download_the_filesystem_answered_for_is_achieved(tmp_path: Path) -> None:
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "us.aws.cdn.hf.co", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {"command": f"curl -sL -o /tmp/key.parquet '{_PARQUET}'", "output": ""},
+            {
+                "command": "python3 -c 'import pyarrow.parquet as p; "
+                'p.read_table("/tmp/key.parquet")\'',
+                "output": "the answer",
+            },
+        ),
     )
-    assert _buckets(run) == {
-        7: "general_web_reference",
-        8: "attempted_leakage",
-        9: "computed_locally",
-    }
+    assert _buckets(run) == {7: "achieved_leakage"}
+    acquisition = run.acquisitions()[0].acquisition
+    assert acquisition["kind"] == "file_download_landed"
+    assert acquisition["destination"] == "/tmp/key.parquet"
+    assert acquisition["persistence"] == "ephemeral"
+    assert acquisition["requested"] == [_PARQUET]
 
 
-def test_a_window_boundary_belongs_to_the_episode_being_pulled(tmp_path: Path) -> None:
-    """Windows are half-open, so traffic at the instant of a dispense is the new episode's."""
-    run = classify_run(
+def test_a_size_printed_by_the_same_command_confirms_the_download(tmp_path: Path) -> None:
+    """The real acquisition was one compound command whose ``du`` answered for the file."""
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "us.aws.cdn.hf.co", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {
+                "command": f"curl -sL -o /tmp/key.parquet '{_PARQUET}'\ndu -h /tmp/key.parquet",
+                "output": "75M\t/tmp/key.parquet\nTraceback: ModuleNotFoundError: pandas",
+                "exit_code": 1,
+                "status": "failed",
+            },
+        ),
+    )
+    assert _buckets(run) == {7: "achieved_leakage"}
+
+
+def test_a_download_that_was_refused_stays_unresolved(tmp_path: Path) -> None:
+    """A 401 leaves a failed command and no file, and nothing here promotes that."""
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "huggingface.co", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {
+                "command": f"curl --fail -sL -o /tmp/key.parquet '{_PARQUET}'",
+                "output": "curl: (22) The requested URL returned error: 401",
+                "exit_code": 22,
+                "status": "failed",
+            },
+        ),
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+    assert "file_download_unconfirmed" in run.episodes[0].reasons
+
+
+def test_a_read_that_could_not_find_the_file_does_not_confirm_it(tmp_path: Path) -> None:
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "huggingface.co", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {"command": f"curl -sL -o /tmp/key.parquet '{_PARQUET}'", "output": ""},
+            {
+                "command": "cat /tmp/key.parquet",
+                "output": "cat: /tmp/key.parquet: No such file or directory",
+                "exit_code": 1,
+                "status": "failed",
+            },
+        ),
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+
+
+# ----- refinement reads requests, not prose -------------------------------------------------------
+
+
+def test_a_url_the_agent_only_talked_about_does_not_move_an_episode(tmp_path: Path) -> None:
+    """Task text, reasoning and command output all mention URLs. Only a command is a request."""
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "en.wikipedia.org", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {
+                "command": "curl -s https://en.wikipedia.org/wiki/Thing",
+                "output": f"see also {_PARQUET} for the dataset",
+            },
+        ),
+    )
+    assert _buckets(run) == {7: "general_web_reference"}
+    assert "answer_source_request" not in run.episodes[0].reasons
+
+
+def test_prose_beside_a_cdn_handshake_still_cannot_reach_achieved(tmp_path: Path) -> None:
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "us.aws.cdn.hf.co", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {"command": "echo thinking", "output": f"I could fetch {_PARQUET}"},
+        ),
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+
+
+def test_a_row_request_built_with_data_urlencode_is_still_a_row_request() -> None:
+    """``curl -G`` leaves the query in parameters, so the URL alone is the bare endpoint."""
+    assert content_url_kind("https://datasets-server.huggingface.co/rows", _HLE) == "row_query"
+    assert content_url_kind("https://datasets-server.huggingface.co/splits", _HLE) is None
+
+
+def test_the_trace_cannot_talk_an_episode_down_from_what_the_observer_saw(
+    tmp_path: Path,
+) -> None:
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "us.aws.cdn.hf.co", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {"command": "echo done", "output": "I did not download anything at all."},
+        ),
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+
+
+@pytest.mark.parametrize("shape", [claude, prime])
+def test_every_harness_shape_is_read_for_requests_and_results(tmp_path: Path, shape) -> None:
+    """claude_code and prime-agent carry the same two halves in their own envelopes."""
+    trace = shape(
+        {"tool": "Bash", "input": {"command": f"curl -s '{_ROWS}'"}, "output": _ANSWER_ROW}
+    )
+    run = (
         RunDir(tmp_path / "r")
-        .egress(_capture((200.0, "huggingface.co", "tls")))
-        .rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 200.0, True)])
+        .egress(_watching((150.0, "datasets-server.huggingface.co", "tls")))
+        .rollout([(1, 7, "lease-a", 100.0, True)])
         .leg("rollout", 0, 99.0, 300.0)
+        .trace("rollout", "leg-0000.stream.jsonl", '{"lease":"lease-a"}\n' + trace)
         .path
     )
-    assert _buckets(run) == {7: "computed_locally", 8: "attempted_leakage"}
+    assert _buckets(classify_run(run)) == {7: "achieved_leakage"}
+
+
+# ----- attribution: rollout windows run to a bound on the seal ------------------------------------
+
+
+def _rollout(tmp_path: Path, *, max_in_flight: int, trace: str = "", n: int = 5, at: float = 250.0):
+    run = (
+        RunDir(tmp_path / "r", max_in_flight=max_in_flight)
+        .egress(_watching((at, "huggingface.co", "tls")))
+        .rollout([(i + 1, i + 1, f"lease-{i}", 100.0 + 100 * i, True) for i in range(n)])
+        .leg("rollout", 0, 99.0, 10_000.0)
+    )
+    if trace:
+        run.trace("rollout", "leg-0000.stream.jsonl", trace)
+    return classify_run(run.path)
+
+
+def test_without_a_transcript_a_window_runs_to_the_streams_capacity_bound(
+    tmp_path: Path,
+) -> None:
+    """At capacity the stream force-seals the oldest lease, which is what bounds the window.
+
+    With three leases in flight and no transcript to place the seals, a connection could belong
+    to any of the three open episodes, and all three say so by naming each other.
+    """
+    run = _rollout(tmp_path, max_in_flight=3)
+    graded = {e.episode.seq: e for e in run.episodes}
+    assert graded[1].episode.ended_at == 400.0
+    assert graded[1].episode.window_kind == "capacity_bound"
+    assert graded[1].bucket == "attempted_leakage"
+    assert graded[2].bucket == "attempted_leakage"
+    assert [r["seq"] for r in graded[1].shared_with] == [2]
+    assert [r["seq"] for r in graded[2].shared_with] == [1]
+
+
+def test_a_transcript_that_shows_the_seal_tightens_the_window(tmp_path: Path) -> None:
+    """A sequential agent submits before it pulls again, and its windows stop overlapping."""
+    trace = codex(
+        {"lease_seen": "lease-0"},
+        {"submit": "lease-0"},
+        {"lease_seen": "lease-1"},
+        {"submit": "lease-1"},
+        {"lease_seen": "lease-2"},
+        {"submit": "lease-2"},
+        {"lease_seen": "lease-3"},
+        {"lease_seen": "lease-4"},
+    )
+    run = _rollout(tmp_path, max_in_flight=3, trace=trace)
+    graded = {e.episode.seq: e for e in run.episodes}
+    assert graded[1].episode.ended_at == 200.0
+    assert graded[1].episode.window_kind == "trace_seal_bound"
+    assert graded[1].bucket == "computed_locally"
+    assert graded[2].bucket == "attempted_leakage"
+    assert graded[2].shared_with == ()
+
+
+def test_an_agent_that_answers_late_gets_a_window_that_overlaps(tmp_path: Path) -> None:
+    """The seal lands after the next task was pulled, so both episodes own the traffic."""
+    trace = codex(
+        {"lease_seen": "lease-0"},
+        {"lease_seen": "lease-1"},
+        {"submit": "lease-0"},
+        {"submit": "lease-1"},
+        {"lease_seen": "lease-2"},
+        {"lease_seen": "lease-3"},
+        {"lease_seen": "lease-4"},
+    )
+    run = _rollout(tmp_path, max_in_flight=3, trace=trace)
+    graded = {e.episode.seq: e for e in run.episodes}
+    assert graded[1].episode.ended_at == 300.0
+    assert graded[1].bucket == "attempted_leakage"
+    assert graded[2].bucket == "attempted_leakage"
+    assert [r["seq"] for r in graded[1].shared_with] == [2]
+    assert [r["seq"] for r in graded[2].shared_with] == [1]
+
+
+def test_a_shared_window_names_its_rivals_rather_than_counting_them(tmp_path: Path) -> None:
+    run = _rollout(tmp_path, max_in_flight=3)
+    rivals = run.episodes[0].shared_with
+    assert rivals
+    assert all(set(r) == {"phase", "seq", "task_idx"} for r in rivals)
 
 
 def test_eval_windows_come_from_the_leg_record_and_overlap_is_shared(tmp_path: Path) -> None:
-    """Eval tasks run several at a time in one namespace, so their evidence is shared."""
     run = classify_run(
         RunDir(tmp_path / "r")
-        .egress(_capture((150.0, "us.aws.cdn.hf.co", "tls")))
+        .egress(_watching((150.0, "huggingface.co", "tls")))
         .eval_task("eval_after", 11, "lease-a", 100.0)
         .eval_task("eval_after", 12, "lease-b", 101.0)
         .eval_task("eval_after", 13, "lease-c", 400.0)
@@ -264,203 +627,151 @@ def test_eval_windows_come_from_the_leg_record_and_overlap_is_shared(tmp_path: P
         .path
     )
     assert _buckets(run) == {
-        11: "achieved_leakage",
-        12: "achieved_leakage",
+        11: "attempted_leakage",
+        12: "attempted_leakage",
         13: "computed_locally",
     }
-    shared = {e.episode.task_idx: e.shared_window_with for e in run.episodes}
-    assert shared[11] == 1 and shared[12] == 1
+    shared = {e.episode.task_idx: [r["task_idx"] for r in e.shared_with] for e in run.episodes}
+    assert shared[11] == [12] and shared[12] == [11]
 
 
-def test_capture_segments_are_read_in_order(tmp_path: Path) -> None:
-    """A resumed run writes a second segment rather than truncating the first."""
-    run_dir = (
-        RunDir(tmp_path / "r")
-        .egress(_capture((105.0, "en.wikipedia.org", "tls")))
-        .egress(_capture((205.0, "us.aws.cdn.hf.co", "tls")), name="egress.2.tsv")
-        .rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 200.0, True)])
-        .leg("rollout", 0, 99.0, 300.0)
-        .path
+# ----- residence: where a fetched file can still be read from -------------------------------------
+
+
+def _resident(tmp_path: Path, destination: str, *, second_reads: bool):
+    read = (
+        f"python3 -c 'import pyarrow.parquet as p; p.read_table(\"{destination}\")'"
+        if second_reads
+        else "python3 -c 'print(1+1)'"
     )
-    assert [c.host for c in read_egress(run_dir)] == [
-        "en.wikipedia.org",
-        "us.aws.cdn.hf.co",
-    ]
-    assert _buckets(classify_run(run_dir))[8] == "achieved_leakage"
-
-
-# ----- what a fetched file does to the episodes after it --------------------------------------
-
-
-def test_a_fetched_file_stays_on_disk_so_later_episodes_in_the_leg_are_achieved(
-    tmp_path: Path,
-) -> None:
-    run = classify_run(
+    trace = codex(
+        {"lease_seen": "lease-0"},
+        {"command": f"curl -sL -o {destination} '{_PARQUET}'", "output": ""},
+        {"command": f"du -h {destination}", "output": f"75M\t{destination}"},
+        {"submit": "lease-0"},
+        {"lease_seen": "lease-1"},
+        {"command": read, "output": "an answer"},
+        {"submit": "lease-1"},
+    )
+    return classify_run(
         RunDir(tmp_path / "r")
-        .egress(_capture((150.0, "us.aws.cdn.hf.co", "tls")))
-        .rollout(
-            [
-                (1, 7, "lease-a", 100.0, True),
-                (2, 8, "lease-b", 200.0, True),
-                (3, 9, "lease-c", 300.0, True),
-            ]
-        )
+        .egress(_watching((150.0, "us.aws.cdn.hf.co", "tls")))
+        .rollout([(1, 7, "lease-0", 100.0, True), (2, 8, "lease-1", 200.0, True)])
         .leg("rollout", 0, 99.0, 400.0)
+        .trace("rollout", "leg-0000.stream.jsonl", trace)
         .path
     )
-    assert _buckets(run) == {
-        7: "achieved_leakage",
-        8: "achieved_leakage",
-        9: "achieved_leakage",
-    }
-    later = [e for e in run.episodes if e.episode.task_idx == 9][0]
-    assert later.reasons == ("answer_source_resident",)
-    assert len(run.acquisitions()) == 1
 
 
-def test_a_fetched_file_does_not_carry_into_a_container_that_never_had_it(
-    tmp_path: Path,
-) -> None:
-    """Every eval task is its own container, so nothing a sibling downloaded is on its disk."""
+def test_a_later_episode_that_reads_the_resident_file_is_achieved(tmp_path: Path) -> None:
+    run = _resident(tmp_path, "/tmp/key.parquet", second_reads=True)
+    graded = {e.episode.task_idx: e for e in run.episodes}
+    assert graded[8].bucket == "achieved_leakage"
+    assert "resident_artifact_read" in graded[8].reasons
+    assert graded[8].inherited_from["task_idx"] == 7
+
+
+def test_a_later_episode_that_never_names_it_is_unresolved_not_clean(tmp_path: Path) -> None:
+    """The key is within reach and a local read leaves no trace, so neither answer is given."""
+    run = _resident(tmp_path, "/tmp/key.parquet", second_reads=False)
+    graded = {e.episode.task_idx: e for e in run.episodes}
+    assert graded[8].bucket == "unresolved_leakage"
+    assert "resident_artifact_available" in graded[8].reasons
+    assert graded[8].inherited_from is not None
+
+
+def test_a_scratch_file_does_not_reach_a_container_that_never_had_it(tmp_path: Path) -> None:
     run = classify_run(
         RunDir(tmp_path / "r")
-        .egress(_capture((150.0, "us.aws.cdn.hf.co", "tls")))
-        .eval_task("eval_after", 11, "lease-a", 100.0)
-        .eval_task("eval_after", 12, "lease-b", 300.0)
-        .leg("eval_after", 1, 100.0, 200.0, task=11)
-        .leg("eval_after", 2, 300.0, 400.0, task=12)
-        .path
-    )
-    assert _buckets(run) == {11: "achieved_leakage", 12: "computed_locally"}
-
-
-# ----- the trace: raises, never lowers ---------------------------------------------------------
-
-
-_PARQUET = (
-    "https://huggingface.co/datasets/macabdul9/hle_text_only/resolve/main/"
-    "data/test-00000-of-00001.parquet"
-)
-
-
-def test_a_named_file_beside_a_cdn_connection_is_cited_as_the_acquisition(
-    tmp_path: Path,
-) -> None:
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(
-            _capture((150.0, "huggingface.co", "tls"), (151.0, "us.aws.cdn.hf.co", "tls"))
-        )
-        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .egress(_watching((150.0, "us.aws.cdn.hf.co", "tls")))
+        .rollout([(1, 7, "lease-0", 100.0, True)])
         .leg("rollout", 0, 99.0, 200.0)
+        .eval_task("eval_after", 11, "lease-b", 300.0)
+        .leg("eval_after", 1, 300.0, 400.0, task=11)
         .trace(
             "rollout",
             "leg-0000.stream.jsonl",
-            json.dumps({"lease": "lease-a", "cmd": _PARQUET}),
+            codex(
+                {"lease_seen": "lease-0"},
+                {"command": f"curl -sL -o /tmp/key.parquet '{_PARQUET}'", "output": ""},
+                {"command": "du -h /tmp/key.parquet", "output": "75M\t/tmp/key.parquet"},
+            ),
         )
-        .path
-    )
-    acquisition = run.acquisitions()[0].acquisition
-    assert acquisition["kind"] == "file_download_confirmed_by_egress"
-    assert acquisition["requested"] == [_PARQUET]
-
-
-def test_a_named_file_with_no_transfer_behind_it_stays_an_attempt(tmp_path: Path) -> None:
-    """Asking for a file is not getting one: a refused resolve never reaches the CDN."""
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_capture((150.0, "huggingface.co", "tls")))
-        .rollout([(1, 7, "lease-a", 100.0, True)])
-        .leg("rollout", 0, 99.0, 200.0)
-        .trace(
-            "rollout",
-            "leg-0000.stream.jsonl",
-            json.dumps({"lease": "lease-a", "cmd": _PARQUET}),
-        )
-        .path
-    )
-    assert _buckets(run) == {7: "attempted_leakage"}
-    assert "file_download_unconfirmed" in run.episodes[0].reasons
-
-
-def test_a_row_query_is_held_at_attempted_and_handed_to_the_judge(tmp_path: Path) -> None:
-    """The row API answers and refuses over one hostname, so only the response settles it."""
-    rows = "https://datasets-server.huggingface.co/rows?dataset=cais%2Fhle&split=test&offset=0"
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_capture((150.0, "datasets-server.huggingface.co", "tls")))
-        .rollout([(1, 7, "lease-a", 100.0, True)])
-        .leg("rollout", 0, 99.0, 200.0)
-        .trace("rollout", "leg-0000.stream.jsonl", json.dumps({"lease": "lease-a", "cmd": rows}))
-        .path
-    )
-    assert _buckets(run) == {7: "attempted_leakage"}
-    assert "answer_rows_requested" in run.episodes[0].reasons
-    assert len(run.unresolved()) == 1
-
-
-def test_the_trace_cannot_talk_an_episode_down_from_what_the_observer_saw(
-    tmp_path: Path,
-) -> None:
-    """The capture is written where the agent has no mount, so its account does not win."""
-    denial = json.dumps(
-        {
-            "lease": "lease-a",
-            "text": "I did not download any dataset. I solved this from first principles.",
-        }
-    )
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_capture((150.0, "us.aws.cdn.hf.co", "tls")))
-        .rollout([(1, 7, "lease-a", 100.0, True)])
-        .leg("rollout", 0, 99.0, 200.0)
-        .trace("rollout", "leg-0000.stream.jsonl", denial)
-        .path
-    )
-    assert _buckets(run) == {7: "achieved_leakage"}
-
-
-def test_a_trace_region_belongs_to_the_lease_that_opened_it(tmp_path: Path) -> None:
-    """One rollout transcript, many episodes: the lease ids are where it is cut."""
-    text = "\n".join(
-        [
-            json.dumps({"lease": "lease-a", "cmd": "https://en.wikipedia.org/wiki/Thing"}),
-            json.dumps({"lease": "lease-b", "cmd": _PARQUET}),
-        ]
-    )
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_capture((250.0, "huggingface.co", "tls")))
-        .rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 200.0, True)])
-        .leg("rollout", 0, 99.0, 300.0)
-        .trace("rollout", "leg-0000.stream.jsonl", text)
         .path
     )
     graded = {e.episode.task_idx: e for e in run.episodes}
-    assert graded[7].trace_urls == ("https://en.wikipedia.org/wiki/Thing",)
-    assert graded[8].trace_urls == (_PARQUET,)
+    assert graded[7].bucket == "achieved_leakage"
+    assert graded[11].bucket == "computed_locally"
 
 
-@pytest.mark.parametrize(
-    ("url", "expected"),
-    [
-        (_PARQUET, "file_download"),
-        ("https://huggingface.co/datasets/x/y/raw/main/data.csv", "file_download"),
-        # A blob route renders the file in a page. The reader was browsing, not downloading.
-        ("https://huggingface.co/datasets/x/y/blob/main/data.tsv", None),
-        ("https://huggingface.co/datasets/x/y/tree/main", None),
-        ("https://datasets-server.huggingface.co/rows?dataset=x&offset=0", "row_query"),
-        ("https://datasets-server.huggingface.co/splits?dataset=x", None),
-        ("https://en.wikipedia.org/wiki/Thing.csv", "file_download"),
-    ],
-)
-def test_a_url_is_read_for_the_route_it_asks_for(url: str, expected: str | None) -> None:
-    from shobench.leakage import ANSWER_SOURCES
+def test_a_file_saved_in_home_reaches_every_later_episode_of_the_run(tmp_path: Path) -> None:
+    """HOME is copied into every eval task's home, so what is saved there is on their disks."""
+    run = classify_run(
+        RunDir(tmp_path / "r")
+        .egress(_watching((150.0, "us.aws.cdn.hf.co", "tls")))
+        .rollout([(1, 7, "lease-0", 100.0, True)])
+        .leg("rollout", 0, 99.0, 200.0)
+        .eval_task("eval_after", 11, "lease-b", 300.0)
+        .leg("eval_after", 1, 300.0, 400.0, task=11)
+        .trace(
+            "rollout",
+            "leg-0000.stream.jsonl",
+            codex(
+                {"lease_seen": "lease-0"},
+                {"command": f"curl -sL -o /root/key.parquet '{_PARQUET}'", "output": ""},
+                {"command": "du -h /root/key.parquet", "output": "75M\t/root/key.parquet"},
+            ),
+        )
+        .path
+    )
+    graded = {e.episode.task_idx: e for e in run.episodes}
+    assert graded[11].bucket == "unresolved_leakage"
+    assert "resident_artifact_available" in graded[11].reasons
 
-    assert content_url_kind(url, ANSWER_SOURCES["hle"]) == expected
+
+def test_a_bookend_inherits_the_durable_artifacts_of_the_run_it_bookends(
+    tmp_path: Path,
+) -> None:
+    source = (
+        RunDir(tmp_path / "source")
+        .egress(_watching((150.0, "us.aws.cdn.hf.co", "tls")))
+        .rollout([(1, 7, "lease-0", 100.0, True)])
+        .leg("rollout", 0, 99.0, 200.0)
+        .trace(
+            "rollout",
+            "leg-0000.stream.jsonl",
+            codex(
+                {"lease_seen": "lease-0"},
+                {"command": f"curl -sL -o /root/key.parquet '{_PARQUET}'", "output": ""},
+                {"command": "du -h /root/key.parquet", "output": "75M\t/root/key.parquet"},
+            ),
+        )
+    )
+    bookend = classify_run(
+        RunDir(tmp_path / "bookend", rebookend_of=source.path.name)
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .eval_task("eval_after", 11, "lease-b", 150.0)
+        .leg("eval_after", 1, 150.0, 200.0, task=11)
+        .path
+    )
+    assert _buckets(bookend) == {11: "unresolved_leakage"}
+    assert bookend.episodes[0].inherited_from["run_id"] == "source"
 
 
-# ----- missing evidence is not clean evidence -------------------------------------------------
+def test_a_bookend_whose_source_is_missing_is_not_reported_clean(tmp_path: Path) -> None:
+    bookend = classify_run(
+        RunDir(tmp_path / "bookend", rebookend_of="a-run-that-is-not-here")
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .eval_task("eval_after", 11, "lease-b", 150.0)
+        .leg("eval_after", 1, 150.0, 200.0, task=11)
+        .path
+    )
+    assert _buckets(bookend) == {11: UNCLASSIFIED}
+    assert "inherited_home_unchecked" in bookend.episodes[0].reasons
+    assert any("cannot be checked" in note for note in bookend.notes)
+
+
+# ----- capture integrity: missing evidence is not clean evidence ---
 
 
 def test_a_run_with_no_capture_grades_nothing_clean(tmp_path: Path) -> None:
@@ -471,26 +782,90 @@ def test_a_run_with_no_capture_grades_nothing_clean(tmp_path: Path) -> None:
         .path
     )
     assert _buckets(run) == {7: UNCLASSIFIED}
-    assert any("no egress record" in note for note in run.notes)
+    assert any("no readable egress record" in note for note in run.notes)
 
 
-def test_an_env_with_no_answer_source_table_says_so(tmp_path: Path) -> None:
+def test_a_capture_of_nothing_but_unreadable_rows_is_not_a_capture(tmp_path: Path) -> None:
+    run = _one(tmp_path, capture="not\ta\tcapture\trow\tat\tall\nalso\tnot\tone\t\t\t\n")
+    assert _buckets(run) == {7: UNCLASSIFIED}
+    assert run.capture.malformed == 2
+    assert any("could not be read" in note for note in run.notes)
+
+
+def test_a_window_the_observer_was_not_watching_is_not_cleared(tmp_path: Path) -> None:
+    """The capture stops before the episode does, so its silence proves nothing."""
+    run = _one(
+        tmp_path, capture=_capture((10.0, "chatgpt.com", "dns"), (50.0, "chatgpt.com", "dns"))
+    )
+    assert _buckets(run) == {7: UNCLASSIFIED}
+    assert run.episodes[0].reasons == ("capture_not_covering_window",)
+    assert run.episodes[0].covered is False
+
+
+def test_a_window_in_the_gap_between_two_segments_is_not_cleared(tmp_path: Path) -> None:
     run = classify_run(
-        RunDir(tmp_path / "r", env="tau2")
-        .egress(_capture((150.0, "us.aws.cdn.hf.co", "tls")))
+        RunDir(tmp_path / "r")
+        .egress(_capture((10.0, "chatgpt.com", "dns"), (50.0, "chatgpt.com", "dns")))
+        .egress(
+            _capture((400.0, "chatgpt.com", "dns"), (500.0, "chatgpt.com", "dns")),
+            name="egress.2.tsv",
+        )
+        .rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 420.0, True)])
+        .leg("rollout", 0, 99.0, 480.0)
+        .path
+    )
+    assert _buckets(run) == {7: UNCLASSIFIED, 8: "computed_locally"}
+
+
+def test_evidence_still_counts_inside_a_window_the_capture_does_not_cover(
+    tmp_path: Path,
+) -> None:
+    """Refusing to clear is not refusing to see: what was observed still classifies."""
+    run = _one(
+        tmp_path,
+        capture=_capture((10.0, "chatgpt.com", "dns"), (150.0, "us.aws.cdn.hf.co", "tls")),
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+    assert "capture_not_covering_window" in run.episodes[0].reasons
+
+
+def test_an_unfinished_run_is_refused_rather_than_graded(tmp_path: Path, capsys) -> None:
+    run_dir = (
+        RunDir(tmp_path / "r", ended_at=None)
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
         .rollout([(1, 7, "lease-a", 100.0, True)])
         .leg("rollout", 0, 99.0, 200.0)
         .path
     )
-    assert not run.answer_source_configured
-    assert _buckets(run) == {7: "general_web_reference"}
-    assert any("no answer-source hosts are configured" in note for note in run.notes)
+    assert main([str(run_dir)]) == 1
+    assert "refusing" in capsys.readouterr().out
+
+
+def test_an_unfinished_run_graded_on_request_clears_nothing(tmp_path: Path) -> None:
+    run = _one(tmp_path, capture=_watching((150.0, "chatgpt.com", "tls")), ended_at=None)
+    assert _buckets(run) == {7: UNCLASSIFIED}
+    assert any("no ended_at" in note for note in run.notes)
+
+
+def test_capture_segments_are_read_in_order(tmp_path: Path) -> None:
+    run_dir = (
+        RunDir(tmp_path / "r")
+        .egress(_capture((105.0, "en.wikipedia.org", "tls")))
+        .egress(_capture((205.0, "us.aws.cdn.hf.co", "tls")), name="egress.2.tsv")
+        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .leg("rollout", 0, 99.0, 300.0)
+        .path
+    )
+    assert [c.host for c in read_capture(run_dir).connections] == [
+        "en.wikipedia.org",
+        "us.aws.cdn.hf.co",
+    ]
 
 
 def test_a_leg_whose_task_was_never_dispensed_is_reported_not_dropped(tmp_path: Path) -> None:
     run = classify_run(
         RunDir(tmp_path / "r")
-        .egress(_capture((150.0, "chatgpt.com", "tls")))
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
         .eval_task("eval_after", 11, "lease-a", 100.0)
         .leg("eval_after", 1, 100.0, 200.0, task=11)
         .leg("eval_after", 2, 200.0, 300.0, task=12)
@@ -500,70 +875,20 @@ def test_a_leg_whose_task_was_never_dispensed_is_reported_not_dropped(tmp_path: 
     assert any("never dispensed" in note for note in run.notes)
 
 
-def test_an_eval_without_a_leg_record_gets_a_bounded_window_and_says_so(tmp_path: Path) -> None:
-    run = classify_run(
-        RunDir(tmp_path / "r", timeout=60.0)
-        .egress(_capture((150.0, "huggingface.co", "tls")))
-        .eval_task("eval_after", 11, "lease-a", 100.0)
-        .path
-    )
-    assert _buckets(run) == {11: "attempted_leakage"}
-    assert run.episodes[0].episode.window_kind == "dispense_timeout_bound"
-    assert any("upper bound" in note for note in run.notes)
-
-
 def test_classifying_a_run_writes_nothing_into_it(tmp_path: Path) -> None:
     run_dir = (
         RunDir(tmp_path / "r")
-        .egress(_capture((150.0, "us.aws.cdn.hf.co", "tls")))
+        .egress(_watching((150.0, "us.aws.cdn.hf.co", "tls")))
         .rollout([(1, 7, "lease-a", 100.0, True)])
         .leg("rollout", 0, 99.0, 200.0)
         .path
     )
     before = {p: p.stat().st_mtime_ns for p in sorted(run_dir.rglob("*")) if p.is_file()}
     classify_run(run_dir)
-    after = {p: p.stat().st_mtime_ns for p in sorted(run_dir.rglob("*")) if p.is_file()}
-    assert before == after
+    assert {p: p.stat().st_mtime_ns for p in sorted(run_dir.rglob("*")) if p.is_file()} == before
 
 
-# ----- the table ------------------------------------------------------------------------------
-
-
-def test_the_table_reports_a_rate_per_bucket_and_never_one_blended(tmp_path: Path) -> None:
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_capture((250.0, "us.aws.cdn.hf.co", "tls")))
-        .rollout(
-            [
-                (1, 7, "lease-a", 100.0, False),
-                (2, 8, "lease-b", 200.0, True),
-                (3, 9, "lease-c", 300.0, True),
-            ]
-        )
-        .leg("rollout", 0, 99.0, 400.0)
-        .path
-    )
-    table = render_table([run])
-    assert "computed_locally  1         0/1" in table
-    assert "achieved_leakage  2         2/2" in table
-    assert "what egress cannot establish" in table
-
-
-def test_a_json_document_carries_the_limits_it_was_read_under(tmp_path: Path) -> None:
-    run = classify_run(
-        RunDir(tmp_path / "r")
-        .egress(_capture((150.0, "chatgpt.com", "tls")))
-        .rollout([(1, 7, "lease-a", 100.0, True)])
-        .leg("rollout", 0, 99.0, 200.0)
-        .path
-    )
-    doc = run.to_json()
-    assert doc["schema"].startswith("shobench.leakage/")
-    assert any("never payloads" in limit for limit in doc["limits"])
-    assert set(doc["buckets"]) == {*BUCKETS, UNCLASSIFIED}
-
-
-# ----- infrastructure is not evidence ----------------------------------------------------------
+# ----- the tables the rules are built on ---
 
 
 @pytest.mark.parametrize(
@@ -575,67 +900,166 @@ def test_a_json_document_carries_the_limits_it_was_read_under(tmp_path: Path) ->
         ("files.pythonhosted.org", "infrastructure"),
         ("en.wikipedia.org", "general"),
         ("huggingface.co", "answer_source_index"),
-        ("datasets-server.huggingface.co", "answer_source_index"),
+        ("datasets-server.huggingface.co", "answer_source_rows"),
         ("us.aws.cdn.hf.co", "answer_source_content"),
         ("cdn-lfs-us-1.hf.co", "answer_source_content"),
     ],
 )
 def test_a_hostname_is_read_for_what_it_serves(host: str, role: str) -> None:
-    from shobench.leakage import ANSWER_SOURCES
-
-    assert host_role(host, ANSWER_SOURCES["hle"]) == role
+    assert host_role(host, _HLE) == role
 
 
-# ----- the run this metric came from ------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (_PARQUET, "file_download"),
+        ("https://huggingface.co/datasets/x/y/raw/main/data.csv", "file_download"),
+        ("https://huggingface.co/datasets/x/y/blob/main/data.tsv", None),
+        ("https://huggingface.co/datasets/x/y/tree/main", None),
+        ("https://huggingface.co/api/datasets/x/y", None),
+        (_ROWS, "row_query"),
+        ("https://datasets-server.huggingface.co/splits?dataset=x", None),
+    ],
+)
+def test_a_url_is_read_for_the_route_it_asks_for(url: str, expected: str | None) -> None:
+    assert content_url_kind(url, _HLE) == expected
 
-# A slice of the real capture, from the rollout that prompted the issue: the agent's dataset-server
-# sweep ends, it opens huggingface.co twice, and the second open is followed by the Hub's file CDN.
-# The dispense times are the run's own, so the transfer lands inside the window of the episode that
-# was open at the time, which was seq 48.
+
+@pytest.mark.parametrize(
+    ("path", "persistence"),
+    [
+        ("/root/key.parquet", "home"),
+        ("/root/.cache/huggingface/x", "home"),
+        ("/tmp/key.parquet", "ephemeral"),
+        ("/work/key.parquet", "ephemeral"),
+        ("/opt/key.parquet", "unknown"),
+    ],
+)
+def test_a_destination_is_read_for_whether_it_survives(path: str, persistence: str) -> None:
+    assert destination_persistence(path) == persistence
+
+
+def test_a_destination_has_to_look_like_a_path() -> None:
+    """``find``'s or operator is spelled ``-o`` too, and it is not somewhere to put a file."""
+    assert download_destinations("find /tmp -o -name '*.parquet'") == []
+    assert download_destinations("curl -o /tmp/key.parquet https://x/y") == ["/tmp/key.parquet"]
+    assert download_destinations("wget --output-document=/root/k.csv https://x") == ["/root/k.csv"]
+
+
+# ----- output ---
+
+
+def test_the_table_reports_a_rate_per_bucket_and_never_one_blended(tmp_path: Path) -> None:
+    run = classify_run(
+        RunDir(tmp_path / "r")
+        .egress(_watching((250.0, "us.aws.cdn.hf.co", "tls")))
+        .rollout([(1, 7, "lease-a", 100.0, False), (2, 8, "lease-b", 200.0, True)])
+        .leg("rollout", 0, 99.0, 400.0)
+        .path
+    )
+    table = render_table([run])
+    assert "computed_locally    1         0/1" in table
+    assert "unresolved_leakage  1         1/1" in table
+    assert "what this cannot establish" in table
+
+
+def test_the_json_lists_every_acquisition_and_the_limits_it_was_read_under(
+    tmp_path: Path,
+) -> None:
+    run = _one(tmp_path, capture=_watching((150.0, "chatgpt.com", "tls")))
+    doc = run.to_json()
+    assert doc["schema"].startswith("shobench.leakage/")
+    assert set(doc["buckets"]) == {*BUCKETS, UNCLASSIFIED}
+    assert any("never a method, a status or a body" in limit for limit in doc["limits"])
+    assert doc["egress"]["segments"][0]["rows"] == 3
+    assert doc["finished"] is True
+
+
+def test_every_achieved_episode_can_be_audited_from_its_own_record(tmp_path: Path) -> None:
+    """A reader given one episode should be able to see what moved and where it landed."""
+    run = _resident(tmp_path, "/tmp/key.parquet", second_reads=True)
+    graded = {e.episode.task_idx: e.to_json() for e in run.episodes}
+    acquisition = graded[7]["acquisition"]
+    assert acquisition["destination"] == "/tmp/key.parquet"
+    assert acquisition["requested"] == [_PARQUET]
+    assert acquisition["episode"]["task_idx"] == 7
+    assert graded[8]["inherited_from"]["task_idx"] == 7
+    assert _PARQUET in graded[7]["requested"]
+
+
+# ----- the run this metric came from -------------------------------------------------------------
+
+# The rollout's real acquisition, in the shape it really has: one compound command that fetched
+# the parquet, printed its size, and failed on a missing pandas. The size is the filesystem
+# answering for the file, and the failure is why a command's exit code cannot be the test.
+_REAL_COMMAND = (
+    '/bin/bash -lc "curl -L --max-time 60 -s -o /tmp/hle_text_only.parquet '
+    f"'{_PARQUET}'\ndu -h /tmp/hle_text_only.parquet\n"
+    'python3 -c \'import pandas as pd; d=pd.read_parquet(\\"/tmp/hle_text_only.parquet\\")\'"'
+)
+_REAL_OUTPUT = (
+    "75M\t/tmp/hle_text_only.parquet\n"
+    "Traceback (most recent call last):\n"
+    '  File "<string>", line 1, in <module>\n'
+    "ModuleNotFoundError: No module named 'pandas'\n"
+)
+# A slice of the real capture: the sweep ends, huggingface.co opens twice, and the second open
+# is followed by the file CDN. On its own that is unresolved; the command above is what settles
+# it, and the dispense times are the run's own.
 _REAL_CAPTURE = """\
 1786660143.435434128\t127.0.0.11\t\t49918\tdatasets-server.huggingface.co\t
 1786660143.527840920\t3.171.139.40\t443\t\t\tdatasets-server.huggingface.co
-1786660144.594830837\t3.171.139.40\t443\t\t\tdatasets-server.huggingface.co
 1786660148.821971756\t127.0.0.11\t\t49918\thuggingface.co\t
 1786660148.833352839\t3.168.73.111\t443\t\t\thuggingface.co
 1786660148.900125923\t172.64.155.209\t443\t\t\tchatgpt.com
-1786660154.288647675\t127.0.0.11\t\t49918\thuggingface.co\t
 1786660154.301030467\t3.168.73.111\t443\t\t\thuggingface.co
 1786660154.352512050\t127.0.0.11\t\t49918\tus.aws.cdn.hf.co\t
 1786660154.443037675\t44.217.206.136\t443\t\t\tus.aws.cdn.hf.co
+1786660400.000000000\t172.64.155.209\t443\t\t\tchatgpt.com
 """
 
 
-def test_the_real_capture_puts_the_parquet_fetch_in_the_episode_that_was_open(
+def test_the_real_acquisition_lands_in_the_episode_that_ran_the_command(
     tmp_path: Path,
 ) -> None:
+    lease = "593679fe311635501bfff30c94ae14b5"
     run = classify_run(
-        RunDir(tmp_path / "real")
+        RunDir(tmp_path / "real", max_in_flight=8)
         .egress(_REAL_CAPTURE)
         .rollout(
             [
                 (47, 237, "4d332b330ab9905788e9a67de40551ba", 1786660036.45137, True),
-                (48, 241, "593679fe311635501bfff30c94ae14b5", 1786660135.783406, True),
+                (48, 241, lease, 1786660135.783406, True),
                 (49, 246, "9883f15d7b1dffe0d9ec7a9e79e5eb35", 1786660195.169622, True),
             ]
         )
-        .leg("rollout", 0, 1786658388.529, 1786665506.372)
+        .leg("rollout", 0, 1786660000.0, 1786660400.0)
         .trace(
             "rollout",
             "leg-0000.stream.jsonl",
-            json.dumps(
-                {"lease": "593679fe311635501bfff30c94ae14b5", "cmd": f"curl -L {_PARQUET}"}
+            codex(
+                {"lease_seen": "4d332b330ab9905788e9a67de40551ba"},
+                {"submit": "4d332b330ab9905788e9a67de40551ba"},
+                {"lease_seen": lease},
+                {
+                    "command": _REAL_COMMAND,
+                    "output": _REAL_OUTPUT,
+                    "exit_code": 1,
+                    "status": "failed",
+                },
+                {"submit": lease},
+                {"lease_seen": "9883f15d7b1dffe0d9ec7a9e79e5eb35"},
             ),
         )
         .path
     )
     graded = {e.episode.seq: e for e in run.episodes}
-    # The slice opens after seq 47's window closed, so nothing in it is that episode's.
-    assert graded[47].bucket == "computed_locally"
-    assert graded[47].evidence == ()
     assert graded[48].bucket == "achieved_leakage"
-    assert graded[48].acquisition["host"] == "us.aws.cdn.hf.co"
-    assert graded[48].acquisition["requested"] == [_PARQUET]
-    # The file is on that container's disk from here on, so the episodes after it are not clean.
-    assert graded[49].bucket == "achieved_leakage"
-    assert graded[49].reasons == ("answer_source_resident",)
+    acquisition = graded[48].acquisition
+    assert acquisition["kind"] == "file_download_landed"
+    assert acquisition["destination"] == "/tmp/hle_text_only.parquet"
+    assert acquisition["persistence"] == "ephemeral"
+    assert acquisition["requested"] == [_PARQUET]
+    # The episode after it has the file within reach and no command naming it.
+    assert graded[49].bucket == "unresolved_leakage"
+    assert graded[49].inherited_from["seq"] == 48

@@ -133,10 +133,19 @@ harness announces a usage limit, and where each rule came from.
 **Some environments publish their answers, so a correct-rate needs a bucket.** hle's questions
 and answers are a public dataset, the cell has open egress by design, and the runner observes
 rather than gates. An episode won by reasoning and an episode won by downloading the answer key
-earn the same reward, so `shobench leakage` grades every episode from the run's egress capture
-before either number is read: computed locally, general web reference, attempted leakage,
-achieved leakage, with the correct-rate reported per bucket and never blended. The capture is
-the floor because the agent has no mount of it; the trace refines and can only raise, since the
-transcript names the endpoint a command asked for while the observer sees whether a body moved.
-The command prints what egress cannot establish alongside the counts, which is most of the
-point: hostnames and times, never payloads.
+earn the same reward, so `shobench leakage` grades every episode before either number is read:
+computed locally, general web reference, attempted leakage, unresolved leakage, achieved
+leakage, with the correct-rate reported per bucket and never blended.
+
+The egress capture is the floor because the agent has no mount of it, and it cannot reach the
+top of that ladder: it sees hostnames and times, never a method, a status or a body, and the
+Hub's file CDN serves the whole platform, so a client hello to it is a connection to a CDN and
+not a download of an answer key. Achieved needs content, and content is in the transcript: a
+result carrying the dataset's own answer columns, or a download whose destination the filesystem
+then answered for. Refinement reads commands rather than prose, so a URL the agent only talked
+about moves nothing.
+
+An episode whose capture does not cover its window is `unclassified`, never clean, and the
+command refuses a run whose manifest has no `ended_at` unless asked twice. `--format json`
+carries every acquisition, the rivals a shared window was charged to, and the limits the
+numbers were read under.
