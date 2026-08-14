@@ -1546,3 +1546,113 @@ def test_the_json_stream_stays_json_when_a_target_is_refused(
     assert "refusing" in captured.err
     document = json.loads(captured.out)
     assert [run["run_id"] for run in document["runs"]] == ["finished"]
+
+
+# ----- a hub call and an MCP fetch are read on the same terms as everything else -------------
+
+
+def test_a_hub_call_in_quoted_data_does_not_raise_an_episode(tmp_path: Path) -> None:
+    """Printing a snippet that names a Hub call asks the Hub for nothing.
+
+    It raised the episode through a separate substring check that the invoked-command rule never
+    saw, and the leg rule then carried that into everything after it.
+    """
+    run = classify_run(
+        RunDir(tmp_path / "r")
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 300.0, True)])
+        .leg("rollout", 0, 50.0, 900.0)
+        .trace(
+            "rollout",
+            "leg-0000.stream.jsonl",
+            codex(
+                {"lease_seen": "lease-a"},
+                {"command": "printf '%s\\n' 'load_dataset(\"hle\")'",
+                 "output": 'load_dataset("hle")'},
+                {"submit": "lease-a"},
+                {"lease_seen": "lease-b"},
+            ),
+        )
+        .path
+    )
+    graded = {e.episode.seq: e for e in run.episodes}
+    assert graded[1].bucket == "computed_locally"
+    assert "hub_download_call" not in graded[1].reasons
+    # And nothing downstream inherits a contact that never happened.
+    assert graded[2].bucket == "computed_locally"
+
+
+def test_a_hub_call_an_interpreter_ran_still_raises_it(tmp_path: Path) -> None:
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {"command": "python3 -c \"load_dataset('cais/hle')\"", "output": "ok"},
+        ),
+    )
+    assert _buckets(run) == {7: "attempted_leakage"}
+    assert "hub_download_call" in run.episodes[0].reasons
+
+
+def test_a_fetch_tool_reached_over_mcp_is_a_request(tmp_path: Path) -> None:
+    """A fetch tool's arguments are where its URL is, whatever transport carried the call."""
+    call = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "web",
+                "tool": "WebFetch",
+                "arguments": {"url": _PARQUET},
+                "result": {"content": [{"type": "text", "text": "ok"}]},
+            },
+        }
+    )
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace='{"lease":"lease-a"}\n' + call + "\n",
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+    assert run.episodes[0].requested == (_PARQUET,)
+
+
+def test_the_streams_own_calls_are_not_read_as_requests(tmp_path: Path) -> None:
+    """``get_task`` asks for a task and ``submit_answer`` carries an answer, not a request."""
+    calls = "\n".join(
+        [
+            '{"lease":"lease-a"}',
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "shogym",
+                        "tool": "get_task",
+                        "arguments": {},
+                        "result": {"content": [{"type": "text", "text": f"see {_PARQUET}"}]},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "shogym",
+                        "tool": "submit_answer",
+                        "arguments": {"lease": "lease-a", "answer": _PARQUET},
+                        "result": {"content": []},
+                    },
+                }
+            ),
+        ]
+    )
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace=calls + "\n",
+    )
+    assert _buckets(run) == {7: "computed_locally"}
+    assert run.episodes[0].requested == ()

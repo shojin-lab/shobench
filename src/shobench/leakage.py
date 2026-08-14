@@ -1212,11 +1212,22 @@ def _actions_for(episode: Episode, traces: dict[str, Trace]) -> tuple[list[Actio
 _TASK_TRACE = re.compile(r"^task-(\d+)-leg-")
 
 
+def _reads_as_a_request(action: Action) -> bool:
+    """Is this action's own input worth reading as something the agent asked for?
+
+    The stream's terminal call is not: its arguments carry the answer being submitted, not a
+    request for anything. Every other tool is, including the ones reached over MCP, because a
+    fetch tool's arguments are where its URL is and dropping the whole envelope would hide the
+    one field that says what was asked for.
+    """
+    return not action.kind.endswith("submit_answer")
+
+
 def _requested_urls(actions: Sequence[Action]) -> list[str]:
     """URLs the agent asked for, taken from command text and never from prose or output."""
     urls: list[str] = []
     for action in actions:
-        if action.kind.startswith("mcp:"):
+        if not _reads_as_a_request(action):
             continue
         # Only from an invocation that fetches. A URL the agent printed, grepped for or wrote
         # into a file is data it handled, and nothing there asked the remote host for a body.
@@ -1428,10 +1439,15 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         # Only where the environment has an answer source at all. Without one this cannot tell a
         # dataset pull from any other, and bucketing it as leakage while the run's own note says
         # the two cannot be distinguished would be the metadata contradicting the number.
+        # Behind the same gate the URLs are read through. A Hub call is a request when an
+        # interpreter runs it and a string when something prints it, and the substring is the
+        # same either way.
         if source is not None and any(
             call in invocation
             for a in actions
+            if _reads_as_a_request(a)
             for invocation in _invocations(a.request)
+            if _fetches(a, invocation)
             for call in _HUB_CALLS
         ):
             bucket = _raise_to(bucket, "attempted_leakage")
