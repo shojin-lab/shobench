@@ -84,6 +84,7 @@ from shobench.redact import MARKER as redact_marker
 from shobench.redact import Redactor, redactor_for, secrets_in_file
 from shobench.results import (
     INCOMPLETE_SUFFIX,
+    MISSING_CLOSURE,
     TaskResult,
     dispensed_positions,
     fill_missing,
@@ -1038,7 +1039,16 @@ def _eval_task_valid_row(prov_dir: Path, idx: int) -> TaskResult | None:
     real outcome the agent reached, and that id is done: a resume must never re-run it, because a
     completed held-out task is expensive and re-running it would also risk a second row.
     """
-    rows = read_phase(prov_dir)
+    return _settled_row(read_phase(prov_dir), idx)
+
+
+def _settled_row(rows: list[TaskResult], idx: int) -> TaskResult | None:
+    """The rule of :func:`_eval_task_valid_row`, applied to rows already read.
+
+    The baseline carry asks the same question of rows it holds in hand rather than of a
+    provenance directory, and one rule answering both is what keeps a carried row and a
+    pending id from disagreeing about whether an id is done.
+    """
     if len(rows) != 1:
         return None
     row = rows[0]
@@ -3920,6 +3930,8 @@ async def rerun_eval(
     agent_image: str = AGENT_IMAGE,
     credentials: dict[str, str] | None = None,
     capture_egress: bool = True,
+    refresh_baseline: bool = False,
+    baseline_run_dir: Path | None = None,
 ) -> Path:
     """Finish an eval phase that lost tasks without a suspension, and republish.
 
@@ -3936,6 +3948,8 @@ async def rerun_eval(
             agent_image=agent_image,
             credentials=credentials,
             capture_egress=capture_egress,
+            refresh_baseline=refresh_baseline,
+            baseline_run_dir=baseline_run_dir,
             stop=stop,
         )
 
@@ -3948,6 +3962,8 @@ async def _rerun_eval_owned(
     agent_image: str = AGENT_IMAGE,
     credentials: dict[str, str] | None = None,
     capture_egress: bool = True,
+    refresh_baseline: bool = False,
+    baseline_run_dir: Path | None = None,
     stop: EarlyEnding | None = None,
 ) -> Path:
     """The reopened run's eval_after, run under an already-held run-directory lock.
@@ -3964,6 +3980,11 @@ async def _rerun_eval_owned(
     running here would spend the window the suspension is waiting out. Refused when the rollout
     never reached a terminus, because eval_after belongs on the far side of one and nowhere
     else, which is the same rule ``_run_phases`` states for a fresh cell.
+
+    ``refresh_baseline`` catches a bookend's carried before rows up to the baseline they were
+    snapshotted from, for the baseline that finished after the snapshot was taken. It composes
+    with the repair rather than replacing it: the pending legs still run, and a run with none
+    pending refreshes the carry and republishes.
     """
     if (run_dir / SUSPENSION_FILE).is_file():
         raise RuntimeError(
@@ -4085,6 +4106,34 @@ async def _rerun_eval_owned(
     if (run_dir / "rollout_stopping.json").is_file() and "rebookend" not in manifest:
         recorded.append("rollout")
     recorded_phases = tuple(recorded)
+    if refresh_baseline:
+        # Before the sandbox and before any leg, so a carry that cannot be caught up refuses
+        # having spent nothing. The refreshed rows go through the run's own publish path, and
+        # the republication below reads them back the way every publication of a bookend does.
+        refresh, refreshed_rows = baseline_refresh_plan(
+            run_dir, manifest, split=split, baseline_run_dir=baseline_run_dir
+        )
+        if refresh["refused"]:
+            raise RuntimeError(
+                f"the baseline {refresh['baseline_run_dir']} no longer holds the rows this "
+                f"bookend carries for held-out {refresh['refused']}: a refresh adds ids the "
+                "carry has none for and upgrades ones that never settled, and never replaces "
+                "a measured row. Nothing has been spent."
+            )
+        ctx.publish_json(
+            run_dir / BASELINE_BEFORE_FILE,
+            {
+                "source_run_id": refresh["baseline_run_id"],
+                "rows": [asdict(row) for row in refreshed_rows],
+            },
+        )
+        manifest["rebookend"].setdefault("baseline_refreshes", []).append(
+            {
+                "refreshed_at": time.time(),
+                "tasks_added": refresh["added"],
+                "tasks_upgraded": refresh["upgraded"],
+            }
+        )
     manifest.setdefault("eval_reruns", []).append({"at": time.time(), "phase": phase})
     ctx.publish_json(run_dir / "manifest.json", manifest)
     sandbox.up()
@@ -4285,6 +4334,148 @@ def _holding_source_still(source_run_dir: Path):
         os.close(fd)
 
 
+def read_baseline_before(baseline_dir: Path, task_ids: Sequence[int]) -> list[TaskResult]:
+    """The baseline's eval_before rows, read the one way every carry of them is taken.
+
+    Held still when the baseline carries a lock file, so a repair that owns it refuses this
+    read rather than being read mid-write; the pre-lock-era baselines have none, and their row
+    files are append-only JSONL written by archived runs, so a plain read is honest there.
+    Creation and refresh both come through here, which is what lets a refreshed carry be
+    compared with the carried one field by field.
+    """
+    hold = (
+        _holding_source_still(baseline_dir)
+        if (baseline_dir / RUN_LOCK_FILE).is_file()
+        else contextlib.nullcontext()
+    )
+    with hold:
+        return read_eval_phase(baseline_dir / "eval_before", task_ids)
+
+
+def _rows_by_task(rows: Sequence[TaskResult]) -> dict[int, list[TaskResult]]:
+    grouped: dict[int, list[TaskResult]] = {}
+    for row in rows:
+        grouped.setdefault(row.task_idx, []).append(row)
+    return grouped
+
+
+def baseline_carry_gaps(
+    rows: Sequence[TaskResult], *, task_ids: Sequence[int]
+) -> dict[str, list[int]]:
+    """The held-out ids a baseline's eval_before cannot account for yet, by kind.
+
+    ``missing`` produced no row at all; ``unsealed`` produced rows but no settled outcome (a
+    drained row, a dispense that never sealed, a double). Both are ids a
+    ``rerun-eval --phase eval_before`` on the baseline would re-run, so both are ids whose
+    rows can still change after a carry is taken.
+    """
+    grouped = _rows_by_task(rows)
+    gaps: dict[str, list[int]] = {"missing": [], "unsealed": []}
+    for idx in task_ids:
+        for_id = grouped.get(idx, [])
+        if _settled_row(for_id, idx) is not None:
+            continue
+        recorded = any(row.closure != MISSING_CLOSURE for row in for_id)
+        gaps["unsealed" if recorded else "missing"].append(idx)
+    return gaps
+
+
+def baseline_refresh_delta(
+    carried: Sequence[TaskResult], live: Sequence[TaskResult], *, task_ids: Sequence[int]
+) -> tuple[dict[str, list[int]], list[TaskResult]]:
+    """What catching a carry up to its baseline would change, and the rows it would then hold.
+
+    Two directions are allowed, because neither replaces a measurement: an id the carry has no
+    row for takes the live one, and an id whose carried row never settled takes a live settled
+    one. Every other difference is refused, since a carried settled row that would change, or
+    one whose live row is gone, is exactly what the carry exists to hold still.
+    """
+    was_by, now_by = _rows_by_task(carried), _rows_by_task(live)
+    delta: dict[str, list[int]] = {"added": [], "upgraded": [], "refused": []}
+    for idx in task_ids:
+        was, now = was_by.get(idx, []), now_by.get(idx, [])
+        if [asdict(row) for row in was] == [asdict(row) for row in now]:
+            continue
+        if _settled_row(was, idx) is None and _settled_row(now, idx) is not None:
+            recorded = any(row.closure != MISSING_CLOSURE for row in was)
+            delta["upgraded" if recorded else "added"].append(idx)
+        else:
+            delta["refused"].append(idx)
+    catching_up = set(delta["added"]) | set(delta["upgraded"])
+    rows: list[TaskResult] = []
+    for idx in sorted(set(was_by) | set(now_by)):
+        rows.extend(now_by[idx] if idx in catching_up else was_by.get(idx, []))
+    return delta, rows
+
+
+def baseline_refresh_plan(
+    run_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    split: Split,
+    baseline_run_dir: Path | None = None,
+) -> tuple[dict[str, Any], list[TaskResult]]:
+    """A bookend's carried baseline rows against the baseline's live ones.
+
+    Returns what a refresh would change and the rows it would carry afterwards, so the plan
+    and the spending path say the same thing. Raises for everything that makes the comparison
+    meaningless: a run that carries no baseline rows at all, and a baseline directory that is
+    not the run the carry and the marker both name.
+    """
+    if "rebookend" not in manifest:
+        raise RuntimeError(
+            f"{run_dir} is not a rebookend, so it carries no baseline rows: a refresh acts on "
+            "the before block a bookend carries, and every other run measured its own."
+        )
+    carry_path = run_dir / BASELINE_BEFORE_FILE
+    if not carry_path.is_file():
+        raise RuntimeError(
+            f"{run_dir} is a rebookend but its carried baseline rows ({BASELINE_BEFORE_FILE}) "
+            "cannot be read, so there is nothing to refresh."
+        )
+    payload = json.loads(carry_path.read_text(encoding="utf-8"))
+    recorded_id = str(manifest["rebookend"].get("baseline_run_id") or "")
+    carried_id = str(payload.get("source_run_id") or "")
+    if carried_id != recorded_id:
+        raise RuntimeError(
+            f"{run_dir} carries rows labeled {carried_id!r} while its manifest names "
+            f"{recorded_id!r} as the baseline: the two disagree about which run measured the "
+            "before side, and a refresh must not decide that."
+        )
+    baseline_dir = (
+        Path(baseline_run_dir) if baseline_run_dir is not None else run_dir.parent / recorded_id
+    ).resolve()
+    baseline_manifest_path = baseline_dir / "manifest.json"
+    if not baseline_manifest_path.is_file():
+        raise RuntimeError(
+            f"{baseline_dir} has no manifest.json, so the baseline {recorded_id} cannot be "
+            "re-read. Name its run directory with --baseline."
+        )
+    live_id = str(
+        json.loads(baseline_manifest_path.read_text(encoding="utf-8")).get("run_id") or ""
+    )
+    if live_id != recorded_id:
+        raise RuntimeError(
+            f"{baseline_dir} is run {live_id!r}, not the {recorded_id!r} this bookend carries: "
+            "refreshing from another run would splice a different experiment's rows into a "
+            "measured before side."
+        )
+    task_ids = [int(task_id) for task_id in side_for_phase(split, "eval_before").task_ids]
+    delta, rows = baseline_refresh_delta(
+        [TaskResult(**row) for row in payload["rows"]],
+        read_baseline_before(baseline_dir, task_ids),
+        task_ids=task_ids,
+    )
+    return (
+        {
+            "baseline_run_id": recorded_id,
+            "baseline_run_dir": str(baseline_dir),
+            **delta,
+        },
+        rows,
+    )
+
+
 async def rebookend_run(
     source_run_dir: Path,
     *,
@@ -4294,6 +4485,7 @@ async def rebookend_run(
     agent_image: str = AGENT_IMAGE,
     credentials: dict[str, str] | None = None,
     capture_egress: bool = True,
+    allow_partial_baseline: bool = False,
 ) -> Path:
     """Give an EXISTING run a resumed eval_after, as a NEW run, and return its results path.
 
@@ -4508,6 +4700,7 @@ async def rebookend_run(
             agent_image=agent_image,
             credentials=credentials,
             capture_egress=capture_egress,
+            allow_partial_baseline=allow_partial_baseline,
             stop=stop,
         )
 
@@ -4533,6 +4726,7 @@ async def _rebookend_owned(
     agent_image: str,
     credentials: dict[str, str] | None,
     capture_egress: bool,
+    allow_partial_baseline: bool,
     stop: EarlyEnding,
 ) -> Path:
     """The rebookend's own run, under an already-held lock on the NEW directory.
@@ -4585,6 +4779,29 @@ async def _rebookend_owned(
     source_home = source_run_dir / "home"
     if not source_home.is_dir():
         raise RuntimeError(f"{source_run_dir} has no home directory to bookend.")
+    # The baseline's before rows, read here and published below as this artifact's own before
+    # block. Read before the snapshot rather than after it, because both refusals below are
+    # about the baseline alone and a home copy is minutes of a real archive's bytes.
+    heldout_ids = [int(t) for t in side_for_phase(split, "eval_before").task_ids]
+    baseline_rows = read_baseline_before(baseline_dir, heldout_ids)
+    if not any(row.scored for row in baseline_rows):
+        raise RuntimeError(
+            f"the baseline {baseline_dir} holds no readable scored eval_before rows, so the "
+            "bookend would have nothing to pair with. Nothing has been spent."
+        )
+    # A baseline still short of ids is the race this refuses: the carry freezes whatever the
+    # baseline holds at this instant, and a repair that finishes minutes later leaves the
+    # bookend's artifact reporting holes forever against a baseline that has none.
+    baseline_gaps = baseline_carry_gaps(baseline_rows, task_ids=heldout_ids)
+    if (baseline_gaps["missing"] or baseline_gaps["unsealed"]) and not allow_partial_baseline:
+        raise RuntimeError(
+            f"the baseline {baseline_dir} has not finished its eval_before: no rows for "
+            f"held-out {baseline_gaps['missing']}, no settled row for "
+            f"{baseline_gaps['unsealed']}. Finish it "
+            f"(`uv run shobench rerun-eval --run {baseline_dir} --phase eval_before --go`) "
+            "and rebookend, or pass --allow-partial-baseline to carry the rows as they stand. "
+            "Nothing has been spent."
+        )
     # Held STILL for the whole snapshot, not merely probed: a probe released before the copy
     # left the copy racing any mutator that acquired in between, and a concurrent rerun's
     # mid-copy write landed in the published snapshot. The shared hold refuses a live owner
@@ -4623,26 +4840,8 @@ async def _rebookend_owned(
             (source_run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
         )
 
-    # The baseline's before rows, carried in at creation and published later as this
-    # artifact's own before block. Read PRE-SPEND, so a baseline whose provenance cannot be
-    # read refuses before anything is paid for, and persisted into the new run directory, so
-    # every publication of this run (the first, a resumed one, a repaired one) reads the same
-    # carried rows. Held still when the baseline carries a lock file; the pre-lock-era
-    # baselines have none, and their row files are append-only JSONL written by archived
-    # runs, so a plain read is honest there.
-    heldout_ids = [int(t) for t in side_for_phase(split, "eval_before").task_ids]
-    baseline_hold = (
-        _holding_source_still(baseline_dir)
-        if (baseline_dir / RUN_LOCK_FILE).is_file()
-        else contextlib.nullcontext()
-    )
-    with baseline_hold:
-        baseline_rows = read_eval_phase(baseline_dir / "eval_before", heldout_ids)
-    if not any(row.scored for row in baseline_rows):
-        raise RuntimeError(
-            f"the baseline {baseline_dir} holds no readable scored eval_before rows, so the "
-            "bookend would have nothing to pair with. Nothing has been spent."
-        )
+    # Persisted into the new run directory, so every publication of this run (the first, a
+    # resumed one, a repaired one) reads the same carried rows.
     ctx.publish_json(
         run_dir / BASELINE_BEFORE_FILE,
         {"source_run_id": baseline_run_id, "rows": [asdict(row) for row in baseline_rows]},
@@ -4727,6 +4926,11 @@ async def _rebookend_owned(
             # it rests on trust for rather than only the ones between the two archives.
             "execution_identity_unproven": sorted(set(unproven)),
         }
+        if baseline_gaps["missing"] or baseline_gaps["unsealed"]:
+            # Carried over the creation guard by --allow-partial-baseline: the ids the baseline
+            # could not account for at snapshot time, so the artifact names the rows an operator
+            # chose to freeze rather than leaving the holes to look like the baseline's own.
+            manifest["rebookend"]["partial_baseline"] = baseline_gaps
         ctx.publish_json(run_dir / "manifest.json", manifest)
         return await _run_phases(
             ctx,
@@ -4812,9 +5016,13 @@ __all__ = [
     "SUSPENSION_FILE",
     "EvalSuspension",
     "Suspension",
+    "baseline_carry_gaps",
+    "baseline_refresh_delta",
+    "baseline_refresh_plan",
     "build_manifest",
     "durable_filter",
     "cleanup",
+    "read_baseline_before",
     "read_eval_phase",
     "read_stop_request",
     "rebookend_run",

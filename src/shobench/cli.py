@@ -300,6 +300,10 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
     The plan without ``--go`` names the run, the ids still row-less, and the drift check, and
     spends nothing. The eval phase runner re-runs only the pending ids, so the plan's count is
     exactly what a ``--go`` will pay for.
+
+    With ``--refresh-baseline`` the plan also names what catching the bookend's carried before
+    rows up to its baseline would add, upgrade, and refuse, computed by the same function the
+    spending path acts on, so a plan cannot say something a ``--go`` will not.
     """
     run_dir = Path(args.run)
     manifest_path = run_dir / "manifest.json"
@@ -332,6 +336,18 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
         "missing_required_env": missing_required,
         "experiment_drift": drift,
     }
+    refresh: dict[str, object] = {}
+    if args.refresh_baseline:
+        try:
+            refresh, _ = runner.baseline_refresh_plan(
+                run_dir,
+                manifest,
+                split=split,
+                baseline_run_dir=Path(args.baseline) if args.baseline else None,
+            )
+        except RuntimeError as exc:
+            refresh = {"blocked": str(exc)}
+        plan["baseline_refresh"] = refresh
     if not args.go:
         print(json.dumps(plan, indent=2))
         print("\nDry plan. Re-run with --go to spend.", file=sys.stderr)
@@ -343,6 +359,14 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
             "not set. Nothing was spent.",
             file=sys.stderr,
         )
+        return 1
+    if refresh.get("blocked") or refresh.get("refused"):
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        why = refresh.get("blocked") or (
+            "the baseline no longer holds the rows this bookend carries for held-out "
+            f"{refresh['refused']}."
+        )
+        print(f"\nBLOCKED: {why} Nothing was spent.", file=sys.stderr)
         return 1
     # A zero-pending invocation still runs the tail: the fan-out may have finished while the
     # prior process died before republishing, and the phase runner is a no-op over complete
@@ -359,6 +383,8 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
             agent_image=args.image,
             credentials=credentials.agent_env(cell.harness, cell.credential_mode, dict(os.environ)),
             capture_egress=not args.no_egress,
+            refresh_baseline=args.refresh_baseline,
+            baseline_run_dir=Path(args.baseline) if args.baseline else None,
         )
     )
     print(f"results: {results_path}")
@@ -639,6 +665,7 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             agent_image=args.image,
             credentials=credentials.agent_env(cell.harness, cell.credential_mode, dict(os.environ)),
             capture_egress=not args.no_egress,
+            allow_partial_baseline=args.allow_partial_baseline,
         )
     )
     print(f"results: {results_path}")
@@ -988,6 +1015,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="eval_after",
         help="which eval phase to repair (eval_before only for a run that never rolled out)",
     )
+    rerun.add_argument(
+        "--refresh-baseline",
+        action="store_true",
+        help=(
+            "on a bookend: catch its carried baseline rows up to the baseline they were "
+            "snapshotted from, adding ids the carry has none for and upgrading unsettled ones"
+        ),
+    )
+    rerun.add_argument(
+        "--baseline",
+        default=None,
+        help=(
+            "the baseline run directory --refresh-baseline re-reads; defaults to the sibling "
+            "named by the manifest's baseline_run_id"
+        ),
+    )
     rerun.add_argument("--go", action="store_true", help="actually re-run the holes (real spend)")
     rerun.add_argument("--results", default="results")
     rerun.add_argument("--image", default=AGENT_IMAGE)
@@ -1005,6 +1048,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=(
             "the run directory whose eval_before pairs with this bookend; required when the "
             "source has no eval_before of its own, defaults to the source when it does"
+        ),
+    )
+    rebookend.add_argument(
+        "--allow-partial-baseline",
+        action="store_true",
+        help=(
+            "carry the baseline's rows even though it cannot account for every held-out id; "
+            "the ids frozen this way are recorded in the bookend's manifest"
         ),
     )
     rebookend.add_argument(

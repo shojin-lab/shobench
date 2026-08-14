@@ -21,7 +21,7 @@ import hashlib
 import json
 import os
 import shutil
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -30,7 +30,7 @@ from shobench import runner
 from shobench.config import load_cell_by_name, load_instruction
 from shobench.containers import CellSandbox
 from shobench.harness import StopKind, StopVerdict
-from shobench.results import TaskResult
+from shobench.results import TaskResult, missing_row
 from shobench.runner import (
     ROLLOUT_STOPPING_FILE,
     SUSPENSION_FILE,
@@ -191,14 +191,21 @@ def _fingerprint(root: Path) -> dict[str, str]:
 
 
 def _wire_fakes(
-    monkeypatch, cell, split, launches: dict[int, dict], probes: list | None = None
+    monkeypatch,
+    cell,
+    split,
+    launches: dict[int, dict],
+    probes: list | None = None,
+    before_rows: dict[int, list[TaskResult]] | None = None,
 ) -> None:
     """The same provider-free fan-out the resumed eval_after tests drive, plus the loaders:
     the cell under test is synthetic, so the checkout loaders hand back the recorded
     definitions the drift check verifies, exactly as they would for a committed cell.
 
     ``probes`` collects the image reference each probe was run against, which is how a test
-    proves the probe and the legs saw the same bytes."""
+    proves the probe and the legs saw the same bytes. ``before_rows`` says what a baseline's
+    held-out id recorded, which is how a test gives a baseline the holes and the drained rows
+    a mid-repair one carries."""
     probes = [] if probes is None else probes
 
     def fake_run_leg(ctx_arg: RunContext, **kw: object) -> LegRecord:
@@ -235,6 +242,8 @@ def _wire_fakes(
         idx = int(prov_dir.name.split("-")[1])
         if "eval_before" in prov_dir.parts:
             # Baseline provenance: the archived before row the creation-time carry reads.
+            if before_rows is not None and idx in before_rows:
+                return list(before_rows[idx])
             return [
                 TaskResult(
                     seq=idx, position=0, task_idx=idx, closure="sealed", reward=0.25,
@@ -1098,8 +1107,10 @@ def test_legacy_artifacts_render_their_recorded_arms(tmp_path: Path) -> None:
 
 def _baseline_run(tmp_path: Path, cell, split, *, name: str = "baseline-run") -> Path:
     """A deferred-baseline run: its own manifest over the same cell and split, its own
-    eval_before provenance, and nothing else. The v0 baselines are exactly this shape."""
-    baseline_dir = tmp_path / name
+    eval_before provenance, and nothing else. The v0 baselines are exactly this shape, down to
+    the directory being named by the run id, which is what lets a bookend find its sibling."""
+    run_id = f"{name}-20260101T000000Z"
+    baseline_dir = tmp_path / run_id
     home = baseline_dir / "home"
     home.mkdir(parents=True)
     ctx = RunContext(
@@ -1107,7 +1118,7 @@ def _baseline_run(tmp_path: Path, cell, split, *, name: str = "baseline-run") ->
         split=split,
         instruction=load_instruction(cell.instruction_arm),
         harness=runner.harness_for(cell.harness),
-        run_id=f"{name}-20260101T000000Z",
+        run_id=run_id,
         run_dir=baseline_dir,
         sandbox=CellSandbox(run_id="b", home=home, workdir=baseline_dir / "work"),
     )
@@ -1455,6 +1466,371 @@ def test_a_marker_bearing_run_refuses_to_publish_without_its_carried_rows(
             )
         )
     assert not (tmp_path / "results").exists()
+
+
+# ----- a carry taken from a baseline that had not finished ------------------------------------
+#
+# The race the carry made invisible: a baseline mid-repair passes every identity check, the
+# creation snapshots whatever it holds at that instant, and the repair finishing minutes later
+# leaves the bookend's artifact reporting holes forever against a baseline that has none. So
+# creation refuses a baseline that cannot account for every held-out id, and a bookend created
+# over one anyway (or created before this guard existed) can be caught up.
+
+
+def _drained(idx: int) -> TaskResult:
+    """What an orderly stream close records for a task a usage limit cut off in flight:
+    scored, so the assembler counts it, and never a settled outcome."""
+    return TaskResult(
+        seq=idx, position=0, task_idx=idx, closure="drained", reward=0.0, success=False
+    )
+
+
+def _sealed(idx: int, *, reward: float = 0.25) -> TaskResult:
+    return TaskResult(
+        seq=idx, position=0, task_idx=idx, closure="sealed", reward=reward, success=False
+    )
+
+
+def _bookend_over(
+    tmp_path: Path, monkeypatch, launches: dict[int, dict], *, before_rows: dict
+) -> tuple[Path, Path, object, object]:
+    """A real bookend, created by the entry, over a baseline holding ``before_rows``.
+
+    The baseline is a sibling of the bookend under the same runs directory, which is where
+    every real pair lives and what a refresh resolves by run id when no baseline is named.
+    """
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path / "runs", cell, split)
+    _wire_fakes(monkeypatch, cell, split, launches, before_rows=before_rows)
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            baseline_run_dir=baseline_dir,
+            capture_egress=False,
+            allow_partial_baseline=True,
+        )
+    )
+    run_dir = next(
+        p for p in (tmp_path / "runs").iterdir() if p.is_dir() and p.name.startswith(cell.name)
+    )
+    return run_dir, baseline_dir, cell, split
+
+
+def _legs_from_here(monkeypatch) -> list[int]:
+    """The task ids any further leg runs, on top of the fakes already wired.
+
+    A rerun's fakes have to keep reading the after rows the bookend already measured, so its
+    launch record cannot also be the proof that nothing new ran; this is that proof.
+    """
+    wired = runner.run_leg
+    calls: list[int] = []
+
+    def counting(ctx, **kw):
+        calls.append(int(kw["task_idx"]))
+        return wired(ctx, **kw)
+
+    monkeypatch.setattr(runner, "run_leg", counting)
+    return calls
+
+
+def _carried(run_dir: Path) -> dict[int, list[dict]]:
+    payload = json.loads((run_dir / runner.BASELINE_BEFORE_FILE).read_text(encoding="utf-8"))
+    rows: dict[int, list[dict]] = {}
+    for row in payload["rows"]:
+        rows.setdefault(row["task_idx"], []).append(row)
+    return rows
+
+
+def test_rebookend_refuses_a_baseline_that_has_not_finished_its_eval_before(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The creation guard, naming the ids and the repair: a baseline with a row-less id and a
+    baseline with a drained one are both still moving, and a carry taken from either freezes
+    the holes into an artifact that can never account for them."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split, with_before=False)
+    baseline_dir = _baseline_run(tmp_path, cell, split)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches, before_rows={1: [], 2: [_drained(2)]})
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(
+            runner.rebookend_run(
+                source_dir,
+                runs_dir=tmp_path / "runs",
+                results_dir=tmp_path / "results",
+                baseline_run_dir=baseline_dir,
+                capture_egress=False,
+            )
+        )
+
+    message = str(excinfo.value)
+    assert "no rows for held-out [1]" in message
+    assert "no settled row for [2]" in message
+    assert "rerun-eval" in message and "--phase eval_before" in message
+    assert launches == {}
+    assert not (tmp_path / "results").exists()
+
+
+def test_allow_partial_baseline_carries_the_gaps_and_records_them(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The override is a decision, so the artifact says it was made: the ids the baseline could
+    not account for are named in the marker, and the published bookend takes the incomplete
+    name the carried holes earn it."""
+    launches: dict[int, dict] = {}
+    run_dir, _, cell, _ = _bookend_over(
+        tmp_path, monkeypatch, launches, before_rows={1: [], 2: [_drained(2)]}
+    )
+
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["rebookend"]["partial_baseline"] == {"missing": [1], "unsealed": [2]}
+    assert set(launches) == {0, 1, 2}
+    published = next((tmp_path / "results").glob(f"{run_dir.name}*"))
+    assert published.name.endswith(".incomplete.json")
+
+
+def test_a_refresh_adds_an_id_the_carry_has_no_row_for(tmp_path: Path, monkeypatch) -> None:
+    """The whole point: the baseline finished after the snapshot was taken, and the bookend's
+    before block catches up to it. The after side is already complete, so nothing is re-run and
+    the refresh alone republishes the artifact, which now accounts for every held-out id."""
+    launches: dict[int, dict] = {}
+    run_dir, _, cell, split = _bookend_over(
+        tmp_path, monkeypatch, launches, before_rows={1: []}
+    )
+    assert _carried(run_dir)[1][0]["closure"] == "missing"
+    assert next((tmp_path / "results").glob(f"{run_dir.name}*")).name.endswith(
+        ".incomplete.json"
+    )
+    # The baseline finished after the carry was taken, and nothing names it: the refresh
+    # resolves it as the sibling run its marker names.
+    _wire_fakes(monkeypatch, cell, split, launches)
+    reran = _legs_from_here(monkeypatch)
+
+    results_path = asyncio.run(
+        runner.rerun_eval(
+            run_dir,
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+            refresh_baseline=True,
+        )
+    )
+
+    # No leg ran: the ids were all measured, and a refresh is a re-read of another run's rows.
+    assert reran == []
+    assert _carried(run_dir)[1] == [
+        {
+            "seq": 1, "position": 0, "task_idx": 1, "closure": "sealed", "reward": 0.25,
+            "success": False, "diagnostic": None, "observed": [], "feedback_regime": None,
+        }
+    ]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    (refresh,) = manifest["rebookend"]["baseline_refreshes"]
+    assert (refresh["tasks_added"], refresh["tasks_upgraded"]) == ([1], [])
+    assert refresh["refreshed_at"] > 0
+    # And the republished artifact accounts for the id the carry had lost, so it takes the
+    # finished name instead of the incomplete one it was published under.
+    assert results_path.name == f"{run_dir.name}.json"
+    published = json.loads(results_path.read_text(encoding="utf-8"))
+    assert published["eval_before"]["summary"]["complete"] is True
+    assert len(published["paired"]) == 3
+
+
+def test_a_refresh_upgrades_a_carried_drained_row_to_the_settled_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A drained row is scored, so the carry counts it as present and no repair of this run can
+    reach it: the id reads as a zero the agent earned when what failed was the window. The
+    refresh replaces it with the outcome the baseline's own repair reached."""
+    launches: dict[int, dict] = {}
+    run_dir, baseline_dir, cell, split = _bookend_over(
+        tmp_path, monkeypatch, launches, before_rows={2: [_drained(2)]}
+    )
+    assert _carried(run_dir)[2][0]["closure"] == "drained"
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    asyncio.run(
+        runner.rerun_eval(
+            run_dir,
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+            refresh_baseline=True,
+            baseline_run_dir=baseline_dir,
+        )
+    )
+
+    assert _carried(run_dir)[2][0]["closure"] == "sealed"
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    (refresh,) = manifest["rebookend"]["baseline_refreshes"]
+    assert (refresh["tasks_added"], refresh["tasks_upgraded"]) == ([], [2])
+
+
+def test_a_refresh_refuses_a_carried_row_the_baseline_would_change(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The line the carry exists to hold: a measured row is never replaced. A baseline whose
+    row for a settled id now reads differently is refused by id, before anything is written,
+    because nothing here can say which of the two measured the task."""
+    launches: dict[int, dict] = {}
+    run_dir, baseline_dir, cell, split = _bookend_over(
+        tmp_path, monkeypatch, launches, before_rows={1: []}
+    )
+    carried_before = (run_dir / runner.BASELINE_BEFORE_FILE).read_bytes()
+    _wire_fakes(
+        monkeypatch, cell, split, launches, before_rows={0: [_sealed(0, reward=0.9)], 2: []}
+    )
+    reran = _legs_from_here(monkeypatch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(
+            runner.rerun_eval(
+                run_dir,
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+                refresh_baseline=True,
+                baseline_run_dir=baseline_dir,
+            )
+        )
+
+    # Both directions of a difference the carry will not take: a settled row that would change
+    # its reward, and a settled row whose live provenance is gone.
+    assert "[0, 2]" in str(excinfo.value)
+    assert (run_dir / runner.BASELINE_BEFORE_FILE).read_bytes() == carried_before
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert "baseline_refreshes" not in manifest["rebookend"]
+    assert reran == []
+
+
+def test_a_refresh_refuses_a_run_that_carries_no_baseline_rows(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every run but a bookend measured its own before side, so there is no carry to catch up
+    and nothing a refresh could mean."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+
+    with pytest.raises(RuntimeError, match="not a rebookend"):
+        asyncio.run(
+            runner.rerun_eval(
+                source_dir,
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+                refresh_baseline=True,
+            )
+        )
+    assert launches == {}
+
+
+def test_a_refresh_refuses_a_baseline_that_is_another_run(tmp_path: Path, monkeypatch) -> None:
+    """The identity the refusal rests on: rows re-read from a different run would splice
+    another experiment's measurements into this bookend's before side."""
+    launches: dict[int, dict] = {}
+    run_dir, _, cell, split = _bookend_over(
+        tmp_path, monkeypatch, launches, before_rows={1: []}
+    )
+    other = _baseline_run(tmp_path / "runs", cell, split, name="baseline-other")
+
+    with pytest.raises(RuntimeError, match="not the 'baseline-run-20260101T000000Z'"):
+        asyncio.run(
+            runner.rerun_eval(
+                run_dir,
+                results_dir=tmp_path / "results",
+                capture_egress=False,
+                refresh_baseline=True,
+                baseline_run_dir=other,
+            )
+        )
+
+
+def test_the_cli_plan_shows_what_a_refresh_would_change(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The plan spends nothing and states the delta by id, from the same function the spending
+    path acts on, and a refusal blocks a --go the same way every other refusal state does."""
+    from shobench.cli import main as cli_main
+
+    cell = load_cell_by_name("smoke-automationbench-claude-code")
+    split = load_split_by_name(cell.split)
+    kept, caught_up = (int(task_id) for task_id in split.heldout.task_ids)
+    baseline_dir = _real_cell_source(tmp_path / "baseline")
+    for idx in (kept, caught_up):
+        (baseline_dir / "eval_before" / f"task-{idx:05d}").mkdir(parents=True, exist_ok=True)
+    bookend_dir = _real_cell_source(tmp_path / "bookend")
+    manifest = json.loads((bookend_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["rebookend"] = {
+        "rebookend_of": "rollout-source",
+        "baseline_run_id": "source-run-20260101T000000Z",
+    }
+    runner.write_json(bookend_dir / "manifest.json", manifest)
+
+    def carry(row: TaskResult) -> None:
+        runner.write_json(
+            bookend_dir / runner.BASELINE_BEFORE_FILE,
+            {
+                "source_run_id": "source-run-20260101T000000Z",
+                "rows": [
+                    {**asdict(row)},
+                    asdict(missing_row(caught_up, diagnostic="no row")),
+                ],
+            },
+        )
+
+    monkeypatch.setattr(
+        runner,
+        "read_phase",
+        lambda prov_dir: (
+            [_sealed(int(prov_dir.name.split("-")[1]))]
+            if prov_dir.parent.name == "eval_before" and prov_dir.name.startswith("task-")
+            else []
+        ),
+    )
+
+    carry(_sealed(kept))
+    assert (
+        cli_main(
+            [
+                "rerun-eval", "--run", str(bookend_dir), "--refresh-baseline",
+                "--baseline", str(baseline_dir),
+            ]
+        )
+        == 0
+    )
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["baseline_refresh"]["added"] == [caught_up]
+    assert plan["baseline_refresh"]["upgraded"] == []
+    assert plan["baseline_refresh"]["refused"] == []
+    assert plan["baseline_refresh"]["baseline_run_id"] == "source-run-20260101T000000Z"
+
+    # The same plan over a carry the baseline no longer agrees with: named in the plan, and a
+    # --go blocked by it rather than spending and refusing later.
+    carry(_sealed(kept, reward=0.9))
+    assert (
+        cli_main(
+            [
+                "rerun-eval", "--run", str(bookend_dir), "--refresh-baseline",
+                "--baseline", str(baseline_dir),
+            ]
+        )
+        == 0
+    )
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["baseline_refresh"]["refused"] == [kept]
+    assert (
+        cli_main(
+            [
+                "rerun-eval", "--run", str(bookend_dir), "--refresh-baseline",
+                "--baseline", str(baseline_dir), "--go",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and str(kept) in err and "Nothing was spent" in err
 
 
 def test_the_source_is_held_still_for_the_whole_snapshot(tmp_path: Path, monkeypatch) -> None:
