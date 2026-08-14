@@ -30,6 +30,7 @@ from shobench.leakage import (
     read_capture,
     read_trace,
     render_table,
+    runs_read,
 )
 
 _HLE = ANSWER_SOURCES["hle"]
@@ -1509,3 +1510,56 @@ def test_the_unfinished_override_survives_the_record_it_exists_for(
     assert "refusing" in capsys.readouterr().err
     assert main([str(run_dir), "--allow-unfinished"]) == 0
     assert "provenance line could not be read" in capsys.readouterr().out
+
+
+def _bookend_pair(tmp_path: Path) -> tuple[Path, Path]:
+    """A bookend and the run it was made from, both readable."""
+    source = (
+        RunDir(tmp_path / "source")
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .rollout([(1, 7, "lease-s", 100.0, True)])
+        .leg("rollout", 0, 50.0, 200.0)
+        .path
+    )
+    bookend = (
+        RunDir(tmp_path / "bookend", rebookend_of="source")
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .eval_task("eval_after", 11, "lease-b", 150.0)
+        .leg("eval_after", 1, 150.0, 190.0, task=11)
+        .path
+    )
+    return source, bookend
+
+
+@pytest.mark.parametrize("target", ["manifest.json", "egress.tsv", "rollout/dispenses.jsonl"])
+def test_the_report_refuses_to_write_into_a_run_it_reaches_through_a_bookend(
+    tmp_path: Path, capsys, target: str
+) -> None:
+    """Classifying a bookend opens the run it names, so that run is one this must not write."""
+    source, bookend = _bookend_pair(tmp_path)
+    destination = source / target
+    before = destination.read_bytes()
+    assert main([str(bookend), "--format", "json", "--out", str(destination)]) == 1
+    assert "refusing to write" in capsys.readouterr().err
+    assert destination.read_bytes() == before
+
+
+def test_a_bookend_report_still_writes_outside_every_run_it_reads(tmp_path: Path) -> None:
+    source, bookend = _bookend_pair(tmp_path)
+    out = tmp_path / "report.json"
+    assert main([str(bookend), "--format", "json", "--out", str(out)]) == 0
+    assert json.loads(out.read_text())["runs"][0]["run_id"] == "bookend"
+    assert (source / "manifest.json").exists()
+
+
+def test_the_protected_set_follows_a_chain_and_survives_a_cycle(tmp_path: Path) -> None:
+    """A source can itself name a source, and a record can name its way round in a circle."""
+    for name, names in (("a", None), ("b", "a"), ("c", "b")):
+        RunDir(tmp_path / name, rebookend_of=names).egress(
+            _watching((150.0, "chatgpt.com", "tls"))
+        )
+    assert {p.name for p in runs_read([tmp_path / "c"])} == {"a", "b", "c"}
+
+    RunDir(tmp_path / "x", rebookend_of="y").egress(_watching((150.0, "chatgpt.com", "tls")))
+    RunDir(tmp_path / "y", rebookend_of="x").egress(_watching((150.0, "chatgpt.com", "tls")))
+    assert {p.name for p in runs_read([tmp_path / "x"])} == {"x", "y"}

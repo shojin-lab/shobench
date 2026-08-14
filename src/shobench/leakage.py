@@ -1343,8 +1343,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 1 if refused and not args.allow_unfinished else 0
 
 
+def runs_read(targets: Sequence[Path]) -> list[Path]:
+    """Every run directory this command will open, not only the ones it was handed.
+
+    A bookend names the run it was made from, and classifying it opens that run's record too. So
+    the set to protect is the targets plus what they reach through
+    ``manifest.rebookend.rebookend_of``, followed transitively and with each directory visited
+    once, since a chain or a cycle is a shape the record can take.
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+    queue = list(targets)
+    while queue:
+        run_dir = queue.pop()
+        try:
+            key = run_dir.expanduser().resolve()
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(run_dir)
+        manifest = run_dir / "manifest.json"
+        if not manifest.is_file():
+            continue
+        try:
+            record = json.loads(manifest.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError, OSError):
+            continue
+        source_id = (record.get("rebookend") or {}).get("rebookend_of")
+        if source_id:
+            queue.append(run_dir.parent / str(source_id))
+    return found
+
+
 def _inside_a_run(out: Path | None, targets: Sequence[Path]) -> Path | None:
     """The run directory an output path would land in, if it would land in one.
+
+    Checked against every run the command will read rather than only the ones named on the
+    command line, because reading a bookend reads its source and a report landing there destroys
+    a record this promised only to open.
 
     Symlinks are resolved on both sides before comparing, so a path that only reaches a run
     through a link is caught with the ones that name it outright.
@@ -1352,8 +1390,11 @@ def _inside_a_run(out: Path | None, targets: Sequence[Path]) -> Path | None:
     if out is None:
         return None
     destination = out.expanduser().resolve()
-    for run_dir in targets:
-        root = run_dir.expanduser().resolve()
+    for run_dir in runs_read(targets):
+        try:
+            root = run_dir.expanduser().resolve()
+        except OSError:
+            continue
         if destination == root or root in destination.parents:
             return run_dir
     return None
@@ -1390,5 +1431,6 @@ __all__ = [
     "main",
     "read_capture",
     "read_trace",
+    "runs_read",
     "render_table",
 ]
