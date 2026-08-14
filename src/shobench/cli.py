@@ -799,6 +799,8 @@ def _cmd_leakage(args: argparse.Namespace) -> int:
     argv = [*args.run_dirs, "--format", args.format]
     if args.out:
         argv += ["--out", args.out]
+    if args.allow_unfinished:
+        argv += ["--allow-unfinished"]
     return leakage.main(argv)
 
 
@@ -893,6 +895,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     leak.add_argument("run_dirs", nargs="+", help="completed run directories")
     leak.add_argument("--format", choices=["table", "json"], default="table")
     leak.add_argument("--out", default=None, help="write the output here instead of printing it")
+    leak.add_argument(
+        "--allow-unfinished",
+        action="store_true",
+        help=(
+            "grade runs whose manifest has no ended_at; their capture cannot be complete, so "
+            "every episode in them is unclassified unless positive evidence raises it"
+        ),
+    )
     leak.set_defaults(func=_cmd_leakage)
 
     args = parser.parse_args(argv)
