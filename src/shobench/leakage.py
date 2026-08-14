@@ -1130,7 +1130,38 @@ def _tidy_url(url: str) -> str:
     return url.rstrip(".,;:!?")
 
 
-def _inherited_artifacts(run_dir: Path, manifest: dict[str, Any]) -> tuple[list[dict], list[str]]:
+def _accounts_for_its_home(source: RunLeakage) -> tuple[bool, str]:
+    """Can this run say what its rollout left in the HOME a bookend would inherit?
+
+    Only its rollout matters, since that is the phase whose writes land in the mounted HOME. It
+    accounts for that HOME when every rollout episode could be classified and every transfer in
+    it was located. An episode this could not classify is one where anything may have happened,
+    and an episode where a body may have moved with no destination found is one where the answer
+    key may be sitting in HOME now; neither is a record another run can be cleared against.
+    """
+    rollout = [e for e in source.episodes if e.episode.phase == "rollout"]
+    if not rollout:
+        return False, "has no rollout record to account for that HOME"
+    blind = sum(1 for e in rollout if e.bucket == UNCLASSIFIED)
+    if blind:
+        return False, f"could not classify {blind} of its {len(rollout)} rollout episodes"
+    unlocated = sum(
+        1
+        for e in rollout
+        if e.acquisition is None
+        and ("content_cdn_handshake" in e.reasons or "file_download_unconfirmed" in e.reasons)
+    )
+    if unlocated:
+        return False, (
+            f"has {unlocated} rollout episodes where a body may have moved with no destination "
+            "found for it"
+        )
+    return True, ""
+
+
+def _inherited_artifacts(
+    run_dir: Path, manifest: dict[str, Any]
+) -> tuple[list[dict], list[str], bool]:
     """What a bookend starts with, because it starts with its source's HOME.
 
     A rebookend runs a new eval against the run it names, and the runner seeds it from that
@@ -1138,21 +1169,28 @@ def _inherited_artifacts(run_dir: Path, manifest: dict[str, Any]) -> tuple[list[
     source saved under HOME is on disk in this run before its first episode begins. An artifact
     the source left somewhere ephemeral is not: that path died with the source's containers.
 
-    When the source directory is not beside this one the question cannot be answered, and the
-    honest answer to a question about durable answer files is not "there were none". The caller
-    floors the run at unclassified and says so.
+    Finding no such artifact is only worth something when the source could have shown one. A
+    source with no capture, with windows its observer was not watching, or with a record still
+    being written produces no acquisitions for the same reason it produces no classifications,
+    and reading that silence as a clean HOME would clear this run on the strength of another
+    run's missing evidence. So the answer is three-valued: what crossed, and whether the
+    question could be answered at all.
     """
     rebookend = manifest.get("rebookend") or {}
     source_id = rebookend.get("rebookend_of")
     if not source_id:
-        return [], []
+        return [], [], False
     source_dir = run_dir.parent / str(source_id)
     if not source_dir.is_dir():
-        return [], [
-            f"this run is a bookend of {source_id}, whose directory is not beside it, so "
-            "whether the source left an answer file in the HOME this run inherited cannot be "
-            "checked; no episode here is cleared"
-        ]
+        return (
+            [],
+            [
+                f"this run is a bookend of {source_id}, whose directory is not beside it, so "
+                "whether the source left an answer file in the HOME this run inherited cannot "
+                "be checked; no episode here is cleared"
+            ],
+            True,
+        )
     source = classify_run(source_dir, _inherit=False)
     # Only what the source's ROLLOUT put in HOME crosses. Its ``/work`` is not copied, its
     # scratch died with its containers, and a file one of its own eval tasks saved lived in that
@@ -1178,15 +1216,19 @@ def _inherited_artifacts(run_dir: Path, manifest: dict[str, Any]) -> tuple[list[
         and e.acquisition.get("persistence") == "home"
         and e.episode.phase == "rollout"
     ]
-    note = (
-        [
+    notes = []
+    if carried:
+        notes.append(
             f"inherited {len(carried)} durable answer artifacts from {source_id}'s rollout HOME, "
             "which this run's eval tasks are copies of"
-        ]
-        if carried
-        else []
-    )
-    return carried, note
+        )
+    accounted, why = _accounts_for_its_home(source)
+    if not accounted:
+        notes.append(
+            f"this run is a bookend of {source_id}, which {why}. Whether the HOME it inherited "
+            "holds an answer file cannot be established, so no episode here is cleared"
+        )
+    return carried, notes, not accounted
 
 
 def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
@@ -1228,8 +1270,9 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
     inheritance_notes: list[str] = []
     unresolved_inheritance = False
     if _inherit:
-        inherited_artifacts, inheritance_notes = _inherited_artifacts(run_dir, manifest)
-        unresolved_inheritance = bool(inheritance_notes) and not inherited_artifacts
+        inherited_artifacts, inheritance_notes, unresolved_inheritance = _inherited_artifacts(
+            run_dir, manifest
+        )
 
     notes = _capture_notes(capture, finished) + _coverage_notes(legs, episodes)
     notes += inheritance_notes

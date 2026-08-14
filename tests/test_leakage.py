@@ -1260,6 +1260,10 @@ def test_a_bookend_does_not_inherit_a_file_an_eval_task_saved(tmp_path: Path) ->
     source = (
         RunDir(tmp_path / "source")
         .egress(_watching((150.0, "us.aws.cdn.hf.co", "tls")))
+        # A quiet rollout, so the source can account for the HOME it hands over, and the only
+        # thing in question is the file its eval task saved.
+        .rollout([(1, 7, "lease-r", 10.0, True)])
+        .leg("rollout", 0, 5.0, 90.0)
         .eval_task("eval_after", 11, "lease-a", 100.0)
         .leg("eval_after", 1, 100.0, 200.0, task=11)
         .trace(
@@ -1369,3 +1373,121 @@ def test_a_file_fetched_from_anywhere_that_reads_back_as_nothing_is_not_achieved
         ),
     )
     assert _buckets(run) == {7: "general_web_reference"}
+
+
+def _bookend_over(tmp_path: Path, source: RunDir):
+    """A quiet, fully covered bookend over a source, so only the source's record is in question."""
+    return classify_run(
+        RunDir(tmp_path / "bookend", rebookend_of=source.path.name)
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .eval_task("eval_after", 12, "lease-b", 150.0)
+        .leg("eval_after", 1, 150.0, 200.0, task=12)
+        .path
+    )
+
+
+def test_a_bookend_is_cleared_only_when_its_source_can_account_for_that_home(
+    tmp_path: Path,
+) -> None:
+    """The positive control: a source that classified its whole rollout and located everything."""
+    source = (
+        RunDir(tmp_path / "source")
+        .egress(_watching((50.0, "chatgpt.com", "tls")))
+        .rollout([(1, 7, "lease-r", 10.0, True)])
+        .leg("rollout", 0, 5.0, 90.0)
+    )
+    assert _buckets(_bookend_over(tmp_path, source)) == {12: "computed_locally"}
+
+
+def test_a_bookend_whose_source_has_no_capture_is_not_cleared(tmp_path: Path) -> None:
+    """The source's silence is missing evidence, not evidence its HOME was clean.
+
+    The runner copied that HOME into this run's eval tasks, so a source that cannot say what it
+    wrote leaves an answer file possible on every one of their disks.
+    """
+    source = (
+        RunDir(tmp_path / "source")
+        .rollout([(1, 7, "lease-r", 10.0, True)])
+        .leg("rollout", 0, 5.0, 90.0)
+    )
+    bookend = _bookend_over(tmp_path, source)
+    assert _buckets(bookend) == {12: UNCLASSIFIED}
+    assert "inherited_home_unchecked" in bookend.episodes[0].reasons
+    assert any("could not classify 1 of its 1 rollout episodes" in n for n in bookend.notes)
+
+
+def test_a_bookend_whose_source_had_an_uncovered_rollout_window_is_not_cleared(
+    tmp_path: Path,
+) -> None:
+    """Same hole, reached the other way: the observer stopped before the rollout did."""
+    source = (
+        RunDir(tmp_path / "source")
+        .egress(_capture((0.0, "chatgpt.com", "dns"), (5.0, "chatgpt.com", "dns")))
+        .rollout([(1, 7, "lease-r", 10.0, True)])
+        .leg("rollout", 0, 5.0, 90.0)
+    )
+    bookend = _bookend_over(tmp_path, source)
+    assert _buckets(bookend) == {12: UNCLASSIFIED}
+    assert any("rollout episodes" in n for n in bookend.notes)
+
+
+def test_a_bookend_whose_source_never_finished_is_not_cleared(tmp_path: Path) -> None:
+    source = (
+        RunDir(tmp_path / "source", ended_at=None)
+        .egress(_watching((50.0, "chatgpt.com", "tls")))
+        .rollout([(1, 7, "lease-r", 10.0, True)])
+        .leg("rollout", 0, 5.0, 90.0)
+    )
+    assert _buckets(_bookend_over(tmp_path, source)) == {12: UNCLASSIFIED}
+
+
+def test_a_bookend_whose_source_left_a_transfer_unlocated_is_not_cleared(
+    tmp_path: Path,
+) -> None:
+    """A body may have moved during the source's rollout and nothing says where it landed."""
+    source = (
+        RunDir(tmp_path / "source")
+        .egress(_watching((50.0, "us.aws.cdn.hf.co", "tls")))
+        .rollout([(1, 7, "lease-r", 10.0, True)])
+        .leg("rollout", 0, 5.0, 90.0)
+    )
+    bookend = _bookend_over(tmp_path, source)
+    assert _buckets(bookend) == {12: UNCLASSIFIED}
+    assert any("no destination found for it" in n for n in bookend.notes)
+
+
+def test_a_source_that_located_its_transfer_still_clears_the_bookend(tmp_path: Path) -> None:
+    """The handshake is explained by a download this found, and it went somewhere scratch."""
+    source = (
+        RunDir(tmp_path / "source")
+        .egress(_watching((50.0, "us.aws.cdn.hf.co", "tls")))
+        .rollout([(1, 7, "lease-r", 10.0, True)])
+        .leg("rollout", 0, 5.0, 90.0)
+        .trace(
+            "rollout",
+            "leg-0000.stream.jsonl",
+            codex(
+                {"lease_seen": "lease-r"},
+                {"command": f"curl -sL -o /tmp/key.parquet '{_PARQUET}'", "output": ""},
+                {"command": "du -h /tmp/key.parquet", "output": "75M\t/tmp/key.parquet"},
+            ),
+        )
+    )
+    assert _buckets(_bookend_over(tmp_path, source)) == {12: "computed_locally"}
+
+
+def test_positive_evidence_still_lands_on_an_unchecked_bookend(tmp_path: Path) -> None:
+    """Refusing to clear is not refusing to see: the bookend's own traffic still classifies."""
+    source = (
+        RunDir(tmp_path / "source")
+        .rollout([(1, 7, "lease-r", 10.0, True)])
+        .leg("rollout", 0, 5.0, 90.0)
+    )
+    bookend = classify_run(
+        RunDir(tmp_path / "bookend", rebookend_of=source.path.name)
+        .egress(_watching((160.0, "us.aws.cdn.hf.co", "tls")))
+        .eval_task("eval_after", 12, "lease-b", 150.0)
+        .leg("eval_after", 1, 150.0, 200.0, task=12)
+        .path
+    )
+    assert _buckets(bookend) == {12: "unresolved_leakage"}
