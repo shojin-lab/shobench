@@ -3113,6 +3113,12 @@ async def _run_phases(
     artifact is the intended one-artifact-per-cell rule. A rebookend is not that run: it
     pairs WITH the cell's artifact, and publishing under the same stem destroyed the very
     result it must pair with, so it publishes under its own run id instead.
+
+    An operator's stop is the one ending that stops the LOOP rather than a leg. It reaches a
+    running leg through the supervisor, which ends the container the way a budget does, and it
+    reaches this loop by keeping any phase that has not started from starting. Everything below
+    then runs unchanged, which is the whole of what stopping this way buys: the records are
+    written, the rollout terminus is real, and the run publishes what it has.
     """
 
     def teardown() -> None:
@@ -3202,9 +3208,10 @@ async def _run_phases(
         "observed_models"
     ]
     if manifest["home"]["digest_after"] is None:
-        # No rollout ran in this process and none was carried forward, which only happens when
-        # an operator asked for a subset of the phases. There is no rollout terminus to have
-        # measured, so the state is read now and said to have been.
+        # No rollout ran in this process and none was carried forward, which happens when an
+        # operator asked for a subset of the phases, and when one stopped the run before its
+        # rollout began. There is no rollout terminus to have measured, so the state is read now
+        # and said to have been.
         _snapshot_durable_state(ctx, manifest, measured_at="publish")
     else:
         _check_evals_left_the_snapshot_alone(ctx, manifest)
