@@ -386,18 +386,33 @@ class Capture:
 
 
 def egress_segments(run_dir: Path) -> list[Path]:
-    """The capture's segment files in the order they were written.
+    """The capture's segment files, without reading any stretch of it twice.
 
-    A continuation gets a segment of its own rather than truncating the first, so the record of
-    a run that was suspended and resumed is several files and reading only the first would drop
-    everything after the interruption.
+    A continuation gets a segment of its own rather than truncating the first, because the
+    capture command truncates whatever file it is pointed at. When that continuation's observer
+    stops, the runner appends its segment into ``egress.tsv`` so the published record covers the
+    whole cell, and leaves the numbered file where it is. Reading both then counts every
+    continuation observation twice, in the totals and in each episode's evidence.
+
+    So a numbered segment already folded into the base is skipped, and one that is not is read.
+    Which it is comes from the record rather than from the run's status: a run interrupted before
+    its observer stopped has a segment that was never folded, and that traffic is evidence.
     """
     first = run_dir / "egress.tsv"
     numbered = sorted(
         (p for p in run_dir.glob("egress.*.tsv") if p.stem.split(".")[-1].isdigit()),
         key=lambda p: int(p.stem.split(".")[-1]),
     )
-    return ([first] if first.exists() else []) + numbered
+    if not first.exists():
+        return numbered
+    base = first.read_text(encoding="utf-8", errors="ignore")
+    kept = [first]
+    for segment in numbered:
+        text = segment.read_text(encoding="utf-8", errors="ignore")
+        if text and text in base:
+            continue
+        kept.append(segment)
+    return kept
 
 
 def read_capture(run_dir: Path) -> Capture:

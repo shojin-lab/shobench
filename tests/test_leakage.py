@@ -28,6 +28,7 @@ from shobench.leakage import (
     content_url_kind,
     destination_persistence,
     download_destinations,
+    egress_segments,
     host_role,
     main,
     reach_of,
@@ -1888,3 +1889,41 @@ def test_a_local_write_naming_an_answer_source_url_is_not_a_landed_download(
 )
 def test_what_counts_as_going_out_and_getting_something(command: str, fetches: bool) -> None:
     assert _is_network_fetch(command) is fetches
+
+
+def test_a_continuation_already_folded_into_the_record_is_not_read_twice(
+    tmp_path: Path,
+) -> None:
+    """The runner appends a stopped continuation into the base and leaves the file behind.
+
+    Reading both counts that stretch twice, in the totals and in every episode window it falls
+    inside. What decides it is the record: a segment whose lines are already in the base has been
+    folded, and one whose lines are not has not.
+    """
+    tail = _capture((205.0, "us.aws.cdn.hf.co", "tls"))
+    run_dir = (
+        RunDir(tmp_path / "r")
+        .egress(_capture((105.0, "en.wikipedia.org", "tls")) + tail)
+        .egress(tail, name="egress.2.tsv")
+        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .leg("rollout", 0, 99.0, 300.0)
+        .path
+    )
+    assert [p.name for p in egress_segments(run_dir)] == ["egress.tsv"]
+    capture = read_capture(run_dir)
+    assert [c.host for c in capture.connections] == ["en.wikipedia.org", "us.aws.cdn.hf.co"]
+
+
+def test_a_continuation_that_was_never_folded_is_still_read(tmp_path: Path) -> None:
+    """A run interrupted before its observer stopped has a segment nobody appended, and that
+    traffic is evidence like any other."""
+    run_dir = (
+        RunDir(tmp_path / "r")
+        .egress(_capture((105.0, "en.wikipedia.org", "tls")))
+        .egress(_capture((205.0, "us.aws.cdn.hf.co", "tls")), name="egress.2.tsv")
+        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .leg("rollout", 0, 99.0, 300.0)
+        .path
+    )
+    assert [p.name for p in egress_segments(run_dir)] == ["egress.tsv", "egress.2.tsv"]
+    assert len(read_capture(run_dir).connections) == 2
