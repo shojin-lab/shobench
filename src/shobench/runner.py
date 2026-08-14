@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import json
 import os
@@ -233,13 +234,20 @@ class EarlyEnding:
     order: int | None = None
 
     def fire(self, verdict: StopVerdict) -> bool:
-        """End the leg with this verdict, unless another watcher already ended it."""
+        """End the leg with this verdict, unless another watcher already ended it.
+
+        The event is set INSIDE the ordering lock, with the verdict and the order, because the
+        three are one publication. Setting it afterwards left a gap in which a handle held an
+        order and no event, and a reader that skipped it for having no event took the later
+        decision instead: an ordinary thread deschedule between the two statements was enough to
+        reintroduce the misclassification the order exists to prevent.
+        """
         with _ENDING_ORDER:
             if self.verdict is not None:
                 return False
             self.verdict = verdict
             self.order = next(_ENDING_SEQUENCE)
-        self.fired.set()
+            self.fired.set()
         return True
 
 
@@ -738,11 +746,17 @@ def _fired_verdict(endings: Sequence[EarlyEnding]) -> StopVerdict | None:
     a caller reads as "classify it normally". That is a fail-safe rather than a case: the only
     way to reach it is a handle fired without one, and inventing a kind here would publish an
     ending nobody decided.
+
+    The decision is the verdict and its order, read under the lock that publishes them, and the
+    event is not consulted at all. The event is what the SUPERVISOR waits on, which is a different
+    question: a handle that has decided but whose event a reader has not yet seen has still
+    decided, and filtering on event visibility is what let a later decision win.
     """
-    fired = [e for e in endings if e.fired.is_set() and e.order is not None and e.verdict]
+    with _ENDING_ORDER:
+        fired = [(e.order, e.verdict) for e in endings if e.order is not None and e.verdict]
     if not fired:
         return None
-    return min(fired, key=lambda ending: ending.order or 0).verdict
+    return min(fired, key=lambda decision: decision[0] or 0)[1]
 
 
 def leg_stem(leg: int, task_idx: int | None) -> str:
@@ -2773,7 +2787,7 @@ class _PulseUnreadable(Exception):
     """This tree could not be read to the bottom, so no reading of it may be compared."""
 
 
-def _unreadable_pulse() -> tuple[int, int, int]:
+def _unreadable_pulse() -> tuple[int, int, int, int]:
     """A reading that can never equal another one, so the caller records progress and resets.
 
     The fail-safe direction, and the only safe one. A tree the host cannot read is a tree the
@@ -2781,11 +2795,41 @@ def _unreadable_pulse() -> tuple[int, int, int]:
     which is what every rollout had before the detector existed, while reading it as a constant
     would end a working leg for being unreadable.
     """
-    return (-1, -1, time.monotonic_ns())
+    return (-1, -1, time.monotonic_ns(), 0)
 
 
-def _tree_pulse(root: Path, *, limit: int | None = None) -> tuple[int, int, int]:
-    """A cheap fingerprint of a directory tree: how many files, how many bytes, newest write.
+# What the fold over entry identities is taken modulo. Wide enough that two different trees
+# colliding is not a thing to reason about, narrow enough to stay one machine word.
+_MARK_MODULUS = 1 << 64
+
+
+def _entry_mark(rel: str, name: str, path: Path) -> int:
+    """A number that moves if this directory entry stops being the same entry.
+
+    The counters beside it are all about the CONTENT a walk reaches, and following links made them
+    about the targets alone. That leaves real filesystem work invisible: a link atomically
+    retargeted between two stat-identical trees moves no count, no byte and no mtime, and an empty
+    directory link appearing or being removed moves nothing at all. A rollout doing exactly that
+    read as silent and could be ended for it, which is the one failure the detector exists to
+    avoid.
+
+    So the entry itself is folded in BESIDE its target's stats rather than replaced by them: where
+    it sits, what it is called, and what it points at when it points at anything. ``readlink`` is
+    the whole test for the last of those, since it fails on anything that is not a link, which
+    saves a second syscall on the ordinary entry.
+    """
+    try:
+        target = os.readlink(path)
+    except OSError:
+        # Not a link, or gone between the listing and here. Either way it contributes its name.
+        target = ""
+    body = "\0".join((rel, name, target)).encode("utf-8", "surrogateescape")
+    return int.from_bytes(hashlib.blake2b(body, digest_size=8).digest(), "big")
+
+
+def _tree_pulse(root: Path, *, limit: int | None = None) -> tuple[int, int, int, int]:
+    """A cheap fingerprint of a directory tree: its files, their bytes, the newest write, and a
+    fold over the entries themselves.
 
     Any write anywhere under ``root`` moves at least one of the three, and none of them moves on
     its own, which is the whole requirement: this is asked only whether the tree CHANGED between
@@ -2821,12 +2865,18 @@ def _tree_pulse(root: Path, *, limit: int | None = None) -> tuple[int, int, int]
     a file count alone would spin on forever; it reports unreadable, which is the fail-safe
     answer. Nothing here needs to deduplicate a tree reached twice by two links: counting it twice
     is deterministic, so the fingerprint still moves if and only if something moved.
+
+    Following also means the counters alone describe the TARGETS and no longer the tree, which is
+    why every entry is folded into a mark beside them (see :func:`_entry_mark`). Retargeting a
+    link between two stat-identical trees moves no counter at all, and so does adding an empty
+    directory link, and both are real work by a working rollout.
     """
     limit = PROGRESS_WALK_LIMIT if limit is None else limit
     files = 0
     entries = 0
     total = 0
     newest = 0
+    mark = 0
 
     def cannot_read(error: OSError) -> None:
         raise _PulseUnreadable(str(error))
@@ -2834,18 +2884,24 @@ def _tree_pulse(root: Path, *, limit: int | None = None) -> tuple[int, int, int]
     try:
         os.stat(root)
     except FileNotFoundError:
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
     except OSError:
         # There, and not listable from here: a statement about this reading, not about the tree.
         return _unreadable_pulse()
     try:
-        for parent, _dirs, names in os.walk(root, onerror=cannot_read, followlinks=True):
+        for parent, dirs, names in os.walk(root, onerror=cannot_read, followlinks=True):
             entries += 1
+            rel = os.path.relpath(parent, root)
+            # Directories are marked but not counted here: every one of them arrives as a
+            # `parent` of its own, which is where the limit counts it and what bounds a cycle.
+            for name in dirs:
+                mark = (mark + _entry_mark(rel, name, Path(parent) / name)) % _MARK_MODULUS
             for name in names:
                 files += 1
                 entries += 1
                 if entries > limit:
                     raise _PulseUnreadable("tree past the walk limit")
+                mark = (mark + _entry_mark(rel, name, Path(parent) / name)) % _MARK_MODULUS
                 # Through the link, not at it. A dangling one raises here and reads as unreadable,
                 # which is the safe direction: it makes the check inert rather than blind.
                 info = os.stat(Path(parent) / name)
@@ -2855,7 +2911,7 @@ def _tree_pulse(root: Path, *, limit: int | None = None) -> tuple[int, int, int]
                 raise _PulseUnreadable("tree past the walk limit")
     except (OSError, _PulseUnreadable):
         return _unreadable_pulse()
-    return (files, total, newest)
+    return (files, total, newest, mark)
 
 
 def _file_pulse(path: Path) -> tuple[int, int]:

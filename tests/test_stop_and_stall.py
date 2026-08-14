@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import os
 import subprocess
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -859,7 +861,7 @@ def test_a_tree_that_does_not_exist_yet_reads_as_stable_emptiness(tmp_path: Path
     """
     absent = tmp_path / "home" / ".prime" / "agent" / "session-artifacts"
 
-    assert runner._tree_pulse(absent) == runner._tree_pulse(absent) == (0, 0, 0)
+    assert runner._tree_pulse(absent) == runner._tree_pulse(absent) == (0, 0, 0, 0)
 
 
 def test_a_leg_writing_under_an_unreadable_subtree_is_not_stalled(tmp_path: Path) -> None:
@@ -1107,3 +1109,121 @@ def test_a_leg_whose_only_activity_is_through_a_link_is_not_stalled(tmp_path: Pa
     os.symlink(target, ctx.sandbox.workdir / "linked")
 
     _never_stalls(ctx, _appender(target / "solver.py"), bound_s=0.2, poll_s=0.02)
+
+
+# ----- a link that stops pointing where it pointed ---------------------------------------------
+
+
+def test_retargeting_a_link_between_identical_trees_is_not_read_as_silence(
+    tmp_path: Path,
+) -> None:
+    """Following links made the counters describe the TARGETS, so a link swung from one
+    stat-identical tree to another moved no count, no byte and no mtime.
+
+    That is real filesystem work by a working rollout, and repeating it while the trace and the
+    provenance are quiet let the clock expire and killed the leg, which is the one failure the
+    detector exists to avoid. The entry itself is folded in beside its target's stats.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    left, right = tmp_path / "A", tmp_path / "B"
+    for tree, body in ((left, "abc"), (right, "xyz")):
+        tree.mkdir()
+        (tree / "f").write_text(body, encoding="utf-8")
+        os.utime(tree / "f", ns=(1_800_000_000_123_456_789, 1_800_000_000_123_456_789))
+    os.symlink(left, work / "current")
+
+    before = runner._tree_pulse(work)
+    # Atomically, the way a build swaps a "current" link.
+    staged = work / ".next"
+    os.symlink(right, staged)
+    os.replace(staged, work / "current")
+
+    # The stats are identical by construction, so only the entry can carry the difference.
+    assert before[:3] == runner._tree_pulse(work)[:3]
+    assert runner._tree_pulse(work) != before
+
+
+def test_an_empty_directory_link_appearing_is_not_read_as_silence(tmp_path: Path) -> None:
+    """The simpler collision: no file, no byte and no mtime anywhere, so every counter agrees
+    while the tree plainly changed."""
+    work = tmp_path / "work"
+    work.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    before = runner._tree_pulse(work)
+    os.symlink(elsewhere, work / "link")
+
+    assert runner._tree_pulse(work) != before
+    assert before[:3] == runner._tree_pulse(work)[:3]
+
+
+def test_a_leg_whose_only_activity_is_retargeting_a_link_is_not_stalled(tmp_path: Path) -> None:
+    """End to end, at the watcher: the reviewer's scenario is a rollout doing this and nothing
+    else, so it is the reading that has to notice, not a test of the helper alone."""
+    ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
+    trees = []
+    for name in ("A", "B"):
+        tree = tmp_path / name
+        tree.mkdir()
+        (tree / "f").write_text("abc", encoding="utf-8")
+        os.utime(tree / "f", ns=(1_800_000_000_123_456_789, 1_800_000_000_123_456_789))
+        trees.append(tree)
+    current = ctx.sandbox.workdir / "current"
+    os.symlink(trees[0], current)
+    swaps = itertools.count()
+
+    def retarget() -> None:
+        # Alternating, so every call really moves the link: pointing it back at where it already
+        # points is not the work under test.
+        turn = next(swaps)
+        staged = ctx.sandbox.workdir / f".next-{turn}"
+        os.symlink(trees[turn % 2], staged)
+        os.replace(staged, current)
+
+    _never_stalls(ctx, retarget, bound_s=0.2, poll_s=0.02)
+
+
+# ----- which decision a leg reports, independent of when a reader sees the event ---------------
+
+
+def test_the_decision_does_not_depend_on_the_event_being_visible_yet(tmp_path: Path) -> None:
+    """``fire()`` published the verdict and the order under the lock and set the event after it, so
+    a handle could hold the earlier decision while a reader that filtered on event visibility
+    skipped it and took the later one. An ordinary thread deschedule between those two statements
+    was enough to reintroduce the misclassification the order exists to prevent.
+
+    Clearing the event stands in for that gap deterministically: the decision is the verdict and
+    its order, and it is the decision whether or not a reader has seen the signal yet.
+    """
+    harness = harness_for("prime_agent")
+    first, second = EarlyEnding(), EarlyEnding()
+    first.fire(harness.operator_verdict(request={"reason": "needed the machine"}))
+    second.fire(harness.no_progress_verdict(bound_s=7200, silent_s=7201.0))
+    assert (first.order, second.order) == (first.order, first.order + 1)
+
+    # A reader that has not yet observed the earlier handle's signal.
+    first.fired.clear()
+
+    assert runner._fired_verdict((second, first)).kind is StopKind.OPERATOR
+
+
+def test_the_signal_is_published_with_the_decision(tmp_path: Path) -> None:
+    """The other half: the event is set inside the ordering lock, so no other firer can be
+    scheduled into a gap between the order and the signal."""
+    harness = harness_for("prime_agent")
+    ending = EarlyEnding()
+    observed: list[tuple[bool, int | None]] = []
+
+    def watching() -> None:
+        # Whatever this thread manages to observe while holding the lock, the two agree.
+        with runner._ENDING_ORDER:
+            observed.append((ending.fired.is_set(), ending.order))
+
+    ending.fire(harness.operator_verdict(request={"reason": "r"}))
+    thread = threading.Thread(target=watching)
+    thread.start()
+    thread.join()
+
+    assert observed == [(True, ending.order)]
