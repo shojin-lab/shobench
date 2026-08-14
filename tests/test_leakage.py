@@ -22,6 +22,7 @@ from shobench.leakage import (
     ANSWER_SOURCES,
     BUCKETS,
     UNCLASSIFIED,
+    Episode,
     _invocations,
     _invokes_a_fetch,
     classify_run,
@@ -444,7 +445,7 @@ def test_without_a_transcript_a_window_runs_to_the_end_of_the_leg(tmp_path: Path
     # which is enough to stop it being cleared and not enough to say more.
     assert graded[2].bucket == "attempted_leakage"
     assert graded[3].bucket == "unresolved_leakage"
-    assert "answer_source_contact_earlier_in_leg" in graded[3].reasons
+    assert "answer_source_contact_earlier_on_this_disk" in graded[3].reasons
 
 
 def test_a_lease_that_outlives_max_in_flight_dispenses_keeps_its_traffic(
@@ -1245,7 +1246,7 @@ def test_an_episode_that_ended_before_the_contact_is_not_tainted(tmp_path: Path)
     graded = {e.episode.seq: e for e in run.episodes}
     # B sealed before the connection was made, so it never saw it and is not tainted by it.
     assert graded[2].episode.ended_at == 900.0 or graded[2].bucket in BUCKETS
-    assert "answer_source_contact_earlier_in_leg" not in graded[2].reasons
+    assert "answer_source_contact_earlier_on_this_disk" not in graded[2].reasons
 
 
 # ----- a fetch is a command that ran, not a word that appears ---------------------------------
@@ -1656,3 +1657,133 @@ def test_the_streams_own_calls_are_not_read_as_requests(tmp_path: Path) -> None:
     )
     assert _buckets(run) == {7: "computed_locally"}
     assert run.episodes[0].requested == ()
+
+
+# ----- the carry key is the disk, not the leg label -------------------------------------------
+
+
+def test_a_resumed_rollout_keeps_what_the_first_leg_reached(tmp_path: Path) -> None:
+    """A continuation is a new container over the same mounted HOME and the same /work.
+
+    The leg label changes and the disk does not, so a file the first leg fetched is still there
+    for the second to read without any new traffic.
+    """
+    run = classify_run(
+        RunDir(tmp_path / "r")
+        .egress(
+            _watching(
+                (150.0, "huggingface.co", "tls"), (450.0, "chatgpt.com", "tls"), until=900.0
+            )
+        )
+        .rollout([(1, 7, "lease-a", 100.0, True), (2, 8, "lease-b", 400.0, True)])
+        .leg("rollout", 0, 50.0, 300.0)
+        .leg("rollout", 1, 380.0, 600.0)
+        .path
+    )
+    graded = {e.episode.seq: e for e in run.episodes}
+    assert graded[1].bucket == "attempted_leakage"
+    assert graded[2].bucket == "unresolved_leakage"
+    assert "answer_source_contact_earlier_on_this_disk" in graded[2].reasons
+
+
+def test_an_eval_task_does_not_contaminate_a_rollout_that_shares_its_leg_number(
+    tmp_path: Path,
+) -> None:
+    """Leg numbers repeat across phases, and those two filesystems share nothing.
+
+    An eval task runs against a private copy of HOME and its own /work, both discarded when it
+    ends, so nothing it reached can be waiting on the rollout's disk.
+    """
+    run = classify_run(
+        RunDir(tmp_path / "r")
+        .egress(
+            _watching(
+                (120.0, "huggingface.co", "tls"), (450.0, "chatgpt.com", "tls"), until=900.0
+            )
+        )
+        .eval_task("eval_before", 0, "lease-e", 100.0)
+        .leg("eval_before", 0, 100.0, 200.0, task=0)
+        .rollout([(1, 7, "lease-r", 400.0, True)])
+        .leg("rollout", 0, 380.0, 600.0)
+        .path
+    )
+    graded = {e.episode.phase: e for e in run.episodes}
+    assert graded["eval_before"].bucket == "attempted_leakage"
+    assert graded["rollout"].bucket == "computed_locally"
+
+
+def test_one_eval_task_does_not_contaminate_another(tmp_path: Path) -> None:
+    run = classify_run(
+        RunDir(tmp_path / "r")
+        .egress(
+            _watching(
+                (120.0, "huggingface.co", "tls"), (450.0, "chatgpt.com", "tls"), until=900.0
+            )
+        )
+        .eval_task("eval_before", 11, "lease-a", 100.0)
+        .eval_task("eval_before", 12, "lease-b", 400.0)
+        .leg("eval_before", 1, 100.0, 200.0, task=11)
+        .leg("eval_before", 2, 400.0, 500.0, task=12)
+        .path
+    )
+    graded = {e.episode.task_idx: e for e in run.episodes}
+    assert graded[11].bucket == "attempted_leakage"
+    assert graded[12].bucket == "computed_locally"
+
+
+@pytest.mark.parametrize(
+    ("phase", "task", "domain"),
+    [
+        ("rollout", 7, "rollout"),
+        ("eval_before", 3, "eval_before:3"),
+        ("eval_after", 3, "eval_after:3"),
+    ],
+)
+def test_the_domain_is_the_disk(phase: str, task: int, domain: str) -> None:
+    episode = Episode(
+        phase=phase, task_idx=task, seq=1, lease="l", leg="leg-9",
+        started_at=0.0, ended_at=1.0, window_kind="leg", correct=None,
+        success=None, reward=None,
+    )
+    assert episode.domain == domain
+
+
+# ----- heredocs and missing targets -----------------------------------------------------------
+
+
+def test_a_heredoc_body_stays_with_the_interpreter_that_was_handed_it(
+    tmp_path: Path,
+) -> None:
+    """``python3 - <<PY`` hands everything up to the delimiter to the interpreter on its left."""
+    script = f"python3 - <<'PY'\nimport requests\nrequests.get('{_PARQUET}')\nPY"
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace=codex({"lease_seen": "lease-a"}, {"command": f'/bin/bash -lc "{script}"',
+                                                "output": ""}),
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+    assert run.episodes[0].requested == (_PARQUET,)
+    assert "file_download_requested" in run.episodes[0].reasons
+
+
+def test_a_command_after_a_heredoc_is_its_own_invocation(tmp_path: Path) -> None:
+    """The body ends at its delimiter, and so does the command that owned it."""
+    assert len(_invocations("python3 - <<PY\nprint(1)\nPY\necho after")) == 2
+    assert len(_invocations("cat <<EOF > /tmp/f\nhello\nEOF\nls /tmp/f")) == 2
+    assert len(_invocations("echo one\necho two")) == 2
+
+
+def test_a_missing_target_refuses_the_batch(tmp_path: Path, capsys) -> None:
+    """A typo that quietly removes a run from an audit is the one hole a report cannot show."""
+    good = (
+        RunDir(tmp_path / "good")
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .rollout([(1, 7, "lease-a", 100.0, True)])
+        .leg("rollout", 0, 50.0, 200.0)
+        .path
+    )
+    assert main([str(good), str(tmp_path / "typo"), "--format", "json"]) == 1
+    captured = capsys.readouterr()
+    assert "no run directory at" in captured.err
+    assert captured.out == ""

@@ -240,19 +240,44 @@ def _fetches(action: Action, invocation: str) -> bool:
     return any(call in invocation for call in _FETCH_CALLS)
 
 
+# A heredoc's body is an argument, not a sequence of commands: ``python3 - <<PY`` hands
+# everything up to the delimiter to the interpreter on its left.
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
 def _split_unquoted(text: str) -> list[str]:
     """Split on shell separators, but only where a shell would see them.
 
     A separator inside quotes is data. ``python3 -c "import requests; requests.get(...)"`` is one
     command whose argument happens to contain a semicolon, and splitting there hands the
     interpreter to one fragment and the call to another, so neither looks like a fetch.
+
+    A heredoc body is the same thing spread over lines. Splitting on the newlines inside
+    ``python3 - <<PY ... PY`` separates the interpreter from the code it was handed, which is the
+    common shape for a script long enough to be worth writing that way.
     """
     parts: list[str] = []
     current: list[str] = []
     quote = ""
+    pending = ""
+    delimiter = ""
+    line_start = 0
     index = 0
     while index < len(text):
         char = text[index]
+        if delimiter:
+            current.append(char)
+            if char == "\n":
+                if "".join(current[line_start:]).strip() == delimiter:
+                    # The body ends at its delimiter, and so does the command that owned it.
+                    delimiter = ""
+                    parts.append("".join(current))
+                    current = []
+                    line_start = 0
+                else:
+                    line_start = len(current)
+            index += 1
+            continue
         if quote:
             current.append(char)
             if char == quote:
@@ -264,10 +289,24 @@ def _split_unquoted(text: str) -> list[str]:
             current.append(char)
             index += 1
             continue
+        if char == "<" and text.startswith("<<", index):
+            opener = _HEREDOC.match(text, index)
+            if opener is not None:
+                pending = opener.group(2)
+                current.append(text[index : opener.end()])
+                index = opener.end()
+                continue
+        if char == "\n" and pending:
+            delimiter, pending = pending, ""
+            current.append(char)
+            line_start = len(current)
+            index += 1
+            continue
         hit = next((b for b in _BOUNDARIES if text.startswith(b, index)), None)
         if hit is not None:
             parts.append("".join(current))
             current = []
+            line_start = 0
             index += len(hit)
             continue
         current.append(char)
@@ -793,6 +832,23 @@ class Episode:
     def label(self) -> str:
         seq = "" if self.seq is None else f"seq {self.seq} "
         return f"{self.phase} {seq}task {self.task_idx}"
+
+    @property
+    def domain(self) -> str:
+        """The disk this episode's container reads and writes, which is what carries.
+
+        A rollout continuation is a new container over the same mounted HOME and the same
+        ``/work``, so a rollout is one domain however many legs it took: what it fetched before
+        an interruption is still there afterwards. An eval task gets a private copy of HOME and a
+        fresh ``/work``, both discarded when it ends, so each task is a domain of its own.
+
+        A leg number is neither of those. Legs are numbered per run and reused across phases, so
+        a rollout leg and an eval task's leg can carry the same label for two filesystems that
+        share nothing, and a continuation changes the label of a filesystem that did not change.
+        """
+        if self.phase == "rollout":
+            return "rollout"
+        return f"{self.phase}:{self.task_idx}"
 
     def identity(self) -> dict[str, Any]:
         return {"phase": self.phase, "seq": self.seq, "task_idx": self.task_idx}
@@ -1368,8 +1424,11 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
     starts = [c.epoch for c in capture.connections]
     ordered = sorted(episodes, key=lambda e: (e.started_at if e.started_at is not None else 0.0))
     graded: list[EpisodeLeakage] = []
-    # When each leg first reached the answer source, so a later episode in the same container is
-    # not cleared over a file that may have been sitting on its disk since. The time comes from
+    # When each persistence domain first reached the answer source, so a later episode reading
+    # the same disk is not cleared over a file that may have been sitting on it since. Keyed by
+    # the domain rather than by the leg, because a continuation relabels a filesystem it did not
+    # change and eval tasks reuse leg numbers for filesystems that share nothing. The time comes
+    # from
     # the observed connection where there is one, because an episode's window is not when its
     # traffic happened: charging contact to the window's start taints episodes that had already
     # ended when the connection was made. A request seen only in the transcript has no epoch, so
@@ -1453,11 +1512,11 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             bucket = _raise_to(bucket, "attempted_leakage")
             _note(reasons, "hub_download_call")
 
-        # Answer-source contact earlier in this leg. The container that made it may have a
-        # copy of the answers on its disk from that moment on, and a local read is invisible to
-        # the observer, so a later episode in the same container cannot be cleared. What it
+        # Answer-source contact earlier on this disk. Whatever reached it may still be there,
+        # and a local read is invisible to the observer, so a later episode reading the same
+        # disk cannot be cleared. What it
         # actually did with such a file is content evidence, which this half does not carry.
-        contact = contacted.get(episode.leg)
+        contact = contacted.get(episode.domain)
         if (
             contact is not None
             and episode.started_at is not None
@@ -1465,7 +1524,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             and bucket != UNCLASSIFIED
         ):
             bucket = _raise_to(bucket, "unresolved_leakage")
-            _note(reasons, "answer_source_contact_earlier_in_leg")
+            _note(reasons, "answer_source_contact_earlier_on_this_disk")
 
         # An eval_after task runs against a copy of the HOME the rollout accumulated, so a
         # rollout that reached the answer source hands every one of them a disk this cannot
@@ -1488,7 +1547,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
                 ),
                 default=episode.started_at,
             )
-            contacted[episode.leg] = min(contacted.get(episode.leg, when), when)
+            contacted[episode.domain] = min(contacted.get(episode.domain, when), when)
         if episode.phase == "rollout":
             if bucket == UNCLASSIFIED:
                 seeded_home_blind = True
@@ -1686,9 +1745,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    targets = [d for d in args.run_dirs if d.is_dir()]
+    missing = [d for d in args.run_dirs if not d.is_dir()]
+    if missing:
+        # Refusing the batch rather than reporting on the rest: a typo that silently removes a
+        # run from an audit is the one failure a report cannot show you.
+        for run_dir in missing:
+            print(f"no run directory at {run_dir}", file=sys.stderr)
+        return 1
+    targets = list(args.run_dirs)
     if not targets:
-        print("no run directories given")
+        print("no run directories given", file=sys.stderr)
         return 1
     refused = [d for d in targets if not _finished(d)]
     if refused and not args.allow_unfinished:
