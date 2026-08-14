@@ -300,6 +300,10 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
     The plan without ``--go`` names the run, the ids still row-less, and the drift check, and
     spends nothing. The eval phase runner re-runs only the pending ids, so the plan's count is
     exactly what a ``--go`` will pay for.
+
+    With ``--refresh-baseline`` the plan also names what catching the bookend's carried before
+    rows up to its baseline would add, upgrade and refuse, from the same function the spending
+    path acts on.
     """
     run_dir = Path(args.run)
     manifest_path = run_dir / "manifest.json"
@@ -332,6 +336,18 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
         "missing_required_env": missing_required,
         "experiment_drift": drift,
     }
+    refresh: dict[str, object] = {}
+    if args.refresh_baseline:
+        try:
+            refresh, _ = runner.baseline_refresh_plan(
+                run_dir,
+                manifest,
+                split=split,
+                baseline_run_dir=Path(args.baseline) if args.baseline else None,
+            )
+        except RuntimeError as exc:
+            refresh = {"blocked": str(exc)}
+        plan["baseline_refresh"] = refresh
     if not args.go:
         print(json.dumps(plan, indent=2))
         print("\nDry plan. Re-run with --go to spend.", file=sys.stderr)
@@ -343,6 +359,14 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
             "not set. Nothing was spent.",
             file=sys.stderr,
         )
+        return 1
+    if refresh.get("blocked") or refresh.get("refused"):
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        why = refresh.get("blocked") or (
+            "the baseline no longer holds the rows this bookend carries for held-out "
+            f"{refresh['refused']}."
+        )
+        print(f"\nBLOCKED: {why} Nothing was spent.", file=sys.stderr)
         return 1
     # A zero-pending invocation still runs the tail: the fan-out may have finished while the
     # prior process died before republishing, and the phase runner is a no-op over complete
@@ -359,6 +383,8 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
             agent_image=args.image,
             credentials=credentials.agent_env(cell.harness, cell.credential_mode, dict(os.environ)),
             capture_egress=not args.no_egress,
+            refresh_baseline=args.refresh_baseline,
+            baseline_run_dir=Path(args.baseline) if args.baseline else None,
         )
     )
     print(f"results: {results_path}")
@@ -438,9 +464,13 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         "baseline_required": not source_has_before and baseline_dir is None,
     }
     baseline_run_id = manifest.get("run_id") if source_has_before else None
+    # The run whose rows the bookend will carry, which is the source itself when it measured
+    # its own before-side.
+    carried_from: Path | None = None
     if baseline_dir is not None:
         baseline_manifest_path = baseline_dir / "manifest.json"
         if baseline_manifest_path.is_file():
+            carried_from = baseline_dir
             baseline_manifest = json.loads(baseline_manifest_path.read_text(encoding="utf-8"))
             baseline_run_id = baseline_manifest.get("run_id")
             baseline_states.update(
@@ -472,10 +502,24 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         # Self-paired: the before rows are the source's own, so the pairing is a record against
         # itself and every fact it states matches. What it does NOT state is still evidence the
         # plan owes an operator, and the manifest carries it either way.
+        carried_from = source_dir
         baseline_states["baseline_pairing_drift"] = runner.pairing_drift(manifest, manifest)
         baseline_states["baseline_pairing_unproven"] = runner.pairing_unproven(
             manifest, manifest
         )
+    if carried_from is not None:
+        # What the carry would freeze, read by the function the creation path reads it with, so
+        # the plan's verdict on a mid-repair baseline is the creation's verdict.
+        heldout_ids = [int(task_id) for task_id in split.heldout.task_ids]
+        try:
+            gaps = runner.baseline_carry_gaps(
+                runner.read_baseline_before(carried_from, heldout_ids), task_ids=heldout_ids
+            )
+        except RuntimeError as exc:
+            baseline_states["baseline_rows_unreadable"] = str(exc)
+        else:
+            baseline_states["baseline_missing_task_ids"] = gaps["missing"]
+            baseline_states["baseline_unsealed_task_ids"] = gaps["unsealed"]
     # The third comparison, at the only stage a plan can make it. The facts that exist only
     # after a container and a credential are checked by the runner at the moment they become
     # knowable, still before any row.
@@ -537,6 +581,7 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
         # Every held-out task, because a rebookend is a fresh bookend rather than a repair:
         # nothing is already complete in a run directory that does not exist yet.
         "heldout_tasks_to_run": len(split.heldout),
+        "allow_partial_baseline": args.allow_partial_baseline,
         # The artifact is SELF-CONTAINED: it carries the baseline run's eval_before rows
         # as its own before block, labeled eval_before.source_run_id, so the paired delta
         # lives inside the artifact and survives the baseline's cell-stem artifact being
@@ -597,6 +642,22 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             "the named baseline was not measured by the same definition as the source: "
             + "; ".join(refusals["baseline_pairing_drift"])
         )
+    if refusals.get("baseline_rows_unreadable"):
+        blockers.append(
+            "the baseline's eval_before rows cannot be read: "
+            f"{refusals['baseline_rows_unreadable']}"
+        )
+    partial = bool(
+        refusals.get("baseline_missing_task_ids") or refusals.get("baseline_unsealed_task_ids")
+    )
+    if partial and not args.allow_partial_baseline:
+        blockers.append(
+            "the baseline has not finished its eval_before (no rows for held-out "
+            f"{refusals['baseline_missing_task_ids']}, no settled row for "
+            f"{refusals['baseline_unsealed_task_ids']}), so the carry would freeze those ids "
+            "into this bookend's artifact; finish it with `rerun-eval --phase eval_before` or "
+            "pass --allow-partial-baseline"
+        )
     if refusals["suspension_present"]:
         blockers.append("the source holds a suspension record; finish it with `shobench resume`")
     if not refusals["source_lock_present"]:
@@ -639,6 +700,7 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
             agent_image=args.image,
             credentials=credentials.agent_env(cell.harness, cell.credential_mode, dict(os.environ)),
             capture_egress=not args.no_egress,
+            allow_partial_baseline=args.allow_partial_baseline,
         )
     )
     print(f"results: {results_path}")
@@ -988,6 +1050,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="eval_after",
         help="which eval phase to repair (eval_before only for a run that never rolled out)",
     )
+    rerun.add_argument(
+        "--refresh-baseline",
+        action="store_true",
+        help=(
+            "on a bookend: catch its carried baseline rows up to the baseline they were "
+            "snapshotted from, adding ids the carry has none for and upgrading unsettled ones"
+        ),
+    )
+    rerun.add_argument(
+        "--baseline",
+        default=None,
+        help=(
+            "the baseline run directory --refresh-baseline re-reads; defaults to the sibling "
+            "named by the manifest's baseline_run_id"
+        ),
+    )
     rerun.add_argument("--go", action="store_true", help="actually re-run the holes (real spend)")
     rerun.add_argument("--results", default="results")
     rerun.add_argument("--image", default=AGENT_IMAGE)
@@ -1005,6 +1083,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=(
             "the run directory whose eval_before pairs with this bookend; required when the "
             "source has no eval_before of its own, defaults to the source when it does"
+        ),
+    )
+    rebookend.add_argument(
+        "--allow-partial-baseline",
+        action="store_true",
+        help=(
+            "carry the baseline's rows even though it cannot account for every held-out id; "
+            "the ids frozen this way are recorded in the bookend's manifest"
         ),
     )
     rebookend.add_argument(
