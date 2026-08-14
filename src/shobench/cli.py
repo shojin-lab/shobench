@@ -13,7 +13,7 @@
 
 ``--go`` is the whole safety story: every command that spends prints its plan and exits unless
 it is present. Nothing here launches the matrix; a cell is run one at a time by name. ``stop``
-carries no ``--go`` because it is the one command that can only reduce what a run spends.
+carries no ``--go``: it can only reduce what a run spends.
 """
 
 from __future__ import annotations
@@ -39,11 +39,8 @@ from shobench.splits import load_split_by_name
 
 DOCKER_DIR = "docker"
 
-# How long `stop` waits for the run's owner to acknowledge its ask by consuming the request, and
-# how often it looks. A supported owner polls at the runner's own STOP_POLL_S, so acknowledgment
-# normally lands in a couple of seconds; the generous ceiling is for an owner busy in a long
-# filesystem walk or a slow teardown, and expiring it reports a run that is still live and still
-# holding an unread request rather than pretending either way.
+# Seconds `stop` waits for the run's owner to acknowledge its ask by consuming the request, and
+# how often it looks. Expiring leaves the request in place for the owner to read.
 STOP_ACK_TIMEOUT_S = 60.0
 STOP_ACK_POLL_S = 0.2
 
@@ -651,11 +648,9 @@ def _cmd_rebookend(args: argparse.Namespace) -> int:
 def _owner_is_live(run_dir: Path) -> bool:
     """Does a live process hold this run's directory?
 
-    Proven rather than assumed, and proven the way `rebookend` proves it: a SHARED flock on the
-    run's own lock file, which every mutating owner holds EXCLUSIVE. Taking it means nothing owns
-    the directory; failing to take it means an owner is there. The run's pid is never consulted,
-    because the lock file is never unlinked and a finished run therefore names a pid the system
-    may since have reissued.
+    Proven the way `rebookend` proves it: a SHARED flock on the run's own lock file, which every
+    mutating owner holds EXCLUSIVE. The run's pid is never consulted, because the lock file is
+    never unlinked and a finished run therefore names a pid the system may since have reissued.
     """
     import fcntl
 
@@ -674,9 +669,8 @@ def _owner_is_live(run_dir: Path) -> bool:
 def _withdraw_stop_request(run_dir: Path) -> bool:
     """Take back an ask no owner consumed, under a shared lock so no new owner can be reading it.
 
-    The lock is what makes this safe rather than a second race. A mutating owner takes the run
-    lock EXCLUSIVE, so holding it SHARED here means no owner exists for the duration, and the
-    request cannot be latched by anyone between the check and the removal.
+    A mutating owner takes the run lock EXCLUSIVE, so holding it SHARED here means no owner
+    exists for the duration and the request cannot be latched between the check and the removal.
     """
     import fcntl
 
@@ -701,27 +695,14 @@ def _withdraw_stop_request(run_dir: Path) -> bool:
 def _cmd_stop(args: argparse.Namespace) -> int:
     """Ask a live run to end through its normal ending, so its records get written.
 
-    The alternative an operator has without this is `pkill` plus `docker rm -f`, which ends the
-    runner before it can write ``legs.json`` and ``rollout_stopping.json``. A run stopped that way
-    has no terminus, so `rebookend` refuses it forever and the cell can never produce an
-    eval_after: the cheap way to stop a wedged run destroys the measurement, while leaving it to
-    burn its whole clock preserves it. This inverts that. It spends nothing, so it takes no
-    ``--go``, and it is safe to call twice and safe to call on a run that has already finished.
+    Spends nothing, so it takes no ``--go``, and it is safe to call twice and on a finished run.
 
-    A busy lock is not enough to write an ask on, and this is the whole shape of the command. A
-    live owner may be one that never reads a request: every process started before the stop path
-    existed is exactly that, and the runs in flight on any machine mid-upgrade are exactly those
-    processes. So the owner has to ADVERTISE that it is watching (``stop_protocol`` in the lock it
-    holds, written by the same entry that starts the watcher), and an owner that does not is
-    refused with nothing written, because the one unacceptable outcome is an ask that is accepted,
-    never consumed, and left on disk for the next resume or rerun to latch.
-
-    Advertising is a promise, so the ask is not reported as delivered until it is KEPT. The runner
-    unlinks the request when it latches it, and that unlink is the acknowledgment this waits for.
-    Waiting is also what closes the window between the liveness probe and the write, where the
-    owner can finish in between: an owner that goes away with the request still on disk is one
-    that never saw it, and this takes the ask back under the now-free shared lock rather than
-    leaving the landmine the check above exists to prevent.
+    A busy lock is not enough to write an ask on: a live owner started before the stop path
+    existed never reads a request. So the owner has to ADVERTISE that it is watching
+    (``stop_protocol`` in the lock it holds), and one that does not is refused with nothing
+    written, because an ask accepted and never consumed is left on disk for the next resume or
+    rerun to latch. Delivery is not reported until the runner unlinks the request, which also
+    closes the window where the owner finishes between the liveness probe and the write.
     """
     run_dir = Path(args.run)
     if not (run_dir / runner.RUN_LOCK_FILE).is_file():
@@ -732,8 +713,8 @@ def _cmd_stop(args: argparse.Namespace) -> int:
         )
         return 1
     if not _owner_is_live(run_dir):
-        # A no-op, and deliberately not a written request: a run nobody owns will not read one,
-        # and a file left behind would end the next process to reopen the directory.
+        # Deliberately not a written request: a run nobody owns will not read one, and a file
+        # left behind would end the next process to reopen the directory.
         print(
             f"{run_dir} is not owned by a live process, so it has already finished or was "
             "killed. Nothing was written and nothing was stopped.",

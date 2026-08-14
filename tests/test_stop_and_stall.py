@@ -1,22 +1,15 @@
 """Ending a run on purpose, and ending one that has stopped getting anywhere.
 
-Two endings, one seam. Before either existed the only way an operator could stop a run was
-``pkill`` plus ``docker rm -f``, which ends the runner before it can write ``legs.json`` and
-``rollout_stopping.json``. A run stopped that way has no terminus, so ``rebookend`` refuses it
-forever and the cell can never produce an eval_after: the cheap way to stop a wedged run destroys
-the measurement while leaving it to burn its whole clock preserves it. Both tests below are
-therefore about the RECORDS an ending leaves, not only about the ending.
+Two endings, one seam. Both halves are about the RECORDS an ending leaves, not only about the
+ending: a run killed with ``pkill`` plus ``docker rm -f`` never writes ``legs.json`` or
+``rollout_stopping.json``, and without those it has no terminus a ``rebookend`` can fork.
 
-The stall half is the one that has to be careful about what it does NOT do. Trace silence is not
-evidence of a stall: a task can legitimately take an hour inside one tool call, and an agent that
-delegates goes quiet in its own trace by design while its children work. So the reading is over
-four sources and any one of them resets the clock, and three of the tests here exist to hold the
-detector to that: a leg whose only activity is child artifacts, a leg whose only activity is
-``/work``, and a leg that seals a row late are each doing exactly what the benchmark wants.
+The stall half also has to hold the detector to what it must NOT do. Trace silence is not evidence
+of a stall, so the reading is over four sources and any one of them resets the clock.
 
 Nothing here needs Docker, a provider, or a bound port. The container is stood in for at the one
-seam the runner owns, which is the leg supervisor; the stream is a fake that never drains, so the
-drain watchdog stays out of tests that are not about it.
+seam the runner owns, the leg supervisor; the stream is a fake that never drains, so the drain
+watchdog stays out of tests that are not about it.
 """
 
 from __future__ import annotations
@@ -129,9 +122,8 @@ def _offline_rollout(monkeypatch) -> None:
 class _AsksToStopMidLeg:
     """A container that runs until an operator asks it to end, and asks on its own first wait.
 
-    Writing the request from inside the leg's own supervision is what makes "mid-leg" the fact
-    under test rather than a race: the leg is provably launched and being waited on before the ask
-    exists at all, so nothing here can pass by stopping a run that had not started.
+    Writing the request from inside the leg's own supervision is what makes "mid-leg" a fact
+    rather than a race: the leg is provably launched and being waited on before the ask exists.
     """
 
     stdin = None
@@ -170,9 +162,8 @@ def _stopped_run(
 ) -> Path:
     """One rollout an operator's ask ended, through the real ownership and the real phase tail.
 
-    Ownership is taken for real rather than faked, because the watcher that consumes the ask
-    belongs to it: a run driven through ``_run_phases`` alone has no watcher at all, which is the
-    state every already-running process is in and exactly what the CLI must refuse.
+    Ownership is taken for real because the watcher that consumes the ask belongs to it: a run
+    driven through ``_run_phases`` alone has no watcher at all.
 
     ``transcript`` decides whether the leg got far enough to leave a resumable conversation
     behind, which is what separates a stop that can be bookended from one that cannot.
@@ -215,12 +206,11 @@ def _seed_claude_transcript(ctx: RunContext, monkeypatch) -> None:
     """Put a resumable transcript where a leg that got that far would have left one.
 
     The leg is stood in for at the supervisor, so nothing writes the conversation a real one
-    would. What the harness requires to reopen a session is the harness's own rule, and the file
-    written here is one that rule accepts rather than an empty one wearing the right name: that is
-    the whole difference between a terminus a bookend can fork and an id in a record.
+    would. The file written here is one the harness's own resume rule accepts, rather than an
+    empty one wearing the right name.
 
     The session id is pinned so the seeded file and the leg agree on it; claude lets the runner
-    choose one, which is exactly why an id alone proves nothing about a transcript existing.
+    choose one, which is why an id alone proves nothing about a transcript existing.
     """
     monkeypatch.setattr(runner, "_fresh_session_id", lambda ctx_arg: _PINNED_SESSION)
     root = ctx.sandbox.home / ".claude" / "projects" / "-work"
@@ -245,8 +235,8 @@ def _seed_claude_transcript(ctx: RunContext, monkeypatch) -> None:
 def test_a_stop_mid_leg_writes_both_records_and_its_own_verdict_kind(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The whole point of the entry: the ending happens through the normal path, so the two files
-    a killed run never gets to write are on disk, and the leg says who ended it."""
+    """The ending happens through the normal path, so the two files a killed run never gets to
+    write are on disk, and the leg says who ended it."""
     run_dir = _stopped_run(tmp_path, monkeypatch)
 
     legs = json.loads((run_dir / "legs.json").read_text())
@@ -254,8 +244,7 @@ def test_a_stop_mid_leg_writes_both_records_and_its_own_verdict_kind(
 
     verdict = legs[0]["verdict"]
     assert verdict["kind"] == "operator_stop"
-    # Its own kind, and specifically none of the four it sits between: each of those means
-    # something different to whoever reads the run.
+    # Its own kind, and none of the four it sits between.
     assert verdict["kind"] not in {"chosen_stop", "leg_timeout", "usage_limit", "stream_drained"}
     # Not resumable: nothing is waiting for a window to reopen, the run is over by a decision.
     assert verdict["resumable"] is False
@@ -283,11 +272,11 @@ def test_a_stop_between_phases_keeps_the_next_phase_from_starting(
 def test_the_stopped_run_carries_the_terminus_a_rebookend_requires(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The refusal this entry exists to remove, checked against the predicates rebookend uses.
+    """Checked against the predicates rebookend uses, all three of them.
 
-    All three of them, not the easy two. A record naming a session is not a terminus a bookend can
-    fork: the plan also resolves the transcript through the harness's own validation, and a
-    stopped leg is exactly where an id can exist with no conversation behind it.
+    A record naming a session is not a terminus a bookend can fork: the plan also resolves the
+    transcript through the harness's own validation, and a stopped leg is exactly where an id can
+    exist with no conversation behind it.
     """
     run_dir = _stopped_run(tmp_path, monkeypatch)
     session = runner.terminal_session_in(run_dir)
@@ -316,8 +305,7 @@ def test_the_ask_is_consumed_so_a_later_reopening_is_not_stopped_by_it(
     tmp_path: Path, monkeypatch
 ) -> None:
     """The request is a one-shot signal and the leg verdict is where it becomes durable. Left on
-    disk it would end the next process to open the directory, so an operator repairing an eval
-    hole in a run they had stopped would watch the repair stop itself."""
+    disk it would end the next process to open the directory."""
     run_dir = _stopped_run(tmp_path, monkeypatch)
 
     assert not (run_dir / STOP_REQUEST_FILE).exists()
@@ -325,11 +313,10 @@ def test_the_ask_is_consumed_so_a_later_reopening_is_not_stopped_by_it(
 
 
 def test_a_stop_during_an_eval_phase_admits_no_further_tasks(tmp_path: Path, monkeypatch) -> None:
-    """A stop is an ask about the run, and the eval fan-out is where ignoring it costs most.
+    """Admission closes on the ask exactly as it does on a usage limit.
 
     Every leg the supervisor kills a second after launching still paid for a home copy and a
-    container start, once per remaining held-out id, so a phase that kept admitting would spend
-    the whole fan-out on nothing. Admission closes on the ask exactly as it does on a usage limit.
+    container start, once per remaining held-out id.
     """
     ctx = _ctx(tmp_path, heldout=tuple(str(i) for i in range(1, 13)))
     launched: list[int] = []
@@ -379,8 +366,8 @@ def test_the_watcher_fires_on_an_ask_and_leaves_a_quiet_run_alone(tmp_path: Path
         assert stop.fired.wait(timeout=5.0)
         assert stop.verdict is not None
         assert stop.verdict.kind is StopKind.OPERATOR
-        # The unlink is the acknowledgment, and the CLI waits on exactly this. It follows the
-        # fire rather than preceding it, so this waits for it the way the CLI does.
+        # The unlink is the acknowledgment, and it follows the fire, so this waits for it the
+        # way the CLI does.
         assert _gone_within(asked / STOP_REQUEST_FILE, 5.0)
 
 
@@ -422,8 +409,8 @@ def test_stopping_a_watching_owner_writes_the_ask_and_waits_to_be_acknowledged(
     """The whole protocol on the happy path: the owner advertises, the ask is written, the owner
     consumes it, and only then does the command report success.
 
-    Liveness is proven by the same shared flock a rebookend proves it with, never by a pid: the
-    lock file is never unlinked, so a finished run names a pid the system may have reissued.
+    Liveness is proven by a shared flock, never by a pid: the lock file is never unlinked, so a
+    finished run names a pid the system may have reissued.
     """
     run_dir = tmp_path / "live"
     seen: list[dict] = []
@@ -441,12 +428,11 @@ def test_stopping_a_watching_owner_writes_the_ask_and_waits_to_be_acknowledged(
 def test_a_stop_against_an_owner_that_cannot_consume_it_is_refused(
     tmp_path: Path, capsys
 ) -> None:
-    """The case that matters most in practice, and the one a busy lock alone gets wrong.
+    """The case a busy lock alone gets wrong.
 
     A process started before the stop path existed holds its directory exactly as a current one
-    does, and reads nothing. Writing an ask there does not stop it, reports success, and leaves a
-    file for the next resume or rerun-eval to act on. So support is advertised in the lock and an
-    owner that does not advertise is refused with nothing written.
+    does, and reads nothing. So support is advertised in the lock, and an owner that does not
+    advertise is refused with nothing written.
     """
     run_dir = tmp_path / "older-build"
     # Ownership taken the way every entry took it before the watcher existed.
@@ -483,9 +469,7 @@ def test_an_owner_that_leaves_without_reading_the_ask_has_it_withdrawn(
     """The window between the liveness probe and the write, where the owner can finish in between.
 
     An owner that goes away with the request still on disk never saw it, so the command takes the
-    ask back under the now-free shared lock and says nothing was stopped. Leaving it would be the
-    same landmine the advertisement check exists to prevent, reached by a race instead of by an
-    old build.
+    ask back under the now-free shared lock and says nothing was stopped.
     """
     run_dir = tmp_path / "finishes-mid-write"
     run_dir.mkdir()
@@ -507,12 +491,9 @@ def test_an_owner_that_leaves_without_reading_the_ask_has_it_withdrawn(
 
 
 def test_an_ask_outside_the_phases_is_still_consumed(tmp_path: Path) -> None:
-    """The watcher's lifetime is the LOCK's lifetime, not the phase loop's.
-
-    An owner holds its directory through setup, between phases, and through publication and
-    teardown. A watcher scoped to the phases left every ask outside that window accepted and
-    unread, which is the state this asserts against: no phase runs here at all.
-    """
+    """The watcher's lifetime is the LOCK's lifetime, not the phase loop's: an owner holds its
+    directory through setup, between phases, and through publication and teardown. No phase runs
+    here at all."""
     run_dir = tmp_path / "between-phases"
     with runner.owning_run(run_dir) as stop:
         runner.write_stop_request(run_dir, reason="while nothing is running")
@@ -559,8 +540,7 @@ def test_a_leg_with_no_progress_anywhere_is_stalled(tmp_path: Path) -> None:
     # Distinguishable from an operator stop, which is the other ending that reaches this seam.
     assert ending.verdict.kind is not StopKind.OPERATOR
     assert ending.verdict.resumable is False
-    # The rule and what actually happened, both: a leg ended a moment past its bound and one
-    # silent for twice it are different observations about the same rule.
+    # The rule and what actually happened, both.
     assert ending.verdict.evidence["bound_s"] == 0.2
     assert ending.verdict.evidence["silent_s"] >= 0.2
 
@@ -568,8 +548,8 @@ def test_a_leg_with_no_progress_anywhere_is_stalled(tmp_path: Path) -> None:
 def _never_stalls(ctx: RunContext, write, *, bound_s: float, poll_s: float) -> None:
     """Run the watcher against a leg whose ONLY activity is ``write``, and require it never fires.
 
-    Four times the bound, so a detector that ignored the source would have fired three times over
-    by the time this gives up waiting for it.
+    Waits four times the bound, so a detector that ignored the source would have fired three times
+    over by the time this gives up.
     """
     ending = EarlyEnding()
 
@@ -610,8 +590,7 @@ def _appender(path: Path):
 
 def test_a_leg_whose_only_activity_is_child_artifacts_is_not_stalled(tmp_path: Path) -> None:
     """A delegating agent goes quiet in its own trace by design while its children work. prime
-    keeps its RLM children under ``session-artifacts/<id>/sub-*``, and a detector that read the
-    parent trace alone would end exactly the legs doing the most substantive work."""
+    keeps its RLM children under ``session-artifacts/<id>/sub-*``."""
     ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
     child = ctx.sandbox.home / ".prime/agent/session-artifacts/sess-1/sub-0/messages.jsonl"
 
@@ -628,8 +607,7 @@ def test_a_leg_whose_only_activity_is_work_files_is_not_stalled(tmp_path: Path) 
 
 def test_a_leg_that_seals_a_row_late_is_not_stalled(tmp_path: Path) -> None:
     """A task can legitimately take an hour inside one tool call. The clock is over the condition
-    rather than over the start of the leg, so a row that lands late resets it rather than arriving
-    after a leg the detector already ended."""
+    rather than over the start of the leg, so a row that lands late resets it."""
     ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
     sealed = ctx.run_dir / "rollout" / "results.jsonl"
 
@@ -649,9 +627,8 @@ def test_a_leg_whose_only_activity_is_its_own_trace_is_not_stalled(tmp_path: Pat
 def test_an_unreadably_large_work_tree_makes_the_check_inert_rather_than_firing(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The fail-safe direction, stated as a test. An agent that npm-installs into /work makes the
-    walk arbitrarily large; the worst that may produce is a rollout with no stall detection, which
-    is what every rollout had before this existed."""
+    """The fail-safe direction. An agent that npm-installs into /work makes the walk arbitrarily
+    large, and the worst that may produce is a rollout with no stall detection."""
     ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
     monkeypatch.setattr(runner, "PROGRESS_WALK_LIMIT", 1)
     for name in ("a", "b", "c"):
@@ -715,8 +692,7 @@ def test_a_cell_that_asks_for_no_bound_gets_no_watcher(tmp_path: Path, monkeypat
 
 def test_the_eval_phase_is_untouched(tmp_path: Path, monkeypatch) -> None:
     """Scoped to the rollout, which is the only leg with no other bound. Every eval leg is already
-    bounded per task by ``eval_task_timeout_s``, and where that bound is legitimately an hour a
-    second guard adds nothing but a way to end a task that is still working."""
+    bounded per task by ``eval_task_timeout_s``."""
     seen = _watched_bounds(monkeypatch)
     ctx = _ctx(tmp_path)
 
@@ -738,17 +714,15 @@ def test_the_eval_phase_is_untouched(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_the_shipped_cells_bound_their_rollouts_generously(tmp_path: Path) -> None:
-    """The default has to sit far above anything observed to be legitimate work, or the guard
-    becomes the thing that ends the agents doing the most computation. The longest single tool
-    call in the archives is a yc_bench hour."""
+    """The default has to sit far above anything observed to be legitimate work: the longest
+    single tool call in the archives is a yc_bench hour."""
     assert Budget(rollout_wall_clock_s=1).rollout_no_progress_s == 7200
     for cell in load_all_cells():
         bound = cell.budget.rollout_no_progress_s
         assert bound == 0 or bound >= 3600, cell.name
         if cell.budget.rollout_wall_clock_s > 3600:
-            # On a cell whose rollout is longer than the bound, the bound has to be reachable, or
-            # the wall clock is the only ending there ever was. A smoke cell is the other case:
-            # its whole rollout is shorter than any legitimate silence, so nothing is lost.
+            # On a cell whose rollout is longer than the bound, the bound has to be reachable,
+            # or the wall clock is the only ending there ever was.
             assert bound < cell.budget.rollout_wall_clock_s, cell.name
 
 
@@ -784,8 +758,8 @@ def test_the_bound_is_read_off_the_cell_file(tmp_path: Path) -> None:
 
 def test_a_record_that_predates_the_bound_still_bookends(tmp_path: Path) -> None:
     """A field added to the cell exists on one side of a bookend's comparison only, and the
-    comparison fails closed on exactly that. Every archived run predates this one, so absence has
-    to read as the value it truly means: a rollout that ran under no such bound.
+    comparison fails closed on exactly that. Every archived run predates this field, so absence
+    has to read as the value it truly means: a rollout that ran under no such bound.
     """
     cell = load_cell_by_name(_PRIME_CELL)
     recorded = cell.to_manifest()
@@ -817,12 +791,10 @@ def test_a_recorded_bound_is_inherited_rather_than_reread_from_the_checkout() ->
 
 def test_an_unreadable_subtree_reads_as_progress_rather_than_as_silence(tmp_path: Path) -> None:
     """``os.walk`` swallows a directory whose listing fails and carries on as though it were not
-    there, so a mode-000 subtree used to produce a perfectly stable ``(0, 0, 0)`` on every reading
-    while the container went on writing inside it.
+    there, so a mode-000 subtree reads as a stable constant while the container writes inside it.
 
-    The container runs as root and the watcher does not, so this is the ordinary case and not an
-    exotic one: an agent that chmods a working directory would have had its rollout ended for
-    silence while it was busy. A partial walk must never be reported as a complete one.
+    The container runs as root and the watcher does not, so this is the ordinary case: a partial
+    walk must never be reported as a complete one.
     """
     root = tmp_path / "work"
     locked = root / "locked"
@@ -852,12 +824,10 @@ def test_an_unreadable_root_reads_as_progress_too(tmp_path: Path) -> None:
 
 
 def test_a_tree_that_does_not_exist_yet_reads_as_stable_emptiness(tmp_path: Path) -> None:
-    """The regression the obvious fix introduces, held down.
+    """Making every unreadable tree reset the clock is only correct if ABSENCE is not unreadable.
 
-    Making every unreadable tree reset the clock is only correct if ABSENCE is not unreadable.
     prime's session-artifact tree appears the first time a child session runs, so a reading that
-    called absence unknowable would disable the detector for every prime cell until then, which is
-    precisely the cell the detector was written for.
+    called absence unknowable would disable the detector for every prime cell until then.
     """
     absent = tmp_path / "home" / ".prime" / "agent" / "session-artifacts"
 
@@ -892,10 +862,9 @@ def test_a_leg_writing_under_an_unreadable_subtree_is_not_stalled(tmp_path: Path
 
 
 def test_the_ending_reported_is_the_one_that_fired_first(tmp_path: Path) -> None:
-    """Not the one the caller listed first. ``run_leg`` appends the run's operator handle after the
-    leg's own, so tuple order always preferred the stall or the drain; an operator who got there
-    first was then recorded as a stall in the leg while the manifest recorded the ask, which is one
-    run described two ways.
+    """Not the one the caller listed first. ``run_leg`` appends the run's operator handle after
+    the leg's own, so tuple order would always prefer the stall or the drain, and the leg record
+    and the manifest would then describe one run two ways.
     """
     harness = harness_for("prime_agent")
 
@@ -928,12 +897,11 @@ def test_a_handle_that_already_fired_keeps_its_first_verdict(tmp_path: Path) -> 
 def test_a_stop_before_a_transcript_lands_says_it_cannot_be_bookended(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """The promise the command used to make unconditionally, and could not keep.
+    """A stop can end a leg before a resumable conversation exists.
 
-    A stop can end a leg before a resumable conversation exists. claude runs under an id the
-    RUNNER pinned, so the record names a session whatever the leg wrote, and an operator told the
-    terminus was bookendable would find out otherwise only when `rebookend` refused it. So the run
-    checks the predicate `rebookend` checks, and says which of the two endings it got.
+    claude runs under an id the RUNNER pinned, so the record names a session whatever the leg
+    wrote. The run checks the predicate `rebookend` checks, and says which of the two endings it
+    got, rather than sending an operator to a refusal.
     """
     run_dir = _stopped_run(tmp_path, monkeypatch, transcript=False)
     stopping = json.loads((run_dir / runner.ROLLOUT_STOPPING_FILE).read_text())
@@ -965,11 +933,9 @@ def test_a_second_ask_inside_one_ownership_is_also_consumed(tmp_path: Path) -> N
     """An owner that consumed one ask goes on holding the directory, still advertising, through
     leg shutdown, publication and teardown.
 
-    A watcher that returned after the first ask left all of that advertising support it no longer
-    had: a second stop passed the capability check, wrote a request nothing could consume, and
-    left it for the next resume to latch. That is the same landmine the advertisement exists to
-    prevent, reached from inside instead of from an older build, and it is why the command
-    documents itself as safe to call twice.
+    A watcher that returned after the first ask would leave all of that advertising support it no
+    longer had, so a second stop would pass the capability check, write a request nothing could
+    consume, and leave it for the next resume to latch.
     """
     run_dir = tmp_path / "twice"
     with runner.owning_run(run_dir) as stop:
@@ -977,7 +943,7 @@ def test_a_second_ask_inside_one_ownership_is_also_consumed(tmp_path: Path) -> N
         assert stop.fired.wait(timeout=5.0)
         assert _gone_within(run_dir / STOP_REQUEST_FILE, 5.0)
 
-        # Everything after this is the finalization window the reviewer's reproduction used.
+        # Everything after this is the run's finalization window.
         runner.write_stop_request(run_dir, reason="second")
         assert _gone_within(run_dir / STOP_REQUEST_FILE, 5.0)
 
@@ -1014,12 +980,9 @@ def test_an_ask_left_by_an_interrupted_command_is_still_consumed(tmp_path: Path)
 
 def test_a_later_owner_does_not_inherit_the_advertisement(tmp_path: Path) -> None:
     """The lock file outlives every owner, so the bytes on disk between one owner taking the lock
-    and writing its own payload are the previous owner's.
-
-    An owner that does not watch, briefly wearing a previous owner's advertisement, is the one
-    state that produces an ask nobody consumes, so the payload is emptied before it is written and
-    the window reads as an owner advertising nothing.
-    """
+    and writing its own payload are the previous owner's. An owner that does not watch, briefly
+    wearing a previous owner's advertisement, is the one state that produces an ask nobody
+    consumes."""
     run_dir = tmp_path / "reused"
     with runner.owning_run(run_dir):
         assert runner.read_lock_holder(run_dir)["stop_protocol"] == runner.STOP_PROTOCOL
@@ -1037,11 +1000,8 @@ def test_a_later_owner_does_not_inherit_the_advertisement(tmp_path: Path) -> Non
 
 def test_a_symlinked_directory_is_not_reported_as_a_complete_walk(tmp_path: Path) -> None:
     """``os.walk`` does not descend into a directory symlink by default and does not fingerprint
-    it either, so a tree the agent was actively writing through read as a stable ``(0, 0, 0)``.
-
-    ``/work`` is the agent's own writable cwd, so a link out of it is an ordinary thing for a
-    working rollout to make, and the leg that made one was the leg being killed for silence.
-    """
+    it either, so a tree the agent is writing through reads as a stable constant. ``/work`` is the
+    agent's own writable cwd, so a link out of it is ordinary for a working rollout."""
     work = tmp_path / "work"
     work.mkdir()
     target = tmp_path / "elsewhere"
@@ -1071,8 +1031,7 @@ def test_a_symlinked_file_moves_when_its_target_moves(tmp_path: Path) -> None:
 
 def test_a_symlink_cycle_terminates_as_unreadable(tmp_path: Path) -> None:
     """Following links makes the walk unbounded in principle, so the limit counts directories as
-    well as files: a cycle made only of directories would spin forever on a file count alone, once
-    a minute, for the life of the rollout."""
+    well as files: a cycle made only of directories would spin forever on a file count alone."""
     root = tmp_path / "cycle"
     root.mkdir()
     os.symlink(root, root / "self")
@@ -1083,13 +1042,10 @@ def test_a_symlink_cycle_terminates_as_unreadable(tmp_path: Path) -> None:
 
 
 def test_a_resolving_link_inside_the_tree_keeps_a_real_fingerprint(tmp_path: Path) -> None:
-    """The regression the blunt fix would introduce, held down.
-
-    Calling every symlink unreadable is the simple fail-safe, and it would have quietly disabled
-    the detector for prime, whose real homes carry relative in-home links that all resolve. A tree
-    reached twice by two links is counted twice, which is deterministic, so the fingerprint still
-    moves if and only if something moved.
-    """
+    """Calling every symlink unreadable would quietly disable the detector for prime, whose real
+    homes carry relative in-home links that all resolve. A tree reached twice by two links is
+    counted twice, which is deterministic, so the fingerprint still moves only when something
+    moved."""
     home = tmp_path / "home"
     (home / "real").mkdir(parents=True)
     (home / "real" / "kernel-state.json").write_text("{}", encoding="utf-8")
@@ -1117,13 +1073,9 @@ def test_a_leg_whose_only_activity_is_through_a_link_is_not_stalled(tmp_path: Pa
 def test_retargeting_a_link_between_identical_trees_is_not_read_as_silence(
     tmp_path: Path,
 ) -> None:
-    """Following links made the counters describe the TARGETS, so a link swung from one
-    stat-identical tree to another moved no count, no byte and no mtime.
-
-    That is real filesystem work by a working rollout, and repeating it while the trace and the
-    provenance are quiet let the clock expire and killed the leg, which is the one failure the
-    detector exists to avoid. The entry itself is folded in beside its target's stats.
-    """
+    """Following links makes the counters describe the TARGETS, so a link swung from one
+    stat-identical tree to another moves no count, no byte and no mtime. That is real filesystem
+    work by a working rollout, so the entry itself is folded in beside its target's stats."""
     work = tmp_path / "work"
     work.mkdir()
     left, right = tmp_path / "A", tmp_path / "B"
@@ -1160,8 +1112,8 @@ def test_an_empty_directory_link_appearing_is_not_read_as_silence(tmp_path: Path
 
 
 def test_a_leg_whose_only_activity_is_retargeting_a_link_is_not_stalled(tmp_path: Path) -> None:
-    """End to end, at the watcher: the reviewer's scenario is a rollout doing this and nothing
-    else, so it is the reading that has to notice, not a test of the helper alone."""
+    """End to end, at the watcher: a rollout doing this and nothing else, so it is the reading
+    that has to notice and not the helper alone."""
     ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
     trees = []
     for name in ("A", "B"):
@@ -1189,13 +1141,11 @@ def test_a_leg_whose_only_activity_is_retargeting_a_link_is_not_stalled(tmp_path
 
 
 def test_the_decision_does_not_depend_on_the_event_being_visible_yet(tmp_path: Path) -> None:
-    """``fire()`` published the verdict and the order under the lock and set the event after it, so
-    a handle could hold the earlier decision while a reader that filtered on event visibility
-    skipped it and took the later one. An ordinary thread deschedule between those two statements
-    was enough to reintroduce the misclassification the order exists to prevent.
+    """A handle can hold the earlier decision while a reader has not yet observed its event, and a
+    reader that filtered on event visibility would skip it and take the later one.
 
     Clearing the event stands in for that gap deterministically: the decision is the verdict and
-    its order, and it is the decision whether or not a reader has seen the signal yet.
+    its order, whether or not a reader has seen the signal yet.
     """
     harness = harness_for("prime_agent")
     first, second = EarlyEnding(), EarlyEnding()

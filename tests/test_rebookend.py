@@ -2112,9 +2112,8 @@ def test_every_cell_field_is_judged() -> None:
         "budget.eval_task_timeout_s",
         "budget.eval_concurrency",
         # Judged on the refusing side, like every other bound that shapes the rollout a bookend
-        # inherits a home from. It compares equal in practice because the bookend RECOVERS it
-        # from the record, which is the rule the arm and the eval runtime already follow; what
-        # the comparison holds is that the recovery happened.
+        # inherits a home from. It compares equal because the bookend RECOVERS it from the
+        # record, so what the comparison holds is that the recovery happened.
         "budget.rollout_no_progress_s",
     }
 
