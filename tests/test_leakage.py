@@ -1050,3 +1050,29 @@ def test_a_continuation_that_was_never_folded_is_still_read(tmp_path: Path) -> N
     )
     assert [p.name for p in egress_segments(run_dir)] == ["egress.tsv", "egress.2.tsv"]
     assert len(read_capture(run_dir).connections) == 2
+
+
+def test_a_link_the_agent_only_wrote_a_note_about_is_not_a_request(tmp_path: Path) -> None:
+    """A comment names a dataset; it does not ask for one, at any bucket."""
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {"command": f"echo thinking  # could try {_PARQUET}", "output": "thinking"},
+        ),
+    )
+    assert _buckets(run) == {7: "computed_locally"}
+
+
+def test_a_link_in_a_command_still_is_a_request(tmp_path: Path) -> None:
+    run = _one(
+        tmp_path,
+        capture=_watching((150.0, "chatgpt.com", "tls")),
+        trace=codex(
+            {"lease_seen": "lease-a"},
+            {"command": f"curl -sL -o /tmp/k.parquet '{_PARQUET}'", "output": ""},
+        ),
+    )
+    assert _buckets(run) == {7: "unresolved_leakage"}
+    assert "file_download_requested" in run.episodes[0].reasons

@@ -152,6 +152,9 @@ _HUB_CALLS = ("load_dataset(", "hf_hub_download(", "snapshot_download(")
 
 _SUBMIT = re.compile(r"submit_answer")
 _URL = re.compile(r"https?://[^\s\"'\\<>)\]}]+")
+# A comment runs to the end of its line. The ``#`` has to follow whitespace or start the text,
+# so a URL fragment stays part of its URL. What an agent wrote a note about is not what it ran.
+_COMMENT = re.compile(r"(?:(?<=\s)|^)#[^\n]*")
 def _matches(host: str, patterns: Iterable[str]) -> bool:
     host = host.lower().rstrip(".")
     return any(fnmatchcase(host, pattern) for pattern in patterns)
@@ -994,7 +997,8 @@ def _requested_urls(actions: Sequence[Action]) -> list[str]:
     for action in actions:
         if action.kind.startswith("mcp:"):
             continue
-        for match in _URL.finditer(action.request):
+        # Comments are stripped first: a link the agent wrote a note about is not a request.
+        for match in _URL.finditer(_COMMENT.sub("", action.request)):
             urls.append(_tidy_url(match.group(0)))
     return list(dict.fromkeys(urls))
 
@@ -1182,11 +1186,17 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             if kind == "row_query":
                 _note(reasons, "answer_rows_requested")
             elif kind == "file_download":
+                # A command that asked the answer source for a file body. Whether one came back
+                # is in the response, which this half does not read, so the episode sits at the
+                # ceiling rather than at either answer.
+                bucket = _raise_to(bucket, "unresolved_leakage")
                 _note(reasons, "file_download_requested")
         # Only where the environment has an answer source at all. Without one this cannot tell a
         # dataset pull from any other, and bucketing it as leakage while the run's own note says
         # the two cannot be distinguished would be the metadata contradicting the number.
-        if source is not None and any(call in a.request for a in actions for call in _HUB_CALLS):
+        if source is not None and any(
+            call in _COMMENT.sub("", a.request) for a in actions for call in _HUB_CALLS
+        ):
             bucket = _raise_to(bucket, "attempted_leakage")
             _note(reasons, "hub_download_call")
 
