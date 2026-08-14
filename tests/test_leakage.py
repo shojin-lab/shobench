@@ -890,7 +890,7 @@ def test_a_bookend_whose_source_has_no_capture_is_not_cleared(tmp_path: Path) ->
     bookend = _bookend_over(tmp_path, source)
     assert _buckets(bookend) == {12: UNCLASSIFIED}
     assert "inherited_home_unchecked" in bookend.episodes[0].reasons
-    assert any("could not classify 1 of its 1 rollout episodes" in n for n in bookend.notes)
+    assert any("could not observe 1 of its 1 rollout episodes" in n for n in bookend.notes)
 
 
 def test_a_bookend_whose_source_had_an_uncovered_rollout_window_is_not_cleared(
@@ -1787,3 +1787,89 @@ def test_a_missing_target_refuses_the_batch(tmp_path: Path, capsys) -> None:
     captured = capsys.readouterr()
     assert "no run directory at" in captured.err
     assert captured.out == ""
+
+
+# ----- coverage is its own bit, and evidence does not close a gap ------------------------------
+
+
+def _partly_watched(tmp_path: Path, name: str = "source") -> RunDir:
+    """A rollout whose window runs past its observer, with one general-web hit inside it.
+
+    A second observer covers the later eval task, so the only thing unwatched here is the
+    rollout, and the eval task's own capture is not what is being tested.
+    """
+    return (
+        RunDir(tmp_path / name)
+        .egress(
+            _capture(
+                (0.0, "chatgpt.com", "dns"),
+                (150.0, "en.wikipedia.org", "tls"),
+                (200.0, "chatgpt.com", "dns"),
+            )
+        )
+        .egress(
+            _capture((450.0, "chatgpt.com", "dns"), (600.0, "chatgpt.com", "dns")),
+            name="egress.2.tsv",
+        )
+        .rollout([(1, 7, "lease-r", 100.0, True)])
+        .leg("rollout", 0, 90.0, 400.0)
+    )
+
+
+def test_a_connection_does_not_close_the_gap_it_was_seen_in(tmp_path: Path) -> None:
+    """The episode reports what was seen and stays unwatched, because those are two facts."""
+    run = classify_run(
+        _partly_watched(tmp_path, "r")
+        .eval_task("eval_after", 11, "lease-e", 500.0)
+        .leg("eval_after", 1, 500.0, 550.0, task=11)
+        .path
+    )
+    graded = {e.episode.phase: e for e in run.episodes}
+    # Its own evidence still reads as what it is.
+    assert graded["rollout"].bucket == "general_web_reference"
+    assert graded["rollout"].covered is False
+    assert graded["rollout"].observed is False
+    # And the HOME it seeded is not accounted for, so the eval task is not cleared.
+    assert graded["eval_after"].bucket == UNCLASSIFIED
+    assert "rollout_home_unaccounted" in graded["eval_after"].reasons
+
+
+def test_a_bookend_over_a_partly_watched_rollout_is_not_cleared(tmp_path: Path) -> None:
+    source = _partly_watched(tmp_path)
+    bookend = classify_run(
+        RunDir(tmp_path / "bookend", rebookend_of=source.path.name)
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .eval_task("eval_after", 12, "lease-b", 150.0)
+        .leg("eval_after", 1, 150.0, 200.0, task=12)
+        .path
+    )
+    assert _buckets(bookend) == {12: UNCLASSIFIED}
+    assert any("could not observe 1 of its 1" in note for note in bookend.notes)
+
+
+def test_a_fully_watched_general_web_rollout_still_clears_what_it_seeded(
+    tmp_path: Path,
+) -> None:
+    """The control: the same bucket, the same evidence, and nothing unwatched."""
+    source = (
+        RunDir(tmp_path / "source")
+        .egress(_watching((150.0, "en.wikipedia.org", "tls")))
+        .rollout([(1, 7, "lease-r", 100.0, True)])
+        .leg("rollout", 0, 90.0, 400.0)
+        .eval_task("eval_after", 11, "lease-e", 500.0)
+        .leg("eval_after", 1, 500.0, 600.0, task=11)
+    )
+    run = classify_run(source.path)
+    graded = {e.episode.phase: e for e in run.episodes}
+    assert graded["rollout"].bucket == "general_web_reference"
+    assert graded["rollout"].observed is True
+    assert graded["eval_after"].bucket == "computed_locally"
+
+    bookend = classify_run(
+        RunDir(tmp_path / "bookend", rebookend_of=source.path.name)
+        .egress(_watching((150.0, "chatgpt.com", "tls")))
+        .eval_task("eval_after", 12, "lease-b", 150.0)
+        .leg("eval_after", 1, 150.0, 200.0, task=12)
+        .path
+    )
+    assert _buckets(bookend) == {12: "computed_locally"}

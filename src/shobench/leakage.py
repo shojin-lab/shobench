@@ -1055,6 +1055,9 @@ class EpisodeLeakage:
     evidence: tuple[Connection, ...]
     requested: tuple[str, ...]
     covered: bool
+    # Whether the whole window was watched, which is what every HOME-inheritance question reads.
+    # Separate from the bucket, because evidence raises a bucket and does not close a gap.
+    observed: bool
     shared_with: tuple[dict[str, Any], ...]
     # Leases whose live region overlaps this episode's, so its commands are not exclusively its.
     action_rivals: tuple[str, ...]
@@ -1071,6 +1074,7 @@ class EpisodeLeakage:
                 "ended_at": self.episode.ended_at,
                 "kind": self.episode.window_kind,
                 "capture_covers": self.covered,
+                "observed": self.observed,
                 "shared_with": list(self.shared_with),
             },
             "action_rivals": list(self.action_rivals),
@@ -1328,9 +1332,12 @@ def _accounts_for_its_home(source: RunLeakage) -> tuple[bool, str]:
     rollout = [e for e in source.episodes if e.episode.phase == "rollout"]
     if not rollout:
         return False, "has no rollout record to account for that HOME"
-    blind = sum(1 for e in rollout if e.bucket == UNCLASSIFIED)
+    # Read off the coverage bit, never off the bucket. An episode nobody was watching that
+    # happened to show one general-web connection is bucketed for that connection and is still
+    # an episode nobody was watching.
+    blind = sum(1 for e in rollout if not e.observed)
     if blind:
-        return False, f"could not classify {blind} of its {len(rollout)} rollout episodes"
+        return False, f"could not observe {blind} of its {len(rollout)} rollout episodes end to end"
     contacted = sum(1 for e in rollout if _rank(e.bucket) >= _rank("attempted_leakage"))
     if contacted:
         return False, (
@@ -1445,6 +1452,12 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
         covered = capture.covers(episode.started_at, episode.ended_at)
         reasons: list[str] = []
 
+        # Whether this episode was watched from end to end, kept as its own bit. The bucket
+        # cannot stand in for it: positive evidence raises an unclassified episode out of
+        # unclassified, so an unwatched stretch that happened to show one connection would read
+        # as an accounted one, and everything downstream that asks "was this rollout observed"
+        # would be answered by the traffic it saw rather than by the watching.
+        observed = False
         if not capture.available:
             bucket = UNCLASSIFIED
             _note(reasons, "capture_unavailable")
@@ -1462,6 +1475,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             _note(reasons, "inherited_home_unchecked")
         else:
             bucket = "computed_locally"
+            observed = True
 
         # The egress floor. It tops out at unresolved: the observer sees a connection, never a
         # body, and the file CDN is shared by the whole platform.
@@ -1549,7 +1563,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
             )
             contacted[episode.domain] = min(contacted.get(episode.domain, when), when)
         if episode.phase == "rollout":
-            if bucket == UNCLASSIFIED:
+            if not observed:
                 seeded_home_blind = True
             elif reached:
                 seeded_home_contact = True
@@ -1562,6 +1576,7 @@ def classify_run(run_dir: Path, *, _inherit: bool = True) -> RunLeakage:
                 evidence=tuple(evidence),
                 requested=tuple(requested),
                 covered=covered,
+                observed=observed,
                 shared_with=(),
                 action_rivals=tuple(action_rivals),
             )
@@ -1682,6 +1697,7 @@ def _mark_shared_windows(graded: Sequence[EpisodeLeakage]) -> list[EpisodeLeakag
                 evidence=row.evidence,
                 requested=row.requested,
                 covered=row.covered,
+                observed=row.observed,
                 shared_with=rivals,
                 action_rivals=row.action_rivals,
             )
