@@ -13,8 +13,8 @@ rerun it and get byte-identical output.
 The builders differ because the splits have different authority. automationbench adopts a
 published split, tau2_telecom honors upstream's declared one, and hle and
 tau2_banking_knowledge have none to honor so this repo draws and publishes its own. The
-``_order2`` manifests have no authority of their own at all: each republishes another
-manifest's membership with the improvement pool in a different order.
+``_order2`` manifests have no authority of their own: each republishes another manifest's
+membership with the improvement pool in a different order.
 """
 
 from __future__ import annotations
@@ -363,13 +363,10 @@ def build_tau2_banking_knowledge(out: Path) -> Path:
 
 # ----- order-permuted replication arms ---------------------------------------------------
 
-# The arms' own seed. One seed across the arms, like SEED across the derivations, so "which
-# seed" stays a question about the arm rather than about each manifest in it. It is not SEED:
-# reusing that would make a pool's second order a function of its first.
+# One seed across the arms, as SEED is one across the derivations. It is not SEED: reusing that
+# would make a pool's second order a function of its first.
 ORDER2_SEED = 20260816
 
-# Which manifest each arm replicates. An arm is a second reading of a split, so it never
-# appears without the split it reads again.
 ORDER2_PARENTS = {
     "automationbench_order2": "automationbench",
     "hle_order2": "hle",
@@ -380,12 +377,10 @@ ORDER2_PARENTS = {
 def _membership(split: Split) -> bytes:
     """What a manifest holds, in the one form two of them can be compared byte for byte.
 
-    Order is what this drops. Everything else about a task it keeps, because an id on its own is
-    not the task: where ids are positions into an env's task list, the label is what a position
-    resolves to and the side's ``env_kwargs`` are the construction it indexes into. An upstream
-    that reordered its rows, or replaced one without changing their count, would hand a fresh
-    build the same integers with a different question behind each of them, and an arm that
-    compared integers alone would republish the parent's stale labels over it.
+    Order is what this drops. An id on its own is not the task: where ids are positions into an
+    env's task list, the label is what a position resolves to and the side's ``env_kwargs`` are
+    the construction it indexes into, so an upstream that reordered its rows without changing
+    their count would hand a fresh build the same integers behind different questions.
     """
     return json.dumps(
         {
@@ -405,9 +400,9 @@ def _membership(split: Split) -> bytes:
 def _served_span(split_name: str, pool_size: int) -> int:
     """How many of a split's pool positions a cell reading it can ever reach.
 
-    Read off the cells rather than written down here: the ceiling is a cell axis, and a copy of
-    it in this file would be a second place for it to be true. Cells that disagree are refused,
-    because one span cannot stand for two candidate sets.
+    Read off the cells rather than written down here: the ceiling is a cell axis, and a copy in
+    this file would be a second place for it to be true. One span cannot stand for two candidate
+    sets, so cells disagreeing on it are refused rather than reconciled.
     """
     from shobench.config import load_all_cells
 
@@ -432,24 +427,19 @@ def build_order2(out: Path, *, parent: Path, rebuild: Callable[[Path], Path]) ->
     """Republish a committed manifest with its improvement pool served in another order.
 
     A cell reading this manifest differs from the same cell reading the parent in the order the
-    pool arrives and in nothing else. The held-out side is copied across id for id and in the
-    parent's own order, because a cold eval reads the same tasks whichever order they arrive in
-    and identical ordering keeps the two sides of the arm comparable.
+    pool arrives and in nothing else. The held-out side is copied across id for id in the
+    parent's order, a cold eval reading the same tasks whichever order they arrive in.
 
-    The permutation is confined to the span a rollout can actually reach, which is the
-    ``pool_ceiling`` the cells reading the parent declare. Shuffling past it would hand the arm a
-    different candidate set rather than a different order: a cell serving 200 of 480 would draw
-    its 200 from somewhere else in the pool, and an effect that failed to repeat could be either
-    finding. Inside the span the candidate set is the parent's exactly; beyond it the parent's
-    order stands untouched.
+    The permutation is confined to the span a rollout can reach, the ``pool_ceiling`` the cells
+    reading the parent declare. Shuffling past it would hand a cell serving 200 of 480 tasks a
+    different 200 rather than the same 200 in another order. Beyond the span the parent's order
+    stands.
 
-    Nothing here draws a task. Membership is the parent's, and the parent is rebuilt from its own
-    sources first: unless the committed manifest still holds exactly what its builder produces,
-    ids with the labels they resolve to and each side's env_kwargs alike, this writes nothing,
-    because a permutation of some other membership answers a different question than the one the
-    arm was launched to answer. Order and the recorded ``shogym_rev`` are what the comparison
-    leaves out, the first because this manifest is about to change it and the second because it
-    moves with the pin and says nothing about which tasks a split holds.
+    Nothing here draws a task. The parent is rebuilt from its own sources first, and unless the
+    committed manifest still holds exactly what that build produces, ids with the labels they
+    resolve to and each side's ``env_kwargs`` alike, this writes nothing. Order is left out of
+    that comparison because it is what this manifest changes, and ``shogym_rev`` because it moves
+    with the pin and says nothing about which tasks a split holds.
     """
     committed = load_split(parent)
     with tempfile.TemporaryDirectory() as tmp:
@@ -465,8 +455,7 @@ def build_order2(out: Path, *, parent: Path, rebuild: Callable[[Path], Path]) ->
     order = list(range(span))
     random.Random(ORDER2_SEED).shuffle(order)
     order += list(range(span, len(committed.pool)))
-    # A manifest whose ids are already the env's own indices carries no labels at all, and the
-    # ones that do carry them positionally, so they move with the ids they name.
+    # Labels are positional where a manifest carries them at all, so they move with their ids.
     parent_labels = committed.pool.labels
     pool_labels = [parent_labels[i] for i in order] if parent_labels else []
 

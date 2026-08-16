@@ -167,8 +167,7 @@ Known per-harness hazards from prior runs:
   held-out side in the parent's own order, and the improvement pool permuted under a recorded
   seed within the span that cell's `pool_ceiling` lets it reach, so the tasks it may serve are
   the parent's and only their order moved. The matrix is still the 16 above. An arm exists so
-  an effect measured over one pool order can be read again over another, and it changes
-  nothing about which tasks v0 holds.
+  an effect measured over one pool order can be read again over another.
 - **Pool sizes are ceilings, not quotas.** The improvement pool is the maximum the runner
   will serve; the agent may stop on its own long before exhausting it. That early stop is a
   primary reported outcome (tasks attempted before stopping, and how the stop happened), not

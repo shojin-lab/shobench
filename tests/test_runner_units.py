@@ -118,9 +118,8 @@ def test_every_cell_config_loads_and_names_a_committed_split() -> None:
         load_instruction(cell.instruction_arm)
 
 
-# A replication arm reruns a cell the matrix already holds under one changed initial condition,
-# so it is a second reading of a matrix position rather than a new one. Its cells carry this
-# suffix, which is what lets the matrix's own shape stay assertable as the arms accumulate.
+# An arm is a second reading of a matrix position, not a new one, so the shape assertions
+# below filter it out and the count stays assertable as arms accumulate.
 REPLICATION_SUFFIX = "-r2"
 
 
@@ -147,9 +146,7 @@ def test_the_v0_matrix_is_four_envs_by_four_harness_model_pairs() -> None:
 
 
 def test_the_replication_arm_varies_the_split_and_nothing_else() -> None:
-    """The arm asks whether a measured effect survives a different curriculum order, which it can
-    only answer if order is the one thing that moved: any other axis drifting between a cell and
-    the one it replicates would leave a difference the arm cannot attribute."""
+    """An arm can only attribute a difference to order if order is the one thing that moved."""
     arm = [c for c in load_all_cells() if c.name.endswith(REPLICATION_SUFFIX)]
     assert {c.name for c in arm} == {
         "automationbench-prime_agent-claude-opus-5-r2",
@@ -157,8 +154,7 @@ def test_the_replication_arm_varies_the_split_and_nothing_else() -> None:
         "tau2_banking_knowledge-prime_agent-claude-opus-5-r2",
         "tau2_banking_knowledge-prime_agent-gpt-56-terra-r2",
     }
-    # The manifest is the full axis list, so comparing it minus the keys the arm is allowed to
-    # move covers every axis a later one adds without this test being edited again.
+    # The manifest is the full axis list, so this covers axes added later without an edit here.
     moved = {"name", "split", "config_path", "config_sha256"}
     for cell in arm:
         base = load_cell_by_name(cell.name.removesuffix(REPLICATION_SUFFIX))
@@ -171,8 +167,7 @@ def test_the_replication_arm_varies_the_split_and_nothing_else() -> None:
 def _labels_by_id(side: Side) -> dict[str, str]:
     """A side's labels keyed by the id each one names, empty where the manifest carries none.
 
-    automationbench carries none: its ids are already the env's own indices, so there is nothing
-    for a label to add.
+    automationbench carries none: its ids are already the env's own indices.
     """
     return dict(zip(side.task_ids, side.labels, strict=True)) if side.labels else {}
 
@@ -188,15 +183,12 @@ def test_every_replication_split_permutes_its_parents_pool_and_nothing_else() ->
         assert list(order2.heldout.task_ids) == list(parent.heldout.task_ids)
         assert set(order2.pool.task_ids) == set(parent.pool.task_ids)
         assert list(order2.pool.task_ids) != list(parent.pool.task_ids)
-        # Labels ride positionally alongside ids, so a permutation that moved one and not the
-        # other would name the wrong upstream task at every position it touched.
+        # Labels ride positionally alongside ids: one moved without the other names another task.
         assert _labels_by_id(order2.pool) == _labels_by_id(parent.pool)
         assert _labels_by_id(order2.heldout) == _labels_by_id(parent.heldout)
 
-        # The permutation is confined to what the cell can reach, so the tasks it may serve are
-        # the parent's tasks and only their order moved. Shuffling the whole pool under a cell
-        # that stops at 200 of 480 would draw a different 200, which is a second difference the
-        # arm could not attribute.
+        # Confined to what the cell can reach: shuffling the whole pool under a cell that stops
+        # at 200 of 480 would hand it a different 200 rather than the same 200 reordered.
         span = cell.budget.pool_ceiling or len(parent.pool)
         assert order2.provenance["permuted_span"] == [0, span - 1]
         assert set(order2.pool.task_ids[:span]) == set(parent.pool.task_ids[:span])

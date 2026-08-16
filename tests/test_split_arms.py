@@ -1,11 +1,10 @@
 """The guard that decides whether a replication arm may be written at all.
 
 An arm republishes another manifest's membership rather than drawing one, so the check inside
-``build_order2`` is the only thing between it and a parent that moved underneath it. These tests
-put a doctored rebuild to that check: they are what says it compares tasks rather than integers.
+``build_order2`` is the only thing between it and a parent that moved underneath it.
 
-They are offline and keyless. The builder is driven with manifests written here and a rebuild
-that returns whatever the case under test needs, so no env, dataset or upstream is involved.
+Offline and keyless: the builder is driven with manifests written here and a rebuild returning
+whatever the case under test needs, so no env, dataset or upstream is involved.
 """
 
 from __future__ import annotations
@@ -22,8 +21,8 @@ sys.path.insert(0, str(repo_root() / "tools"))
 
 import build_splits  # noqa: E402
 
-# The builder looks the parent's pool_ceiling up in the cells that read it, so the fixture takes
-# the name of a split some cell actually reads. Nothing else about that split is used here.
+# The builder looks the parent's pool_ceiling up in the cells that read it, so the fixture
+# borrows the name of a split some cell reads. Nothing else about that split is used.
 PARENT = "hle"
 
 IDS = [str(i) for i in range(12)]
@@ -69,8 +68,7 @@ def test_an_unmoved_parent_is_replicated_and_reruns_byte_identically(tmp_path: P
     assert list(arm.heldout.task_ids) == list(committed.heldout.task_ids)
     assert set(arm.pool.task_ids) == set(committed.pool.task_ids)
     assert list(arm.pool.task_ids) != list(committed.pool.task_ids)
-    # The label a position resolves to travels with it, which is the same property the drift
-    # check reads: an arm that reordered ids alone would name the wrong task at every position.
+    # The label a position resolves to travels with it, which is what the drift check reads.
     assert dict(zip(arm.pool.task_ids, arm.pool.labels, strict=True)) == dict(
         zip(committed.pool.task_ids, committed.pool.labels, strict=True)
     )
@@ -88,10 +86,8 @@ def test_an_unmoved_parent_is_replicated_and_reruns_byte_identically(tmp_path: P
 def test_a_parent_whose_tasks_moved_is_refused(
     tmp_path: Path, moved: str, rebuilt: dict[str, object]
 ) -> None:
-    """Every one of these leaves the id list a fresh build produces intact or nearly so, which is
-    what makes them worth testing: an upstream reorder that keeps its row count hands the builder
-    the same integers pointing at different questions, and the arm would publish the parent's
-    stale labels over them."""
+    """An upstream reorder that keeps its row count hands the builder the same integers behind
+    different questions, so every case here leaves the drawn ids intact or nearly so."""
     parent = _write(tmp_path / f"{PARENT}.json")
     out = tmp_path / f"{PARENT}_order2.json"
 
