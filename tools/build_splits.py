@@ -25,14 +25,14 @@ import random
 import sys
 import tempfile
 import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from shobench.pins import SHOGYM_REV, TAU2_UPSTREAM_SHA  # noqa: E402
-from shobench.splits import load_split, splits_dir, write_split  # noqa: E402
+from shobench.splits import Split, load_split, splits_dir, write_split  # noqa: E402
 
 # One seed for every derivation in this repo, so "which seed" is never a per-file question.
 SEED = 20260807
@@ -377,10 +377,26 @@ ORDER2_PARENTS = {
 }
 
 
-def _membership(heldout: Sequence[str], pool: Sequence[str]) -> bytes:
-    """Both sides as sets, in the one form two manifests can be compared byte for byte."""
+def _membership(split: Split) -> bytes:
+    """What a manifest holds, in the one form two of them can be compared byte for byte.
+
+    Order is what this drops. Everything else about a task it keeps, because an id on its own is
+    not the task: where ids are positions into an env's task list, the label is what a position
+    resolves to and the side's ``env_kwargs`` are the construction it indexes into. An upstream
+    that reordered its rows, or replaced one without changing their count, would hand a fresh
+    build the same integers with a different question behind each of them, and an arm that
+    compared integers alone would republish the parent's stale labels over it.
+    """
     return json.dumps(
-        {"heldout": sorted(heldout), "pool": sorted(pool)},
+        {
+            name: {
+                "env_kwargs": side.env_kwargs,
+                "tasks": sorted(
+                    zip(side.task_ids, side.labels or ("",) * len(side.task_ids), strict=True)
+                ),
+            }
+            for name, side in (("heldout", split.heldout), ("pool", split.pool))
+        },
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -428,21 +444,21 @@ def build_order2(out: Path, *, parent: Path, rebuild: Callable[[Path], Path]) ->
     order stands untouched.
 
     Nothing here draws a task. Membership is the parent's, and the parent is rebuilt from its own
-    sources first: unless the committed manifest still holds exactly the membership its builder
-    produces, this writes nothing, because a permutation of some other membership answers a
-    different question than the one the arm was launched to answer. Only membership is compared,
-    since the recorded ``shogym_rev`` moves with the pin and says nothing about which tasks the
-    split holds.
+    sources first: unless the committed manifest still holds exactly what its builder produces,
+    ids with the labels they resolve to and each side's env_kwargs alike, this writes nothing,
+    because a permutation of some other membership answers a different question than the one the
+    arm was launched to answer. Order and the recorded ``shogym_rev`` are what the comparison
+    leaves out, the first because this manifest is about to change it and the second because it
+    moves with the pin and says nothing about which tasks a split holds.
     """
     committed = load_split(parent)
     with tempfile.TemporaryDirectory() as tmp:
         fresh = load_split(rebuild(Path(tmp) / parent.name))
-    if _membership(committed.heldout.task_ids, committed.pool.task_ids) != _membership(
-        fresh.heldout.task_ids, fresh.pool.task_ids
-    ):
+    if _membership(committed) != _membership(fresh):
         raise SystemExit(
-            f"{parent} no longer holds the membership its own builder produces, so there is "
-            "nothing here to replicate: rebuild the parent and settle what moved first"
+            f"{parent} no longer holds the tasks its own builder produces: an id, the label a "
+            "position resolves to, or a side's env_kwargs has moved, so there is nothing here "
+            "to replicate. Rebuild the parent and settle what moved first"
         )
 
     span = _served_span(parent.stem, len(committed.pool))
