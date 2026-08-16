@@ -162,6 +162,11 @@ Known per-harness hazards from prior runs:
     size. The nine ACTION-only tasks and the one carrying an NL assertion are out of the
     population because that evaluator does not score them, not because they are hard; serving
     them means the keyed full-fidelity cell, which is a v1 follow-up.
+- **Replication arms are second readings, not new cells.** A cell whose name ends `-r2` reruns
+  a cell of the matrix over an `_order2` split: the parent's membership on both sides, the
+  held-out side in the parent's own order, and the improvement pool permuted under a recorded
+  seed. The matrix is still the 16 above. An arm exists so an effect measured over one pool
+  order can be read again over another, and it changes nothing about which tasks v0 holds.
 - **Pool sizes are ceilings, not quotas.** The improvement pool is the maximum the runner
   will serve; the agent may stop on its own long before exhausting it. That early stop is a
   primary reported outcome (tasks attempted before stopping, and how the stop happened), not

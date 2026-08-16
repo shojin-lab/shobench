@@ -28,7 +28,7 @@ from shobench.report import paired_bootstrap, render_table, report_cell
 from shobench.results import TaskResult, eval_summary, pair_evals, write_results
 from shobench.runner import LegRecord, RunContext, build_manifest, is_noise, write_home_files
 from shobench.serving import side_for_phase, task_indices
-from shobench.splits import load_split_by_name, splits_dir
+from shobench.splits import Side, load_split_by_name, splits_dir
 
 # ----- splits ------------------------------------------------------------------------------
 
@@ -118,8 +118,18 @@ def test_every_cell_config_loads_and_names_a_committed_split() -> None:
         load_instruction(cell.instruction_arm)
 
 
+# A replication arm reruns a cell the matrix already holds under one changed initial condition,
+# so it is a second reading of a matrix position rather than a new one. Its cells carry this
+# suffix, which is what lets the matrix's own shape stay assertable as the arms accumulate.
+REPLICATION_SUFFIX = "-r2"
+
+
 def test_the_v0_matrix_is_four_envs_by_four_harness_model_pairs() -> None:
-    cells = [c for c in load_all_cells() if not c.name.startswith("smoke")]
+    cells = [
+        c
+        for c in load_all_cells()
+        if not c.name.startswith("smoke") and not c.name.endswith(REPLICATION_SUFFIX)
+    ]
     assert len(cells) == 16
     assert {c.env for c in cells} == {
         "automationbench",
@@ -134,6 +144,54 @@ def test_the_v0_matrix_is_four_envs_by_four_harness_model_pairs() -> None:
         ("prime_agent", "claude-opus-5"),
         ("prime_agent", "gpt-5.6-terra"),
     }
+
+
+def test_the_replication_arm_varies_the_split_and_nothing_else() -> None:
+    """The arm asks whether a measured effect survives a different curriculum order, which it can
+    only answer if order is the one thing that moved: any other axis drifting between a cell and
+    the one it replicates would leave a difference the arm cannot attribute."""
+    arm = [c for c in load_all_cells() if c.name.endswith(REPLICATION_SUFFIX)]
+    assert {c.name for c in arm} == {
+        "automationbench-prime_agent-claude-opus-5-r2",
+        "hle-prime_agent-gpt-56-terra-r2",
+        "tau2_banking_knowledge-prime_agent-claude-opus-5-r2",
+        "tau2_banking_knowledge-prime_agent-gpt-56-terra-r2",
+    }
+    # The manifest is the full axis list, so comparing it minus the keys the arm is allowed to
+    # move covers every axis a later one adds without this test being edited again.
+    moved = {"name", "split", "config_path", "config_sha256"}
+    for cell in arm:
+        base = load_cell_by_name(cell.name.removesuffix(REPLICATION_SUFFIX))
+        assert cell.split == f"{base.split}_order2"
+        assert {k: v for k, v in cell.to_manifest().items() if k not in moved} == {
+            k: v for k, v in base.to_manifest().items() if k not in moved
+        }
+
+
+def _labels_by_id(side: Side) -> dict[str, str]:
+    """A side's labels keyed by the id each one names, empty where the manifest carries none.
+
+    automationbench carries none: its ids are already the env's own indices, so there is nothing
+    for a label to add.
+    """
+    return dict(zip(side.task_ids, side.labels, strict=True)) if side.labels else {}
+
+
+def test_every_replication_split_permutes_its_parents_pool_and_nothing_else() -> None:
+    for cell in load_all_cells():
+        if not cell.name.endswith(REPLICATION_SUFFIX):
+            continue
+        order2 = load_split_by_name(cell.split)
+        parent = load_split_by_name(order2.provenance["parent_split"])
+        assert cell.split == f"{order2.provenance['parent_split']}_order2"
+        assert parent.id_digest == order2.provenance["parent_id_digest"]
+        assert list(order2.heldout.task_ids) == list(parent.heldout.task_ids)
+        assert set(order2.pool.task_ids) == set(parent.pool.task_ids)
+        assert list(order2.pool.task_ids) != list(parent.pool.task_ids)
+        # Labels ride positionally alongside ids, so a permutation that moved one and not the
+        # other would name the wrong upstream task at every position it touched.
+        assert _labels_by_id(order2.pool) == _labels_by_id(parent.pool)
+        assert _labels_by_id(order2.heldout) == _labels_by_id(parent.heldout)
 
 
 def test_every_v0_cell_pins_xhigh_effort_and_the_manifest_records_it() -> None:
