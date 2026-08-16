@@ -7,9 +7,14 @@
     "seed": 20260816,
     "parent_split": "hle",
     "parent_id_digest": "924a59dc6920a755f6de1a6969c95ec95570c1911c9ebea6b6798e60d7e3ef42",
+    "permuted_span": [
+      0,
+      299
+    ],
     "arm": "An order-only replication of the parent split. Both sides hold exactly the parent's ids, the held-out side in the parent's own order, and only the pool's serving order differs. It exists so an effect measured over one pool order can be read again over another: one that repeats is not a property of the order that pool happened to arrive in.",
     "authority": "This manifest draws nothing and adopts nothing. Membership and its authority are the parent's, carried below under parent_provenance and unchanged here, whether the parent adopted a published split, honored an upstream one or drew its own. The seed recorded here permutes the pool's serving order locally and governs nothing else.",
-    "procedure": "Rebuild the parent from its own sources, refuse unless the committed parent still holds exactly that membership, copy the held-out side across id for id in the parent's order, then shuffle the pool's positions once with the recorded seed, labels moving with the ids they name. The pool is a ceiling on what the rollout may serve, not a quota, so a cell that stops short of it on its pool_ceiling or its wall clock serves a prefix of this order: the tasks in that prefix are not the ones the same cell reaches under the parent.",
+    "procedure": "Rebuild the parent from its own sources, refuse unless the committed parent still holds exactly that membership, copy the held-out side across id for id in the parent's order, then shuffle positions 0 to 299 of its pool once with the recorded seed, labels moving with the ids they name. Positions beyond that span, if the pool has any, keep the parent's order. The span is the pool_ceiling declared by every cell that reads the parent, read off those cell files rather than written down in the builder, and cells disagreeing on it are refused.",
+    "truncation": "Confining the permutation to the served span makes the candidate set a rollout can reach identical to the parent's, so only order differs. What the rollout realizes inside that set still varies: a leg ending on its wall clock serves a prefix of the span, and the two readings reach different prefixes of the same candidates. That is the arm working rather than a confound, the set being fixed and the order being the thing under test.",
     "parent_provenance": {
       "kind": "seeded",
       "seed": 20260807,

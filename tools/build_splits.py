@@ -386,6 +386,32 @@ def _membership(heldout: Sequence[str], pool: Sequence[str]) -> bytes:
     ).encode("utf-8")
 
 
+def _served_span(split_name: str, pool_size: int) -> int:
+    """How many of a split's pool positions a cell reading it can ever reach.
+
+    Read off the cells rather than written down here: the ceiling is a cell axis, and a copy of
+    it in this file would be a second place for it to be true. Cells that disagree are refused,
+    because one span cannot stand for two candidate sets.
+    """
+    from shobench.config import load_all_cells
+
+    ceilings = {
+        min(cell.budget.pool_ceiling or pool_size, pool_size)
+        for cell in load_all_cells()
+        if cell.split == split_name
+    }
+    if not ceilings:
+        raise SystemExit(
+            f"no cell reads {split_name}, so there is no served span to replicate under"
+        )
+    if len(ceilings) > 1:
+        raise SystemExit(
+            f"cells reading {split_name} disagree on pool_ceiling ({sorted(ceilings)}), so the "
+            "candidate set a rollout reaches is not one set and an order-only arm cannot be built"
+        )
+    return ceilings.pop()
+
+
 def build_order2(out: Path, *, parent: Path, rebuild: Callable[[Path], Path]) -> Path:
     """Republish a committed manifest with its improvement pool served in another order.
 
@@ -393,6 +419,13 @@ def build_order2(out: Path, *, parent: Path, rebuild: Callable[[Path], Path]) ->
     pool arrives and in nothing else. The held-out side is copied across id for id and in the
     parent's own order, because a cold eval reads the same tasks whichever order they arrive in
     and identical ordering keeps the two sides of the arm comparable.
+
+    The permutation is confined to the span a rollout can actually reach, which is the
+    ``pool_ceiling`` the cells reading the parent declare. Shuffling past it would hand the arm a
+    different candidate set rather than a different order: a cell serving 200 of 480 would draw
+    its 200 from somewhere else in the pool, and an effect that failed to repeat could be either
+    finding. Inside the span the candidate set is the parent's exactly; beyond it the parent's
+    order stands untouched.
 
     Nothing here draws a task. Membership is the parent's, and the parent is rebuilt from its own
     sources first: unless the committed manifest still holds exactly the membership its builder
@@ -412,8 +445,10 @@ def build_order2(out: Path, *, parent: Path, rebuild: Callable[[Path], Path]) ->
             "nothing here to replicate: rebuild the parent and settle what moved first"
         )
 
-    order = list(range(len(committed.pool)))
+    span = _served_span(parent.stem, len(committed.pool))
+    order = list(range(span))
     random.Random(ORDER2_SEED).shuffle(order)
+    order += list(range(span, len(committed.pool)))
     # A manifest whose ids are already the env's own indices carries no labels at all, and the
     # ones that do carry them positionally, so they move with the ids they name.
     parent_labels = committed.pool.labels
@@ -434,6 +469,7 @@ def build_order2(out: Path, *, parent: Path, rebuild: Callable[[Path], Path]) ->
             "seed": ORDER2_SEED,
             "parent_split": parent.stem,
             "parent_id_digest": committed.id_digest,
+            "permuted_span": [0, span - 1],
             "arm": (
                 "An order-only replication of the parent split. Both sides hold exactly the "
                 "parent's ids, the held-out side in the parent's own order, and only the pool's "
@@ -451,11 +487,20 @@ def build_order2(out: Path, *, parent: Path, rebuild: Callable[[Path], Path]) ->
             "procedure": (
                 "Rebuild the parent from its own sources, refuse unless the committed parent "
                 "still holds exactly that membership, copy the held-out side across id for id "
-                "in the parent's order, then shuffle the pool's positions once with the "
-                "recorded seed, labels moving with the ids they name. The pool is a ceiling on "
-                "what the rollout may serve, not a quota, so a cell that stops short of it on "
-                "its pool_ceiling or its wall clock serves a prefix of this order: the tasks in "
-                "that prefix are not the ones the same cell reaches under the parent."
+                f"in the parent's order, then shuffle positions 0 to {span - 1} of its pool "
+                "once with the recorded seed, labels moving with the ids they name. "
+                "Positions beyond that span, if the pool has any, keep the "
+                "parent's order. The span is the pool_ceiling declared by every cell that reads "
+                "the parent, read off those cell files rather than written down in the builder, "
+                "and cells disagreeing on it are refused."
+            ),
+            "truncation": (
+                "Confining the permutation to the served span makes the candidate set a rollout "
+                "can reach identical to the parent's, so only order differs. What the rollout "
+                "realizes inside that set still varies: a leg ending on its wall clock serves a "
+                "prefix of the span, and the two readings reach different prefixes of the same "
+                "candidates. That is the arm working rather than a confound, the set being "
+                "fixed and the order being the thing under test."
             ),
             "parent_provenance": committed.provenance,
             "shogym_rev": SHOGYM_REV,

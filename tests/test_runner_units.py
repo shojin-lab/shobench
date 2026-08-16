@@ -193,6 +193,16 @@ def test_every_replication_split_permutes_its_parents_pool_and_nothing_else() ->
         assert _labels_by_id(order2.pool) == _labels_by_id(parent.pool)
         assert _labels_by_id(order2.heldout) == _labels_by_id(parent.heldout)
 
+        # The permutation is confined to what the cell can reach, so the tasks it may serve are
+        # the parent's tasks and only their order moved. Shuffling the whole pool under a cell
+        # that stops at 200 of 480 would draw a different 200, which is a second difference the
+        # arm could not attribute.
+        span = cell.budget.pool_ceiling or len(parent.pool)
+        assert order2.provenance["permuted_span"] == [0, span - 1]
+        assert set(order2.pool.task_ids[:span]) == set(parent.pool.task_ids[:span])
+        assert list(order2.pool.task_ids[:span]) != list(parent.pool.task_ids[:span])
+        assert list(order2.pool.task_ids[span:]) == list(parent.pool.task_ids[span:])
+
 
 def test_every_v0_cell_pins_xhigh_effort_and_the_manifest_records_it() -> None:
     """Effort is a cell axis, so the v0 matrix pins one value rather than inheriting each
