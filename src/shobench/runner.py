@@ -1019,13 +1019,17 @@ def _copy_task_home(base: Path, dst: Path, *, keep: tuple[str, ...] = ()) -> Non
         shutil.copy2(path, target)
 
 
-def _copy_task_work(base: Path, dst: Path) -> None:
-    """Copy one eval task's ``/work`` off the phase's base ``/work``.
+def _copy_work_tree(base: Path, dst: Path) -> None:
+    """Copy a rollout's ``/work`` as the container saw it.
 
     ``/work`` is the cwd every harness runs in, so it is the most natural place for an agent that
-    improves itself by writing a helper script or a note to put one. A task that started from an
-    empty directory would sit the exam stripped of everything the rollout built there, and the
+    improves itself by writing a helper script or a note to put one. A session that started from
+    an empty directory would sit the exam stripped of everything the rollout built there, and the
     cell would report no transfer for an agent that genuinely improved.
+
+    ONE function for both copies of this tree, the eval task's and the bookend's snapshot of an
+    archived source, because two policies over one tree is exactly how a bookend comes to measure
+    a different cwd than an ordinary eval_after measures.
 
     A COPY, for the reason ``_copy_task_home`` copies: a task's writes reach neither the base nor
     a sibling, and the copy is discarded when the task ends. Sharing the directory would carry the
@@ -1034,11 +1038,23 @@ def _copy_task_work(base: Path, dst: Path) -> None:
     Nothing is filtered. The durability filter names what a session leaves in a HOME without
     meaning to; ``/work`` has no such byproducts, because the rollout is its only writer.
 
-    Links are copied as links rather than resolved. Every copy is mounted back at ``/work`` under
-    the same image, so a link the rollout wrote names in the task what it named in the rollout,
-    and a link out of ``/work`` reaches the container's own filesystem rather than anything on the
-    host. What is neither a file, a directory, nor a link is left behind: a socket or a fifo names
-    no bytes a later session could read.
+    Links are copied as links, which is where this parts company with the HOME snapshot
+    (``_materialize_home``, which resolves each link on the HOST into the bytes it names). These
+    are CONTAINER paths and the host is not where they are read: ``/work/tool -> /home/oai/tool``
+    is ordinary in a rollout and names nothing on a host, resolving a link would de-alias two
+    names the agent deliberately made one, and a link leaving ``/work`` would refuse a source the
+    rollout ran on perfectly well. Preserving them is what makes the copy the cwd that ran.
+
+    That the HOME snapshot materializes is not an argument for doing it here. What that protects
+    is an archive from being written THROUGH a preserved link, and it needs a host-side writer:
+    the HOME copy has several (the credential seeding, the runner files, the per-leg files).
+    Neither destination here has one. A task's copy is written only from inside its container, a
+    bookend's snapshot is seeded with nothing and mounted into no leg, and a container that mounts
+    either resolves its links inside its own filesystem, where no archive is mounted at all.
+
+    What is neither a file, a directory, nor a link is left behind: a socket or a fifo names no
+    bytes a later session could read, and refusing a bookend over one would refuse an honest
+    source for a file that carries nothing.
     """
     # A leftover from an attempt something killed before its cleanup is cleared rather than
     # merged, so a re-run of that id starts from the rollout's cwd and not from the dead leg's
@@ -1461,10 +1477,17 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
             shutil.rmtree(prov_dir, ignore_errors=True)
             prov_dir.mkdir(parents=True, exist_ok=True)
             try:
+                # Both trees are copied in a worker thread. This coroutine shares its loop with
+                # the stream server and the drain watcher of every task already launched, and
+                # neither tree is bounded: a rollout that cloned a repository or built a venv
+                # leaves a copy long enough to starve those live sessions and time them out, and
+                # to serialize the setup the concurrency knob exists to overlap.
+                #
                 # A resumed fork's copy also carries the harness's recorded conversations,
                 # which are noise everywhere else; the transcript has to be in the HOME the
                 # harness runs with or there is nothing to reopen.
-                _copy_task_home(
+                await asyncio.to_thread(
+                    _copy_task_home,
                     base_home,
                     task_home,
                     keep=ctx.harness.session_state_dirs if resume_session else (),
@@ -1475,7 +1498,7 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                 # task's files into another with nothing in the HOME digest to show it. A private
                 # copy is the isolation the concurrency needs and the inheritance the measurement
                 # needs at once.
-                _copy_task_work(base_work, task_work)
+                await asyncio.to_thread(_copy_work_tree, base_work, task_work)
                 # A fresh port per task, so a socket still in TIME_WAIT from a finished task
                 # cannot make another look like a server that refused to start.
                 port = free_port()
@@ -1558,8 +1581,11 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
             finally:
                 # Discard the task's home and /work the moment it is done, so N concurrent copies
                 # is the ceiling on disk and nothing a task wrote survives to be read by anything.
-                shutil.rmtree(task_home, ignore_errors=True)
-                shutil.rmtree(task_work, ignore_errors=True)
+                # Off the loop like the copies, and for the same reason: deleting an unbounded
+                # tree is the same stall as writing one. Nothing cancels these tasks, so the
+                # awaits here run.
+                await asyncio.to_thread(shutil.rmtree, task_home, ignore_errors=True)
+                await asyncio.to_thread(shutil.rmtree, task_work, ignore_errors=True)
 
     pending = _eval_pending_ids(phase_dir, side.task_ids)
     await asyncio.gather(*(one_task(task_id) for task_id in pending))
@@ -4870,13 +4896,14 @@ async def _rebookend_owned(
                 "the source was mutated. Re-run the rebookend against the settled archive."
             )
         _materialize_home(source_home, sandbox.home)
-        # The rollout's cwd, taken under the same hold and through the same materializer, because
-        # it is read the same way afterwards and the archive it comes from must stay untouched by
-        # every writer downstream of the copy. An archive that ran before /work was carried has
-        # nothing here, and its bookend starts the exam from an empty one, as it did.
+        # The rollout's cwd, taken under the same hold and through the function this run's own
+        # eval tasks will copy it with. NOT the home materializer: it resolves links on the host,
+        # which for container paths drops or refuses what the rollout used, so a bookend would
+        # measure a cwd its source never had (see ``_copy_work_tree``). An archive that ran
+        # before /work was carried has nothing here, and its bookend starts from an empty one.
         source_work = source_run_dir / "work"
         if source_work.is_dir():
-            _materialize_home(source_work, sandbox.workdir)
+            _copy_work_tree(source_work, sandbox.workdir)
         shutil.copy2(source_run_dir / ROLLOUT_STOPPING_FILE, run_dir / ROLLOUT_STOPPING_FILE)
         source_stopping = json.loads(
             (source_run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")

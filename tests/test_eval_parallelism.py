@@ -36,7 +36,7 @@ from shobench.runner import (
     LegRecord,
     RunContext,
     _copy_task_home,
-    _copy_task_work,
+    _copy_work_tree,
     _eval_container_name,
     is_noise,
 )
@@ -250,6 +250,11 @@ def _seed_base_work(base: Path) -> None:
     (base / "scratch.log").write_text("a log the agent keeps for itself\n", encoding="utf-8")
     (base / "empty-dir").mkdir()
     (base / "shortcut.md").symlink_to(Path("notes/what-works.md"))
+    # Two CONTAINER paths, both ordinary in a rollout and neither meaning on the host what it
+    # means at /work: one absolute (the shape a venv's interpreter link takes), one leaving
+    # /work altogether.
+    (base / "tool").symlink_to(Path("/home/oai/tool"))
+    (base / "up-and-out").symlink_to(Path("../elsewhere/thing"))
 
 
 def test_a_task_work_copy_carries_the_whole_rollout_cwd(tmp_path: Path) -> None:
@@ -258,17 +263,23 @@ def test_a_task_work_copy_carries_the_whole_rollout_cwd(tmp_path: Path) -> None:
     _seed_base_work(base)
     task_work = tmp_path / "task"
 
-    _copy_task_work(base, task_work)
+    _copy_work_tree(base, task_work)
 
     assert (task_work / "helper.py").read_text().startswith("def batch_get")
     assert (task_work / "notes/what-works.md").read_text() == "batch, never one at a time\n"
     assert (task_work / "scratch.log").is_file()
     assert (task_work / "empty-dir").is_dir()
-    # A link stays a link: the copy is mounted back at /work under the same image, so it names
-    # in the task what it named in the rollout.
+    # A link stays a link, so it names in the task what it named in the rollout: the copy is
+    # mounted back at /work under the same image, and resolving one on the host would drop the
+    # container paths and de-alias the in-tree one.
     assert (task_work / "shortcut.md").is_symlink()
     assert (task_work / "shortcut.md").readlink() == Path("notes/what-works.md")
     assert (task_work / "shortcut.md").read_text() == "batch, never one at a time\n"
+    assert (task_work / "tool").readlink() == Path("/home/oai/tool")
+    assert (task_work / "up-and-out").readlink() == Path("../elsewhere/thing")
+    # And the alias is still an alias rather than two independent files.
+    (task_work / "notes/what-works.md").write_text("edited\n", encoding="utf-8")
+    assert (task_work / "shortcut.md").read_text() == "edited\n"
 
 
 def test_a_task_work_write_reaches_neither_the_base_nor_a_sibling(tmp_path: Path) -> None:
@@ -278,8 +289,8 @@ def test_a_task_work_write_reaches_neither_the_base_nor_a_sibling(tmp_path: Path
 
     work_a = tmp_path / "a"
     work_b = tmp_path / "b"
-    _copy_task_work(base, work_a)
-    _copy_task_work(base, work_b)
+    _copy_work_tree(base, work_a)
+    _copy_work_tree(base, work_b)
 
     # Task A does what a running agent does in its cwd: writes a file and edits an inherited one.
     (work_a / "the-exam-wrote-this.py").write_text("scratch\n", encoding="utf-8")
@@ -297,10 +308,10 @@ def test_a_copy_clears_what_a_killed_attempt_left_in_the_task_cwd(tmp_path: Path
     base = tmp_path / "work"
     _seed_base_work(base)
     task_work = tmp_path / "task"
-    _copy_task_work(base, task_work)
+    _copy_work_tree(base, task_work)
     (task_work / "the-killed-leg-wrote-this.py").write_text("half a thought\n", encoding="utf-8")
 
-    _copy_task_work(base, task_work)
+    _copy_work_tree(base, task_work)
 
     assert not (task_work / "the-killed-leg-wrote-this.py").exists()
     assert (task_work / "helper.py").is_file()
@@ -310,13 +321,13 @@ def test_copying_a_base_work_that_holds_nothing_yields_an_empty_one(tmp_path: Pa
     """A run that has not rolled out yet has written nothing into its cwd, and on a fresh run
     the directory does not exist at all. Both copy to the empty cwd a cold baseline needs."""
     absent = tmp_path / "task-from-absent"
-    _copy_task_work(tmp_path / "never-created", absent)
+    _copy_work_tree(tmp_path / "never-created", absent)
     assert absent.is_dir() and list(absent.rglob("*")) == []
 
     empty_base = tmp_path / "created-and-empty"
     empty_base.mkdir()
     from_empty = tmp_path / "task-from-empty"
-    _copy_task_work(empty_base, from_empty)
+    _copy_work_tree(empty_base, from_empty)
     assert from_empty.is_dir() and list(from_empty.rglob("*")) == []
 
 
@@ -679,6 +690,61 @@ def test_every_eval_after_task_starts_from_the_rollout_cwd_and_none_sees_a_sibli
     # The rollout's cwd is the record of what the rollout did, and no task moved it.
     assert home_digest(ctx.sandbox.workdir, exclude=is_noise) == base_digest
     assert not list(ctx.sandbox.workdir.glob("task-*.py"))
+
+
+def test_the_task_copies_run_off_the_event_loop(tmp_path: Path, monkeypatch) -> None:
+    """A task's copies share their loop with the stream server and the drain watcher of every
+    task already launched, so a tree copied inline pauses live held-out sessions for as long as
+    the copy runs, and serializes the setup the concurrency knob was meant to overlap. Both
+    trees are copied in a worker thread, and the loop keeps turning while they do.
+
+    Slowed deliberately, because size is what makes this visible: a rollout that cloned a
+    repository or built a venv leaves a tree whose copy takes long enough to time a live task
+    out, and the archive's own cwds are far too small to show it.
+    """
+    ctx = _ctx(tmp_path, ("1", "2"))
+    _seed_base_work(ctx.sandbox.workdir)
+    seen: dict[int, dict] = {}
+    _work_reading_legs(monkeypatch, seen)
+    copy_threads: set[int] = set()
+
+    def slowed(real):
+        def copy(*args, **kwargs):
+            copy_threads.add(threading.get_ident())
+            time.sleep(0.25)
+            return real(*args, **kwargs)
+
+        return copy
+
+    monkeypatch.setattr(runner, "_copy_task_home", slowed(runner._copy_task_home))
+    monkeypatch.setattr(runner, "_copy_work_tree", slowed(runner._copy_work_tree))
+
+    async def drive() -> tuple[int, int]:
+        beats = 0
+
+        async def pulse() -> None:
+            nonlocal beats
+            while True:
+                await asyncio.sleep(0.01)
+                beats += 1
+
+        beating = asyncio.create_task(pulse())
+        try:
+            await runner.run_eval_phase(ctx, "eval_before")
+        finally:
+            beating.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await beating
+        return threading.get_ident(), beats
+
+    loop_thread, beats = asyncio.run(drive())
+
+    assert set(seen) == {1, 2}
+    # A second of filesystem work, none of it on the thread the loop runs on.
+    assert copy_threads and loop_thread not in copy_threads
+    # And the loop kept turning throughout, which is what an already-launched task's server and
+    # drain watcher need. Run inline, the same phase lets it turn once.
+    assert beats > 10
 
 
 def test_an_eval_before_task_starts_from_an_empty_cwd(tmp_path: Path, monkeypatch) -> None:

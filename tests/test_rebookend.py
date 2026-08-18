@@ -128,10 +128,16 @@ def _source_run(
     cache = home / ".cache"
     cache.mkdir()
     (cache / "blob").write_text("x" * 512, encoding="utf-8")
-    # The rollout's cwd, which the bookend's tasks inherit the way they inherit the home.
+    # The rollout's cwd, which the bookend's tasks inherit the way they inherit the home. The
+    # links are the three shapes a rollout leaves that a host reads differently: one absolute
+    # container path, one leaving /work whose host target happens to exist (the source's own
+    # home), and one in-tree alias.
     work = source_dir / "work"
     work.mkdir()
     (work / "helper.py").write_text("def batch_get(ids):\n    ...\n", encoding="utf-8")
+    (work / "tool").symlink_to("/home/oai/tool")
+    (work / "from-home").symlink_to("../home/.claude/projects/-work/memory/note.md")
+    (work / "alias.py").symlink_to("helper.py")
     source_cell = replace(cell, eval_context="cold")
     ctx = RunContext(
         cell=source_cell,
@@ -396,12 +402,17 @@ def test_the_bookend_inherits_the_source_cwd_and_leaves_it_untouched(
     launches: dict[int, dict] = {}
     _wire_fakes(monkeypatch, cell, split, launches)
     wired_leg = runner.run_leg
+    task_links: dict[int, dict[str, Path]] = {}
 
     def writing_leg(ctx_arg, **kw):
         record = wired_leg(ctx_arg, **kw)
+        work = Path(kw["workdir"])
+        task_links[int(kw["task_idx"])] = {
+            p.name: p.readlink() for p in work.iterdir() if p.is_symlink()
+        }
         # What a held-out session writes into its cwd, which must reach neither the snapshot it
         # was copied from nor the archive behind that.
-        (Path(kw["workdir"]) / "the-exam-wrote-this.py").write_text("x", encoding="utf-8")
+        (work / "the-exam-wrote-this.py").write_text("x", encoding="utf-8")
         return record
 
     monkeypatch.setattr(runner, "run_leg", writing_leg)
@@ -417,14 +428,31 @@ def test_the_bookend_inherits_the_source_cwd_and_leaves_it_untouched(
 
     assert set(launches) == {0, 1, 2}
     for record in launches.values():
-        assert record["work_at_launch"] == ["helper.py"]
+        assert record["work_at_launch"] == ["alias.py", "from-home", "helper.py", "tool"]
+    # Every link arrived as a link, naming what it named in the archive. Resolved on the host,
+    # as the HOME snapshot resolves its own, the container-absolute one would have been dropped
+    # as dangling, the one leaving /work would have refused this bookend outright, and the alias
+    # would have become a second independent file. All three ran fine in the rollout.
+    for links in task_links.values():
+        assert links == {
+            "tool": Path("/home/oai/tool"),
+            "from-home": Path("../home/.claude/projects/-work/memory/note.md"),
+            "alias.py": Path("helper.py"),
+        }
     # The archive is byte-identical, its /work included.
     assert _fingerprint(source_dir) == before
-    # And so is the run's own snapshot of it, the one every task copied from.
-    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
-    assert _fingerprint(new_run / "work") == {
-        "helper.py": hashlib.sha256(b"def batch_get(ids):\n    ...\n").hexdigest()
-    }
+    # And so is the run's own snapshot of it, the one every task copied from: what the sessions
+    # wrote stayed in the copies that were discarded with them.
+    snapshot = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir()) / "work"
+    assert sorted(p.name for p in snapshot.iterdir()) == [
+        "alias.py",
+        "from-home",
+        "helper.py",
+        "tool",
+    ]
+    assert _fingerprint(snapshot)["helper.py"] == hashlib.sha256(
+        b"def batch_get(ids):\n    ...\n"
+    ).hexdigest()
 
 
 def test_rebookend_refuses_a_source_without_a_terminus(tmp_path: Path, monkeypatch) -> None:
