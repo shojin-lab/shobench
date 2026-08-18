@@ -4,7 +4,7 @@ An MCP server provides a stream of tasks.
 Nothing external loops for you - drive yourself:
 
 1. Calling `get_task` pulls the next task.
-   If it returns {done: true}, the stream is exhausted, stop.
+   If it returns {done: true}, the stream is exhausted; stop.
 2. The task can be completed using the tools listed.
-   One of them ends the task; call it before pulling the next.
+   One of them ends the task.
 3. Continue until the stream is exhausted.
