@@ -36,6 +36,7 @@ from shobench.runner import (
     LegRecord,
     RunContext,
     _copy_task_home,
+    _copy_task_work,
     _eval_container_name,
     is_noise,
 )
@@ -235,6 +236,88 @@ def test_each_eval_task_mounts_its_own_work_directory(tmp_path: Path) -> None:
     # The rollout keeps the cell's one accumulating /work (the default), unchanged by the fix.
     rollout_args = sandbox.docker_args(env={}, mounts={})
     assert _work_mount(rollout_args) == f"{tmp_path / 'cellwork'}:/work:rw"
+
+
+def _seed_base_work(base: Path) -> None:
+    """A base /work shaped like a post-rollout one: what an agent builds in its own cwd."""
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "helper.py").write_text("def batch_get(ids):\n    ...\n", encoding="utf-8")
+    notes = base / "notes"
+    notes.mkdir()
+    (notes / "what-works.md").write_text("batch, never one at a time\n", encoding="utf-8")
+    # A name the durable filter calls noise in a HOME. /work has no such filter: whatever is
+    # here, the rollout put here.
+    (base / "scratch.log").write_text("a log the agent keeps for itself\n", encoding="utf-8")
+    (base / "empty-dir").mkdir()
+    (base / "shortcut.md").symlink_to(Path("notes/what-works.md"))
+
+
+def test_a_task_work_copy_carries_the_whole_rollout_cwd(tmp_path: Path) -> None:
+    """Everything the rollout left in its cwd crosses, unfiltered, links included."""
+    base = tmp_path / "work"
+    _seed_base_work(base)
+    task_work = tmp_path / "task"
+
+    _copy_task_work(base, task_work)
+
+    assert (task_work / "helper.py").read_text().startswith("def batch_get")
+    assert (task_work / "notes/what-works.md").read_text() == "batch, never one at a time\n"
+    assert (task_work / "scratch.log").is_file()
+    assert (task_work / "empty-dir").is_dir()
+    # A link stays a link: the copy is mounted back at /work under the same image, so it names
+    # in the task what it named in the rollout.
+    assert (task_work / "shortcut.md").is_symlink()
+    assert (task_work / "shortcut.md").readlink() == Path("notes/what-works.md")
+    assert (task_work / "shortcut.md").read_text() == "batch, never one at a time\n"
+
+
+def test_a_task_work_write_reaches_neither_the_base_nor_a_sibling(tmp_path: Path) -> None:
+    base = tmp_path / "work"
+    _seed_base_work(base)
+    base_digest = home_digest(base, exclude=is_noise)
+
+    work_a = tmp_path / "a"
+    work_b = tmp_path / "b"
+    _copy_task_work(base, work_a)
+    _copy_task_work(base, work_b)
+
+    # Task A does what a running agent does in its cwd: writes a file and edits an inherited one.
+    (work_a / "the-exam-wrote-this.py").write_text("scratch\n", encoding="utf-8")
+    (work_a / "notes/what-works.md").write_text("MUTATED\n", encoding="utf-8")
+
+    assert home_digest(base, exclude=is_noise) == base_digest
+    assert (base / "notes/what-works.md").read_text() == "batch, never one at a time\n"
+    assert not (work_b / "the-exam-wrote-this.py").exists()
+    assert (work_b / "notes/what-works.md").read_text() == "batch, never one at a time\n"
+
+
+def test_a_copy_clears_what_a_killed_attempt_left_in_the_task_cwd(tmp_path: Path) -> None:
+    """A re-run of an id whose first attempt died before its cleanup starts from the rollout's
+    cwd, never from the dead leg's own writes sitting on top of it."""
+    base = tmp_path / "work"
+    _seed_base_work(base)
+    task_work = tmp_path / "task"
+    _copy_task_work(base, task_work)
+    (task_work / "the-killed-leg-wrote-this.py").write_text("half a thought\n", encoding="utf-8")
+
+    _copy_task_work(base, task_work)
+
+    assert not (task_work / "the-killed-leg-wrote-this.py").exists()
+    assert (task_work / "helper.py").is_file()
+
+
+def test_copying_a_base_work_that_holds_nothing_yields_an_empty_one(tmp_path: Path) -> None:
+    """A run that has not rolled out yet has written nothing into its cwd, and on a fresh run
+    the directory does not exist at all. Both copy to the empty cwd a cold baseline needs."""
+    absent = tmp_path / "task-from-absent"
+    _copy_task_work(tmp_path / "never-created", absent)
+    assert absent.is_dir() and list(absent.rglob("*")) == []
+
+    empty_base = tmp_path / "created-and-empty"
+    empty_base.mkdir()
+    from_empty = tmp_path / "task-from-empty"
+    _copy_task_work(empty_base, from_empty)
+    assert from_empty.is_dir() and list(from_empty.rglob("*")) == []
 
 
 # ----- concurrency correctness ---------------------------------------------------------------
@@ -518,6 +601,99 @@ def test_a_resumed_eval_after_forks_the_rollout_session_into_every_task(
         assert record["resume"] is True
         assert record["transcript_in_copy"] is True
         assert record["system_prompt"] == ctx.instruction.rollout_system
+
+
+def _work_reading_legs(
+    monkeypatch, seen: dict[int, dict], barrier: threading.Barrier | None = None
+) -> None:
+    """Route the fan-out through a leg that reads its own /work and writes into it."""
+    lock = threading.Lock()
+
+    def fake_run_leg(ctx_arg: RunContext, **kw: object) -> LegRecord:
+        idx = int(kw["task_idx"])  # type: ignore[arg-type]
+        work = Path(kw["workdir"])  # type: ignore[arg-type]
+        inherited = sorted(p.relative_to(work).as_posix() for p in work.rglob("*"))
+        (work / f"task-{idx}.py").write_text("what this session tried\n", encoding="utf-8")
+        if barrier is not None:
+            # Every task has written before any of them looks, so a shared /work would show.
+            barrier.wait()
+        with lock:
+            seen[idx] = {
+                "inherited": inherited,
+                "own": sorted(p.name for p in work.glob("task-*.py")),
+            }
+        return LegRecord(
+            leg=idx,
+            phase=str(kw["phase"]),
+            task_idx=idx,
+            started_at=0.0,
+            ended_at=1.0,
+            returncode=0,
+            verdict=StopVerdict(StopKind.CHOSEN, "it stopped on its own"),
+            tasks_consumed_before=0,
+            tasks_consumed_after=0,
+            trace_path="t",
+            run_dir=ctx_arg.run_dir,
+        )
+
+    def fake_read_phase(prov_dir: Path) -> list[TaskResult]:
+        idx = int(prov_dir.name.split("-")[1])
+        if idx not in seen:
+            return []
+        return [
+            TaskResult(
+                seq=idx, position=0, task_idx=idx, closure="sealed", reward=1.0, success=True
+            )
+        ]
+
+    monkeypatch.setattr(runner, "warm_env", lambda cell: None)
+    monkeypatch.setattr(runner, "build_stream", lambda *a, **k: _FakeStream())
+    monkeypatch.setattr(runner, "_served", _fake_served)
+    monkeypatch.setattr(runner, "run_leg", fake_run_leg)
+    monkeypatch.setattr(runner, "read_phase", fake_read_phase)
+
+
+def test_every_eval_after_task_starts_from_the_rollout_cwd_and_none_sees_a_sibling(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The transfer, through the real phase: three tasks run at once, each reads what the rollout
+    left in /work, each writes into a copy of its own, and the rollout's cwd comes out unmoved."""
+    ctx = _ctx(tmp_path, ("1", "2", "3"))
+    ctx = replace(ctx, cell=replace(ctx.cell, budget=replace(ctx.cell.budget, eval_concurrency=3)))
+    _rollout_terminus(ctx)
+    _seed_base_work(ctx.sandbox.workdir)
+    base_digest = home_digest(ctx.sandbox.workdir, exclude=is_noise)
+    seen: dict[int, dict] = {}
+    _work_reading_legs(monkeypatch, seen, barrier=threading.Barrier(3, timeout=30))
+
+    rows = asyncio.run(runner.run_eval_phase(ctx, "eval_after"))
+
+    assert [r.task_idx for r in rows] == [1, 2, 3]
+    assert set(seen) == {1, 2, 3}
+    for idx, record in seen.items():
+        # The rollout's own helper and notes, in every task, before that task wrote anything.
+        assert "helper.py" in record["inherited"]
+        assert "notes/what-works.md" in record["inherited"]
+        # And of the three files the three concurrent tasks wrote, a task sees only its own.
+        assert record["own"] == [f"task-{idx}.py"]
+    # The rollout's cwd is the record of what the rollout did, and no task moved it.
+    assert home_digest(ctx.sandbox.workdir, exclude=is_noise) == base_digest
+    assert not list(ctx.sandbox.workdir.glob("task-*.py"))
+
+
+def test_an_eval_before_task_starts_from_an_empty_cwd(tmp_path: Path, monkeypatch) -> None:
+    """The baseline stays cold, and not because the phase is named eval_before: the rollout is
+    the only thing that ever writes the cell's /work and eval_before runs before it, so what
+    every task copies is empty. Re-measuring a before after a rollout is refused outright, so no
+    path carries an accumulated cwd into a baseline."""
+    ctx = _ctx(tmp_path, ("1", "2"))
+    seen: dict[int, dict] = {}
+    _work_reading_legs(monkeypatch, seen)
+
+    asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
+
+    assert set(seen) == {1, 2}
+    assert all(record["inherited"] == [] for record in seen.values())
 
 
 def test_eval_before_never_resumes_whatever_the_axis_says(tmp_path: Path, monkeypatch) -> None:

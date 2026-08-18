@@ -128,6 +128,10 @@ def _source_run(
     cache = home / ".cache"
     cache.mkdir()
     (cache / "blob").write_text("x" * 512, encoding="utf-8")
+    # The rollout's cwd, which the bookend's tasks inherit the way they inherit the home.
+    work = source_dir / "work"
+    work.mkdir()
+    (work / "helper.py").write_text("def batch_get(ids):\n    ...\n", encoding="utf-8")
     source_cell = replace(cell, eval_context="cold")
     ctx = RunContext(
         cell=source_cell,
@@ -211,6 +215,7 @@ def _wire_fakes(
     def fake_run_leg(ctx_arg: RunContext, **kw: object) -> LegRecord:
         idx = int(kw["task_idx"])  # type: ignore[arg-type]
         home = Path(kw["home"])  # type: ignore[arg-type]
+        work = Path(kw["workdir"])  # type: ignore[arg-type]
         launches[idx] = {
             "session_id": kw["session_id"],
             "resume": kw["resume"],
@@ -221,6 +226,9 @@ def _wire_fakes(
             "transcript_in_copy": (
                 home / ".claude/projects/-work" / f"{_SID}.jsonl"
             ).is_file(),
+            # What the task's cwd held when the leg started. Read here because the copy is
+            # discarded the moment the task ends.
+            "work_at_launch": sorted(p.relative_to(work).as_posix() for p in work.rglob("*")),
         }
         return LegRecord(
             leg=idx,
@@ -373,6 +381,50 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
     assert len(published["paired"]) == 3
     assert all(p["reward_delta"] == pytest.approx(0.75) for p in published["paired"])
     assert published["manifest"]["rebookend"]["rebookend_of"] == "source-run-20260101T000000Z"
+
+
+def test_the_bookend_inherits_the_source_cwd_and_leaves_it_untouched(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A bookend is a NEW run over an archived source, so the source's ``/work`` reaches its exam
+    by the route its home already takes: snapshotted once under the hold, copied per task off the
+    snapshot, written back never. What the rollout built in its cwd is what its held-out sessions
+    read, and the archive stays the record of what the rollout did."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    before = _fingerprint(source_dir)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+    wired_leg = runner.run_leg
+
+    def writing_leg(ctx_arg, **kw):
+        record = wired_leg(ctx_arg, **kw)
+        # What a held-out session writes into its cwd, which must reach neither the snapshot it
+        # was copied from nor the archive behind that.
+        (Path(kw["workdir"]) / "the-exam-wrote-this.py").write_text("x", encoding="utf-8")
+        return record
+
+    monkeypatch.setattr(runner, "run_leg", writing_leg)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    assert set(launches) == {0, 1, 2}
+    for record in launches.values():
+        assert record["work_at_launch"] == ["helper.py"]
+    # The archive is byte-identical, its /work included.
+    assert _fingerprint(source_dir) == before
+    # And so is the run's own snapshot of it, the one every task copied from.
+    new_run = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir())
+    assert _fingerprint(new_run / "work") == {
+        "helper.py": hashlib.sha256(b"def batch_get(ids):\n    ...\n").hexdigest()
+    }
 
 
 def test_rebookend_refuses_a_source_without_a_terminus(tmp_path: Path, monkeypatch) -> None:
