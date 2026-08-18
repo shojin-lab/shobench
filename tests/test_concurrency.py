@@ -4,10 +4,16 @@ The floor is the whole design, so these tests are mostly about where it stops. A
 tasks sealed in the order they were pulled reads as unknown, never as sequential, because that
 record is equally consistent with an agent holding eight tasks and finishing them in turn. A
 seal out of pull order is the case the record does settle, and a lease with no result row at all
-is the case it settles only as far as the leg record reaches.
+is the case it settles only as far as a leg record or a replay of its queue position reaches.
 
-The fixtures are the shapes shogym writes: a dispense record carrying the lease and the moment
-it was handed out, and a result row per seal, appended in seal order.
+The floor has to hold in both directions, so the cases that must NOT read as overlap are here
+beside the ones that must: a lease its replay proves was over, a one-slot ceiling, and the
+trailing drained rows a saturated ending leaves, which are bracketed rather than assigned.
+
+The fixtures are the shapes shogym writes: a dispense record carrying the lease, its queue
+position and the moment it was handed out, and a result row per seal, appended in seal order.
+One case is taken from a real ``TaskStream`` instead, because the trailing-row shape is the one
+worth checking against the writer rather than against a belief about it.
 """
 
 from __future__ import annotations
@@ -23,11 +29,11 @@ from shobench.concurrency import find_runs, render_table, run_concurrency, strea
 CEILING = 8
 
 
-def _dispense(seq: int, at: float) -> dict:
+def _dispense(seq: int, at: float, position: int | None = None) -> dict:
     return {
         "lease": f"lease-{seq:04d}",
         "seq": seq,
-        "position": seq - 1,
+        "position": seq - 1 if position is None else position,
         "env": "toy",
         "task_idx": seq,
         "dispensed_at": at,
@@ -36,11 +42,11 @@ def _dispense(seq: int, at: float) -> dict:
     }
 
 
-def _result(seq: int, closure: str = "sealed") -> dict:
+def _result(seq: int, closure: str = "sealed", position: int | None = None) -> dict:
     return {
         "seq": seq,
         "lease": f"lease-{seq:04d}",
-        "position": seq - 1,
+        "position": seq - 1 if position is None else position,
         "env": "toy",
         "task_idx": seq,
         "closure": closure,
@@ -64,12 +70,13 @@ def _run(
     results: list[dict],
     phase: str = "rollout",
     legs: list[dict] | None = None,
+    ceiling: int = CEILING,
 ) -> Path:
     run_dir = tmp_path / "run"
     _write_jsonl(run_dir / phase / "dispenses.jsonl", dispenses)
     _write_jsonl(run_dir / phase / "results.jsonl", results)
     (run_dir / "manifest.json").write_text(
-        json.dumps({"run_id": "toy-run", "cell": {"max_in_flight": CEILING}}), encoding="utf-8"
+        json.dumps({"run_id": "toy-run", "cell": {"max_in_flight": ceiling}}), encoding="utf-8"
     )
     if legs is not None:
         (run_dir / "legs.json").write_text(json.dumps(legs), encoding="utf-8")
@@ -103,6 +110,19 @@ def test_a_stream_that_dispensed_one_task_is_provably_sequential(tmp_path):
     assert row.max_open == 1
 
 
+def test_a_one_slot_ceiling_is_provably_sequential(tmp_path):
+    """One slot serves one lease, whatever the seal order leaves open to interpretation."""
+    run_dir = _run(
+        tmp_path,
+        dispenses=[_dispense(1, 100.0), _dispense(2, 200.0)],
+        results=[_result(1), _result(2)],
+        ceiling=1,
+    )
+    row = _rollout(run_dir)
+    assert row.max_in_flight == 1
+    assert row.strictly_sequential is True
+
+
 def test_a_seal_out_of_pull_order_proves_two_leases_were_open(tmp_path):
     """Task 2 sealed after task 3, so it was open across task 3's whole life."""
     run_dir = _run(
@@ -117,8 +137,8 @@ def test_a_seal_out_of_pull_order_proves_two_leases_were_open(tmp_path):
     assert row.never_sealed == 0
 
 
-def test_displacement_is_counted_apart_from_the_closing_drain(tmp_path):
-    """Both end in the same closure, so the closing drain is the trailing block and no more."""
+def test_a_forced_row_above_an_earned_one_is_certainly_a_displacement(tmp_path):
+    """The close claims every live task in one pass, so nothing is earned after it begins."""
     run_dir = _run(
         tmp_path,
         dispenses=[_dispense(seq, 100.0 * seq) for seq in range(1, 5)],
@@ -130,9 +150,38 @@ def test_displacement_is_counted_apart_from_the_closing_drain(tmp_path):
         ],
     )
     row = _rollout(run_dir)
-    assert row.displaced == 1
-    assert row.drained_at_close == 1
+    assert row.drained == 2
+    assert (row.displaced_at_least, row.displaced_at_most) == (1, 2)
     assert row.strictly_sequential is False
+
+
+def test_a_saturated_ending_reports_displacement_as_a_range(tmp_path):
+    """A stream that ends holding a full registry mixes both causes in its trailing rows, and
+    only the ceiling bounds how many of them the close can account for."""
+    run_dir = _run(
+        tmp_path,
+        dispenses=[_dispense(seq, 100.0 * seq) for seq in range(1, 4)],
+        results=[_result(seq, closure="drained") for seq in (1, 2, 3)],
+        ceiling=2,
+    )
+    row = _rollout(run_dir)
+    assert row.drained == 3
+    assert (row.displaced_at_least, row.displaced_at_most) == (1, 3)
+
+
+def test_without_a_ceiling_the_trailing_rows_bound_nothing(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_jsonl(
+        run_dir / "rollout" / "dispenses.jsonl", [_dispense(seq, 100.0 * seq) for seq in (1, 2)]
+    )
+    _write_jsonl(
+        run_dir / "rollout" / "results.jsonl",
+        [_result(seq, closure="drained") for seq in (1, 2)],
+    )
+    (run_dir / "manifest.json").write_text(json.dumps({"run_id": "toy-run"}), encoding="utf-8")
+    (row,) = run_concurrency(run_dir)
+    assert row.max_in_flight is None
+    assert (row.displaced_at_least, row.displaced_at_most) == (0, 2)
 
 
 def test_a_lease_with_no_result_row_stays_open_when_nothing_says_when_it_ended(tmp_path):
@@ -141,6 +190,40 @@ def test_a_lease_with_no_result_row_stays_open_when_nothing_says_when_it_ended(t
         tmp_path,
         dispenses=[_dispense(1, 100.0), _dispense(2, 200.0), _dispense(3, 300.0)],
         results=[_result(1), _result(3)],
+    )
+    row = _rollout(run_dir)
+    assert row.never_sealed == 1
+    assert row.max_open == 2
+    assert row.strictly_sequential is False
+
+
+def test_a_replayed_position_bounds_the_lease_it_abandoned(tmp_path):
+    """Only a reopened stream replays a position, and it reopens with an empty registry, so the
+    abandoned lease was over before the replay went out. No leg file is needed to say so."""
+    run_dir = _run(
+        tmp_path,
+        dispenses=[_dispense(1, 100.0, position=0), _dispense(2, 200.0, position=0)],
+        results=[_result(2, position=0)],
+    )
+    row = _rollout(run_dir)
+    assert row.never_sealed == 1
+    assert row.max_open == 1
+    assert row.mean_open_at_pull == 0.0
+    assert row.strictly_sequential is True
+
+
+def test_a_replay_bounds_an_abandoned_lease_without_ending_the_ones_beside_it(tmp_path):
+    """The replay closes the lease it replaced and nothing else, so a genuine overlap somewhere
+    else in the same record still reads as one."""
+    run_dir = _run(
+        tmp_path,
+        dispenses=[
+            _dispense(1, 100.0, position=0),
+            _dispense(2, 200.0, position=1),
+            _dispense(3, 300.0, position=0),
+            _dispense(4, 400.0, position=2),
+        ],
+        results=[_result(2, position=1), _result(4, position=2), _result(3, position=0)],
     )
     row = _rollout(run_dir)
     assert row.never_sealed == 1
@@ -213,6 +296,18 @@ def test_the_table_says_the_numbers_are_floors(tmp_path):
     assert "unknown" in rendered
 
 
+def test_the_table_renders_an_unsettled_displacement_count_as_a_range(tmp_path):
+    run_dir = _run(
+        tmp_path,
+        dispenses=[_dispense(seq, 100.0 * seq) for seq in range(1, 4)],
+        results=[_result(seq, closure="drained") for seq in (1, 2, 3)],
+        ceiling=2,
+    )
+    rendered = render_table(run_concurrency(run_dir))
+    assert "1..3" in rendered
+    assert "a range wherever the record cannot separate them" in rendered
+
+
 def test_the_cli_serves_it_read_only(tmp_path, capsys):
     run_dir = _run(
         tmp_path,
@@ -226,6 +321,8 @@ def test_the_cli_serves_it_read_only(tmp_path, capsys):
     assert phase["max_open"] == 2
     assert phase["max_open_is_floor"] is True
     assert phase["seal_times"] == "unrecorded"
+    assert phase["displaced_at_least"] == 0
+    assert phase["displaced_at_most"] == 0
 
 
 def test_an_empty_target_is_reported_rather_than_rendered(tmp_path, capsys):
@@ -242,3 +339,39 @@ def test_a_stream_alone_can_be_read(tmp_path):
     assert stream.max_open == 2
     assert stream.sealed == 2
     assert stream.strictly_sequential is False
+
+
+def test_a_real_saturated_stream_is_read_the_way_shogym_wrote_it(tmp_path):
+    """The shape the range exists for, taken from a real stream rather than a hand-built file.
+
+    Three pulls into two slots is one displacement at the third pull and two tasks the close
+    drains, and shogym records all three under the one closure. The reader may not report the
+    split as though the file held it, and its lower bound has to find the displacement.
+    """
+    import asyncio
+
+    import shogym
+    from shogym.serve import Immediate, TaskRef, TaskStream
+
+    prov = tmp_path / "run" / "rollout"
+    prov.mkdir(parents=True)
+
+    async def saturate() -> None:
+        stream = TaskStream(
+            shogym.make,
+            [TaskRef("wordle_v1", index) for index in range(3)],
+            prov_dir=prov,
+            feedback=Immediate(),
+            max_in_flight=2,
+        )
+        async with stream:
+            for _ in range(3):
+                await stream.get_task()
+
+    asyncio.run(saturate())
+    (tmp_path / "run" / "manifest.json").write_text(
+        json.dumps({"run_id": "toy-run", "cell": {"max_in_flight": 2}}), encoding="utf-8"
+    )
+    row = _rollout(tmp_path / "run")
+    assert row.drained == 3
+    assert (row.displaced_at_least, row.displaced_at_most) == (1, 3)

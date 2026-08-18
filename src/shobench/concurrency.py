@@ -28,12 +28,16 @@ The time-weighted mean the same question would want is not among the numbers, fo
 reason: weighting by time needs the interval a lease was open, and the close half of that
 interval is what the record does not hold. ``mean_open_at_pull`` stands in for it, over the
 instants the record does stamp: how many tasks the agent already had open each time it pulled.
+
+The tasks a pull force-ended are bracketed rather than counted, because that ending and the one
+the stream's close performs are written under a single closure name. A run that finishes holding
+a full registry mixes the two in its trailing rows, so ``displaced`` is reported as the range
+the record and the ceiling force and never as an exact number the file cannot support.
 """
 
 from __future__ import annotations
 
 import argparse
-import bisect
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -49,6 +53,11 @@ LEGS_FILE = "legs.json"
 # TaskStream.aclose), so the two are told apart by where the row sits, not by what it says.
 FORCED_CLOSURE = "drained"
 
+# The closures only the agent's own call produces. `aclose` claims every unsettled task in the
+# critical section that closes the stream, so no task can reach one of these after the closing
+# drain has begun: a row carrying one proves every forced row above it was ended at a pull.
+EARNED_CLOSURES = frozenset({"sealed", "aborted"})
+
 
 @dataclass(frozen=True)
 class StreamConcurrency:
@@ -59,8 +68,12 @@ class StreamConcurrency:
     leases that were open at different times.
 
     ``never_sealed`` counts leases the record holds a dispense for and no result row: the stream
-    died holding them. They are open in the floor from their dispense until the leg that
-    dispensed them ended, and for the whole timeline when no leg record says when that was.
+    died holding them. Their close is bounded by whichever of two records reaches them, the leg
+    that dispensed them ending or their queue position being replayed, and where neither does
+    they stay open for the rest of the timeline.
+
+    ``displaced_at_least`` and ``displaced_at_most`` bracket the tasks a pull force-ended,
+    because displacement and the closing drain are one closure name (see :func:`_drain_split`).
     """
 
     prov_dir: str
@@ -68,8 +81,9 @@ class StreamConcurrency:
     sealed: int
     max_open: int
     mean_open_at_pull: float
-    displaced: int
-    drained_at_close: int
+    drained: int
+    displaced_at_least: int
+    displaced_at_most: int
     never_sealed: int
     strictly_sequential: bool | None
 
@@ -91,8 +105,9 @@ class PhaseConcurrency:
     max_in_flight: int | None
     max_open: int
     mean_open_at_pull: float
-    displaced: int
-    drained_at_close: int
+    drained: int
+    displaced_at_least: int
+    displaced_at_most: int
     never_sealed: int
     strictly_sequential: bool | None
 
@@ -107,28 +122,38 @@ class PhaseConcurrency:
             "max_open": self.max_open,
             "max_open_is_floor": True,
             "mean_open_at_pull": self.mean_open_at_pull,
-            "displaced": self.displaced,
-            "drained_at_close": self.drained_at_close,
+            "drained": self.drained,
+            "displaced_at_least": self.displaced_at_least,
+            "displaced_at_most": self.displaced_at_most,
             "never_sealed": self.never_sealed,
             "strictly_sequential": self.strictly_sequential,
         }
 
 
-def _drain_split(closures: Sequence[str]) -> tuple[int, int]:
-    """Split the forced closures into the ones a pull caused and the ones the close did.
+def _drain_split(closures: Sequence[str], ceiling: int | None) -> tuple[int, int, int]:
+    """Bracket the forced closures a pull caused, as ``(total, at_least, at_most)``.
 
-    ``aclose`` seals every still-live task in one pass and nothing is dispensed after it, so the
-    closing drain is the trailing block of the file and a forced closure anywhere above it was a
-    pull arriving at capacity. The one case the record cannot separate is a displacement by the
-    final pull whose task then ended in the closing drain too, which reads here as one more
-    close drain.
+    Displacement and the closing drain are one closure name, and the record does not separate
+    them. What it does settle is a boundary and a ceiling. A row carrying a closure the agent
+    earned proves the stream was still serving when it landed, so every forced row above the
+    last of those was ended by a pull. Below it the two causes are mixed, and only the registry
+    bounds them: the live set never exceeds ``max_in_flight``, so at most that many of the
+    trailing forced rows can be the closing drain and the rest were pulls.
+
+    A run at capacity that ends holding a full registry is exactly where the trailing block
+    stops being readable as the close alone, and it is the common shape rather than a rare one.
     """
-    at_close = 0
-    for closure in reversed(closures):
-        if closure != FORCED_CLOSURE:
+    boundary = 0
+    for index in range(len(closures) - 1, -1, -1):
+        if closures[index] in EARNED_CLOSURES:
+            boundary = index + 1
             break
-        at_close += 1
-    return sum(1 for closure in closures if closure == FORCED_CLOSURE) - at_close, at_close
+    above = sum(1 for closure in closures[:boundary] if closure == FORCED_CLOSURE)
+    trailing = sum(1 for closure in closures[boundary:] if closure == FORCED_CLOSURE)
+    at_least = above + (max(0, trailing - ceiling) if ceiling is not None else 0)
+    # A pull and the close are the only two producers of this closure, so every row carrying it
+    # is a candidate and the whole count is the upper bound.
+    return above + trailing, at_least, above + trailing
 
 
 def _floor_timeline(
@@ -143,10 +168,18 @@ def _floor_timeline(
     off this timeline floors rather than estimates. A close is emitted as soon as both bounds
     allow and never past the next dispense, so a lease that could have closed before the next
     pull does.
+
+    A lease with no result row closes at the bound ``unsealed_close`` carries for it, and it is
+    merged in AHEAD of everything sharing its instant rather than behind. The bound is the moment
+    something else proves the lease was already over, and a replay of its queue position is
+    exactly such a moment stamped at the instant of another dispense, so trailing that dispense
+    would invent the one overlap the bound rules out. Its own open is the one event it may never
+    precede.
     """
     opened = dict(opens)
     order = [lease for lease in seal_order if lease in opened]
     events: list[tuple[float, int]] = []
+    opened_at_index: dict[str, int] = {}
     live: set[str] = set()
     i = j = 0
     previous = float("-inf")
@@ -162,6 +195,7 @@ def _floor_timeline(
                 continue
         if i < len(opens):
             lease, at = opens[i]
+            opened_at_index[lease] = len(events)
             events.append((at, 1))
             live.add(lease)
             i += 1
@@ -172,16 +206,21 @@ def _floor_timeline(
             j += 1
             continue
         break
-    times = [event[0] for event in events]
-    for lease in live:
-        at = unsealed_close.get(lease)
-        if at is None:
-            continue
-        at = max(at, opened[lease])
-        where = bisect.bisect_right(times, at)
-        events.insert(where, (at, -1))
-        times.insert(where, at)
-    return events
+
+    bounded = sorted(
+        (max(unsealed_close[lease], opened[lease]), opened_at_index[lease])
+        for lease in live
+        if lease in unsealed_close
+    )
+    merged: list[tuple[float, int]] = []
+    k = 0
+    for index, event in enumerate(events):
+        while k < len(bounded) and bounded[k][0] <= event[0] and bounded[k][1] < index:
+            merged.append((bounded[k][0], -1))
+            k += 1
+        merged.append(event)
+    merged += [(at, -1) for at, _ in bounded[k:]]
+    return merged
 
 
 def _leg_windows(run_dir: Path, phase: str) -> list[tuple[float, float]]:
@@ -201,8 +240,44 @@ def _leg_windows(run_dir: Path, phase: str) -> list[tuple[float, float]]:
     return sorted(windows)
 
 
+def _abandoned_closes(
+    records: Sequence[dict[str, Any]],
+    sealed: set[str],
+    leg_windows: Sequence[tuple[float, float]],
+) -> dict[str, float]:
+    """When each lease with no result row can be shown to have ended.
+
+    Two records reach it, and the earlier of the two is the one to take. Its own session ending
+    is one: a lease cannot outlive the process holding it. Its queue position being dispensed
+    again is the other, and it is the stronger of the two because it needs no leg file at all.
+    Only a reopened stream replays a position, ``resume`` skipping the ones that already have a
+    settled row, and a reopened stream begins with an empty registry, so the earlier lease was
+    over before the replay was handed out.
+
+    A lease neither record reaches keeps no close here, which leaves it open for the rest of the
+    timeline rather than closed on a guess.
+    """
+    closes: dict[str, float] = {}
+    replayed_at: dict[int, float] = {}
+    for record in reversed(records):
+        position = int(record["position"])
+        lease, at = str(record["lease"]), float(record["dispensed_at"])
+        if lease not in sealed:
+            bounds = [ended for started, ended in leg_windows if started <= at <= ended]
+            if position in replayed_at:
+                bounds.append(replayed_at[position])
+            if bounds:
+                closes[lease] = min(bounds)
+        replayed_at[position] = at
+    return closes
+
+
 def stream_concurrency(
-    prov_dir: Path, *, label: str, leg_windows: Sequence[tuple[float, float]] = ()
+    prov_dir: Path,
+    *,
+    label: str,
+    max_in_flight: int | None = None,
+    leg_windows: Sequence[tuple[float, float]] = (),
 ) -> StreamConcurrency:
     """Read one provenance directory and floor its concurrency. Reads only."""
     from shogym.serve import read_dispenses, read_results
@@ -211,19 +286,12 @@ def stream_concurrency(
     rows = read_results(prov_dir)
     opens = [(str(record["lease"]), float(record["dispensed_at"])) for record in records]
     sealed = {row.lease for row in rows}
-    # A lease with no result row outlived nothing: the process holding it died, and a resumed
-    # stream starts with an empty registry. So it is open until its own session ended, which is
-    # the leg record's business rather than the stream's.
-    unsealed_close: dict[str, float] = {}
-    for lease, at in opens:
-        if lease in sealed:
-            continue
-        for started, ended in leg_windows:
-            if started <= at <= ended:
-                unsealed_close[lease] = ended
-                break
 
-    events = _floor_timeline(opens, [row.lease for row in rows], unsealed_close)
+    events = _floor_timeline(
+        opens,
+        [row.lease for row in rows],
+        _abandoned_closes(records, sealed, leg_windows),
+    )
     open_now = 0
     max_open = 0
     at_pull: list[int] = []
@@ -233,11 +301,15 @@ def stream_concurrency(
         open_now += delta
         max_open = max(max_open, open_now)
 
-    displaced, drained_at_close = _drain_split([row.closure for row in rows])
+    drained, at_least, at_most = _drain_split([row.closure for row in rows], max_in_flight)
+    # One slot serves one lease, and one queue position is dispensed once per stream, so a
+    # directory holding replays of a single position holds leases from streams that never
+    # overlapped. Either way no second lease existed for a first to be open beside.
+    positions = {int(record["position"]) for record in records}
     sequential: bool | None = None
     if max_open > 1:
         sequential = False
-    elif len(opens) <= 1:
+    elif max_in_flight == 1 or len(positions) <= 1:
         sequential = True
     return StreamConcurrency(
         prov_dir=label,
@@ -245,8 +317,9 @@ def stream_concurrency(
         sealed=len(rows),
         max_open=max_open,
         mean_open_at_pull=(sum(at_pull) / len(at_pull)) if at_pull else 0.0,
-        displaced=displaced,
-        drained_at_close=drained_at_close,
+        drained=drained,
+        displaced_at_least=at_least,
+        displaced_at_most=at_most,
         never_sealed=sum(1 for lease, _ in opens if lease not in sealed),
         strictly_sequential=sequential,
     )
@@ -295,7 +368,10 @@ def run_concurrency(run_dir: Path) -> list[PhaseConcurrency]:
         windows = _leg_windows(run_dir, phase)
         streams = [
             stream_concurrency(
-                prov_dir, label=str(prov_dir.relative_to(run_dir)), leg_windows=windows
+                prov_dir,
+                label=str(prov_dir.relative_to(run_dir)),
+                max_in_flight=ceiling,
+                leg_windows=windows,
             )
             for prov_dir in prov_dirs
         ]
@@ -310,8 +386,9 @@ def run_concurrency(run_dir: Path) -> list[PhaseConcurrency]:
                 max_in_flight=ceiling,
                 max_open=max(stream.max_open for stream in streams),
                 mean_open_at_pull=(weighted / pulls) if pulls else 0.0,
-                displaced=sum(stream.displaced for stream in streams),
-                drained_at_close=sum(stream.drained_at_close for stream in streams),
+                drained=sum(stream.drained for stream in streams),
+                displaced_at_least=sum(stream.displaced_at_least for stream in streams),
+                displaced_at_most=sum(stream.displaced_at_most for stream in streams),
                 never_sealed=sum(stream.never_sealed for stream in streams),
                 strictly_sequential=_roll_up([s.strictly_sequential for s in streams]),
             )
@@ -334,6 +411,10 @@ def _sequential(value: bool | None) -> str:
     return "unknown" if value is None else ("yes" if value else "no")
 
 
+def _bracket(at_least: int, at_most: int) -> str:
+    return str(at_least) if at_least == at_most else f"{at_least}..{at_most}"
+
+
 def render_table(rows: Sequence[PhaseConcurrency]) -> str:
     header = (
         "run",
@@ -343,8 +424,8 @@ def render_table(rows: Sequence[PhaseConcurrency]) -> str:
         "ceiling",
         "max open",
         "open@pull",
+        "drained",
         "displaced",
-        "at close",
         "unsealed",
         "sequential",
     )
@@ -357,8 +438,8 @@ def render_table(rows: Sequence[PhaseConcurrency]) -> str:
             "?" if row.max_in_flight is None else str(row.max_in_flight),
             f">={row.max_open}",
             f">={row.mean_open_at_pull:.2f}",
-            str(row.displaced),
-            str(row.drained_at_close),
+            str(row.drained),
+            _bracket(row.displaced_at_least, row.displaced_at_most),
             str(row.never_sealed),
             _sequential(row.strictly_sequential),
         )
@@ -381,9 +462,11 @@ def render_table(rows: Sequence[PhaseConcurrency]) -> str:
         "sequential out and unknown where the record cannot settle it; only a stream that could "
         "not have held two leases reads yes.",
         "",
-        "'displaced' counts tasks the stream force-ended because a pull arrived at capacity, and "
-        "'at close' the ones it ended when the stream closed. Both are recorded under the same "
-        "closure. 'unsealed' counts dispensed tasks with no result row at all.",
+        "'drained' counts the tasks the stream ended rather than the agent. A pull arriving at "
+        "capacity and the closing drain are recorded under that one closure, so 'displaced' is "
+        "a range wherever the record cannot separate them: its low end is what the trailing "
+        "rows and the ceiling force, its high end is every drained row. 'unsealed' counts "
+        "dispensed tasks with no result row at all.",
     ]
     return "\n".join(lines)
 
