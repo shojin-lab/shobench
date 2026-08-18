@@ -10,6 +10,7 @@
     shobench rerun-eval --run <run-dir> --go # finish an eval_after that lost tasks
     shobench rebookend --run <run-dir> --go # a resumed eval_after for an existing run, as a new run
     shobench report [results/]              # the summary table
+    shobench concurrency <run-dir> [...]    # how many leases each phase held open at once
 
 ``--go`` is the whole safety story: every command that spends prints its plan and exits unless
 it is present. Nothing here launches the matrix; a cell is run one at a time by name. ``stop``
@@ -27,7 +28,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from shobench import credentials, report, runner, tau2_data
+from shobench import concurrency, credentials, report, runner, tau2_data
 from shobench.config import load_all_cells, load_cell_by_name, load_instruction, repo_root
 from shobench.containers import AGENT_IMAGE, NETNS_IMAGE, CellSandbox, build_image, daemon_available
 from shobench.egress import EGRESS_IMAGE
@@ -1106,6 +1107,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     rep.add_argument("results", nargs="?", default="results")
     rep.add_argument("--format", choices=["table", "json"], default="table")
     rep.set_defaults(func=lambda a: report.main([str(a.results), "--format", a.format]))
+
+    conc = sub.add_parser("concurrency", help="how many leases a run held open at once")
+    conc.add_argument("runs", nargs="+")
+    conc.add_argument("--format", choices=["table", "json"], default="table")
+    conc.set_defaults(
+        func=lambda a: concurrency.main([*a.runs, "--format", a.format]),
+    )
 
     args = parser.parse_args(argv)
     return int(args.func(args))
