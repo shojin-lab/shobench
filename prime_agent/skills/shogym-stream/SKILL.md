@@ -1,6 +1,6 @@
 ---
 name: shogym-stream
-description: Play a stream of shogym evaluation tasks served over MCP. Pull a task with get_task, complete it with the tools that task lists, end it, and repeat until the stream is exhausted. Use whenever you are asked to work through a queue of shogym tasks or a task server.
+description: Play a stream of shogym evaluation tasks served over MCP. Pull tasks with get_task, complete them with the tools each task lists, and end them. Use whenever you are asked to work through a queue of shogym tasks or a task server.
 ---
 
 # shogym-stream
@@ -31,11 +31,13 @@ rather not depend on it: `value if isinstance(value, dict) else json.loads(value
 2. `tools` lists the tools that task published, by name and schema. They are methods on this
    same module: `await shogym_stream.<name>(**kwargs)`. Nothing else is available for the task,
    and their results are the JSON strings above.
-3. One of them ends the episode. Call it when you are finished; then go back to step 1.
-4. Stop when `get_task()` reports `done`.
+3. One of them ends the episode.
+4. `get_task()` reports `done` once the queue is empty.
 
 Do not assume tool names between tasks; read `tools` each time. `queue_info()` reports
-`{remaining, consumed, in_flight}` if you want to know how much is left.
+`{remaining, consumed, in_flight}` if you want to know how much is left. Every bound method
+carries the server's own description of that tool, including what a call costs; read one with
+`help(shogym_stream.get_task)`.
 
 ## Failures
 
