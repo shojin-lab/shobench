@@ -128,6 +128,15 @@ def _source_run(
     cache = home / ".cache"
     cache.mkdir()
     (cache / "blob").write_text("x" * 512, encoding="utf-8")
+    # The rollout's cwd, with the three link shapes a host reads differently from the container:
+    # one absolute container path, one leaving /work whose host target does exist (the source's
+    # own home), and one in-tree alias.
+    work = source_dir / "work"
+    work.mkdir()
+    (work / "helper.py").write_text("def batch_get(ids):\n    ...\n", encoding="utf-8")
+    (work / "tool").symlink_to("/home/oai/tool")
+    (work / "from-home").symlink_to("../home/.claude/projects/-work/memory/note.md")
+    (work / "alias.py").symlink_to("helper.py")
     source_cell = replace(cell, eval_context="cold")
     ctx = RunContext(
         cell=source_cell,
@@ -211,6 +220,7 @@ def _wire_fakes(
     def fake_run_leg(ctx_arg: RunContext, **kw: object) -> LegRecord:
         idx = int(kw["task_idx"])  # type: ignore[arg-type]
         home = Path(kw["home"])  # type: ignore[arg-type]
+        work = Path(kw["workdir"])  # type: ignore[arg-type]
         launches[idx] = {
             "session_id": kw["session_id"],
             "resume": kw["resume"],
@@ -221,6 +231,8 @@ def _wire_fakes(
             "transcript_in_copy": (
                 home / ".claude/projects/-work" / f"{_SID}.jsonl"
             ).is_file(),
+            # Read here because the copy is discarded the moment the task ends.
+            "work_at_launch": sorted(p.relative_to(work).as_posix() for p in work.rglob("*")),
         }
         return LegRecord(
             leg=idx,
@@ -373,6 +385,69 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
     assert len(published["paired"]) == 3
     assert all(p["reward_delta"] == pytest.approx(0.75) for p in published["paired"])
     assert published["manifest"]["rebookend"]["rebookend_of"] == "source-run-20260101T000000Z"
+
+
+def test_the_bookend_inherits_the_source_cwd_and_leaves_it_untouched(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The source's ``/work`` reaches the bookend's exam by the route its home already takes:
+    snapshotted once under the hold, copied per task off the snapshot, written back never."""
+    cell, split = _synthetic_definitions(tmp_path)
+    source_dir = _source_run(tmp_path, cell, split)
+    before = _fingerprint(source_dir)
+    launches: dict[int, dict] = {}
+    _wire_fakes(monkeypatch, cell, split, launches)
+    wired_leg = runner.run_leg
+    task_links: dict[int, dict[str, Path]] = {}
+
+    def writing_leg(ctx_arg, **kw):
+        record = wired_leg(ctx_arg, **kw)
+        work = Path(kw["workdir"])
+        task_links[int(kw["task_idx"])] = {
+            p.name: p.readlink() for p in work.iterdir() if p.is_symlink()
+        }
+        # A held-out session's own write, which must reach neither the snapshot it was copied
+        # from nor the archive behind that.
+        (work / "the-exam-wrote-this.py").write_text("x", encoding="utf-8")
+        return record
+
+    monkeypatch.setattr(runner, "run_leg", writing_leg)
+
+    asyncio.run(
+        runner.rebookend_run(
+            source_dir,
+            runs_dir=tmp_path / "runs",
+            results_dir=tmp_path / "results",
+            capture_egress=False,
+        )
+    )
+
+    assert set(launches) == {0, 1, 2}
+    for record in launches.values():
+        assert record["work_at_launch"] == ["alias.py", "from-home", "helper.py", "tool"]
+    # Every link arrived as a link, naming what it named in the archive. Resolved on the host as
+    # the HOME snapshot resolves its own, the container-absolute one would have dropped as
+    # dangling, the one leaving /work would have refused this bookend, and the alias would have
+    # become a second independent file.
+    for links in task_links.values():
+        assert links == {
+            "tool": Path("/home/oai/tool"),
+            "from-home": Path("../home/.claude/projects/-work/memory/note.md"),
+            "alias.py": Path("helper.py"),
+        }
+    # The archive is byte-identical, its /work included.
+    assert _fingerprint(source_dir) == before
+    # And so is the run's own snapshot, the one every task copied from.
+    snapshot = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir()) / "work"
+    assert sorted(p.name for p in snapshot.iterdir()) == [
+        "alias.py",
+        "from-home",
+        "helper.py",
+        "tool",
+    ]
+    assert _fingerprint(snapshot)["helper.py"] == hashlib.sha256(
+        b"def batch_get(ids):\n    ...\n"
+    ).hexdigest()
 
 
 def test_rebookend_refuses_a_source_without_a_terminus(tmp_path: Path, monkeypatch) -> None:

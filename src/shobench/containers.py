@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -174,12 +175,10 @@ class CellSandbox:
         two tasks can run at once without one task's writes reaching the other or the base.
 
         ``workdir`` overrides which host directory is mounted at ``/work``, the cwd every
-        harness runs in. It is the same isolation story as ``home`` and it matters for the same
-        reason: ``/work`` is writable, so concurrent eval tasks sharing one would let task A's
-        file reach task B, and one phase's ``/work`` would leak into the next. Unlike ``home``,
-        ``/work`` is not part of the measured durable self (only the HOME digest is), so an eval
-        task gets a fresh empty directory of its own, discarded with its task HOME, rather than a
-        copy of anything. The rollout keeps the cell's one accumulating ``/work`` (the default).
+        harness runs in. An eval task mounts its own copy of the phase's ``/work``, discarded
+        with its task HOME: sharing one would let task A's file reach task B, and starting from
+        an empty one would measure an agent stripped of what it built there. The rollout keeps
+        the cell's one accumulating ``/work`` (the default).
         """
         # Host paths must be absolute: docker reads a non-absolute ``-v`` source as a named
         # volume, and the default runs/ layout arrives here relative to the invocation cwd.
@@ -257,6 +256,70 @@ def home_inventory(home: Path, *, exclude: DurableFilter) -> list[dict[str, obje
     ]
 
 
+def work_inventory(work: Path) -> list[dict[str, object]]:
+    """Every entry under a rollout's ``/work``, as the container sees it.
+
+    Unfiltered, unlike the HOME inventory beside it: the whole tree is copied into every held-out
+    session, so a projection would publish a digest two runs could share while their sessions
+    read different trees. A link is recorded by its TARGET rather than by what it resolves to,
+    since the link is what crosses and a container-absolute one resolves to nothing on this host;
+    hard links are recorded as alias groups, since two names on one inode behave differently from
+    two copies.
+    """
+    if not work.exists():
+        return []
+    entries = sorted(work.rglob("*"))
+    # An alias only when BOTH names are in this tree: a link count raised from outside it would
+    # make a tree's digest depend on a file the tree does not contain.
+    names: dict[tuple[int, int], list[str]] = {}
+    for path in entries:
+        if path.is_symlink() or not path.is_file():
+            continue
+        info = path.stat()
+        if info.st_nlink > 1:
+            names.setdefault((info.st_dev, info.st_ino), []).append(
+                path.relative_to(work).as_posix()
+            )
+    rows: list[dict[str, object]] = []
+    for path in entries:
+        rel = path.relative_to(work).as_posix()
+        if path.is_symlink():
+            rows.append({"path": rel, "kind": "link", "target": os.readlink(path)})
+        elif path.is_dir():
+            rows.append({"path": rel, "kind": "dir"})
+        elif path.is_file():
+            info = path.stat()
+            row: dict[str, object] = {
+                "path": rel,
+                "kind": "file",
+                "bytes": info.st_size,
+                "sha256": _digest_file(path),
+            }
+            group = names.get((info.st_dev, info.st_ino), [])
+            if len(group) > 1:
+                # The group's first path, so every member of one group says the same thing.
+                row["alias"] = group[0]
+            rows.append(row)
+        else:
+            rows.append({"path": rel, "kind": "other"})
+    return rows
+
+
+# Every field a work inventory row can carry. A field added to a row and not to this tuple is
+# published and unhashed, which is a difference between two trees their digests would call none.
+_WORK_ROW_FIELDS = ("path", "kind", "bytes", "sha256", "target", "alias")
+
+
+def work_digest(work: Path) -> str:
+    """A content hash over the whole ``/work`` tree, entry kinds and link targets included."""
+    digest = hashlib.sha256()
+    for row in work_inventory(work):
+        for field_name in _WORK_ROW_FIELDS:
+            digest.update(str(row.get(field_name, "")).encode("utf-8"))
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def run_relative(path: Path | str, run_dir: Path) -> str:
     """A run-internal path recorded portably: relative to the run directory, in POSIX form.
 
@@ -292,5 +355,7 @@ __all__ = [
     "home_digest",
     "home_inventory",
     "run_relative",
+    "work_digest",
+    "work_inventory",
     "write_json",
 ]

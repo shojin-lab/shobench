@@ -67,6 +67,8 @@ from shobench.containers import (
     image_digest,
     run_relative,
     run_stem,
+    work_digest,
+    work_inventory,
     write_json,
 )
 from shobench.credentials import (
@@ -474,7 +476,7 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
     would land on the far side of it and every prime_agent cell would publish those bytes as
     something the rollout wrote.
     """
-    exclude = ctx.durable
+    digest_of = {key: readers[0] for key, readers in _channel_readers(ctx).items()}
     return {
         "schema": "shobench.manifest/1",
         "run_id": ctx.run_id,
@@ -541,24 +543,23 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
             "forms_watched": ctx.redactor.count,
             "applied_to": ["traces", "legs.json", "manifest.json", "results", "suspension"],
         },
-        # The two channels that persist across a leg and that the agent can write. HOME is the
-        # durable self the benchmark measures. /work is the writable cwd every harness runs in;
-        # it is not the durable self (an eval session gets a fresh empty one, so nothing written
-        # there reaches a later session) but it is persistent and agent-visible for the whole
-        # rollout, and a cell that left a CLAUDE.md or a pile of scripts there used to publish a
-        # manifest that mentioned none of it. Recorded, not scored.
+        # The two channels that persist across a leg and that the agent can write, each read the
+        # way it is used rather than alike (:func:`_channel_readers`). HOME is the durable self
+        # and the only one scored; /work is inherited by every eval task, recorded not scored.
         "home": {
-            "digest_before": home_digest(ctx.sandbox.home, exclude=exclude),
+            "digest_before": digest_of["home"](),
             "digest_after": None,
             "inventory_after": [],
         },
         "work": {
-            "digest_before": home_digest(ctx.sandbox.workdir, exclude=exclude),
+            "digest_before": digest_of["work"](),
             "digest_after": None,
             "inventory_after": [],
             "note": (
                 "the rollout's writable cwd, persistent for the cell and visible to the agent; "
-                "an eval task gets its own empty one, so this reaches no later session"
+                "an eval task starts from a copy of it, so this reaches the held-out sessions. "
+                "Recorded whole, entry by entry with kinds and link targets, unlike the home "
+                "beside it: what is copied is the tree, not the durable subset of it"
             ),
         },
     }
@@ -1020,6 +1021,56 @@ def _copy_task_home(base: Path, dst: Path, *, keep: tuple[str, ...] = ()) -> Non
         shutil.copy2(path, target)
 
 
+def _copy_work_tree(base: Path, dst: Path) -> None:
+    """Copy a rollout's ``/work``, the cwd the exam inherits, as the container saw it.
+
+    The one copier for both copies of this tree, the eval task's and the bookend's snapshot of an
+    archived source: two policies over one tree is how a bookend comes to measure a cwd its source
+    never had. Nothing is filtered, since the rollout is this tree's only writer and leaves none
+    of the session byproducts the durability filter names in a HOME.
+
+    Links are copied as links, unlike the HOME snapshot (``_materialize_home``, which resolves
+    each link on the HOST into the bytes it names). These are CONTAINER paths:
+    ``/work/tool -> /home/oai/tool`` is ordinary in a rollout and names nothing on a host,
+    resolving one would de-alias two names the agent made one, and a link leaving ``/work`` would
+    refuse a source the rollout ran on. Hard links are kept for the same reason, since an agent
+    that linked ``active.py`` to ``helper.py`` edits both by editing either. Preserving them is
+    safe because no host-side writer reaches these trees, which is what materializing protects.
+
+    What is neither a file, a directory, nor a link is left behind: refusing a bookend over a
+    socket would refuse an honest source for an entry that carries no bytes.
+    """
+    # A leftover from a killed attempt is cleared rather than merged, so a re-run of that id
+    # starts from the rollout's cwd and not on top of the dead leg's own writes.
+    shutil.rmtree(dst, ignore_errors=True)
+    dst.mkdir(parents=True, exist_ok=True)
+    if not base.is_dir():
+        return
+    aliased: dict[tuple[int, int], Path] = {}
+    for path in sorted(base.rglob("*")):
+        target = dst / path.relative_to(base)
+        if path.is_symlink():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(os.readlink(path))
+        elif path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif path.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            info = path.stat()
+            key = (info.st_dev, info.st_ino)
+            first = aliased.get(key) if info.st_nlink > 1 else None
+            if first is not None:
+                try:
+                    os.link(first, target)
+                    continue
+                except OSError:
+                    # A destination that cannot hold the link still gets the bytes.
+                    pass
+            elif info.st_nlink > 1:
+                aliased[key] = target
+            shutil.copy2(path, target)
+
+
 def _eval_task_valid_row(prov_dir: Path, idx: int) -> TaskResult | None:
     """The one valid completed row for held-out id ``idx``, or ``None`` when the task is not done.
 
@@ -1252,14 +1303,13 @@ EVAL_LAUNCH_STAGGER_S = 2.0
 class _StaggeredAdmission:
     """Hands the first launches of an eval phase out one at a time, a fixed gap apart.
 
-    It sits AFTER the concurrency gate on purpose. That costs a held slot for the length of the
-    spacing and buys the only property worth having: the first ``first_n`` LAUNCHES are spaced,
-    in the order the gate admitted them, whatever order the coroutines were scheduled in.
-    Spacing ahead of the gate spaces only the coroutines that sleep, and a task that skips the
-    sleep takes a free slot the sleeping ones have not claimed yet: eight tasks at a concurrency
-    of four launched in the order 5, 6, 7, 8, 1, 2, 3, 4, which is an unstaggered first wave
-    wearing reversed membership. Spacing where admission happens cannot be bypassed, because
-    there is no path to a launch that does not pass through it.
+    Taken at the LAUNCH, the last point before a container starts, and the placement is the
+    mechanism: a gap held anywhere earlier spaces setup rather than launches, and setup is
+    unbounded. Ahead of the gate it spaced only the coroutines that slept, and the ones that
+    skipped the sleep took the free slots and launched first; at the gate, with the per-task
+    copies between the gap and the leg, a task that copied quickly launched inside the window of
+    one still copying. Which held-out ids the wave contains is not part of the property, only
+    that the first ``first_n`` launches are a gap apart.
 
     Once ``first_n`` launches have gone through this is a no-op forever. Past the first wave a
     slot opens only when a task finishes, so the launches are already spread by the work itself.
@@ -1330,9 +1380,9 @@ def _preflight_eval_credential(ctx: RunContext) -> None:
 async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     """Serve the held-out split, one session per task, up to N tasks at once.
 
-    Each task gets its own single-task stream on its own port, its own session, its own
-    throwaway copy of the phase's home, and its own throwaway ``/work``, so the one-session-per-task
-    rule is enforced by the server and nothing a task does can reach another task or the base home.
+    Each task gets its own single-task stream on its own port, its own session, and its own
+    throwaway copies of the phase's home and ``/work``, so the one-session-per-task rule is
+    enforced by the server and nothing a task does can reach another task or the base.
     Concurrency is bounded by ``budget.eval_concurrency``; the tasks are independent, so a task that
     fails to run lands unscored (``reconcile`` records the dispense-without-seal) rather than
     sinking the batch, and the reported rows are sorted by task id regardless of finish order.
@@ -1342,7 +1392,8 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     the transcript rides in the task's own home copy, so the forks are independent by the same
     isolation that keeps their writes apart, and each one carries what the rollout still held in
     context, compaction summaries included. Under "cold" (and always for eval_before, which has
-    no conversation to resume) the session is fresh and only the durable channels cross.
+    no conversation to resume) the session is fresh and what crosses is only what the rollout
+    left on disk, in the two copies.
 
     Two things happen before the first container starts, and both exist because a fan-out
     multiplies a single fault by the size of the held-out set. The credential every task will
@@ -1363,9 +1414,12 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
     # Before anything is copied, served or launched: the one credential every task in this phase
     # will carry, refreshed where that is possible and refused where it is already unusable.
     _preflight_eval_credential(ctx)
-    # The home every task copies from: pristine-plus-credential for eval_before, the rollout's
-    # accumulated home for eval_after. It is read only from here on, since tasks write to copies.
+    # The two channels every task copies from. Which state a phase gets is not decided here and
+    # is not read off the phase name: the rollout is the only thing that writes either of them,
+    # and eval_before runs before it, so a baseline copies a credential and an empty cwd. Both
+    # are read only from here on, since tasks write to copies.
     base_home = ctx.sandbox.home
+    base_work = ctx.sandbox.workdir
     # The session every task forks, when this phase carries the rollout's context. Resolved and
     # proven present before anything is copied, served, or launched: a missing session must fail
     # the phase here, loudly, because the axis is a recorded claim about what was measured and a
@@ -1397,11 +1451,6 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
         task_work = phase_dir / "work" / f"task-{idx:05d}"
         task_cfg = phase_dir / "cfg" / f"task-{idx:05d}"
         async with gate:
-            # Spaced inside the gate, where a launch actually becomes a launch. Nothing about the
-            # phase's ordering or its accounting rides on it: the ids are gathered, the rows are
-            # read back by task id, and a task held here runs the same leg against the same
-            # one-task stream a moment later.
-            await admission.wait()
             if usage_limit:
                 return  # a usage limit closed the window; this task waits for the resume
             if ctx.operator_stop.fired.is_set():
@@ -1416,19 +1465,23 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
             shutil.rmtree(prov_dir, ignore_errors=True)
             prov_dir.mkdir(parents=True, exist_ok=True)
             try:
+                # Both trees are copied in a worker thread: this coroutine shares its loop with
+                # the stream server and the drain watcher of every task already launched, and
+                # neither tree is bounded, so an inline copy starves live sessions until it ends.
+                #
                 # A resumed fork's copy also carries the harness's recorded conversations,
                 # which are noise everywhere else; the transcript has to be in the HOME the
                 # harness runs with or there is nothing to reopen.
-                _copy_task_home(
+                await asyncio.to_thread(
+                    _copy_task_home,
                     base_home,
                     task_home,
                     keep=ctx.harness.session_state_dirs if resume_session else (),
                 )
-                # A fresh empty /work of its own, discarded with the home. /work is the writable
-                # cwd every harness runs in and is not part of the measured self, so sharing it
-                # would leak one task's files into another with nothing in the HOME digest to show
-                # it; a private empty directory is the isolation the concurrency needs.
-                task_work.mkdir(parents=True, exist_ok=True)
+                # Its own copy of the phase's /work, discarded with the home. Sharing the
+                # directory would carry the same files and leak one task's writes into another
+                # with nothing in the HOME digest to show it.
+                await asyncio.to_thread(_copy_work_tree, base_work, task_work)
                 # A fresh port per task, so a socket still in TIME_WAIT from a finished task
                 # cannot make another look like a server that refused to start.
                 port = free_port()
@@ -1448,6 +1501,14 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                 # what the grace covers is that harness's own wrap-up after the seal.
                 drained = EarlyEnding()
                 async with stream, _served(stream, port):
+                    # The spacing, taken at the last point before the container starts: what a
+                    # credential race is between is launches, not setup. Nothing between here and
+                    # the leg awaits, so the order legs start in is the order this hands out.
+                    await admission.wait()
+                    if usage_limit or ctx.operator_stop.fired.is_set():
+                        # The window can close during the wave's seconds of spacing, and the
+                        # check at the gate protects the copy rather than the launch.
+                        return
                     watching = asyncio.create_task(
                         _watch_for_drain(
                             stream,
@@ -1511,8 +1572,10 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
             finally:
                 # Discard the task's home and /work the moment it is done, so N concurrent copies
                 # is the ceiling on disk and nothing a task wrote survives to be read by anything.
-                shutil.rmtree(task_home, ignore_errors=True)
-                shutil.rmtree(task_work, ignore_errors=True)
+                # Off the loop like the copies: deleting an unbounded tree stalls it the same
+                # way. Nothing cancels these tasks, so the awaits here run.
+                await asyncio.to_thread(shutil.rmtree, task_home, ignore_errors=True)
+                await asyncio.to_thread(shutil.rmtree, task_work, ignore_errors=True)
 
     pending = _eval_pending_ids(phase_dir, side.task_ids)
     await asyncio.gather(*(one_task(task_id) for task_id in pending))
@@ -3346,6 +3409,28 @@ async def _run_phases(
     return results_path
 
 
+def _channel_readers(
+    ctx: RunContext,
+) -> dict[str, tuple[Callable[[], str], Callable[[], list[dict[str, Any]]]]]:
+    """How each persistent channel is read, digest and inventory together.
+
+    HOME is read through the durability filter and as files only, which is what makes its digest
+    the durable self rather than "did a session happen". ``/work`` is read whole, because that is
+    how the eval copies it: a filtered projection would let two runs publish one digest while
+    their held-out sessions read different trees. Paired here so the two cannot drift apart, and
+    so both callers answer the question the same way.
+    """
+    exclude = ctx.durable
+    home, work = ctx.sandbox.home, ctx.sandbox.workdir
+    return {
+        "home": (
+            lambda: home_digest(home, exclude=exclude),
+            lambda: home_inventory(home, exclude=exclude),
+        ),
+        "work": (lambda: work_digest(work), lambda: work_inventory(work)),
+    }
+
+
 def _snapshot_durable_state(
     ctx: RunContext, manifest: dict[str, Any], *, measured_at: str = "rollout_end"
 ) -> None:
@@ -3363,17 +3448,13 @@ def _snapshot_durable_state(
       rollout's and nothing else's;
     - **eval_after** reads that same post-rollout state through its own throwaway copies.
 
-    Both channels are recorded, but they answer different questions. The HOME digest is the
-    durable self, the thing a later fresh session inherits. ``/work`` is persistent and
-    agent-visible but reaches no later session, so it is inventoried as evidence rather than
-    scored: a rollout that spent its time writing scripts and notes into its cwd should be
-    legible in the record instead of showing up as an agent that did nothing.
+    Both channels are recorded and a later session inherits both, but only the HOME digest is
+    the durable self the cell scores; ``/work`` is inventoried as evidence beside it.
     """
-    exclude = ctx.durable
-    for key, root in (("home", ctx.sandbox.home), ("work", ctx.sandbox.workdir)):
+    for key, (digest, inventory) in _channel_readers(ctx).items():
         channel = manifest.setdefault(key, {"digest_before": None})
-        channel["digest_after"] = home_digest(root, exclude=exclude)
-        channel["inventory_after"] = home_inventory(root, exclude=exclude)
+        channel["digest_after"] = digest()
+        channel["inventory_after"] = inventory()
         channel["changed"] = channel["digest_after"] != channel["digest_before"]
         channel["measured_at"] = measured_at
 
@@ -3381,20 +3462,17 @@ def _snapshot_durable_state(
 def _check_evals_left_the_snapshot_alone(ctx: RunContext, manifest: dict[str, Any]) -> None:
     """Confirm at publish time that no eval phase moved either channel after the rollout.
 
-    An eval task runs against its own copy of the HOME and its own empty ``/work``, so this is
-    an invariant rather than a measurement. Checking it is what turns a future change that
-    quietly shares one of them into a recorded fact instead of a rollout credited with writes it
-    did not make. It never rewrites the snapshot: the rollout's terminus is the measurement, and
-    a mismatch is reported beside it rather than folded into it.
+    An eval task runs against copies of both the HOME and ``/work``, so this is an invariant
+    rather than a measurement. Checking it is what turns a future change that quietly shares one
+    of them into a recorded fact instead of a rollout credited with writes it did not make. It
+    never rewrites the snapshot: the rollout's terminus is the measurement, and a mismatch is
+    reported beside it rather than folded into it.
     """
-    exclude = ctx.durable
-    for key, root in (("home", ctx.sandbox.home), ("work", ctx.sandbox.workdir)):
+    for key, (digest, _) in _channel_readers(ctx).items():
         channel = manifest.get(key)
         if channel is None or channel.get("digest_after") is None:
             continue
-        channel["unchanged_by_evals"] = (
-            home_digest(root, exclude=exclude) == channel["digest_after"]
-        )
+        channel["unchanged_by_evals"] = digest() == channel["digest_after"]
 
 
 def _place_runner_files(ctx: RunContext) -> list[str]:
@@ -4719,14 +4797,15 @@ async def _rebookend_owned(
 ) -> Path:
     """The rebookend's own run, under an already-held lock on the NEW directory.
 
-    Three copies make it work, and each has a reason to be a copy rather than a reference.
+    Four copies make it work, and each has a reason to be a copy rather than a reference.
     The source's accumulated HOME is copied whole, transcripts included, because the resumed
     forks reopen the terminal session out of it and the source must stay the archived artifact
-    it is; nothing here ever writes back. The source's stopping record is copied in, because
+    it is; nothing here ever writes back. Its ``/work`` is copied beside it, because the bookend's
+    tasks take their own copies off this one. The source's stopping record is copied in, because
     the resumed preflight reads the terminus off the run it is part of, and because it makes
     the new run self-contained: a usage limit that suspends this bookend resumes through the
     ordinary `shobench resume`, which re-reads the same copied record. And the manifest is
-    built fresh from the recovered cell rather than copied, so its digests describe the home
+    built fresh from the recovered cell rather than copied, so its digests describe the state
     this run actually starts from, with a provenance block naming the source it bookends.
 
     What is deliberately NOT copied: the source's provenance rows and legs. This run measures
@@ -4821,6 +4900,13 @@ async def _rebookend_owned(
                 "the source was mutated. Re-run the rebookend against the settled archive."
             )
         _materialize_home(source_home, sandbox.home)
+        # The rollout's cwd, taken under the same hold and through the copier this run's own eval
+        # tasks use. NOT the home materializer: it resolves links on the host, which for container
+        # paths drops or refuses what the rollout used (see ``_copy_work_tree``). An archive that
+        # predates the carry has nothing here, and its bookend starts from an empty cwd.
+        source_work = source_run_dir / "work"
+        if source_work.is_dir():
+            _copy_work_tree(source_work, sandbox.workdir)
         shutil.copy2(source_run_dir / ROLLOUT_STOPPING_FILE, run_dir / ROLLOUT_STOPPING_FILE)
         source_stopping = json.loads(
             (source_run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
