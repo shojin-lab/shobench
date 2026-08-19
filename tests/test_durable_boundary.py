@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -202,12 +203,54 @@ def test_the_work_record_is_the_tree_the_exam_gets(tmp_path) -> None:
     assert set(rows) == {p.relative_to(work).as_posix() for p in work.rglob("*")}
     assert rows["notes"]["kind"] == "dir"
     assert rows["scratch.log"]["kind"] == "file"
-    # A link is recorded by what it names, not by what it currently resolves to here.
+    # A link is recorded by what it names, not by what it currently resolves to here, and it
+    # carries no mode: nothing honors a symlink's own.
     assert rows["tool"] == {"path": "tool", "kind": "link", "target": "/home/oai/tool"}
     assert rows["shortcut.md"]["target"] == "helper.py"
     assert "sha256" not in rows["shortcut.md"]
+    assert "mode" not in rows["shortcut.md"]
     # The two names on one inode say they are one inode, and say it identically.
     assert rows["helper.py"]["alias"] == rows["active.py"]["alias"] == "active.py"
+    # And permissions are recorded on what has them, because a session reads a cwd through them.
+    assert rows["helper.py"]["mode"] == format(
+        stat.S_IMODE((work / "helper.py").stat().st_mode), "04o"
+    )
+    assert rows["notes"]["mode"] == format(stat.S_IMODE((work / "notes").stat().st_mode), "04o")
+
+
+def test_a_mode_only_change_moves_the_work_record(tmp_path) -> None:
+    """A rollout whose whole improvement is a chmod published a cwd the record called unchanged.
+
+    Both directions of it: making a helper executable is the difference between a file the
+    session reads and a program it runs, and closing a directory is the difference between a
+    session that can write there and one that cannot. Neither touches a byte of content, so a
+    record over content alone reports a rollout that did nothing.
+    """
+    ctx = _context(tmp_path, "claude_code")
+    work = ctx.sandbox.workdir
+    helper = work / "helper"
+    helper.write_text("#!/bin/sh\necho ready\n", encoding="utf-8")
+    os.chmod(helper, 0o644)
+    private = work / "private"
+    private.mkdir()
+    os.chmod(private, 0o755)
+    manifest = build_manifest(ctx, probes={})
+    runner._snapshot_durable_state(ctx, manifest)
+    content = {row["path"]: row["sha256"] for row in manifest["work"]["inventory_after"]
+               if row["kind"] == "file"}
+
+    os.chmod(helper, 0o755)
+    os.chmod(private, 0o700)
+    after = build_manifest(ctx, probes={})
+
+    assert after["work"]["digest_before"] != manifest["work"]["digest_after"]
+    runner._snapshot_durable_state(ctx, manifest)
+    assert manifest["work"]["changed"] is True
+    rows = {row["path"]: row for row in manifest["work"]["inventory_after"]}
+    assert rows["helper"]["mode"] == "0755"
+    assert rows["private"]["mode"] == "0700"
+    # Nothing about the content moved, which is exactly why the old record saw nothing.
+    assert {path: row["sha256"] for path, row in rows.items() if row["kind"] == "file"} == content
 
 
 def test_two_work_trees_a_projection_calls_equal_digest_differently(tmp_path) -> None:

@@ -1024,6 +1024,29 @@ def _copy_task_home(base: Path, dst: Path, *, keep: tuple[str, ...] = ()) -> Non
         shutil.copy2(path, target)
 
 
+def _discard_work_tree(path: Path) -> None:
+    """Remove a copy of a ``/work`` tree, including one the rollout's own modes made unremovable.
+
+    The copies carry the agent's directory modes, and a directory it made read-only is one the
+    host cannot unlink out of: the plain removal fails, silently under ``ignore_errors``, and the
+    copy survives to be merged into the next attempt at that task and to sit on the disk of every
+    phase after it. Owner write is restored on the way down and the tree is then removed.
+
+    Forceful only in appearance. What is being loosened is this runner's own throwaway copy, made
+    seconds ago and named after the task discarding it; the tree those modes describe is the base,
+    and nothing here touches that.
+    """
+    if not path.exists():
+        return
+    with contextlib.suppress(OSError):
+        path.chmod(0o700)
+    for parent, names, _ in os.walk(path):
+        for name in names:
+            with contextlib.suppress(OSError):
+                os.chmod(os.path.join(parent, name), 0o700)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def _copy_work_tree(base: Path, dst: Path) -> None:
     """Copy a rollout's ``/work`` as the container saw it.
 
@@ -1062,20 +1085,31 @@ def _copy_work_tree(base: Path, dst: Path) -> None:
     both by editing either, and a copy that broke that apart would hand the exam a cwd that
     behaves differently from the one the rollout worked in.
 
+    Modes cross with both. A file's ride along with its bytes, and a directory's is applied here
+    once the directory has been filled, because a session reads a cwd through its permissions:
+    the helper the rollout made executable has to still be executable, and the directory it made
+    private has to still be private. Applied AFTER the contents rather than at the mkdir, since a
+    mode that forbids writing forbids writing the tree underneath it too.
+
     What is neither a file, a directory, nor a link is left behind: a socket or a fifo names no
     bytes a later session could read, and refusing a bookend over one would refuse an honest
     source for a file that carries nothing.
+
+    The destination root is left as the caller made it. It is a mount point rather than an entry
+    of the tree, so its mode belongs to the runner, which is also why the record does not carry
+    it (see :func:`shobench.containers.work_inventory`).
     """
     # A leftover from an attempt something killed before its cleanup is cleared rather than
     # merged, so a re-run of that id starts from the rollout's cwd and not from the dead leg's
     # own writes on top of it.
-    shutil.rmtree(dst, ignore_errors=True)
+    _discard_work_tree(dst)
     dst.mkdir(parents=True, exist_ok=True)
     if not base.is_dir():
         return
     # Where each multiply-named inode landed, so the second name through here becomes a link to
     # the first rather than a second copy of its bytes.
     aliased: dict[tuple[int, int], Path] = {}
+    directories: list[tuple[Path, Path]] = []
     for path in sorted(base.rglob("*")):
         target = dst / path.relative_to(base)
         if path.is_symlink():
@@ -1083,6 +1117,7 @@ def _copy_work_tree(base: Path, dst: Path) -> None:
             target.symlink_to(os.readlink(path))
         elif path.is_dir():
             target.mkdir(parents=True, exist_ok=True)
+            directories.append((path, target))
         elif path.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             info = path.stat()
@@ -1099,6 +1134,10 @@ def _copy_work_tree(base: Path, dst: Path) -> None:
             elif info.st_nlink > 1:
                 aliased[key] = target
             shutil.copy2(path, target)
+    # Deepest first, so a directory that is about to become unwritable is not one this still has
+    # to write a stricter child into.
+    for source_dir, target_dir in reversed(directories):
+        shutil.copystat(source_dir, target_dir)
 
 
 def _eval_task_valid_row(prov_dir: Path, idx: int) -> TaskResult | None:
@@ -1624,7 +1663,7 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                 # tree is the same stall as writing one. Nothing cancels these tasks, so the
                 # awaits here run.
                 await asyncio.to_thread(shutil.rmtree, task_home, ignore_errors=True)
-                await asyncio.to_thread(shutil.rmtree, task_work, ignore_errors=True)
+                await asyncio.to_thread(_discard_work_tree, task_work)
 
     pending = _eval_pending_ids(phase_dir, side.task_ids)
     await asyncio.gather(*(one_task(task_id) for task_id in pending))

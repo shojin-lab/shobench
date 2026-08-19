@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import json
 import os
+import stat
 import threading
 import time
 from dataclasses import replace
@@ -256,6 +257,13 @@ def _seed_base_work(base: Path) -> None:
     # /work altogether.
     (base / "tool").symlink_to(Path("/home/oai/tool"))
     (base / "up-and-out").symlink_to(Path("../elsewhere/thing"))
+    # Modes an agent sets on purpose: a helper it made runnable, and a directory it closed.
+    (base / "run-me.sh").write_text("#!/bin/sh\necho ready\n", encoding="utf-8")
+    os.chmod(base / "run-me.sh", 0o755)
+    locked = base / "locked"
+    locked.mkdir()
+    (locked / "answer.md").write_text("do not edit this\n", encoding="utf-8")
+    os.chmod(locked, 0o500)
 
 
 def test_a_task_work_copy_carries_the_whole_rollout_cwd(tmp_path: Path) -> None:
@@ -303,6 +311,48 @@ def test_a_hard_link_alias_survives_the_copy(tmp_path: Path) -> None:
     # The alias lives inside the copy, so the exam's edit still reaches neither source name.
     assert (base / "helper.py").read_text().startswith("def batch_get")
     assert (base / "active.py").read_text().startswith("def batch_get")
+
+
+def test_the_copy_carries_the_modes_the_rollout_set(tmp_path: Path) -> None:
+    """A cwd is read through its permissions, so the exam has to inherit them.
+
+    A helper the rollout made executable is a program the session can run, and a directory the
+    rollout closed is one the session has to open the same way. Directory modes were recreated
+    under the host umask, so a private directory arrived at the exam world-readable, which is
+    both a cwd the rollout never had and a mode-only improvement the record could not see.
+    """
+    base = tmp_path / "work"
+    _seed_base_work(base)
+    task_work = tmp_path / "task"
+
+    _copy_work_tree(base, task_work)
+
+    def mode(path: Path) -> int:
+        return stat.S_IMODE(path.stat().st_mode)
+
+    assert mode(task_work / "run-me.sh") == mode(base / "run-me.sh") == 0o755
+    assert mode(task_work / "locked") == mode(base / "locked") == 0o500
+    # Applied after the directory was filled, so what it closes is still inside it.
+    assert (task_work / "locked/answer.md").read_text() == "do not edit this\n"
+    assert mode(task_work / "notes") == mode(base / "notes")
+
+
+def test_a_task_cwd_is_discarded_even_when_the_rollout_locked_a_directory(tmp_path: Path) -> None:
+    """The copy carries the agent's modes, and a read-only directory is one the host cannot
+    unlink out of. Left to the plain removal, that copy survives its task silently: it sits on
+    the disk of every phase after it and merges into the next attempt at the same held-out id,
+    which is the stale-leftover case the copy starts by clearing."""
+    base = tmp_path / "work"
+    _seed_base_work(base)
+    task_work = tmp_path / "task"
+    _copy_work_tree(base, task_work)
+    (task_work / "the-dead-leg-wrote-this.py").write_text("half a thought\n", encoding="utf-8")
+
+    runner._discard_work_tree(task_work)
+
+    assert not task_work.exists()
+    # And the base keeps the modes the discard had to work around.
+    assert stat.S_IMODE((base / "locked").stat().st_mode) == 0o500
 
 
 def test_the_copy_is_the_tree_the_record_describes(tmp_path: Path) -> None:
@@ -730,6 +780,9 @@ def test_every_eval_after_task_starts_from_the_rollout_cwd_and_none_sees_a_sibli
     # The rollout's cwd is the record of what the rollout did, and no task moved it.
     assert home_digest(ctx.sandbox.workdir, exclude=is_noise) == base_digest
     assert not list(ctx.sandbox.workdir.glob("task-*.py"))
+    # And every copy is gone, the rollout's read-only directory inside each of them included: a
+    # copy that outlived its task would sit here and merge into the next attempt at that id.
+    assert not list((ctx.run_dir / "eval_after" / "work").iterdir())
 
 
 def test_the_task_copies_run_off_the_event_loop(tmp_path: Path, monkeypatch) -> None:
