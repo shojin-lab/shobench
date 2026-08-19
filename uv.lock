@@ -1612,7 +1612,7 @@ wheels = [
 
 [[package]]
 name = "shobench"
-version = "0.0.1"
+version = "0.1.0a1"
 source = { editable = "." }
 dependencies = [
     { name = "shogym", extra = ["automationbench", "hle", "tau2"] },
