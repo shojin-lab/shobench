@@ -1,6 +1,6 @@
 ---
 name: shogym-stream
-description: Play a stream of shogym evaluation tasks served over MCP. Pull tasks with get_task, complete them with the tools each task lists, and end them. Use whenever you are asked to work through a queue of shogym tasks or a task server.
+description: Play a stream of shogym evaluation tasks served over MCP. Pull a task with get_task, complete it with the tools that task lists, end it, and repeat until the stream is exhausted. Use whenever you are asked to work through a queue of shogym tasks or a task server.
 ---
 
 # shogym-stream
@@ -27,18 +27,15 @@ rather not depend on it: `value if isinstance(value, dict) else json.loads(value
 ## The loop
 
 1. `get_task()` takes the next task off the queue. It answers either
-   `{env, instructions, budget, tools}` or `{done: true, ...}`, and `done` means the queue is
-   empty.
+   `{env, instructions, budget, tools}` or `{done: true, ...}`, and `done` means stop.
 2. `tools` lists the tools that task published, by name and schema. They are methods on this
    same module: `await shogym_stream.<name>(**kwargs)`. Nothing else is available for the task,
    and their results are the JSON strings above.
-3. One of them ends the episode.
-4. The stream is exhausted once the queue is empty and no task you pulled is unfinished.
+3. One of them ends the episode. Call it when you are finished; then go back to step 1.
+4. Stop when `get_task()` reports `done`.
 
 Do not assume tool names between tasks; read `tools` each time. `queue_info()` reports
-`{remaining, consumed, in_flight}` if you want to know how much is left. Every tool the server
-publishes carries its own description, including what a call costs:
-`await shogym_stream.list_tools()` returns them.
+`{remaining, consumed, in_flight}` if you want to know how much is left.
 
 ## Failures
 
