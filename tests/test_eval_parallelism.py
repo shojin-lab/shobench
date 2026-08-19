@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import threading
 import time
 from dataclasses import replace
@@ -28,7 +29,7 @@ import pytest
 
 from shobench import runner, serving
 from shobench.config import load_cell_by_name, load_instruction
-from shobench.containers import CellSandbox, home_digest
+from shobench.containers import CellSandbox, home_digest, work_digest
 from shobench.harness import StopKind, StopVerdict
 from shobench.harnesses import harness_for
 from shobench.results import TaskResult
@@ -280,6 +281,45 @@ def test_a_task_work_copy_carries_the_whole_rollout_cwd(tmp_path: Path) -> None:
     # And the alias is still an alias rather than two independent files.
     (task_work / "notes/what-works.md").write_text("edited\n", encoding="utf-8")
     assert (task_work / "shortcut.md").read_text() == "edited\n"
+
+
+def test_a_hard_link_alias_survives_the_copy(tmp_path: Path) -> None:
+    """Two names on one inode stay one inode, which is not two files that merely match.
+
+    An agent that hard-linked ``active.py`` to ``helper.py`` edited both by editing either. Copied
+    path by path, the exam gets two unrelated files, and the same edit now reaches one of them:
+    a cwd that behaves differently from the one the rollout worked in.
+    """
+    base = tmp_path / "work"
+    _seed_base_work(base)
+    os.link(base / "helper.py", base / "active.py")
+    task_work = tmp_path / "task"
+
+    _copy_work_tree(base, task_work)
+
+    assert (task_work / "helper.py").stat().st_ino == (task_work / "active.py").stat().st_ino
+    (task_work / "helper.py").write_text("edited through one name\n", encoding="utf-8")
+    assert (task_work / "active.py").read_text() == "edited through one name\n"
+    # The alias lives inside the copy, so the exam's edit still reaches neither source name.
+    assert (base / "helper.py").read_text().startswith("def batch_get")
+    assert (base / "active.py").read_text().startswith("def batch_get")
+
+
+def test_the_copy_is_the_tree_the_record_describes(tmp_path: Path) -> None:
+    """The two halves meet: what a manifest records about a rollout's cwd is what the exam gets.
+
+    Checked by digesting the copy with the record's own definition, which reads kinds, link
+    targets and alias groups. A copy that dropped a log, resolved a link into bytes, or split an
+    alias into two files would digest differently from the tree it came from.
+    """
+    base = tmp_path / "work"
+    _seed_base_work(base)
+    os.link(base / "helper.py", base / "active.py")
+
+    task_work = tmp_path / "task"
+    _copy_work_tree(base, task_work)
+
+    assert work_digest(task_work) == work_digest(base)
 
 
 def test_a_task_work_write_reaches_neither_the_base_nor_a_sibling(tmp_path: Path) -> None:

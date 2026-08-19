@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -257,6 +258,81 @@ def home_inventory(home: Path, *, exclude: DurableFilter) -> list[dict[str, obje
     ]
 
 
+def work_inventory(work: Path) -> list[dict[str, object]]:
+    """Every entry under a rollout's ``/work``, as the container sees it.
+
+    A different record from the HOME one, because ``/work`` is a different thing. The HOME
+    inventory is a projection: the durable self, noise filtered out, files only. That is right
+    for a channel whose digest answers "did the rollout write anything a later session can use".
+    ``/work`` is copied WHOLE into every held-out session, links and logs and caches included,
+    so a projection of it would publish a digest two runs could share while their sessions read
+    different trees. What is recorded here is the tree itself.
+
+    So every entry appears, unfiltered, with the thing about it that decides what the session
+    reads: a file's bytes, a link's TARGET rather than the bytes it currently resolves to (the
+    link is what crosses, and a container-absolute one resolves to nothing on this host), a
+    directory's presence (an empty one is still a directory the agent made), and the alias groups
+    hard links form, since two names on one inode behave differently from two copies. Anything
+    else, a socket or a fifo, is named as present and nothing more: it carries no bytes and the
+    copy leaves it behind.
+    """
+    if not work.exists():
+        return []
+    entries = sorted(work.rglob("*"))
+    # Two names on one inode are an alias only if BOTH names are in this tree. A link count
+    # raised from outside it says nothing about what a session reads, and reading it as an alias
+    # would make the digest of a tree depend on a file the tree does not contain.
+    names: dict[tuple[int, int], list[str]] = {}
+    for path in entries:
+        if path.is_symlink() or not path.is_file():
+            continue
+        info = path.stat()
+        if info.st_nlink > 1:
+            names.setdefault((info.st_dev, info.st_ino), []).append(
+                path.relative_to(work).as_posix()
+            )
+    rows: list[dict[str, object]] = []
+    for path in entries:
+        rel = path.relative_to(work).as_posix()
+        if path.is_symlink():
+            rows.append({"path": rel, "kind": "link", "target": os.readlink(path)})
+        elif path.is_dir():
+            rows.append({"path": rel, "kind": "dir"})
+        elif path.is_file():
+            info = path.stat()
+            row: dict[str, object] = {
+                "path": rel,
+                "kind": "file",
+                "bytes": info.st_size,
+                "sha256": _digest_file(path),
+            }
+            group = names.get((info.st_dev, info.st_ino), [])
+            if len(group) > 1:
+                # Named by the group's first path, so every member of one alias group says the
+                # same thing and a tree that lost the aliasing says something else.
+                row["alias"] = group[0]
+            rows.append(row)
+        else:
+            rows.append({"path": rel, "kind": "other"})
+    return rows
+
+
+# Every field a work inventory row can carry, in the order the digest reads them. A field added
+# to a row and not to this tuple would be published and unhashed, which is a difference between
+# two trees that their digests would call sameness.
+_WORK_ROW_FIELDS = ("path", "kind", "bytes", "sha256", "target", "alias")
+
+
+def work_digest(work: Path) -> str:
+    """A content hash over the whole ``/work`` tree, entry kinds and link targets included."""
+    digest = hashlib.sha256()
+    for row in work_inventory(work):
+        for field_name in _WORK_ROW_FIELDS:
+            digest.update(str(row.get(field_name, "")).encode("utf-8"))
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def run_relative(path: Path | str, run_dir: Path) -> str:
     """A run-internal path recorded portably: relative to the run directory, in POSIX form.
 
@@ -292,5 +368,7 @@ __all__ = [
     "home_digest",
     "home_inventory",
     "run_relative",
+    "work_digest",
+    "work_inventory",
     "write_json",
 ]

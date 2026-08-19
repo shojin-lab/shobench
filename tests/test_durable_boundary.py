@@ -23,13 +23,14 @@ changed files as its own durable output.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
 
 from shobench import runner
 from shobench.config import load_cell_by_name, load_instruction
-from shobench.containers import CellSandbox, home_digest
+from shobench.containers import CellSandbox, home_digest, work_digest
 from shobench.harnesses import harness_for
 from shobench.runner import RunContext, build_manifest, durable_filter, is_noise, write_home_files
 from shobench.splits import load_split_by_name
@@ -152,19 +153,91 @@ def test_every_harness_declares_the_home_files_its_launch_actually_writes(harnes
     assert set(spec.home_seed_files) == set(instance.home_seed_files())
 
 
-def test_work_is_inventoried_as_a_persistent_agent_visible_channel(tmp_path) -> None:
-    """A rollout that wrote its notes into its cwd used to publish a manifest mentioning none."""
+def test_work_is_inventoried_whole_because_the_exam_inherits_it_whole(tmp_path) -> None:
+    """A rollout that wrote its notes into its cwd used to publish a manifest mentioning none.
+
+    Recorded WHOLE, unlike the HOME beside it. The durability filter answers "is this part of
+    the self a later session inherits", which is the HOME's question; every entry of ``/work``
+    is copied into every held-out session whatever the filter would call it, so a ``.log`` the
+    filter drops is still a file the agent reads. Filtering here published a digest two runs
+    could share while their sessions read different trees.
+    """
     ctx = _context(tmp_path, "claude_code")
     manifest = build_manifest(ctx, probes={})
 
     (ctx.sandbox.workdir / "AGENTS.md").write_text("read the policy first\n", encoding="utf-8")
     (ctx.sandbox.workdir / "scratch.log").write_text("noise\n", encoding="utf-8")
+    (ctx.sandbox.home / "notes.log").write_text("noise\n", encoding="utf-8")
     runner._snapshot_durable_state(ctx, manifest)
 
     assert manifest["work"]["changed"] is True
     inventory = {row["path"] for row in manifest["work"]["inventory_after"]}
-    assert inventory == {"AGENTS.md"}, "the same noise filter applies to both channels"
+    assert inventory == {"AGENTS.md", "scratch.log"}
+    # And the HOME's own filter is untouched by that: the same name is noise on that side.
+    assert "notes.log" not in {row["path"] for row in manifest["home"]["inventory_after"]}
     assert manifest["work"]["measured_at"] == "rollout_end"
+
+
+def test_the_work_record_is_the_tree_the_exam_gets(tmp_path) -> None:
+    """Entry for entry, with what decides how each behaves in the session that reads it.
+
+    A projection cannot do this. Files the filter calls noise reach the exam; a container path
+    like ``/home/oai/tool`` is a link the exam gets and a dangling nothing on this host, so
+    hashing what it resolves to drops it; and an alias, symbolic or hard, is not two files that
+    happen to match, because an edit through one name is an edit through both.
+    """
+    ctx = _context(tmp_path, "claude_code")
+    work = ctx.sandbox.workdir
+    (work / "helper.py").write_text("real\n", encoding="utf-8")
+    (work / "scratch.log").write_text("a log the agent keeps\n", encoding="utf-8")
+    (work / "notes").mkdir()
+    (work / "tool").symlink_to("/home/oai/tool")
+    (work / "shortcut.md").symlink_to("helper.py")
+    os.link(work / "helper.py", work / "active.py")
+
+    manifest = build_manifest(ctx, probes={})
+    runner._snapshot_durable_state(ctx, manifest)
+    rows = {row["path"]: row for row in manifest["work"]["inventory_after"]}
+
+    assert set(rows) == {p.relative_to(work).as_posix() for p in work.rglob("*")}
+    assert rows["notes"]["kind"] == "dir"
+    assert rows["scratch.log"]["kind"] == "file"
+    # A link is recorded by what it names, not by what it currently resolves to here.
+    assert rows["tool"] == {"path": "tool", "kind": "link", "target": "/home/oai/tool"}
+    assert rows["shortcut.md"]["target"] == "helper.py"
+    assert "sha256" not in rows["shortcut.md"]
+    # The two names on one inode say they are one inode, and say it identically.
+    assert rows["helper.py"]["alias"] == rows["active.py"]["alias"] == "active.py"
+
+
+def test_two_work_trees_a_projection_calls_equal_digest_differently(tmp_path) -> None:
+    """The digest has to separate trees that hand a session different behavior.
+
+    All three of these hold two paths and the same bytes, and the durable-self projection hashed
+    them identically. They are not the same cwd: editing ``alias.md`` in the first two changes
+    one file and in the third changes both, and the first two differ again in whether the second
+    path even exists once the target moves.
+    """
+
+    def tree(name: str, build) -> Path:
+        root = tmp_path / name
+        root.mkdir()
+        (root / "helper.py").write_text("real\n", encoding="utf-8")
+        build(root)
+        return root
+
+    linked = tree("linked", lambda r: (r / "alias.md").symlink_to("helper.py"))
+    copied = tree("copied", lambda r: (r / "alias.md").write_text("real\n", encoding="utf-8"))
+    hard = tree("hard", lambda r: os.link(r / "helper.py", r / "alias.md"))
+
+    digests = {work_digest(linked), work_digest(copied), work_digest(hard)}
+    assert len(digests) == 3
+
+    # And a link that starts naming something else is a different tree too.
+    before = work_digest(linked)
+    (linked / "alias.md").unlink()
+    (linked / "alias.md").symlink_to("elsewhere.py")
+    assert work_digest(linked) != before
 
 
 def test_an_eval_task_copy_cannot_move_either_channel(tmp_path) -> None:

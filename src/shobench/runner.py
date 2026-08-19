@@ -67,6 +67,8 @@ from shobench.containers import (
     image_digest,
     run_relative,
     run_stem,
+    work_digest,
+    work_inventory,
     write_json,
 )
 from shobench.credentials import (
@@ -474,7 +476,7 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
     would land on the far side of it and every prime_agent cell would publish those bytes as
     something the rollout wrote.
     """
-    exclude = ctx.durable
+    digest_of = {key: readers[0] for key, readers in _channel_readers(ctx).items()}
     return {
         "schema": "shobench.manifest/1",
         "run_id": ctx.run_id,
@@ -546,18 +548,21 @@ def build_manifest(ctx: RunContext, *, probes: dict[str, str]) -> dict[str, Any]
         # runs in; it is persistent and agent-visible for the whole rollout, every eval task
         # inherits it through a copy of its own, and a cell that left a CLAUDE.md or a pile of
         # scripts there used to publish a manifest that mentioned none of it. Recorded, not scored.
+        # Each is read the way it is used, which is not the same way (:func:`_channel_readers`).
         "home": {
-            "digest_before": home_digest(ctx.sandbox.home, exclude=exclude),
+            "digest_before": digest_of["home"](),
             "digest_after": None,
             "inventory_after": [],
         },
         "work": {
-            "digest_before": home_digest(ctx.sandbox.workdir, exclude=exclude),
+            "digest_before": digest_of["work"](),
             "digest_after": None,
             "inventory_after": [],
             "note": (
                 "the rollout's writable cwd, persistent for the cell and visible to the agent; "
-                "an eval task starts from a copy of it, so this reaches the held-out sessions"
+                "an eval task starts from a copy of it, so this reaches the held-out sessions. "
+                "Recorded whole, entry by entry with kinds and link targets, unlike the home "
+                "beside it: what is copied is the tree, not the durable subset of it"
             ),
         },
     }
@@ -1052,6 +1057,11 @@ def _copy_work_tree(base: Path, dst: Path) -> None:
     bookend's snapshot is seeded with nothing and mounted into no leg, and a container that mounts
     either resolves its links inside its own filesystem, where no archive is mounted at all.
 
+    Hard links are kept as links for the same reason, one inode behind two names rather than two
+    files that merely start out equal. An agent that linked ``active.py`` to ``helper.py`` edits
+    both by editing either, and a copy that broke that apart would hand the exam a cwd that
+    behaves differently from the one the rollout worked in.
+
     What is neither a file, a directory, nor a link is left behind: a socket or a fifo names no
     bytes a later session could read, and refusing a bookend over one would refuse an honest
     source for a file that carries nothing.
@@ -1063,6 +1073,9 @@ def _copy_work_tree(base: Path, dst: Path) -> None:
     dst.mkdir(parents=True, exist_ok=True)
     if not base.is_dir():
         return
+    # Where each multiply-named inode landed, so the second name through here becomes a link to
+    # the first rather than a second copy of its bytes.
+    aliased: dict[tuple[int, int], Path] = {}
     for path in sorted(base.rglob("*")):
         target = dst / path.relative_to(base)
         if path.is_symlink():
@@ -1072,6 +1085,19 @@ def _copy_work_tree(base: Path, dst: Path) -> None:
             target.mkdir(parents=True, exist_ok=True)
         elif path.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
+            info = path.stat()
+            key = (info.st_dev, info.st_ino)
+            first = aliased.get(key) if info.st_nlink > 1 else None
+            if first is not None:
+                try:
+                    os.link(first, target)
+                    continue
+                except OSError:
+                    # A destination that cannot hold the link still gets the bytes: an exam that
+                    # reads the file is worth more than one that refuses over its topology.
+                    pass
+            elif info.st_nlink > 1:
+                aliased[key] = target
             shutil.copy2(path, target)
 
 
@@ -3432,6 +3458,33 @@ async def _run_phases(
     return results_path
 
 
+def _channel_readers(
+    ctx: RunContext,
+) -> dict[str, tuple[Callable[[], str], Callable[[], list[dict[str, Any]]]]]:
+    """How each persistent channel is read, digest and inventory together.
+
+    The two are not read alike, and the difference is the difference between what they are.
+    HOME is read through the durability filter and as files only, which is what makes its digest
+    the durable self rather than "did a session happen". ``/work`` is read WHOLE, every entry,
+    with kinds and link targets and alias groups, because that is how the eval copies it: a
+    filtered projection of it would let two runs publish one digest while their held-out sessions
+    read different trees, and a ``.log`` the filter drops is a file the agent still reads.
+
+    Paired in one place because a digest and an inventory that disagreed about what a channel is
+    would describe a run nothing produced, and because the two callers of this need to answer
+    that question the same way.
+    """
+    exclude = ctx.durable
+    home, work = ctx.sandbox.home, ctx.sandbox.workdir
+    return {
+        "home": (
+            lambda: home_digest(home, exclude=exclude),
+            lambda: home_inventory(home, exclude=exclude),
+        ),
+        "work": (lambda: work_digest(work), lambda: work_inventory(work)),
+    }
+
+
 def _snapshot_durable_state(
     ctx: RunContext, manifest: dict[str, Any], *, measured_at: str = "rollout_end"
 ) -> None:
@@ -3454,11 +3507,10 @@ def _snapshot_durable_state(
     a rollout that spent its time writing scripts and notes into its cwd should be legible in the
     record instead of showing up as an agent that did nothing.
     """
-    exclude = ctx.durable
-    for key, root in (("home", ctx.sandbox.home), ("work", ctx.sandbox.workdir)):
+    for key, (digest, inventory) in _channel_readers(ctx).items():
         channel = manifest.setdefault(key, {"digest_before": None})
-        channel["digest_after"] = home_digest(root, exclude=exclude)
-        channel["inventory_after"] = home_inventory(root, exclude=exclude)
+        channel["digest_after"] = digest()
+        channel["inventory_after"] = inventory()
         channel["changed"] = channel["digest_after"] != channel["digest_before"]
         channel["measured_at"] = measured_at
 
@@ -3472,14 +3524,11 @@ def _check_evals_left_the_snapshot_alone(ctx: RunContext, manifest: dict[str, An
     never rewrites the snapshot: the rollout's terminus is the measurement, and a mismatch is
     reported beside it rather than folded into it.
     """
-    exclude = ctx.durable
-    for key, root in (("home", ctx.sandbox.home), ("work", ctx.sandbox.workdir)):
+    for key, (digest, _) in _channel_readers(ctx).items():
         channel = manifest.get(key)
         if channel is None or channel.get("digest_after") is None:
             continue
-        channel["unchanged_by_evals"] = (
-            home_digest(root, exclude=exclude) == channel["digest_after"]
-        )
+        channel["unchanged_by_evals"] = digest() == channel["digest_after"]
 
 
 def _place_runner_files(ctx: RunContext) -> list[str]:
