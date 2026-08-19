@@ -54,7 +54,7 @@ def shobench_revision() -> tuple[str | None, bool]:
     root = Path(top)
     if (root / "src" / "shobench" / "pins.py").resolve() != module:
         # An installed build, or a checkout inside another repository. There is no revision that
-        # identifies these bytes, and the package version is a static 0.0.1 that identifies
+        # identifies these bytes, and the static package version identifies
         # nothing either, so the honest answer is that nothing is known.
         return None, False
     rev = _git(root, "rev-parse", "HEAD")

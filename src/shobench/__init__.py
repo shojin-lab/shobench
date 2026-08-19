@@ -4,4 +4,4 @@ The package namespace is reserved; the benchmark arrives with the program's firs
 published comparison. See the repository README.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.1.0a1"
