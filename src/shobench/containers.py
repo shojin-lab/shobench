@@ -27,7 +27,6 @@ import hashlib
 import json
 import os
 import shutil
-import stat
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -259,15 +258,6 @@ def home_inventory(home: Path, *, exclude: DurableFilter) -> list[dict[str, obje
     ]
 
 
-def _mode(path: Path) -> str:
-    """The permission bits, as the four octal digits a reader of a manifest can act on.
-
-    Four rather than three: setuid, setgid and the sticky bit are permission too, and a copy
-    that kept them silently would be a difference no digest over three digits could see.
-    """
-    return format(stat.S_IMODE(path.stat().st_mode), "04o")
-
-
 def work_inventory(work: Path) -> list[dict[str, object]]:
     """Every entry under a rollout's ``/work``, as the container sees it.
 
@@ -285,16 +275,6 @@ def work_inventory(work: Path) -> list[dict[str, object]]:
     hard links form, since two names on one inode behave differently from two copies. Anything
     else, a socket or a fifo, is named as present and nothing more: it carries no bytes and the
     copy leaves it behind.
-
-    MODE too, on files and directories, because it is behavior rather than decoration: a helper
-    the rollout made executable is a helper the exam can run, and a directory the rollout made
-    private is one the exam has to open the same way. Left out, a session that spent its rollout
-    turning a script into a program published a cwd the record called unchanged. Links carry no
-    mode of their own that a reader honors, so they carry none here.
-
-    The tree's own root is not an entry of it. The runner makes that directory and mounts it, so
-    its mode is the runner's rather than the agent's, and the copy leaves it alone for the same
-    reason this leaves it out.
     """
     if not work.exists():
         return []
@@ -317,7 +297,7 @@ def work_inventory(work: Path) -> list[dict[str, object]]:
         if path.is_symlink():
             rows.append({"path": rel, "kind": "link", "target": os.readlink(path)})
         elif path.is_dir():
-            rows.append({"path": rel, "kind": "dir", "mode": _mode(path)})
+            rows.append({"path": rel, "kind": "dir"})
         elif path.is_file():
             info = path.stat()
             row: dict[str, object] = {
@@ -325,7 +305,6 @@ def work_inventory(work: Path) -> list[dict[str, object]]:
                 "kind": "file",
                 "bytes": info.st_size,
                 "sha256": _digest_file(path),
-                "mode": _mode(path),
             }
             group = names.get((info.st_dev, info.st_ino), [])
             if len(group) > 1:
@@ -341,7 +320,7 @@ def work_inventory(work: Path) -> list[dict[str, object]]:
 # Every field a work inventory row can carry, in the order the digest reads them. A field added
 # to a row and not to this tuple would be published and unhashed, which is a difference between
 # two trees that their digests would call sameness.
-_WORK_ROW_FIELDS = ("path", "kind", "bytes", "sha256", "mode", "target", "alias")
+_WORK_ROW_FIELDS = ("path", "kind", "bytes", "sha256", "target", "alias")
 
 
 def work_digest(work: Path) -> str:
