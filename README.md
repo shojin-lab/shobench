@@ -175,3 +175,7 @@ digests the manifest recorded, or the run would publish one run id describing tw
 Each of those refusals leaves the suspension record where it is, so the run stays resumable
 once the shell or the checkout is put right. `docs/harness-autonomy.md` records how each
 harness announces a usage limit, and where each rule came from.
+
+## Community
+
+Questions, results, and replications: [the shōjin Discord](https://discord.gg/cRmZYt5smz).
