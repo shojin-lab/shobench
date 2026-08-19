@@ -128,10 +128,9 @@ def _source_run(
     cache = home / ".cache"
     cache.mkdir()
     (cache / "blob").write_text("x" * 512, encoding="utf-8")
-    # The rollout's cwd, which the bookend's tasks inherit the way they inherit the home. The
-    # links are the three shapes a rollout leaves that a host reads differently: one absolute
-    # container path, one leaving /work whose host target happens to exist (the source's own
-    # home), and one in-tree alias.
+    # The rollout's cwd, with the three link shapes a host reads differently from the container:
+    # one absolute container path, one leaving /work whose host target does exist (the source's
+    # own home), and one in-tree alias.
     work = source_dir / "work"
     work.mkdir()
     (work / "helper.py").write_text("def batch_get(ids):\n    ...\n", encoding="utf-8")
@@ -232,8 +231,7 @@ def _wire_fakes(
             "transcript_in_copy": (
                 home / ".claude/projects/-work" / f"{_SID}.jsonl"
             ).is_file(),
-            # What the task's cwd held when the leg started. Read here because the copy is
-            # discarded the moment the task ends.
+            # Read here because the copy is discarded the moment the task ends.
             "work_at_launch": sorted(p.relative_to(work).as_posix() for p in work.rglob("*")),
         }
         return LegRecord(
@@ -392,10 +390,8 @@ def test_rebookend_leaves_the_source_untouched_and_publishes_an_honest_bookend(
 def test_the_bookend_inherits_the_source_cwd_and_leaves_it_untouched(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A bookend is a NEW run over an archived source, so the source's ``/work`` reaches its exam
-    by the route its home already takes: snapshotted once under the hold, copied per task off the
-    snapshot, written back never. What the rollout built in its cwd is what its held-out sessions
-    read, and the archive stays the record of what the rollout did."""
+    """The source's ``/work`` reaches the bookend's exam by the route its home already takes:
+    snapshotted once under the hold, copied per task off the snapshot, written back never."""
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split)
     before = _fingerprint(source_dir)
@@ -410,8 +406,8 @@ def test_the_bookend_inherits_the_source_cwd_and_leaves_it_untouched(
         task_links[int(kw["task_idx"])] = {
             p.name: p.readlink() for p in work.iterdir() if p.is_symlink()
         }
-        # What a held-out session writes into its cwd, which must reach neither the snapshot it
-        # was copied from nor the archive behind that.
+        # A held-out session's own write, which must reach neither the snapshot it was copied
+        # from nor the archive behind that.
         (work / "the-exam-wrote-this.py").write_text("x", encoding="utf-8")
         return record
 
@@ -429,10 +425,10 @@ def test_the_bookend_inherits_the_source_cwd_and_leaves_it_untouched(
     assert set(launches) == {0, 1, 2}
     for record in launches.values():
         assert record["work_at_launch"] == ["alias.py", "from-home", "helper.py", "tool"]
-    # Every link arrived as a link, naming what it named in the archive. Resolved on the host,
-    # as the HOME snapshot resolves its own, the container-absolute one would have been dropped
-    # as dangling, the one leaving /work would have refused this bookend outright, and the alias
-    # would have become a second independent file. All three ran fine in the rollout.
+    # Every link arrived as a link, naming what it named in the archive. Resolved on the host as
+    # the HOME snapshot resolves its own, the container-absolute one would have dropped as
+    # dangling, the one leaving /work would have refused this bookend, and the alias would have
+    # become a second independent file.
     for links in task_links.values():
         assert links == {
             "tool": Path("/home/oai/tool"),
@@ -441,8 +437,7 @@ def test_the_bookend_inherits_the_source_cwd_and_leaves_it_untouched(
         }
     # The archive is byte-identical, its /work included.
     assert _fingerprint(source_dir) == before
-    # And so is the run's own snapshot of it, the one every task copied from: what the sessions
-    # wrote stayed in the copies that were discarded with them.
+    # And so is the run's own snapshot, the one every task copied from.
     snapshot = next(p for p in (tmp_path / "runs").iterdir() if p.is_dir()) / "work"
     assert sorted(p.name for p in snapshot.iterdir()) == [
         "alias.py",

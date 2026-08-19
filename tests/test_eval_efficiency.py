@@ -474,12 +474,10 @@ def test_the_first_wave_is_spaced_and_no_task_launches_around_it(
     both unstaggered and reversed. What this asserts is what the mechanism is for: the first four
     LAUNCHES are each a gap after the last, and every id launches exactly once.
 
-    Not WHICH four ids they are. A task reaches the spacing only by holding a slot at the gate,
-    so the wave is drawn from the tasks the gate admitted, but they arrive in the order their
-    setup finished in and setup runs off the loop. Asserting the four ids read as a stronger
-    promise than the mechanism makes, and once the copies moved off the loop it failed about a
-    third of the time. ``test_a_slow_setup_cannot_let_a_later_launch_into_the_wave`` is the
-    guard for the property that ordering assertion was standing in for.
+    Not WHICH four ids they are: tasks arrive at the spacing in the order their setup finished
+    in, and setup runs off the loop, so asserting the ids promises more than the mechanism makes.
+    ``test_a_slow_setup_cannot_let_a_later_launch_into_the_wave`` guards what that assertion was
+    standing in for.
     """
     gap = 0.05
     limit = 4
@@ -524,13 +522,10 @@ def test_a_slow_setup_cannot_let_a_later_launch_into_the_wave(
 ) -> None:
     """The wave has to stay spaced when the tasks in it are slow to get ready.
 
-    Setup is unbounded (a per-task copy of a HOME and a cwd, both off the loop) and a phase's
-    tasks do not take equally long at it. Held at the gate rather than at the launch, the gap
-    was spent by three slow tasks while they were still copying: their reservations ran out on
-    the clock, and the tasks behind them then launched one after another with no spacing at all,
-    which is the burst of simultaneous credential presentations the mechanism exists to prevent.
-    Three of the four slots are made slow here, so the wave can only stay spaced if the gap is
-    taken where the container starts.
+    Setup is unbounded and a phase's tasks do not take equally long at it. Held at the gate, the
+    gap was spent by the slow tasks while they were still copying, and the tasks behind them
+    launched one after another unspaced. Three of the four slots are slow here, so the wave stays
+    spaced only if the gap is taken where the container starts.
     """
     gap = 0.15
     limit = 4
@@ -549,8 +544,7 @@ def test_a_slow_setup_cannot_let_a_later_launch_into_the_wave(
     real_copy = runner._copy_task_home
 
     def slow_for_some(base: Path, dst: Path, **kw: object) -> None:
-        # The task's own id is in the path it copies into, which is the only handle a copy has
-        # on which task it is preparing.
+        # The destination path is the only handle a copy has on which task it is preparing.
         if int(dst.name.split("-")[1]) in slow_ids:
             time.sleep(gap * 6)
         real_copy(base, dst, **kw)

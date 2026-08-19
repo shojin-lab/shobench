@@ -246,14 +246,12 @@ def _seed_base_work(base: Path) -> None:
     notes = base / "notes"
     notes.mkdir()
     (notes / "what-works.md").write_text("batch, never one at a time\n", encoding="utf-8")
-    # A name the durable filter calls noise in a HOME. /work has no such filter: whatever is
-    # here, the rollout put here.
+    # A name the durable filter calls noise in a HOME, which /work has no filter to drop.
     (base / "scratch.log").write_text("a log the agent keeps for itself\n", encoding="utf-8")
     (base / "empty-dir").mkdir()
     (base / "shortcut.md").symlink_to(Path("notes/what-works.md"))
-    # Two CONTAINER paths, both ordinary in a rollout and neither meaning on the host what it
-    # means at /work: one absolute (the shape a venv's interpreter link takes), one leaving
-    # /work altogether.
+    # Two CONTAINER paths, neither meaning on the host what it means at /work: one absolute (the
+    # shape a venv's interpreter link takes), one leaving /work altogether.
     (base / "tool").symlink_to(Path("/home/oai/tool"))
     (base / "up-and-out").symlink_to(Path("../elsewhere/thing"))
 
@@ -270,9 +268,7 @@ def test_a_task_work_copy_carries_the_whole_rollout_cwd(tmp_path: Path) -> None:
     assert (task_work / "notes/what-works.md").read_text() == "batch, never one at a time\n"
     assert (task_work / "scratch.log").is_file()
     assert (task_work / "empty-dir").is_dir()
-    # A link stays a link, so it names in the task what it named in the rollout: the copy is
-    # mounted back at /work under the same image, and resolving one on the host would drop the
-    # container paths and de-alias the in-tree one.
+    # A link stays a link, so it names in the task what it named in the rollout.
     assert (task_work / "shortcut.md").is_symlink()
     assert (task_work / "shortcut.md").readlink() == Path("notes/what-works.md")
     assert (task_work / "shortcut.md").read_text() == "batch, never one at a time\n"
@@ -284,12 +280,7 @@ def test_a_task_work_copy_carries_the_whole_rollout_cwd(tmp_path: Path) -> None:
 
 
 def test_a_hard_link_alias_survives_the_copy(tmp_path: Path) -> None:
-    """Two names on one inode stay one inode, which is not two files that merely match.
-
-    An agent that hard-linked ``active.py`` to ``helper.py`` edited both by editing either. Copied
-    path by path, the exam gets two unrelated files, and the same edit now reaches one of them:
-    a cwd that behaves differently from the one the rollout worked in.
-    """
+    """Two names on one inode stay one inode, which is not two files that merely match."""
     base = tmp_path / "work"
     _seed_base_work(base)
     os.link(base / "helper.py", base / "active.py")
@@ -306,11 +297,11 @@ def test_a_hard_link_alias_survives_the_copy(tmp_path: Path) -> None:
 
 
 def test_the_copy_is_the_tree_the_record_describes(tmp_path: Path) -> None:
-    """The two halves meet: what a manifest records about a rollout's cwd is what the exam gets.
+    """What a manifest records about a rollout's cwd is what the exam gets.
 
-    Checked by digesting the copy with the record's own definition, which reads kinds, link
-    targets and alias groups. A copy that dropped a log, resolved a link into bytes, or split an
-    alias into two files would digest differently from the tree it came from.
+    Digesting the copy with the record's own definition, which reads kinds, link targets and
+    alias groups, so a copy that dropped a log, resolved a link, or split an alias reads as a
+    different tree from the one it came from.
     """
     base = tmp_path / "work"
     _seed_base_work(base)
@@ -343,8 +334,7 @@ def test_a_task_work_write_reaches_neither_the_base_nor_a_sibling(tmp_path: Path
 
 
 def test_a_copy_clears_what_a_killed_attempt_left_in_the_task_cwd(tmp_path: Path) -> None:
-    """A re-run of an id whose first attempt died before its cleanup starts from the rollout's
-    cwd, never from the dead leg's own writes sitting on top of it."""
+    """A re-run of an id starts from the rollout's cwd, not on top of a dead leg's own writes."""
     base = tmp_path / "work"
     _seed_base_work(base)
     task_work = tmp_path / "task"
@@ -358,8 +348,7 @@ def test_a_copy_clears_what_a_killed_attempt_left_in_the_task_cwd(tmp_path: Path
 
 
 def test_copying_a_base_work_that_holds_nothing_yields_an_empty_one(tmp_path: Path) -> None:
-    """A run that has not rolled out yet has written nothing into its cwd, and on a fresh run
-    the directory does not exist at all. Both copy to the empty cwd a cold baseline needs."""
+    """A cwd nothing has written to yet, and on a fresh run one that does not exist at all."""
     absent = tmp_path / "task-from-absent"
     _copy_work_tree(tmp_path / "never-created", absent)
     assert absent.is_dir() and list(absent.rglob("*")) == []
@@ -707,8 +696,8 @@ def _work_reading_legs(
 def test_every_eval_after_task_starts_from_the_rollout_cwd_and_none_sees_a_sibling(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The transfer, through the real phase: three tasks run at once, each reads what the rollout
-    left in /work, each writes into a copy of its own, and the rollout's cwd comes out unmoved."""
+    """Three tasks at once, each reading what the rollout left in /work and writing into a copy
+    of its own, with the rollout's cwd unmoved at the end."""
     ctx = _ctx(tmp_path, ("1", "2", "3"))
     ctx = replace(ctx, cell=replace(ctx.cell, budget=replace(ctx.cell.budget, eval_concurrency=3)))
     _rollout_terminus(ctx)
@@ -722,25 +711,19 @@ def test_every_eval_after_task_starts_from_the_rollout_cwd_and_none_sees_a_sibli
     assert [r.task_idx for r in rows] == [1, 2, 3]
     assert set(seen) == {1, 2, 3}
     for idx, record in seen.items():
-        # The rollout's own helper and notes, in every task, before that task wrote anything.
+        # Read before this task wrote anything, so what it holds is the rollout's alone.
         assert "helper.py" in record["inherited"]
         assert "notes/what-works.md" in record["inherited"]
-        # And of the three files the three concurrent tasks wrote, a task sees only its own.
         assert record["own"] == [f"task-{idx}.py"]
-    # The rollout's cwd is the record of what the rollout did, and no task moved it.
     assert home_digest(ctx.sandbox.workdir, exclude=is_noise) == base_digest
     assert not list(ctx.sandbox.workdir.glob("task-*.py"))
 
 
 def test_the_task_copies_run_off_the_event_loop(tmp_path: Path, monkeypatch) -> None:
-    """A task's copies share their loop with the stream server and the drain watcher of every
-    task already launched, so a tree copied inline pauses live held-out sessions for as long as
-    the copy runs, and serializes the setup the concurrency knob was meant to overlap. Both
-    trees are copied in a worker thread, and the loop keeps turning while they do.
+    """A copy taken inline would pause the loop that serves every already-launched task.
 
-    Slowed deliberately, because size is what makes this visible: a rollout that cloned a
-    repository or built a venv leaves a tree whose copy takes long enough to time a live task
-    out, and the archive's own cwds are far too small to show it.
+    Slowed deliberately, because size is what makes this visible: the trees a real rollout leaves
+    are unbounded, and the archive's own cwds are far too small to show it.
     """
     ctx = _ctx(tmp_path, ("1", "2"))
     _seed_base_work(ctx.sandbox.workdir)
@@ -782,16 +765,13 @@ def test_the_task_copies_run_off_the_event_loop(tmp_path: Path, monkeypatch) -> 
     assert set(seen) == {1, 2}
     # A second of filesystem work, none of it on the thread the loop runs on.
     assert copy_threads and loop_thread not in copy_threads
-    # And the loop kept turning throughout, which is what an already-launched task's server and
-    # drain watcher need. Run inline, the same phase lets it turn once.
+    # And the loop kept turning throughout. Run inline, the same phase lets it turn once.
     assert beats > 10
 
 
 def test_an_eval_before_task_starts_from_an_empty_cwd(tmp_path: Path, monkeypatch) -> None:
     """The baseline stays cold, and not because the phase is named eval_before: the rollout is
-    the only thing that ever writes the cell's /work and eval_before runs before it, so what
-    every task copies is empty. Re-measuring a before after a rollout is refused outright, so no
-    path carries an accumulated cwd into a baseline."""
+    the only thing that writes the cell's /work and eval_before runs before it."""
     ctx = _ctx(tmp_path, ("1", "2"))
     seen: dict[int, dict] = {}
     _work_reading_legs(monkeypatch, seen)

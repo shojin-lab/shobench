@@ -175,12 +175,10 @@ class CellSandbox:
         two tasks can run at once without one task's writes reaching the other or the base.
 
         ``workdir`` overrides which host directory is mounted at ``/work``, the cwd every
-        harness runs in. It is the same story as ``home``, for the same two reasons: ``/work`` is
-        writable, so concurrent eval tasks sharing one would let task A's file reach task B, and
-        it is where an agent's own scripts and notes end up, so a task that saw none of them
-        would measure an agent stripped of them. An eval task gets its own copy of the phase's
-        ``/work``, discarded with its task HOME. The rollout keeps the cell's one accumulating
-        ``/work`` (the default).
+        harness runs in. An eval task mounts its own copy of the phase's ``/work``, discarded
+        with its task HOME: sharing one would let task A's file reach task B, and starting from
+        an empty one would measure an agent stripped of what it built there. The rollout keeps
+        the cell's one accumulating ``/work`` (the default).
         """
         # Host paths must be absolute: docker reads a non-absolute ``-v`` source as a named
         # volume, and the default runs/ layout arrives here relative to the invocation cwd.
@@ -261,27 +259,18 @@ def home_inventory(home: Path, *, exclude: DurableFilter) -> list[dict[str, obje
 def work_inventory(work: Path) -> list[dict[str, object]]:
     """Every entry under a rollout's ``/work``, as the container sees it.
 
-    A different record from the HOME one, because ``/work`` is a different thing. The HOME
-    inventory is a projection: the durable self, noise filtered out, files only. That is right
-    for a channel whose digest answers "did the rollout write anything a later session can use".
-    ``/work`` is copied WHOLE into every held-out session, links and logs and caches included,
-    so a projection of it would publish a digest two runs could share while their sessions read
-    different trees. What is recorded here is the tree itself.
-
-    So every entry appears, unfiltered, with the thing about it that decides what the session
-    reads: a file's bytes, a link's TARGET rather than the bytes it currently resolves to (the
-    link is what crosses, and a container-absolute one resolves to nothing on this host), a
-    directory's presence (an empty one is still a directory the agent made), and the alias groups
-    hard links form, since two names on one inode behave differently from two copies. Anything
-    else, a socket or a fifo, is named as present and nothing more: it carries no bytes and the
-    copy leaves it behind.
+    Unfiltered, unlike the HOME inventory beside it: the whole tree is copied into every held-out
+    session, so a projection would publish a digest two runs could share while their sessions
+    read different trees. A link is recorded by its TARGET rather than by what it resolves to,
+    since the link is what crosses and a container-absolute one resolves to nothing on this host;
+    hard links are recorded as alias groups, since two names on one inode behave differently from
+    two copies.
     """
     if not work.exists():
         return []
     entries = sorted(work.rglob("*"))
-    # Two names on one inode are an alias only if BOTH names are in this tree. A link count
-    # raised from outside it says nothing about what a session reads, and reading it as an alias
-    # would make the digest of a tree depend on a file the tree does not contain.
+    # An alias only when BOTH names are in this tree: a link count raised from outside it would
+    # make a tree's digest depend on a file the tree does not contain.
     names: dict[tuple[int, int], list[str]] = {}
     for path in entries:
         if path.is_symlink() or not path.is_file():
@@ -308,8 +297,7 @@ def work_inventory(work: Path) -> list[dict[str, object]]:
             }
             group = names.get((info.st_dev, info.st_ino), [])
             if len(group) > 1:
-                # Named by the group's first path, so every member of one alias group says the
-                # same thing and a tree that lost the aliasing says something else.
+                # The group's first path, so every member of one group says the same thing.
                 row["alias"] = group[0]
             rows.append(row)
         else:
@@ -317,9 +305,8 @@ def work_inventory(work: Path) -> list[dict[str, object]]:
     return rows
 
 
-# Every field a work inventory row can carry, in the order the digest reads them. A field added
-# to a row and not to this tuple would be published and unhashed, which is a difference between
-# two trees that their digests would call sameness.
+# Every field a work inventory row can carry. A field added to a row and not to this tuple is
+# published and unhashed, which is a difference between two trees their digests would call none.
 _WORK_ROW_FIELDS = ("path", "kind", "bytes", "sha256", "target", "alias")
 
 

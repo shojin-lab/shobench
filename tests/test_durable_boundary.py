@@ -156,11 +156,9 @@ def test_every_harness_declares_the_home_files_its_launch_actually_writes(harnes
 def test_work_is_inventoried_whole_because_the_exam_inherits_it_whole(tmp_path) -> None:
     """A rollout that wrote its notes into its cwd used to publish a manifest mentioning none.
 
-    Recorded WHOLE, unlike the HOME beside it. The durability filter answers "is this part of
-    the self a later session inherits", which is the HOME's question; every entry of ``/work``
-    is copied into every held-out session whatever the filter would call it, so a ``.log`` the
-    filter drops is still a file the agent reads. Filtering here published a digest two runs
-    could share while their sessions read different trees.
+    Recorded whole, unlike the HOME beside it: every entry of ``/work`` is copied into every
+    held-out session whatever the durability filter would call it, so a ``.log`` the filter drops
+    is still a file the agent reads.
     """
     ctx = _context(tmp_path, "claude_code")
     manifest = build_manifest(ctx, probes={})
@@ -173,7 +171,7 @@ def test_work_is_inventoried_whole_because_the_exam_inherits_it_whole(tmp_path) 
     assert manifest["work"]["changed"] is True
     inventory = {row["path"] for row in manifest["work"]["inventory_after"]}
     assert inventory == {"AGENTS.md", "scratch.log"}
-    # And the HOME's own filter is untouched by that: the same name is noise on that side.
+    # The same name is still noise on the HOME side, whose filter this does not touch.
     assert "notes.log" not in {row["path"] for row in manifest["home"]["inventory_after"]}
     assert manifest["work"]["measured_at"] == "rollout_end"
 
@@ -181,9 +179,8 @@ def test_work_is_inventoried_whole_because_the_exam_inherits_it_whole(tmp_path) 
 def test_the_work_record_is_the_tree_the_exam_gets(tmp_path) -> None:
     """Entry for entry, with what decides how each behaves in the session that reads it.
 
-    A projection cannot do this. Files the filter calls noise reach the exam; a container path
-    like ``/home/oai/tool`` is a link the exam gets and a dangling nothing on this host, so
-    hashing what it resolves to drops it; and an alias, symbolic or hard, is not two files that
+    A container path like ``/home/oai/tool`` is a link the exam gets and a dangling nothing on
+    this host, so hashing what it resolves to would drop it, and an alias is not two files that
     happen to match, because an edit through one name is an edit through both.
     """
     ctx = _context(tmp_path, "claude_code")
@@ -206,17 +203,15 @@ def test_the_work_record_is_the_tree_the_exam_gets(tmp_path) -> None:
     assert rows["tool"] == {"path": "tool", "kind": "link", "target": "/home/oai/tool"}
     assert rows["shortcut.md"]["target"] == "helper.py"
     assert "sha256" not in rows["shortcut.md"]
-    # The two names on one inode say they are one inode, and say it identically.
+    # Both names of one inode say they are one inode, and say it identically.
     assert rows["helper.py"]["alias"] == rows["active.py"]["alias"] == "active.py"
 
 
 def test_two_work_trees_a_projection_calls_equal_digest_differently(tmp_path) -> None:
     """The digest has to separate trees that hand a session different behavior.
 
-    All three of these hold two paths and the same bytes, and the durable-self projection hashed
-    them identically. They are not the same cwd: editing ``alias.md`` in the first two changes
-    one file and in the third changes both, and the first two differ again in whether the second
-    path even exists once the target moves.
+    All three hold two paths and the same bytes, which the durable-self projection hashed
+    identically. Editing ``alias.md`` changes one file in the first two and both in the third.
     """
 
     def tree(name: str, build) -> Path:
@@ -233,7 +228,7 @@ def test_two_work_trees_a_projection_calls_equal_digest_differently(tmp_path) ->
     digests = {work_digest(linked), work_digest(copied), work_digest(hard)}
     assert len(digests) == 3
 
-    # And a link that starts naming something else is a different tree too.
+    # A link that starts naming something else is a different tree too.
     before = work_digest(linked)
     (linked / "alias.md").unlink()
     (linked / "alias.md").symlink_to("elsewhere.py")
