@@ -83,7 +83,8 @@ def test_a_prime_cell_whose_login_has_happened_is_no_longer_pending(prime_spec, 
     arms: list[str] = []
 
     def fake_probe(*, harness, model, docker_args, image, env, timeout_s=300, credential_file=None):
-        # Bogus fails, real succeeds: the outcome a correctly isolated HOME produces.
+        # The bogus arm fails, which is the outcome a correctly isolated HOME produces. prime's
+        # credential rotates on use, so the positive arm is static and no probe runs for it.
         seeded = json.loads((tmp_path / "home" / spec.seed_to).read_text(encoding="utf-8"))
         is_bogus = seeded["anthropic"]["access"] == BOGUS
         arms.append("negative" if is_bogus else "positive")
@@ -106,9 +107,130 @@ def test_a_prime_cell_whose_login_has_happened_is_no_longer_pending(prime_spec, 
     finally:
         credentials.run_probe = original
 
-    assert arms == ["negative", "positive"]
+    assert arms == ["negative"]
     assert verdict.trusted
     assert verdict.pending == ""
+
+
+def test_a_rotating_credential_is_read_by_the_positive_check_and_never_presented(
+    prime_spec, tmp_path, monkeypatch
+) -> None:
+    """The positive check may not spend the credential it is checking.
+
+    Anthropic's OAuth mints a new refresh pair whenever one is redeemed and retires the pair it
+    was handed. A positive check that authenticates for real does that redemption inside a HOME it
+    is about to delete: the rotated pair dies with the sandbox and the host file is left holding a
+    token the provider has already retired, so the check reports the credential healthy and the
+    real launch a minute later cannot authenticate at all. The credential is read instead, and the
+    record says so rather than letting a structural pass read as a live one.
+    """
+    spec = prime_spec(_LOGGED_IN)
+    home = tmp_path / "home"
+    arms: list[str] = []
+
+    def fake_probe(*, harness, model, docker_args, image, env, timeout_s=300, credential_file=None):
+        seeded = json.loads((home / spec.seed_to).read_text(encoding="utf-8"))
+        assert seeded["anthropic"]["access"] == BOGUS, "a probe was handed the real credential"
+        arms.append("negative")
+        return credentials.ControlResult(arm="", returncode=1, succeeded=False, duration_s=0.0)
+
+    monkeypatch.setattr(credentials, "run_probe", fake_probe)
+
+    verdict = validate_isolation(
+        harness="prime_agent",
+        mode="subscription",
+        model="claude-opus-5",
+        docker_args=[],
+        image="img",
+        environ={},
+        home=home,
+    )
+
+    assert arms == ["negative"]
+    assert verdict.trusted
+    recorded = verdict.to_json()["positive_check"]
+    assert recorded["method"] == "static"
+    assert "rotates it" in recorded["detail"]
+    assert "reading the seeded file" in verdict.reason
+
+
+def test_a_rotating_credential_with_no_life_left_still_fails_its_positive_check(
+    prime_spec, tmp_path, monkeypatch
+) -> None:
+    """Static is not a pass: the same reader the eval fan-out gates on refuses a spent file."""
+    spec = prime_spec(
+        {
+            "anthropic": {
+                "type": "oauth",
+                "access": "host-access-token-value",
+                "refresh": "host-refresh-token-value",
+                "expires": int(time.time() * 1000),
+            }
+        }
+    )
+    home = tmp_path / "home"
+
+    monkeypatch.setattr(
+        credentials,
+        "run_probe",
+        lambda **kwargs: credentials.ControlResult(
+            arm="", returncode=1, succeeded=False, duration_s=0.0
+        ),
+    )
+
+    verdict = validate_isolation(
+        harness="prime_agent",
+        mode="subscription",
+        model="claude-opus-5",
+        docker_args=[],
+        image="img",
+        environ={},
+        home=home,
+    )
+
+    assert not verdict.trusted
+    assert "life left" in verdict.reason
+    assert spec.seed_to in verdict.reason
+
+
+def test_a_credential_that_does_not_rotate_keeps_its_live_positive_check(
+    tmp_path, monkeypatch
+) -> None:
+    """The static arm is scoped to the specs that need it; codex still proves it authenticates."""
+    path = tmp_path / "codex-auth.json"
+    path.write_text(
+        json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "host-token-value"}}),
+        encoding="utf-8",
+    )
+    spec = spec_for("codex", "subscription")
+    patched = credentials.CredentialSpec(**{**spec.__dict__, "seed_from": str(path)})
+    monkeypatch.setitem(credentials.SPECS, ("codex", "subscription"), patched)
+    home = tmp_path / "home"
+    arms: list[str] = []
+
+    def fake_probe(*, harness, model, docker_args, image, env, timeout_s=300, credential_file=None):
+        seeded = json.loads((home / patched.seed_to).read_text(encoding="utf-8"))
+        is_bogus = seeded["tokens"]["access_token"] == BOGUS
+        arms.append("negative" if is_bogus else "positive")
+        return credentials.ControlResult(
+            arm="", returncode=0 if not is_bogus else 1, succeeded=not is_bogus, duration_s=0.0
+        )
+
+    monkeypatch.setattr(credentials, "run_probe", fake_probe)
+
+    verdict = validate_isolation(
+        harness="codex",
+        mode="subscription",
+        model="gpt-5.6-terra",
+        docker_args=[],
+        image="img",
+        environ={},
+        home=home,
+    )
+
+    assert arms == ["negative", "positive"]
+    assert verdict.trusted
+    assert verdict.to_json()["positive_check"]["method"] == "probe"
 
 
 def test_a_prime_cell_with_no_login_is_pending_with_something_to_do(prime_spec, tmp_path) -> None:

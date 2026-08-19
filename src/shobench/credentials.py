@@ -57,6 +57,19 @@ class CredentialSpec:
     # the file was the wrong shape tests the parser rather than the credential, which is exactly
     # the thing the negative control exists to rule out.
     seed_schema: str = ""
+    # Whether presenting this credential once destroys the copy the host still holds. An OAuth
+    # provider that rotates the refresh token on use mints a new pair and invalidates the pair it
+    # was handed, and the positive check presents the credential inside a throwaway HOME: the
+    # rotated pair is written into that copy and discarded with it, while the host file is left
+    # holding a token the provider has already retired. Observed on the prime_agent subscription
+    # arm, where a positive check reported the credential healthy and the real launch 76 seconds
+    # later failed to authenticate on a fresh copy of the same host file. A preflight whose
+    # success breaks the thing it tested is worse than no preflight, so a credential marked here
+    # is validated by reading it rather than by using it (see :func:`static_positive_check`).
+    # Only the arm this was observed on is marked: codex's auth.json states no expiry a reader
+    # can check, so marking it would trade a probe for a check too weak to replace one, and the
+    # environment-carried modes seed no file to read at all.
+    rotates_on_use: bool = False
     # What a human has to do when this mode's credential is not on the host yet. It is a hint
     # rather than a verdict: whether a cell is pending is decided by looking at the credential
     # now (see :func:`credential_available`), never by a field written months ago. A static
@@ -128,6 +141,7 @@ SPECS: dict[tuple[str, str], CredentialSpec] = {
         seed_from="~/.prime/agent/auth.json",
         seed_to=".prime/agent/auth.json",
         seed_schema="prime_auth",
+        rotates_on_use=True,
         pending_hint=(
             "prime-agent's auth.json exists but declares no provider, and a "
             "CLAUDE_CODE_OAUTH_TOKEN does not substitute for one. Observed: with that token "
@@ -524,10 +538,16 @@ class ControlResult:
     succeeded: bool
     duration_s: float
     detail: str = ""
+    # How the arm reached its answer: "probe" for a real call in an isolated HOME, "static" for a
+    # credential read rather than presented. A reader who cannot tell the two apart would take a
+    # structural pass for evidence that the credential authenticates, which it is not, so the
+    # method travels in the record beside the outcome and the detail says why it was chosen.
+    method: str = "probe"
 
     def to_json(self) -> dict[str, Any]:
         return {
             "arm": self.arm,
+            "method": self.method,
             "returncode": self.returncode,
             "succeeded": self.succeeded,
             "duration_s": round(self.duration_s, 3),
@@ -728,6 +748,45 @@ def run_probe(
     )
 
 
+def static_positive_check(
+    spec: CredentialSpec, home: Path, *, model: str = "", now: float | None = None
+) -> ControlResult:
+    """The positive arm for a credential using it would spend: read the file, never present it.
+
+    Structure and expiry, against the same seeded file the cell's legs will copy, using the same
+    reader the eval fan-out already trusts to refuse a phase before it spends
+    (:func:`preflight_seeded_credential`). The one entry judged is the one the cell will present,
+    resolved by the harness itself so this and the launch cannot drift.
+
+    What is given up is real and worth naming. A live probe proves the credential authenticates
+    against the provider today; this proves only that the file is the shape the harness reads and
+    has life left on it. What is kept is the rest of the protocol: the negative control still ran
+    first in this same HOME and still failed, so an ambient login cannot be answering for the
+    credential, and the file this reads is byte-for-byte the one every leg will present. The trade
+    is forced rather than chosen, because the live probe's evidence costs the credential itself.
+
+    ``returncode`` mirrors the outcome because no process ran to have one, and ``method`` says so.
+    """
+    from shobench.harnesses import harness_for
+
+    started = time.time()
+    provider = harness_for(spec.harness).credential_provider(model) if model else ""
+    ok, why_not = preflight_seeded_credential(spec, home, provider=provider, now=now)
+    checked = f"{spec.seed_to} is well-formed and unexpired" if ok else why_not
+    return ControlResult(
+        arm="",
+        returncode=0 if ok else 1,
+        succeeded=ok,
+        duration_s=time.time() - started,
+        detail=(
+            f"checked statically: {checked}. Presenting this credential rotates it, and the "
+            "rotated pair would be written into a throwaway HOME and discarded with it, leaving "
+            "the host holding a token the provider had already retired"
+        ),
+        method="static",
+    )
+
+
 def validate_isolation(
     *,
     harness: str,
@@ -742,6 +801,11 @@ def validate_isolation(
 
     Order matters. The negative control runs first because it is the one that can reveal a
     broken isolation, and a positive check that runs first would look fine either way.
+
+    How the positive check runs is decided by the credential rather than by the harness's name.
+    A credential the spec marks as rotating on use is read instead of presented, because a probe
+    that authenticates for real consumes the host's copy of it; the negative control is untouched
+    either way, since it presents a bogus secret and there is nothing there to spend.
 
     Whether the cell is pending is decided by looking at the credential now, not by a field on
     the spec. A static pending is how every prime_agent cell stayed untrusted forever: the check
@@ -797,15 +861,26 @@ def validate_isolation(
         )
 
     seeded_real = seed_home(spec, home)
-    real = {name: environ[name] for name in spec.env_names if environ.get(name)}
-    positive = run_probe(
-        harness=harness,
-        model=model,
-        docker_args=docker_args,
-        image=image,
-        env=real,
-        credential_file=(home / spec.seed_to) if spec.seed_to else None,
-    )
+    if spec.rotates_on_use:
+        positive = static_positive_check(spec, home, model=model)
+        failed = f"the real credential did not pass its static check: {positive.detail}"
+        passed = (
+            "bogus credential failed in this HOME and the real credential is the shape the "
+            "harness reads with life left on it, checked by reading the seeded file rather than "
+            "by presenting it, because presenting it would have consumed the host's copy"
+        )
+    else:
+        real = {name: environ[name] for name in spec.env_names if environ.get(name)}
+        positive = run_probe(
+            harness=harness,
+            model=model,
+            docker_args=docker_args,
+            image=image,
+            env=real,
+            credential_file=(home / spec.seed_to) if spec.seed_to else None,
+        )
+        failed = "the real credential did not authenticate in the isolated HOME"
+        passed = "bogus credential failed and the real credential succeeded in the same HOME"
     positive.arm = "positive_check"
     positive.detail = f"[{seeded_real}] {positive.detail}"
     if not positive.succeeded:
@@ -813,7 +888,7 @@ def validate_isolation(
             harness=harness,
             mode=mode,
             trusted=False,
-            reason="the real credential did not authenticate in the isolated HOME",
+            reason=failed,
             negative=negative,
             positive=positive,
             env_names_present=present,
@@ -822,7 +897,7 @@ def validate_isolation(
         harness=harness,
         mode=mode,
         trusted=True,
-        reason="bogus credential failed and the real credential succeeded in the same HOME",
+        reason=passed,
         negative=negative,
         positive=positive,
         env_names_present=present,
@@ -900,6 +975,7 @@ __all__ = [
     "refresh_seeded_credential",
     "run_probe",
     "spec_for",
+    "static_positive_check",
     "validate_isolation",
     "write_verdict",
 ]
