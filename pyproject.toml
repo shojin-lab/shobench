@@ -1,6 +1,6 @@
 [project]
 name = "shobench"
-version = "0.0.1"
+version = "0.1.0a1"
 description = "A benchmark of agents from shared initial conditions: what they do, and when they choose to stop"
 readme = "README.md"
 license = "Apache-2.0"
