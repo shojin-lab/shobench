@@ -1307,14 +1307,20 @@ EVAL_LAUNCH_STAGGER_S = 2.0
 class _StaggeredAdmission:
     """Hands the first launches of an eval phase out one at a time, a fixed gap apart.
 
-    It sits AFTER the concurrency gate on purpose. That costs a held slot for the length of the
-    spacing and buys the only property worth having: the first ``first_n`` LAUNCHES are spaced,
-    in the order the gate admitted them, whatever order the coroutines were scheduled in.
-    Spacing ahead of the gate spaces only the coroutines that sleep, and a task that skips the
-    sleep takes a free slot the sleeping ones have not claimed yet: eight tasks at a concurrency
-    of four launched in the order 5, 6, 7, 8, 1, 2, 3, 4, which is an unstaggered first wave
-    wearing reversed membership. Spacing where admission happens cannot be bypassed, because
-    there is no path to a launch that does not pass through it.
+    It is taken at the LAUNCH, the last point before a container starts, and that placement is
+    the whole mechanism. The property is that the first ``first_n`` launches of a phase are a
+    gap apart, whatever order the coroutines were scheduled in and however long each spent
+    setting itself up. Which held-out ids those launches belong to is not part of it: a task
+    reaches this point only by holding a slot at the gate, so the wave is drawn from the tasks
+    the gate admitted, and the ids are gathered and the rows read back by task id regardless.
+
+    Both earlier placements were bypassable, each in its own way. Spacing ahead of the gate
+    spaces only the coroutines that sleep, and a task that skips the sleep takes a free slot the
+    sleeping ones have not claimed yet: eight tasks at a concurrency of four launched in the
+    order 5, 6, 7, 8, 1, 2, 3, 4, an unstaggered wave wearing reversed membership. Spacing at
+    the gate instead, with the per-task copies between it and the leg, let a task that copied
+    quickly launch inside the window of one still copying, so the wave went out unspaced again.
+    A gap held between two things that both happen before a launch spaces neither.
 
     Once ``first_n`` launches have gone through this is a no-op forever. Past the first wave a
     slot opens only when a task finishes, so the launches are already spread by the work itself.
@@ -1458,11 +1464,6 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
         task_work = phase_dir / "work" / f"task-{idx:05d}"
         task_cfg = phase_dir / "cfg" / f"task-{idx:05d}"
         async with gate:
-            # Spaced inside the gate, where a launch actually becomes a launch. Nothing about the
-            # phase's ordering or its accounting rides on it: the ids are gathered, the rows are
-            # read back by task id, and a task held here runs the same leg against the same
-            # one-task stream a moment later.
-            await admission.wait()
             if usage_limit:
                 return  # a usage limit closed the window; this task waits for the resume
             if ctx.operator_stop.fired.is_set():
@@ -1518,6 +1519,18 @@ async def run_eval_phase(ctx: RunContext, phase: str) -> list[TaskResult]:
                 # what the grace covers is that harness's own wrap-up after the seal.
                 drained = EarlyEnding()
                 async with stream, _served(stream, port):
+                    # The spacing, taken at the last point before the container starts. Anything
+                    # before this is setup, and setup is not what a credential race is between:
+                    # a task admitted at the gate and then held in an unbounded copy would let
+                    # a later task's launch land inside the wave it was supposed to follow.
+                    # Nothing between here and the leg awaits, so the order legs start in is the
+                    # order this hands out.
+                    await admission.wait()
+                    if usage_limit or ctx.operator_stop.fired.is_set():
+                        # The window closed while this launch was being spaced. Checked again
+                        # here because the wave's spacing is seconds of a phase's opening, and
+                        # what the earlier check protects is the copy rather than the launch.
+                        return
                     watching = asyncio.create_task(
                         _watch_for_drain(
                             stream,

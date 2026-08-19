@@ -472,8 +472,14 @@ def test_the_first_wave_is_spaced_and_no_task_launches_around_it(
     tasks at a concurrency of four, spacing ahead of the gate let 5, 6, 7 and 8 take the free
     slots the sleepers had not claimed yet and launch first, unspaced, so the real first wave was
     both unstaggered and reversed. What this asserts is what the mechanism is for: the first four
-    LAUNCHES are the first four pending ids, each a gap after the last, and no fifth task starts
-    before the wave is out.
+    LAUNCHES are each a gap after the last, and every id launches exactly once.
+
+    Not WHICH four ids they are. A task reaches the spacing only by holding a slot at the gate,
+    so the wave is drawn from the tasks the gate admitted, but they arrive in the order their
+    setup finished in and setup runs off the loop. Asserting the four ids read as a stronger
+    promise than the mechanism makes, and once the copies moved off the loop it failed about a
+    third of the time. ``test_a_slow_setup_cannot_let_a_later_launch_into_the_wave`` is the
+    guard for the property that ordering assertion was standing in for.
     """
     gap = 0.05
     limit = 4
@@ -490,8 +496,7 @@ def test_the_first_wave_is_spaced_and_no_task_launches_around_it(
 
     staggered = asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
 
-    # The wave is the first four ids, in order, and nothing overtook it.
-    assert launched[:limit] == [1, 2, 3, 4]
+    # The first four launches, whichever ids they belong to, a gap apart.
     wave = [at[idx] for idx in launched[:limit]]
     # Pairwise, so a wave that arrived in one burst with a long tail cannot pass on its span.
     assert min(later - earlier for earlier, later in zip(wave, wave[1:], strict=False)) >= gap * 0.8
@@ -512,6 +517,51 @@ def test_the_first_wave_is_spaced_and_no_task_launches_around_it(
 
     assert sorted(launched) == sorted(plain_launched)
     assert [r.task_idx for r in staggered] == [r.task_idx for r in plain] == list(range(1, 9))
+
+
+def test_a_slow_setup_cannot_let_a_later_launch_into_the_wave(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The wave has to stay spaced when the tasks in it are slow to get ready.
+
+    Setup is unbounded (a per-task copy of a HOME and a cwd, both off the loop) and a phase's
+    tasks do not take equally long at it. Held at the gate rather than at the launch, the gap
+    was spent by three slow tasks while they were still copying: their reservations ran out on
+    the clock, and the tasks behind them then launched one after another with no spacing at all,
+    which is the burst of simultaneous credential presentations the mechanism exists to prevent.
+    Three of the four slots are made slow here, so the wave can only stay spaced if the gap is
+    taken where the container starts.
+    """
+    gap = 0.15
+    limit = 4
+    slow_ids = {2, 3, 4}
+    monkeypatch.setattr(runner, "EVAL_LAUNCH_STAGGER_S", gap)
+    ids = tuple(str(i) for i in range(1, 9))
+    ctx = _ctx(tmp_path, cell_name=_PRIME_CELL, heldout=ids)
+    ctx = replace(
+        ctx, cell=replace(ctx.cell, budget=replace(ctx.cell.budget, eval_concurrency=limit))
+    )
+    _seed_prime_auth(ctx, lifetime_s=PREFLIGHT_MIN_LIFETIME_S + 7200, monkeypatch=monkeypatch)
+    launched: list[int] = []
+    at: dict[int, float] = {}
+    _capture_launches(monkeypatch, launched, at)
+
+    real_copy = runner._copy_task_home
+
+    def slow_for_some(base: Path, dst: Path, **kw: object) -> None:
+        # The task's own id is in the path it copies into, which is the only handle a copy has
+        # on which task it is preparing.
+        if int(dst.name.split("-")[1]) in slow_ids:
+            time.sleep(gap * 6)
+        real_copy(base, dst, **kw)
+
+    monkeypatch.setattr(runner, "_copy_task_home", slow_for_some)
+
+    asyncio.run(runner.run_eval_phase(ctx, "eval_before"))
+
+    wave = [at[idx] for idx in launched[:limit]]
+    assert min(later - earlier for earlier, later in zip(wave, wave[1:], strict=False)) >= gap * 0.8
+    assert sorted(launched) == list(range(1, 9))
 
 
 def test_the_stagger_stops_after_the_first_wave(tmp_path: Path, monkeypatch) -> None:
