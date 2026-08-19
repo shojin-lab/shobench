@@ -8,10 +8,13 @@ rerun it and get byte-identical output.
     uv run python tools/build_splits.py tau2_telecom
     uv run python tools/build_splits.py hle
     uv run python tools/build_splits.py tau2_banking_knowledge
+    uv run python tools/build_splits.py hle_order2
 
 The builders differ because the splits have different authority. automationbench adopts a
 published split, tau2_telecom honors upstream's declared one, and hle and
-tau2_banking_knowledge have none to honor so this repo draws and publishes its own.
+tau2_banking_knowledge have none to honor so this repo draws and publishes its own. The
+``_order2`` manifests have no authority of their own: each republishes another manifest's
+membership with the improvement pool in a different order.
 """
 
 from __future__ import annotations
@@ -20,14 +23,16 @@ import argparse
 import json
 import random
 import sys
+import tempfile
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from shobench.pins import SHOGYM_REV, TAU2_UPSTREAM_SHA  # noqa: E402
-from shobench.splits import splits_dir, write_split  # noqa: E402
+from shobench.splits import Split, load_split, splits_dir, write_split  # noqa: E402
 
 # One seed for every derivation in this repo, so "which seed" is never a per-file question.
 SEED = 20260807
@@ -356,11 +361,170 @@ def build_tau2_banking_knowledge(out: Path) -> Path:
     )
 
 
+# ----- order-permuted replication arms ---------------------------------------------------
+
+# One seed across the arms, as SEED is one across the derivations. It is not SEED: reusing that
+# would make a pool's second order a function of its first.
+ORDER2_SEED = 20260816
+
+ORDER2_PARENTS = {
+    "automationbench_order2": "automationbench",
+    "hle_order2": "hle",
+    "tau2_banking_knowledge_order2": "tau2_banking_knowledge",
+}
+
+
+def _membership(split: Split) -> bytes:
+    """What a manifest holds, in the one form two of them can be compared byte for byte.
+
+    Order is what this drops. An id on its own is not the task: where ids are positions into an
+    env's task list, the label is what a position resolves to and the side's ``env_kwargs`` are
+    the construction it indexes into, so an upstream that reordered its rows without changing
+    their count would hand a fresh build the same integers behind different questions.
+    """
+    return json.dumps(
+        {
+            name: {
+                "env_kwargs": side.env_kwargs,
+                "tasks": sorted(
+                    zip(side.task_ids, side.labels or ("",) * len(side.task_ids), strict=True)
+                ),
+            }
+            for name, side in (("heldout", split.heldout), ("pool", split.pool))
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _served_span(split_name: str, pool_size: int) -> int:
+    """How many of a split's pool positions a cell reading it can ever reach.
+
+    Read off the cells rather than written down here: the ceiling is a cell axis, and a copy in
+    this file would be a second place for it to be true. One span cannot stand for two candidate
+    sets, so cells disagreeing on it are refused rather than reconciled.
+    """
+    from shobench.config import load_all_cells
+
+    ceilings = {
+        min(cell.budget.pool_ceiling or pool_size, pool_size)
+        for cell in load_all_cells()
+        if cell.split == split_name
+    }
+    if not ceilings:
+        raise SystemExit(
+            f"no cell reads {split_name}, so there is no served span to replicate under"
+        )
+    if len(ceilings) > 1:
+        raise SystemExit(
+            f"cells reading {split_name} disagree on pool_ceiling ({sorted(ceilings)}), so the "
+            "candidate set a rollout reaches is not one set and an order-only arm cannot be built"
+        )
+    return ceilings.pop()
+
+
+def build_order2(out: Path, *, parent: Path, rebuild: Callable[[Path], Path]) -> Path:
+    """Republish a committed manifest with its improvement pool served in another order.
+
+    A cell reading this manifest differs from the same cell reading the parent in the order the
+    pool arrives and in nothing else. The held-out side is copied across id for id in the
+    parent's order, a cold eval reading the same tasks whichever order they arrive in.
+
+    The permutation is confined to the span a rollout can reach, the ``pool_ceiling`` the cells
+    reading the parent declare. Shuffling past it would hand a cell serving 200 of 480 tasks a
+    different 200 rather than the same 200 in another order. Beyond the span the parent's order
+    stands.
+
+    Nothing here draws a task. The parent is rebuilt from its own sources first, and unless the
+    committed manifest still holds exactly what that build produces, ids with the labels they
+    resolve to and each side's ``env_kwargs`` alike, this writes nothing. Order is left out of
+    that comparison because it is what this manifest changes, and ``shogym_rev`` because it moves
+    with the pin and says nothing about which tasks a split holds.
+    """
+    committed = load_split(parent)
+    with tempfile.TemporaryDirectory() as tmp:
+        fresh = load_split(rebuild(Path(tmp) / parent.name))
+    if _membership(committed) != _membership(fresh):
+        raise SystemExit(
+            f"{parent} no longer holds the tasks its own builder produces: an id, the label a "
+            "position resolves to, or a side's env_kwargs has moved, so there is nothing here "
+            "to replicate. Rebuild the parent and settle what moved first"
+        )
+
+    span = _served_span(parent.stem, len(committed.pool))
+    order = list(range(span))
+    random.Random(ORDER2_SEED).shuffle(order)
+    order += list(range(span, len(committed.pool)))
+    # Labels are positional where a manifest carries them at all, so they move with their ids.
+    parent_labels = committed.pool.labels
+    pool_labels = [parent_labels[i] for i in order] if parent_labels else []
+
+    return write_split(
+        out,
+        env=committed.env,
+        total_tasks=committed.total_tasks,
+        heldout=list(committed.heldout.task_ids),
+        pool=[committed.pool.task_ids[i] for i in order],
+        heldout_env_kwargs=dict(committed.heldout.env_kwargs),
+        pool_env_kwargs=dict(committed.pool.env_kwargs),
+        heldout_labels=list(committed.heldout.labels),
+        pool_labels=pool_labels,
+        provenance={
+            "kind": "seeded",
+            "seed": ORDER2_SEED,
+            "parent_split": parent.stem,
+            "parent_id_digest": committed.id_digest,
+            "permuted_span": [0, span - 1],
+            "arm": (
+                "An order-only replication of the parent split. Both sides hold exactly the "
+                "parent's ids, the held-out side in the parent's own order, and only the pool's "
+                "serving order differs. It exists so an effect measured over one pool order can "
+                "be read again over another: one that repeats is not a property of the order "
+                "that pool happened to arrive in."
+            ),
+            "authority": (
+                "This manifest draws nothing and adopts nothing. Membership and its authority "
+                "are the parent's, carried below under parent_provenance and unchanged here, "
+                "whether the parent adopted a published split, honored an upstream one or drew "
+                "its own. The seed recorded here permutes the pool's serving order locally and "
+                "governs nothing else."
+            ),
+            "procedure": (
+                "Rebuild the parent from its own sources, refuse unless the committed parent "
+                "still holds exactly that membership, copy the held-out side across id for id "
+                f"in the parent's order, then shuffle positions 0 to {span - 1} of its pool "
+                "once with the recorded seed, labels moving with the ids they name. "
+                "Positions beyond that span, if the pool has any, keep the "
+                "parent's order. The span is the pool_ceiling declared by every cell that reads "
+                "the parent, read off those cell files rather than written down in the builder, "
+                "and cells disagreeing on it are refused."
+            ),
+            "truncation": (
+                "Confining the permutation to the served span makes the candidate set a rollout "
+                "can reach identical to the parent's, so only order differs. What the rollout "
+                "realizes inside that set still varies: a leg ending on its wall clock serves a "
+                "prefix of the span, and the two readings reach different prefixes of the same "
+                "candidates. That is the arm working rather than a confound, the set being "
+                "fixed and the order being the thing under test."
+            ),
+            "parent_provenance": committed.provenance,
+            "shogym_rev": SHOGYM_REV,
+        },
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "env",
-        choices=["automationbench", "tau2_telecom", "hle", "tau2_banking_knowledge", "all"],
+        choices=[
+            "automationbench",
+            "tau2_telecom",
+            "hle",
+            "tau2_banking_knowledge",
+            *ORDER2_PARENTS,
+            "all",
+        ],
     )
     parser.add_argument("--shorep", type=Path, default=Path("../shorep"))
     parser.add_argument("--cache", type=Path, default=Path.home() / ".cache" / "shobench")
@@ -368,18 +532,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     out_dir = args.out_dir or splits_dir()
-    all_envs = ["automationbench", "tau2_telecom", "hle", "tau2_banking_knowledge"]
-    targets = all_envs if args.env == "all" else [args.env]
+    builders: dict[str, Callable[[Path], Path]] = {
+        "automationbench": lambda out: build_automationbench(args.shorep.resolve(), out),
+        "tau2_telecom": lambda out: build_tau2_telecom(out, args.cache),
+        "hle": build_hle,
+        "tau2_banking_knowledge": build_tau2_banking_knowledge,
+    }
+    # An arm reads the manifest it replicates, so every parent is built before any arm is.
+    targets = [*builders, *ORDER2_PARENTS] if args.env == "all" else [args.env]
     for env in targets:
         out = out_dir / f"{env}.json"
-        if env == "automationbench":
-            build_automationbench(args.shorep.resolve(), out)
-        elif env == "tau2_telecom":
-            build_tau2_telecom(out, args.cache)
-        elif env == "tau2_banking_knowledge":
-            build_tau2_banking_knowledge(out)
+        if env in ORDER2_PARENTS:
+            parent = ORDER2_PARENTS[env]
+            build_order2(out, parent=out_dir / f"{parent}.json", rebuild=builders[parent])
         else:
-            build_hle(out)
+            builders[env](out)
         print(f"wrote {out}")
     return 0
 
