@@ -109,6 +109,12 @@ def test_the_pool_ceiling_truncates_and_never_extends() -> None:
 
 # ----- cells and instructions ---------------------------------------------------------------
 
+# Read off the tree rather than listed here, so an arm added later is held to the same
+# invariants without anyone remembering to name it twice.
+_INSTRUCTION_ARMS = tuple(
+    sorted(path.name for path in (repo_root() / "instructions").iterdir() if path.is_dir())
+)
+
 
 def test_every_cell_config_loads_and_names_a_committed_split() -> None:
     cells = load_all_cells()
@@ -171,17 +177,34 @@ def test_the_instruction_is_byte_identical_across_every_cell() -> None:
     assert len(digests) == 1
 
 
-def test_the_improvement_objective_is_absent_from_the_eval_instruction() -> None:
-    instruction = load_instruction("get-better")
+@pytest.mark.parametrize("arm", _INSTRUCTION_ARMS)
+def test_the_improvement_objective_is_absent_from_the_eval_instruction(arm: str) -> None:
+    instruction = load_instruction(arm)
     assert instruction.rollout_system.startswith("Get Better.")
     assert "Get Better" not in instruction.eval_system
 
 
-def test_the_instruction_names_no_env_and_no_env_specific_tool() -> None:
+@pytest.mark.skipif(
+    len(_INSTRUCTION_ARMS) < 2,
+    reason="one arm on the tree, so there is no second wording to compare it against",
+)
+def test_the_arms_vary_the_rollout_prompt_and_nothing_else() -> None:
+    """An arm is one rollout wording against a shared exam. A bookend compares the EVAL digest
+    between the two archives it pairs, so an arm that changed the eval prompt, the kickoff, or
+    the continuation cue could not be measured against another arm's baseline at all."""
+    arms = [load_instruction(arm) for arm in _INSTRUCTION_ARMS]
+    assert len({instruction.eval_system_sha256 for instruction in arms}) == 1
+    assert len({instruction.continuation_sha256 for instruction in arms}) == 1
+    assert len({instruction.kickoff for instruction in arms}) == 1
+    assert len({instruction.rollout_system_sha256 for instruction in arms}) == len(arms)
+
+
+@pytest.mark.parametrize("arm", _INSTRUCTION_ARMS)
+def test_the_instruction_names_no_env_and_no_env_specific_tool(arm: str) -> None:
     """The prompt is env-agnostic by design, so it may not name an env or an env's scoring
     tool. `get_task` is the stream's own tool and is the one allowed name; `{done: true}` is
     that tool's own reply field, not a tool the agent is told to call."""
-    text = load_instruction("get-better").rollout_system.lower()
+    text = load_instruction(arm).rollout_system.lower()
     for env_name in ("automationbench", "tau2", "telecom", "hle", "wordle", "orca"):
         assert env_name not in text
     for tool_name in ("submit_answer", "`done`", "call `done", "send_message"):
