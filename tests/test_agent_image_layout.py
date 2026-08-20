@@ -58,8 +58,8 @@ def test_relative_host_paths_still_reach_docker_absolute(tmp_path: Path, monkeyp
     """Docker reads a non-absolute ``-v`` source as a named volume and refuses it.
 
     The CLI's default layout hands the sandbox paths relative to the invocation cwd
-    (``runs/precheck-<cell>/home``), which is how the first real precheck died with
-    "invalid characters for a local volume name" before any spend.
+    (``runs/precheck-<cell>/home``), which docker refuses with "invalid characters for a
+    local volume name" before any spend.
     """
     monkeypatch.chdir(tmp_path)
     sandbox = CellSandbox(run_id="r", home=Path("runs/pre/home"), workdir=Path("runs/pre/work"))
@@ -119,9 +119,9 @@ def test_the_build_verifies_its_own_bake(tmp_path: Path) -> None:
 def test_two_runs_of_one_cell_never_share_container_names(tmp_path: Path) -> None:
     """Truncation must not erase what makes a run unique.
 
-    The prime-opus cell name is long enough that a bare [:50] cut off the whole timestamp, two
-    concurrent runs of the cell shared one namespace-holder name, and the second run's up()
-    (a docker rm -f before the create) tore down the first run's live network mid-eval.
+    A long enough cell name lets a bare [:50] cut off the whole timestamp, so two concurrent
+    runs of the cell share one namespace-holder name and the second run's up() (a docker rm -f
+    before the create) tears down the first run's live network mid-eval.
     """
     cell = "automationbench-prime_agent-claude-opus-5"
     a = CellSandbox(run_id=f"{cell}-20260812T001456Z", home=tmp_path / "a", workdir=tmp_path / "aw")
@@ -141,7 +141,7 @@ def test_two_runs_of_one_cell_never_share_container_names(tmp_path: Path) -> Non
 def test_crash_cleanup_and_the_sandbox_agree_on_every_name(tmp_path: Path, monkeypatch) -> None:
     """cleanup() must remove the names up() creates, not a hand-reconstructed formula.
 
-    The first digest fix left cleanup rebuilding the OLD stem by hand, so it silently removed
+    A cleanup that rebuilds the stem by hand drifts from the real one and silently removes
     nothing: every docker call in it is check=False.
     """
     from shobench import runner

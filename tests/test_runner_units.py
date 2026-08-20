@@ -1009,13 +1009,14 @@ def test_prime_resumes_only_a_session_recorded_at_the_leg_cwd(tmp_path: Path) ->
 
 
 def test_prime_resolves_the_header_id_whatever_the_file_is_called(tmp_path: Path) -> None:
-    """The filename is not the identity, and requiring it refused real runs.
+    """The filename is not the identity, and requiring it refuses sessions the CLI resumes.
 
     The daemon mints the session file under one id and the print run's header carries
     another, rewritten into that same file: observed on a session the pinned CLI itself wrote,
-    and the shape of both real prime rollouts, whose recorded terminal id sits inside a file
-    named for a different id. The CLI resolves the HEADER id out of the differently named
-    file and appends to it (observed, network off), because its scanner indexes header ids
+    whose recorded terminal id sits inside a file named for a different id. That is the
+    ordinary shape of a rollout's terminus. The CLI resolves the HEADER id out of the
+    differently named file and appends to it (observed, network off), because its scanner
+    indexes header ids
     and never filenames (source). Ambiguity is the one thing the scan must not paper over:
     the resolver refuses a selector matching two sessions (source), so two files carrying the
     same header id refuse here too.
@@ -1112,7 +1113,7 @@ def test_the_preflight_reads_the_decoders_json_dialect_not_pythons(tmp_path: Pat
             },
         }
     )
-    # The review's verbatim counterexample: an escaped lone surrogate in the meta, no
+    # The counterexample, verbatim: an escaped lone surrogate in the meta, no
     # envelope timestamp. Refused by the CLI, and refused with the envelope restored (the
     # encoding is fatal on its own), and refused with clean values but no envelope timestamp
     # (that field is load-bearing on its own), and refused when the first line does not
@@ -1432,9 +1433,9 @@ def test_publication_replaces_a_planted_leaf_and_never_writes_through_it(
     tmp_path: Path,
 ) -> None:
     """The result leaf names are deterministic, so an entry can be waiting there before the
-    run publishes: a symlink at the leaf turned publication into a write through the results
-    directory into wherever it pointed (an archived run, in review). Publication now swaps
-    the entry atomically, so whatever held the name is replaced and nothing is followed."""
+    run publishes: a symlink at the leaf turns publication into a write through the results
+    directory into wherever it points. Publication swaps the entry atomically instead, so
+    whatever held the name is replaced and nothing is followed."""
     elsewhere = tmp_path / "elsewhere.json"
     elsewhere.write_text("UNTOUCHED", encoding="utf-8")
     results = tmp_path / "results"

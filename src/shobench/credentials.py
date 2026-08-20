@@ -72,7 +72,7 @@ class CredentialSpec:
     # of that question and not the whole of it, because one spec's file can hold either kind:
     # prime's auth.json carries an oauth entry or an api_key entry under a provider id, and an
     # api key is the same key after it is presented.
-    # Only the arm this was observed on is marked: codex's auth.json states no expiry a reader
+    # Only the arm it can happen on is marked: codex's auth.json states no expiry a reader
     # can check, so a guard on it would refuse nothing, and the environment-carried modes seed
     # no file to read at all.
     rotates_on_use: bool = False
@@ -281,15 +281,14 @@ def describe_seed(spec: CredentialSpec, body: Any) -> str:
 # copies the one seeded file into a HOME of its own and starts within seconds of its siblings, so
 # a credential that is about to expire is not one leg's problem: each copy reaches for a refresh
 # of its own, and a provider that rotates the refresh token on use invalidates every copy that
-# was a moment behind the first. One prime eval phase lost 119 of 120 legs to "No API key for
-# provider" in bursts of near-identical ~19s failures, with the file's own expiry hours away, so
-# the margin is a floor rather than the whole story: it rules out the credential that was already
-# dead before the phase began, and the launch stagger is what addresses the rest.
+# was a moment behind the first, which can refuse a whole phase of legs at once. The margin is a
+# floor rather than the whole story: it rules out the credential that was already dead before the
+# phase began, and the launch stagger is what addresses the rest.
 #
 # The same margin is what makes the positive probe safe to run against a rotating credential. The
 # harness reaches for a refresh only once the clock has passed the entry's expiry, so an entry with
 # a quarter of an hour left cannot be refreshed by a probe that finishes in seconds, and the rotated
-# pair that broke a launch cannot be minted inside a HOME that is about to be deleted.
+# pair cannot be minted inside a HOME that is about to be deleted.
 PREFLIGHT_MIN_LIFETIME_S = 900
 
 
@@ -604,8 +603,8 @@ class IsolationVerdict:
 # own output stream and still exit 0 on an authentication failure (prime-agent does both).
 # And the expectation is matched only against the model's own answer text, extracted from the
 # harness's structured stream by ``_probe_answer``, because the surrounding stream carries
-# incidental numerics (prime-agent stamps millisecond timestamps on every message, and every
-# epoch millisecond in a three-hour window of late 2026 begins with this sum's digits).
+# incidental numerics (prime-agent stamps millisecond timestamps on every message, and an epoch
+# millisecond can begin with this sum's digits).
 PROBE_PROMPT = "Add 179312 and 41, then reply with only the digits of the sum."
 PROBE_EXPECT = "179353"
 

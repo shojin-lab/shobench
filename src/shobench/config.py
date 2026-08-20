@@ -152,9 +152,10 @@ class Budget:
     eval_concurrency: int = 4
     # Seconds the ROLLOUT leg may show no evidence of progress from any source before the runner
     # ends it. 0 disables the check, which is what every run recorded before this existed ran
-    # under. A bound on silence rather than on work: the default sits above the longest single
-    # tool call in the archives (a yc_bench hour), and a cell with longer tasks raises it. The
-    # eval phases are untouched, being bounded per task by eval_task_timeout_s.
+    # under. A bound on silence rather than on work: the default sits well above the longest
+    # single tool call legitimate work takes, which can run to an hour, and a cell with longer
+    # tasks raises it. The eval phases are untouched, being bounded per task by
+    # eval_task_timeout_s.
     rollout_no_progress_s: int = 7200
 
     def to_manifest(self) -> dict[str, Any]:

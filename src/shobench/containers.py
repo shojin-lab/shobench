@@ -94,15 +94,14 @@ def run_stem(run_id: str) -> str:
     """The one name stem every docker resource of a run derives from.
 
     Container names become DNS labels, capped at 63 characters, so the stem is truncated.
-    Truncation alone once erased the run timestamp for a long cell name, and two concurrent
-    runs of one cell then fought over a single namespace holder: ``up()`` is a docker rm -f
-    before the create, so the second run tore down the first run's live network mid-eval. The
+    Truncation alone erases the run timestamp for a long enough cell name, and two concurrent
+    runs of one cell then fight over a single namespace holder: ``up()`` is a docker rm -f
+    before the create, so the second run tears down the first run's live network mid-eval. The
     64-bit digest of the FULL run id keeps distinct runs' names distinct whatever the cell
-    name's length (a pairwise collision is 1 in 2**64; the 32-bit version this replaced was
-    reviewably weak), while the same run keeps the same names across resume and rerun, which
-    reclaim their own holder by name. Derivation lives in one function because a cleanup path
-    that reconstructed the stem by hand kept the OLD formula after the fix and silently
-    removed nothing.
+    name's length (a pairwise collision is 1 in 2**64; a 32-bit digest is reviewably weak),
+    while the same run keeps the same names across resume and rerun, which reclaim their own
+    holder by name. Derivation lives in one function because a cleanup path that reconstructs
+    the stem by hand drifts from it silently and then removes nothing.
     """
     digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:16]
     return f"shobench-{run_id}"[:33] + f"-{digest}"

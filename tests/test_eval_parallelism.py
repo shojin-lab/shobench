@@ -218,9 +218,9 @@ def _work_mount(args: list[str]) -> str:
 
 
 def test_each_eval_task_mounts_its_own_work_directory(tmp_path: Path) -> None:
-    """Finding 1: every eval task's ``/work`` is a directory of its own, never the cell-wide one,
-    so two concurrent tasks cannot share the writable cwd. Inspected on the generated docker args,
-    the same construction the reviewer drove against the real image."""
+    """Every eval task's ``/work`` is a directory of its own, never the cell-wide one, so two
+    concurrent tasks cannot share the writable cwd. Inspected on the generated docker args, which
+    is the construction a real leg runs under."""
     sandbox = CellSandbox(run_id="r", home=tmp_path / "home", workdir=tmp_path / "cellwork")
     work_a = tmp_path / "task-a"
     work_b = tmp_path / "task-b"
@@ -496,7 +496,7 @@ def test_the_eval_phase_runs_in_parallel_keys_every_result_and_survives_a_failur
     for home in homes_seen.values():
         assert not home.exists()
     # And a distinct /work of its own, discarded with the home: no eval-writable directory is
-    # shared, which is what keeps one task's file from reaching another (finding 1).
+    # shared, which is what keeps one task's file from reaching another.
     assert len(set(works_seen.values())) == len(works_seen)
     for work in works_seen.values():
         assert not work.exists()

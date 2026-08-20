@@ -427,11 +427,11 @@ def write_results(
     path.parent.mkdir(parents=True, exist_ok=True)
     # Written beside the leaf and swapped in atomically, so publication REPLACES whatever
     # holds the name: a stale file, a hard link, or a symlink someone left at the
-    # deterministic leaf. A plain write follows an existing symlink, which turned a link
+    # deterministic leaf. A plain write follows an existing symlink, which turns a link
     # planted at the leaf name into a write through the results directory into wherever it
-    # pointed (an archived source run, in review); ``os.replace`` swaps the directory entry
-    # itself and follows nothing. Owned here rather than by each caller, so every publisher
-    # (a fresh cell, a resume, a rerun, a rebookend) inherits the same guarantee.
+    # points; ``os.replace`` swaps the directory entry itself and follows nothing. Owned here
+    # rather than by each caller, so every publisher (a fresh cell, a resume, a rerun, a
+    # rebookend) inherits the same guarantee.
     #
     # The scratch entry is per CALL, minted exclusively by mkstemp, in the same directory so
     # the swap can never cross devices. A per-process name was not enough: two publishers in
