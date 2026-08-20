@@ -528,7 +528,7 @@ def _watching(ctx: RunContext, *, bound_s: float, poll_s: float, ending: EarlyEn
 
 
 def test_a_leg_with_no_progress_anywhere_is_stalled(tmp_path: Path) -> None:
-    """The observed wedge: a container alive and holding a core, writing nothing anywhere."""
+    """The wedge: a container alive and holding a core, writing nothing anywhere."""
     ctx = _ctx(tmp_path, cell_name=_PRIME_CELL)
     ending = EarlyEnding()
 
@@ -714,8 +714,8 @@ def test_the_eval_phase_is_untouched(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_the_shipped_cells_bound_their_rollouts_generously(tmp_path: Path) -> None:
-    """The default has to sit far above anything observed to be legitimate work: the longest
-    single tool call in the archives is a yc_bench hour."""
+    """The default has to sit far above anything that is legitimate work: a single tool call
+    can run to an hour."""
     assert Budget(rollout_wall_clock_s=1).rollout_no_progress_s == 7200
     for cell in load_all_cells():
         bound = cell.budget.rollout_no_progress_s
@@ -1042,7 +1042,7 @@ def test_a_symlink_cycle_terminates_as_unreadable(tmp_path: Path) -> None:
 
 
 def test_a_resolving_link_inside_the_tree_keeps_a_real_fingerprint(tmp_path: Path) -> None:
-    """Calling every symlink unreadable would quietly disable the detector for prime, whose real
+    """Calling every symlink unreadable would quietly disable the detector for prime, whose
     homes carry relative in-home links that all resolve. A tree reached twice by two links is
     counted twice, which is deterministic, so the fingerprint still moves only when something
     moved."""

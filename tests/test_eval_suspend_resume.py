@@ -11,8 +11,8 @@ property of each task's own provenance, a finished id is never re-run, and a pha
 account for every id is not published. The only thing added here is the trigger, a usage-limit
 verdict that suspends the cell through the same hard-exit/resume plumbing the rollout uses.
 
-None of this needs Docker. The eval streams are real (driven in-process, one per task, the way
-the reviewer drained a real held-out stream), and the harness leg is stood in for by connecting
+None of this needs Docker. The eval streams are real (driven in-process, one per task, the way a
+real held-out stream is drained), and the harness leg is stood in for by connecting
 to the served stream over the loopback and pulling a task, which is all the leg's container does
 over MCP anyway: a completed task terminates it, an interrupted one leaves it in flight so the
 stream drains it exactly as a usage limit would.
@@ -59,8 +59,8 @@ def _play_eval_task(prov_dir: Path, task_id: int, *, terminate: bool) -> None:
 
     ``terminate`` decides which. Terminating leaves an ``aborted`` scored row, a real outcome the
     agent reached. Not terminating leaves the task in flight, so closing the stream drains it into
-    a ``drained`` row: exactly the state a usage limit mid-task leaves, and the row finding 2 is
-    about.
+    a ``drained`` row: exactly the state a usage limit mid-task leaves, and the row a suspension
+    must not publish.
     """
     import shogym
     from fastmcp import Client
@@ -782,7 +782,7 @@ def _reopenable_run(tmp_path, *, with_suspension=False, with_terminus=True, with
 
     split = load_split_by_name(cell.split)
     instruction = load_instruction(cell.instruction_arm)
-    # Modeled on a wave-1 artifact: written before the rollout_feedback and eval_context axes
+    # Modeled on a pre-axis artifact: written before the rollout_feedback and eval_context axes
     # existed, so both keys are absent; absence must read as never and as cold.
     cell_manifest = {
         k: v
@@ -924,7 +924,7 @@ def test_a_live_owners_lock_refuses_a_second_owner_and_a_dead_one_is_free(tmp_pa
 
 
 def test_rerun_eval_is_refused_while_the_run_has_a_live_owner(tmp_path) -> None:
-    """The exact race the review demonstrated: reopening a cell mid-eval tears its network."""
+    """The race this refusal exists for: reopening a cell mid-eval tears its network."""
     from shobench import runner
 
     run_dir = _reopenable_run(tmp_path)

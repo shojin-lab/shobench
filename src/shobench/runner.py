@@ -912,11 +912,11 @@ def run_leg(
 def free_port() -> int:
     """Claim a free ephemeral port by binding it and letting go.
 
-    A fixed port is not safe here. A stale server from an unrelated session was found
-    listening on the conventional port during development, and the agent connected to it and
-    was told the queue was exhausted, which would have been recorded as an agent that chose to
-    stop immediately. Asking the kernel for a port it believes is free, and then proving our
-    own server is the one answering, is what makes that impossible rather than unlikely.
+    A fixed port is not safe here. A stale server from an unrelated session can be listening on
+    the conventional port, and an agent that connects to it is told the queue is exhausted,
+    which would be recorded as an agent that chose to stop immediately. Asking the kernel for a
+    port it believes is free, and then proving our own server is the one answering, is what
+    makes that impossible rather than unlikely.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1119,13 +1119,12 @@ def _eval_pending_ids(phase_dir: Path, task_ids: Sequence[str]) -> list[str]:
 
 # prime_agent is why the watchdog exists. Launched autonomous with no quality gate, its
 # continuation check has nothing to evaluate and returns "keep going" unconditionally, so the leg
-# has no terminal condition of its own and runs until the task timeout kills it: a median
-# time-to-terminal of about two minutes stretched into 25 to 30 minutes of wall clock, roughly 90%
-# of it after the measurement was already complete. The score is unaffected either way (the row
-# seals at the task's completion call and the per-task home is discarded), so what this recovers
-# is time and spend, and the ending is recorded as its own kind so the finding stays visible. How
-# long a leg is given after its task is finished, if anything at all, is the harness's own
-# ``eval_drain_grace_s``.
+# has no terminal condition of its own and runs until the task timeout kills it, which is most of
+# a leg's wall clock spent after the measurement is already complete. The score is unaffected
+# either way (the row seals at the task's completion call and the per-task home is discarded), so
+# what this recovers is time and spend, and the ending is recorded as its own kind so the finding
+# stays visible. How long a leg is given after its task is finished, if anything at all, is the
+# harness's own ``eval_drain_grace_s``.
 #
 # How often the condition is re-read. The condition is monotone in practice, so this only decides
 # how promptly the grace timer starts; it costs one queue read and one small file read. For a
@@ -1290,9 +1289,9 @@ def _rollout_terminal_session(ctx: RunContext) -> str:
 # After the first wave the launches space themselves out, because a slot opens only when a task
 # finishes. The first wave is the one moment N containers start at the same instant, each with
 # its own copy of one file-backed OAuth credential, each presenting the same token and each free
-# to refresh it. That is the shape of the failure this addresses: one prime eval phase lost 119
-# of 120 legs to "No API key for provider: anthropic", in bursts, at ~19s a leg, with the file's
-# own expiry hours in the future, which rules out plain expiry and leaves the simultaneity.
+# to refresh it. That is the shape of the failure this addresses: a provider that rotates the
+# refresh token on use invalidates every copy a moment behind the first, and a whole wave of legs
+# is refused for "No API key for provider" with the file's own expiry still hours away.
 #
 # Generic rather than prime-specific: codex seeds a refreshable auth.json the same way. It is
 # skipped for a mode that seeds no file, because a token handed to the container as an
@@ -1920,10 +1919,10 @@ BOOKEND_UNCOMPARED_CELL_FIELDS = (
 # group a PAIRING does not compare. A deferred baseline runs eval_before alone: ``EvalStream``
 # pins the blind feedback posture whatever the cell's arm says and refuses a provenance directory
 # recorded under any other, the eval fan-out is one session per task whatever max_in_flight says,
-# and neither the rollout's wall clock nor its serving ceiling is read by an eval phase. Both v0
-# pairs really do differ here, their sources having run the immediate arm and their deferred
-# baselines the never arm, so comparing these would refuse every pairing there is over what
-# provably cannot reach a before row. The source-to-checkout comparison still refuses them, for a
+# and neither the rollout's wall clock nor its serving ceiling is read by an eval phase. A source
+# that ran the immediate arm and a deferred baseline that ran the never arm really do differ here,
+# so comparing these would refuse such a pairing over what provably cannot reach a before row.
+# The source-to-checkout comparison still refuses them, for a
 # different reason: there they would relabel the arm the bookend publishes.
 ROLLOUT_ONLY_CELL_FIELDS = (
     "rollout_feedback",
@@ -2015,9 +2014,9 @@ PAIRING_UNCOMPARED_IDENTITY_PATHS = ("substrate.shobench_dirty",)
 # comparison guards it.
 # instruction.arm and split.path are lookup keys whose identities are the digests above.
 # axes.model.observed and observed_models are OUTCOMES read off the traces, not definitions, and
-# the two sides' come from different phases: in the real terra pair the source recorded
-# ['gpt-5.6-terra'] from its rollout and the baseline [] from its before legs, so comparing them
-# would refuse a pairing for having measured something.
+# the two sides' come from different phases: a source reports what its rollout legs observed and a
+# deferred baseline what its before legs did, so comparing them would refuse a pairing for having
+# measured something.
 # axes.model.requested restates a cell field already compared. axes.effort does NOT, and is
 # compared as a block above.
 # substrate.shobench_dirty is not compared for its own sake: it says whether the revision beside
@@ -4237,9 +4236,9 @@ def _materialize_home(
 
     ``shutil.copytree(symlinks=False, ignore_dangling_symlinks=True)`` was not this: CPython
     tests a link's TEXTUAL target against the process cwd rather than the link's parent, so a
-    valid relative link (the shape of every link in the real prime homes: in-home cache links,
-    all relative, all resolving) read as dangling and silently vanished from the snapshot.
-    Here each link resolves the way the filesystem resolves it, from its own parent:
+    valid relative link, which is the ordinary shape of an in-home cache link, reads as
+    dangling and silently vanishes from the snapshot. Here each link resolves the way the
+    filesystem resolves it, from its own parent:
 
     - a link to a file inside the source home becomes that file's bytes;
     - a link to a directory inside the source home becomes that tree, links within it
@@ -4303,9 +4302,9 @@ def _materialize_home(
                 "cannot be part of the snapshot"
             )
     # The directory's own metadata, applied after its contents so the content writes cannot
-    # re-stamp it. mkdir alone left every directory with the process defaults, which widened
-    # the real homes' 0700 directories (session leases and daemon caches among them) to 0755:
-    # a loosened mode is not the snapshot, and a resumed CLI can behave differently over it.
+    # re-stamp it. mkdir alone leaves every directory with the process defaults, which widens
+    # a home's 0700 directories (session leases and daemon caches among them) to 0755: a
+    # loosened mode is not the snapshot, and a resumed CLI can behave differently over it.
     # Every directory passes through here, ordinary ones and materialized link targets alike,
     # because both recurse through this function.
     shutil.copystat(source, destination)
@@ -4367,18 +4366,17 @@ def _holding_source_still(source_run_dir: Path):
     together. Releasing on the way out is what lets the archive be mutated again the moment
     the snapshot no longer depends on it; the probe form releases immediately, and the
     snapshot form holds across the whole materialization, because a lock released after a
-    probe left the copy racing any mutator that acquired in between (a concurrent rerun's
-    mid-copy write landed in the published snapshot, in review).
+    probe leaves the copy racing any mutator that acquired in between, whose mid-copy write
+    lands in the published snapshot.
 
     A missing lock file is a refusal, not an empty hold. Every mutator would CREATE the lock
     on its way in (``_acquire_run_lock`` opens with O_CREAT), so a source without one is not
     quiet, it is unholdable: a resume or rerun starting mid-copy would mint the lock and
     mutate under the advertised hold (reproduced). Creating the lock from here would itself
     write into the archive, so the honest options are refusing or copy-and-revalidate, and
-    refusal is chosen because it is simple and the archives this entry exists for all carry
-    their locks (every run since the lock landed writes one; only pre-lock-era directories
-    lack it). The message names the workaround, which is the operator's deliberate one-file
-    write, never this runner's.
+    refusal is chosen because it is simple and costs a real archive nothing: every run since
+    the lock landed writes one, and only pre-lock-era directories lack it. The message names
+    the workaround, which is the operator's deliberate one-file write, never this runner's.
     """
     import fcntl
 
@@ -4595,9 +4593,9 @@ async def rebookend_run(
             f"directly. Rebookend the original run ({original}) instead."
         )
     cell = load_cell_by_name(source_manifest["cell"]["name"])
-    # The baseline is its own identity, not an assumption about the source. The v0 sources
-    # are rollout-only or after-only runs whose before-side was measured by a SEPARATE
-    # deferred-baseline run, so a marker that named only the rollout source left the
+    # The baseline is its own identity, not an assumption about the source. A source can be a
+    # rollout-only or after-only run whose before-side was measured by a SEPARATE
+    # deferred-baseline run, so a marker that named only the rollout source would leave the
     # assembler pairing against emptiness. A source that measured its own eval_before
     # defaults to itself, which is the self-paired case stated rather than assumed; a source
     # that did not REQUIRES the baseline run to be named, and every named baseline is
@@ -4839,10 +4837,9 @@ async def _rebookend_owned(
     # guarantee, because everything that runs afterwards writes into this tree (the credential
     # seeding, the runner files, the RW container mount), and a preserved link pointing back
     # into the source turns any of those writes into a write THROUGH the copy into the
-    # archive; a credential reseed did exactly that in review. Every link becomes the bytes it
-    # names, resolved from the link's own parent (see ``_materialize_home`` for the whole
-    # policy: valid links materialize, dangling ones drop, escaping ones and cycles refuse
-    # loudly), and the snapshot references nothing beyond itself.
+    # archive. Every link becomes the bytes it names, resolved from the link's own parent (see
+    # ``_materialize_home`` for the whole policy: valid links materialize, dangling ones drop,
+    # escaping ones and cycles refuse loudly), and the snapshot references nothing beyond itself.
     source_home = source_run_dir / "home"
     if not source_home.is_dir():
         raise RuntimeError(f"{source_run_dir} has no home directory to bookend.")
@@ -4868,8 +4865,8 @@ async def _rebookend_owned(
             "Nothing has been spent."
         )
     # Held STILL for the whole snapshot, not merely probed: a probe released before the copy
-    # left the copy racing any mutator that acquired in between, and a concurrent rerun's
-    # mid-copy write landed in the published snapshot. The shared hold refuses a live owner
+    # leaves the copy racing any mutator that acquired in between, whose mid-copy write lands
+    # in the published snapshot. The shared hold refuses a live owner
     # and blocks a would-be one until the copy is whole, and it is released here, before any
     # spend, so the archive is never held during the eval itself.
     with _holding_source_still(source_run_dir):
@@ -4989,7 +4986,7 @@ async def _rebookend_owned(
             "cell_drift": checkout_drift,
             # What the pairing could NOT establish, named rather than left to a reader's
             # assumption: the identities neither archive recorded, which is empty for any pair
-            # of runs made after the recording started and never empty for the v0 archives.
+            # of runs made after the recording started and non-empty for anything older.
             # Every other identity refused before this run spent, so this list is the whole of
             # what the published delta rests on trust for.
             "pairing_identity_unproven": unproven_identities,

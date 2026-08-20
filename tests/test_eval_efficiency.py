@@ -1060,8 +1060,8 @@ def test_prime_asks_for_the_long_prompt_cache_and_reaches_the_leg_with_it(tmp_pa
 
 def test_every_prime_cell_bounds_an_eval_task_behind_the_watchdog() -> None:
     """Belt and braces: the watchdog ends these legs minutes in, and the timeout is what catches a
-    leg the watchdog could not reach. Pooled time-to-terminal p99 was 665s, so 900 leaves the
-    measurement itself untouched."""
+    leg the watchdog could not reach. 900 sits well above the time-to-terminal tail, so it leaves
+    the measurement itself untouched."""
     for cell in load_all_cells():
         if cell.harness != "prime_agent":
             continue

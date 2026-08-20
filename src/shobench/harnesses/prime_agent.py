@@ -136,20 +136,19 @@ class PrimeAgent(Harness):
 
     # None, meaning the first drain poll that finds a finished eval leg ends it.
     #
-    # With no quality gate prime has no terminal condition of its own, and voluntary eval-leg
-    # stops are vanishingly rare in the archives (a handful across hundreds of legs, the inspected
-    # one 1163s after its seal, far beyond any plausible grace), so a wait protects nothing here
-    # and buys only post-seal turns. What rules out a short wait as well as a long one is what a
-    # wait would be racing: the billable event is a request being DISPATCHED rather than a turn
-    # completing, and a dispatched request is charged whether or not anyone is still listening for
-    # its answer, while prime can begin planning its refinement at an assistant-message boundary
-    # with tools still running, so on a slow seal the distance from the seal to the next dispatch
-    # collapses toward nothing. Any fixed number is a clock racing a behavior this runner does not
-    # control, so prime is given no clock, and what is left is the poll interval, which is as
-    # close to the seal as an out-of-band watcher can read. The stake is measured: on a resumed
-    # fork the post-seal refine turn writes the whole inherited prefix again as a fresh cache
-    # entry, about $4.56 a leg against a 447K-token context and two thirds of the leg's spend. No
-    # score moves either way, since the row is sealed and the stream drained before any of it.
+    # With no quality gate prime has no terminal condition of its own, and a voluntary eval-leg
+    # stop is vanishingly rare and arrives far beyond any plausible grace when it does, so a wait
+    # protects nothing here and buys only post-seal turns. What rules out a short wait as well as
+    # a long one is what a wait would be racing: the billable event is a request being DISPATCHED
+    # rather than a turn completing, and a dispatched request is charged whether or not anyone is
+    # still listening for its answer, while prime can begin planning its refinement at an
+    # assistant-message boundary with tools still running, so on a slow seal the distance from the
+    # seal to the next dispatch collapses toward nothing. Any fixed number is a clock racing a
+    # behavior this runner does not control, so prime is given no clock, and what is left is the
+    # poll interval, which is as close to the seal as an out-of-band watcher can read. The stake
+    # is real: on a resumed fork the post-seal refine turn writes the whole inherited prefix again
+    # as a fresh cache entry, which can be most of a leg's spend. No score moves either way, since
+    # the row is sealed and the stream drained before any of it.
     eval_drain_grace_s = None
 
     # The structured signal, which is the cleanest of the three harnesses: a stream failure is
@@ -186,9 +185,9 @@ class PrimeAgent(Harness):
     MAX_TOKENS = 1000000000
 
     # Which provider serves each model, passed as an explicit ``--provider`` on every launch
-    # and probe. Left to resolve a bare model id on its own, prime-agent 0.7.1 routed
+    # and probe. Left to resolve a bare model id on its own, prime-agent 0.7.1 routes
     # ``gpt-5.6-terra`` to azure-openai-responses, a provider nothing here is logged into, and
-    # the run died with "No API key found" while the openai-codex login sat unused. The map is
+    # the launch dies with "No API key found" while the openai-codex login sits unused. The map is
     # exact rather than by prefix: an explicit provider disables 0.7.1's catalog check (an
     # absent id falls back to a custom-model launch), so a prefix rule would silently misroute
     # any GPT id the codex backend does not serve. Every model a cell may name is listed here
@@ -272,12 +271,11 @@ class PrimeAgent(Harness):
         """The one session file whose FIRST parseable line is a header naming this id,
         recorded at the cwd the fork resumes in, whatever the file is called.
 
-        The filename is NOT the identity, and requiring it broke real runs. The daemon mints
-        a session file under one id and the print run's header carries another, rewritten
-        into that same file: observed on a CLI-written session (a failed-auth run persisted a
-        file whose header id differed from its filename), and on both real prime rollouts,
-        whose recorded terminal id sits inside a file named for a different id. The CLI's
-        resolver never looks at the name: it indexes saved sessions by the header id
+        The filename is NOT the identity, and requiring it refuses sessions the CLI resumes.
+        The daemon mints a session file under one id and the print run's header carries
+        another, rewritten into that same file: observed on a CLI-written session (a
+        failed-auth run persisted a file whose header id differed from its filename). The
+        CLI's resolver never looks at the name: it indexes saved sessions by the header id
         (source: ``scanSessionInfo`` walks ``readdir`` of the flat sessions dir), a file
         named for one id whose header names another is "No session found matching" for the
         FILENAME's id (observed), and resuming the HEADER id out of a differently named file

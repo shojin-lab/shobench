@@ -569,11 +569,10 @@ def test_rebookend_refuses_outputs_inside_the_source(tmp_path: Path, monkeypatch
 def test_the_snapshot_materializes_symlinks_so_no_writer_reaches_the_source(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The reviewed write-through, closed: a source home whose ``.codex`` is a symlink used to
-    be copied AS a link, and the first writer into the new home (the credential reseed, in the
-    reproduction) wrote through it into the archive. The snapshot is now materialized: every
-    link becomes the bytes it pointed at, nothing in the new tree references the source, and a
-    writer can do its worst."""
+    """The write-through, closed: a source home whose ``.codex`` is a symlink copied AS a link
+    lets the first writer into the new home, the credential reseed, write through it into the
+    archive. The snapshot is materialized instead: every link becomes the bytes it pointed at,
+    nothing in the new tree references the source, and a writer can do its worst."""
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split)
     secrets = source_dir / "home" / "codex-real"
@@ -600,7 +599,7 @@ def test_the_snapshot_materializes_symlinks_so_no_writer_reaches_the_source(
     assert not (new_home / ".codex").is_symlink()
     assert (new_home / ".codex" / "auth.json").read_text() == '{"auth_mode": "chatgpt"}'
     assert not any(p.is_symlink() for p in new_home.rglob("*"))
-    # The reproduction's write, thrown at the copy: it stays in the copy.
+    # The write that used to reach through, thrown at the copy: it stays in the copy.
     (new_home / ".codex" / "auth.json").write_text('{"auth_mode": "OVERWRITTEN"}')
     assert (secrets / "auth.json").read_text() == '{"auth_mode": "chatgpt"}'
     assert _fingerprint(source_dir) == before
@@ -609,12 +608,12 @@ def test_the_snapshot_materializes_symlinks_so_no_writer_reaches_the_source(
 def test_the_snapshot_materializes_valid_relative_links_from_their_own_parent(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The round-2 silent loss, closed. copytree tested a link's textual target against the
-    process CWD, so valid RELATIVE links (the shape of every link in the real prime homes)
-    read as dangling and vanished. The materializer resolves from the link's parent, so the
-    CWD is irrelevant: valid file and directory links become their bytes, two links to one
-    target both materialize, an absolute in-source link materializes, and only the genuinely
-    dangling link drops."""
+    """The silent loss, closed. copytree tests a link's textual target against the process CWD,
+    so valid RELATIVE links, which is the ordinary shape of an in-home cache link, read as
+    dangling and vanish. The materializer resolves from the link's parent, so the CWD is
+    irrelevant: valid file and directory links become their bytes, two links to one target both
+    materialize, an absolute in-source link materializes, and only the genuinely dangling link
+    drops."""
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split)
     home = source_dir / "home"
@@ -627,7 +626,7 @@ def test_the_snapshot_materializes_valid_relative_links_from_their_own_parent(
     (home / "abs-link").symlink_to(real / "payload")
     (home / "dangling").symlink_to("no-such-target")
     before = _fingerprint(source_dir)
-    # The repro condition: run somewhere the RAW target strings resolve to nothing.
+    # The condition that triggers it: run somewhere the RAW target strings resolve to nothing.
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
@@ -657,9 +656,9 @@ def test_the_snapshot_refuses_a_link_escaping_the_source_home(
     tmp_path: Path, monkeypatch
 ) -> None:
     """A link resolving outside the source home refuses loudly rather than importing bytes
-    the run never saw: the snapshot must be OF the source, and with the write-through history
-    a silent import is the same class of surprise. (Both real homes carry only in-home
-    relative links, so this policy costs the report set nothing.)"""
+    the run never saw: the snapshot must be OF the source, and a silent import is the same
+    class of surprise as a write through the copy. A home whose links are all in-home and
+    relative, which is the ordinary shape, pays nothing for the policy."""
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split)
     outside = source_dir / "secrets"
@@ -879,7 +878,7 @@ def test_a_suspended_bookend_resumes_with_nothing_recorded(tmp_path: Path, monke
     assert captured["phases"] == ("eval_after",)
     assert captured["recorded_phases"] == ()
     # The reopened bookend keeps its own artifact stem: the cell-name fallback is the
-    # source's artifact, and republishing under it is the round-5 destruction resurrected.
+    # source's artifact, and republishing under it would destroy the result it pairs with.
     assert captured["artifact"] == "bookend-run-1"
 
 
@@ -1243,7 +1242,7 @@ def test_a_rollout_only_source_pairs_through_its_named_baseline(
 
 def test_a_before_less_source_requires_a_named_baseline(tmp_path: Path, monkeypatch) -> None:
     """Without a baseline the bookend has nothing to pair with, and pairing against the
-    source's emptiness rendered every v0 row 0/120: the absence refuses in the runner and
+    source's emptiness renders every row unpaired: the absence refuses in the runner and
     blocks in the plan, naming why."""
 
     cell, split = _synthetic_definitions(tmp_path)
@@ -1472,11 +1471,10 @@ def _self_contained_bookend(results: Path, *, ids: list[int], before_holes: tupl
 def test_a_self_contained_bookend_reports_with_zero_cross_file_dependence(
     tmp_path: Path,
 ) -> None:
-    """The round-9 property, at the real scale: the artifact carries the baseline's 118 of
-    120 scored before rows, labeled, and the 118/120 pairing lives INSIDE it, so the report
-    renders it correctly with no other file loaded at all: the baseline artifact being
-    evicted by a later same-cell publication (the real report directory's state for three of
-    the four baselines) changes nothing."""
+    """Self-containment at a real scale: the artifact carries the baseline's 118 of 120 scored
+    before rows, labeled, and the 118/120 pairing lives INSIDE it, so the report renders it
+    correctly with no other file loaded at all, and the baseline artifact being evicted by a
+    later same-cell publication changes nothing."""
     from shobench.report import assemble, load_results, render_table, report_cell
 
     results = tmp_path / "results"
@@ -1958,10 +1956,10 @@ def test_the_cli_plan_shows_what_a_refresh_would_change(
 
 
 def test_the_source_is_held_still_for_the_whole_snapshot(tmp_path: Path, monkeypatch) -> None:
-    """A probe released before the copy left the copy racing any mutator that acquired in
-    between (a concurrent rerun's write landed in the published snapshot, in review). The
-    shared hold spans the materialization: a would-be exclusive owner is refused for as long
-    as the copy runs, which is asserted from inside the copy itself."""
+    """A probe released before the copy leaves the copy racing any mutator that acquired in
+    between, whose mid-copy write lands in the published snapshot. The shared hold spans the
+    materialization: a would-be exclusive owner is refused for as long as the copy runs, which
+    is asserted from inside the copy itself."""
     import fcntl
 
     cell, split = _synthetic_definitions(tmp_path)
@@ -2038,9 +2036,9 @@ def test_a_source_mutated_between_read_and_snapshot_refuses(
 
 
 def test_the_snapshot_keeps_directory_modes(tmp_path: Path, monkeypatch) -> None:
-    """mkdir alone stamped every directory with the process defaults, which widened the real
-    homes' 0700 directories (session leases, daemon caches) to 0755: a loosened mode is not
-    the snapshot. Directory metadata is copied after contents, for ordinary directories and
+    """mkdir alone stamps every directory with the process defaults, which widens a home's
+    0700 directories (session leases, daemon caches) to 0755: a loosened mode is not the
+    snapshot. Directory metadata is copied after contents, for ordinary directories and
     materialized link targets alike."""
     import stat as stat_module
 
@@ -2188,9 +2186,9 @@ def test_cli_rebookend_plans_without_spending(tmp_path: Path, capsys) -> None:
 
 
 def test_cli_plan_refuses_an_unresolvable_transcript(tmp_path: Path, capsys) -> None:
-    """The reviewed fixture shape: a stopping record that names an id whose transcript is not
-    in the source home. The plan used to say resolvable and only the runner refused, after
-    minting; the plan now runs the same per-harness validation and blocks the --go."""
+    """A stopping record that names an id whose transcript is not in the source home. An id
+    alone would let the plan say resolvable and leave the refusal to the runner, after
+    minting; the plan runs the same per-harness validation instead and blocks the --go."""
     from shobench.cli import main as cli_main
 
     source_dir = _real_cell_source(tmp_path)
@@ -2229,16 +2227,15 @@ def test_cli_rebookend_reports_and_blocks_on_a_refusal_state(tmp_path: Path, cap
 
 def test_the_bookend_and_the_source_results_coexist(tmp_path: Path, monkeypatch) -> None:
     """The whole point of the namespace: the cell-name artifact is the SOURCE's measurement,
-    the one the bookend pairs with, and sharing that stem destroyed it (write_results keeps
-    one artifact per stem by design; reproduced). The bookend publishes under its own run id,
-    so the source result, in either of its shapes, and every bookend all coexist."""
+    the one the bookend pairs with, and sharing that stem destroys it (write_results keeps
+    one artifact per stem by design). The bookend publishes under its own run id, so the
+    source result, in either of its shapes, and every bookend all coexist."""
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split)
     results = tmp_path / "results"
     results.mkdir()
-    # The source's published artifact, in the report set's real shape (incomplete), plus the
-    # finished-name shape for good measure: a same-stem publish would have removed one and
-    # replaced the other.
+    # The source's published artifact under the incomplete name, plus the finished-name shape
+    # for good measure: a same-stem publish would have removed one and replaced the other.
     (results / f"{cell.name}.incomplete.json").write_text('{"marker": "SOURCE"}')
     launches: dict[int, dict] = {}
     _wire_fakes(monkeypatch, cell, split, launches)
@@ -2262,9 +2259,9 @@ def test_the_bookend_and_the_source_results_coexist(tmp_path: Path, monkeypatch)
 
 def test_rebookend_refuses_an_unlockable_source(tmp_path: Path, monkeypatch, capsys) -> None:
     """A source without a lock file cannot be held still: a mutator would CREATE the lock and
-    write mid-copy (reproduced), and creating it from here would write into the archive. The
-    refusal names the operator's own workaround, and the plan surfaces the state; the real
-    report-set sources all carry their locks, so this costs them nothing."""
+    write mid-copy, and creating it from here would write into the archive. The refusal names
+    the operator's own workaround, and the plan surfaces the state; every run since the lock
+    landed writes one, so this costs a real source nothing."""
     from shobench.cli import main as cli_main
 
     cell, split = _synthetic_definitions(tmp_path)
@@ -2297,10 +2294,10 @@ def test_rebookend_refuses_an_unlockable_source(tmp_path: Path, monkeypatch, cap
 def test_a_suspension_written_between_probe_and_hold_refuses(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A usage-limit ending writes suspended.json without touching the manifest, so the
-    manifest recheck alone missed it (reproduced interleaving: an owner took the lock, wrote
-    the suspension, released, and the copy proceeded). Suspension eligibility is re-proven
-    under the hold, before anything is copied."""
+    """A usage-limit ending writes suspended.json without touching the manifest, so a manifest
+    recheck alone misses it: an owner takes the lock, writes the suspension, releases, and the
+    copy proceeds. Suspension eligibility is re-proven under the hold, before anything is
+    copied."""
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split)
     launches: dict[int, dict] = {}
@@ -2331,14 +2328,13 @@ def test_a_suspension_written_between_probe_and_hold_refuses(
 # ----- the drift comparison a bookend applies -------------------------------------------------
 #
 # A rebookend is a NEW run over a rollout that already ended, so the cell file's digest is the
-# wrong question: it moves for a comment and for a swapped model alike, and it refused the real
-# planned bookends after their cells' eval timeout was retuned. What the bookend measures has to
-# be the source's arm, and the rule its rows are scored by has to be the rule the before side was
-# scored by, so the arm and the eval runtime are taken from the RECORD and everything refuses on
-# drift.
+# wrong question: it moves for a comment and for a swapped model alike, so a retuned eval timeout
+# refuses a bookend that is perfectly measurable. What the bookend measures has to be the source's
+# arm, and the rule its rows are scored by has to be the rule the before side was scored by, so
+# the arm and the eval runtime are taken from the RECORD and everything refuses on drift.
 
-# The two planned bookends recorded this bound, and their cells now carry a shorter one. Every
-# other field of those cells is untouched, which is exactly the shape modeled here.
+# The bound a source recorded, against a cell file that now carries a shorter one. Every other
+# field of the cell is untouched, which is the shape modeled here.
 _RECORDED_EVAL_TIMEOUT_S = 1800
 
 
@@ -2392,10 +2388,10 @@ def _bookend_drift(manifest, cell, split, instruction, *, recover: bool = True):
     ],
 )
 def test_a_bookend_of_a_retuned_cell_runs_under_the_recorded_bound(cell_name: str) -> None:
-    """The two real refusals, and the reason the fix is inheritance rather than permission.
+    """The refusal a retuned timeout raises, and why inheritance rather than permission answers it.
 
-    Both sources finished their rollouts before the timeout moved, so the edit cannot reach
-    them and the bookend is measurable. It runs under the RECORDED bound, not the file's: the
+    A source that finished its rollout before the timeout moved is out of the edit's reach and
+    still measurable. The bookend runs under the RECORDED bound, not the file's: the
     before side it will be paired against was scored by that bound, and a task that seals
     between the two would otherwise be scoreable before and force-stopped after.
     """
@@ -2569,7 +2565,7 @@ def test_only_the_versioned_legacy_axes_read_absence_as_a_value() -> None:
     manifest, cell, split, instruction = _retuned_timeout_source(
         "automationbench-prime_agent-claude-opus-5"
     )
-    # A wave-1 record: written before either axis existed, so both keys are simply absent.
+    # A pre-axis record: written before either axis existed, so both keys are simply absent.
     del manifest["cell"]["rollout_feedback"]
     del manifest["cell"]["eval_context"]
 
@@ -2714,9 +2710,9 @@ def test_the_bookend_runs_and_records_the_recorded_eval_runtime(
 
 
 def test_cli_plans_a_bookend_whose_cell_timeout_was_retuned(tmp_path: Path, capsys) -> None:
-    """The refusal an operator actually met, at the entry they met it in: the plan runs the
-    checkout's real loaders, reports no drift, names the bound the legs will run under, and
-    names what the file says instead."""
+    """The refusal at the entry an operator meets it in: the plan runs the checkout's real
+    loaders, reports no drift, names the bound the legs will run under, and names what the
+    file says instead."""
     from shobench.cli import main as cli_main
 
     source_dir = _real_cell_source(tmp_path)
@@ -3030,9 +3026,9 @@ def test_a_baseline_that_only_rolled_out_differently_still_pairs(
 ) -> None:
     """The fields a deferred baseline cannot have used. It runs eval_before alone, the eval
     stream pins the blind feedback posture whatever the cell's arm says, and the eval fan-out
-    is one session per task whatever max_in_flight says. Both v0 pairs really do differ here,
-    their sources having run the immediate arm and their baselines the never arm, so comparing
-    the rollout knobs would refuse every pairing there is over what cannot reach a row."""
+    is one session per task whatever max_in_flight says. A source that ran the immediate arm
+    and a baseline that ran the never arm really do differ here, so comparing the rollout knobs
+    would refuse such a pairing over what cannot reach a row."""
     cell, split = _synthetic_definitions(tmp_path)
     source_dir = _source_run(tmp_path, cell, split, with_before=False)
     baseline_dir = _divergent_baseline(

@@ -119,9 +119,9 @@ def test_a_rotating_credential_is_checked_before_it_is_presented(
 
     Anthropic's OAuth mints a new refresh pair whenever one is redeemed and retires the pair it
     was handed, and a check that redeems inside a HOME it is about to delete leaves the host file
-    holding a token the provider has already retired: that is how a check reported a credential
-    healthy and the launch a minute later could not authenticate at all. But redeeming is not what
-    presenting a credential does. The pinned harness reaches for the refresh only once the clock
+    holding a token the provider has already retired: the check reports the credential healthy
+    and the launch that follows cannot authenticate at all. But redeeming is not what presenting
+    a credential does. The pinned harness reaches for the refresh only once the clock
     has passed the entry's expiry and presents the access token as it stands otherwise, so a check
     that refuses anything with less than ``PREFLIGHT_MIN_LIFETIME_S`` of life left is enough to
     keep the probe out of that window, and the cell is still trusted on a call that authenticated.
@@ -495,9 +495,8 @@ def test_a_prime_401_stream_with_echo_and_timestamps_is_not_a_success(monkeypatc
     """The two ways a failed exit-0 prime-agent run can carry the expectation anyway.
 
     The user message echoes the prompt, and every message is stamped with an epoch-millisecond
-    timestamp. In a three-hour window of late 2026 those timestamps begin with the probe sum's
-    digits, so a match against anything but the assistant's own words would deterministically
-    pass the negative control and block a good cell.
+    timestamp that can itself begin with the probe sum's digits, so a match against anything
+    but the assistant's own words would pass the negative control and block a good cell.
     """
     stream = "\n".join(
         [
