@@ -154,6 +154,89 @@ def test_a_rotating_credential_is_read_by_the_positive_check_and_never_presented
     assert "reading the seeded file" in verdict.reason
 
 
+_MIXED_LOGIN = {
+    # One host file, two kinds of credential, and a cell presents exactly one of them. Which one
+    # is what decides whether the positive check may read the file instead of using it.
+    "anthropic": {"type": "api_key", "key": "well-formed-and-authenticates-nothing"},
+    "openai-codex": {
+        "type": "oauth",
+        "access": "host-access-token-value",
+        "refresh": "host-refresh-token-value",
+        "expires": 4102444800000,
+    },
+}
+
+
+def test_a_selected_api_key_entry_keeps_its_live_positive_check(
+    prime_spec, tmp_path, monkeypatch
+) -> None:
+    """An api key is not spent by being presented, so the weaker check buys nothing here.
+
+    prime-agent presents an api_key entry as it stands and it is the same key afterwards: there is
+    no rotation to protect the host file from, and the live arm is the only one that can tell this
+    entry from a working one, since a key that authenticates nowhere is as well-formed on the page
+    as a key that does. Reading it would have passed the cell and recorded that presenting it would
+    have consumed the host's copy, which of an api key is not true either.
+    """
+    spec = prime_spec(_MIXED_LOGIN)
+    home = tmp_path / "home"
+    arms: list[str] = []
+
+    def fake_probe(*, harness, model, docker_args, image, env, timeout_s=300, credential_file=None):
+        seeded = json.loads((home / spec.seed_to).read_text(encoding="utf-8"))
+        arms.append("negative" if seeded["anthropic"].get("access") == BOGUS else "positive")
+        # Both arms fail: the bogus secret because it is bogus, the real one because the key the
+        # cell selects does not authenticate, which is exactly what reading the file cannot see.
+        return credentials.ControlResult(arm="", returncode=1, succeeded=False, duration_s=0.0)
+
+    monkeypatch.setattr(credentials, "run_probe", fake_probe)
+
+    verdict = validate_isolation(
+        harness="prime_agent",
+        mode="subscription",
+        model="claude-opus-5",
+        docker_args=[],
+        image="img",
+        environ={},
+        home=home,
+    )
+
+    assert arms == ["negative", "positive"]
+    assert not verdict.trusted
+    assert verdict.to_json()["positive_check"]["method"] == "probe"
+
+
+def test_a_selected_oauth_entry_is_read_beside_an_api_key_sibling(
+    prime_spec, tmp_path, monkeypatch
+) -> None:
+    """The same file, the other cell: the entry the model resolves to is the one that decides."""
+    spec = prime_spec(_MIXED_LOGIN)
+    home = tmp_path / "home"
+    arms: list[str] = []
+
+    def fake_probe(*, harness, model, docker_args, image, env, timeout_s=300, credential_file=None):
+        seeded = json.loads((home / spec.seed_to).read_text(encoding="utf-8"))
+        assert seeded["openai-codex"]["access"] == BOGUS, "a probe was handed the real credential"
+        arms.append("negative")
+        return credentials.ControlResult(arm="", returncode=1, succeeded=False, duration_s=0.0)
+
+    monkeypatch.setattr(credentials, "run_probe", fake_probe)
+
+    verdict = validate_isolation(
+        harness="prime_agent",
+        mode="subscription",
+        model="gpt-5.6-terra",
+        docker_args=[],
+        image="img",
+        environ={},
+        home=home,
+    )
+
+    assert arms == ["negative"]
+    assert verdict.trusted
+    assert verdict.to_json()["positive_check"]["method"] == "static"
+
+
 def test_a_rotating_credential_with_no_life_left_still_fails_its_positive_check(
     prime_spec, tmp_path, monkeypatch
 ) -> None:
