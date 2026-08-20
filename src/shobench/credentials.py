@@ -61,9 +61,7 @@ class CredentialSpec:
     # provider that rotates the refresh token on use mints a new pair and invalidates the pair it
     # was handed, and the positive check presents the credential inside a throwaway HOME: the
     # rotated pair is written into that copy and discarded with it, while the host file is left
-    # holding a token the provider has already retired. Observed on the prime_agent subscription
-    # arm, where a positive check reported the credential healthy and the real launch 76 seconds
-    # later failed to authenticate on a fresh copy of the same host file.
+    # holding a token the provider has already retired.
     # What this buys is a GUARD in front of the probe rather than a replacement for it. The
     # rotation is not something presenting a credential does unconditionally: the pinned harness
     # redeems the refresh token only once the clock has passed the entry's expiry, and presents
