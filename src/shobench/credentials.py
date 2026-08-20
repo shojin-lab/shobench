@@ -63,16 +63,20 @@ class CredentialSpec:
     # rotated pair is written into that copy and discarded with it, while the host file is left
     # holding a token the provider has already retired. Observed on the prime_agent subscription
     # arm, where a positive check reported the credential healthy and the real launch 76 seconds
-    # later failed to authenticate on a fresh copy of the same host file. A preflight whose
-    # success breaks the thing it tested is worse than no preflight, so a credential this marks
-    # and the seeded file confirms is validated by reading it rather than by using it (see
+    # later failed to authenticate on a fresh copy of the same host file.
+    # What this buys is a GUARD in front of the probe rather than a replacement for it. The
+    # rotation is not something presenting a credential does unconditionally: the pinned harness
+    # redeems the refresh token only once the clock has passed the entry's expiry, and presents
+    # the access token as it stands otherwise. So a static check that refuses anything with less
+    # than PREFLIGHT_MIN_LIFETIME_S left keeps the probe out of the window where a refresh can
+    # fire, and the live arm still has to authenticate for the cell to be trusted (see
     # :func:`_rotates_as_seeded` and :func:`static_positive_check`). The mark is the spec's half
     # of that question and not the whole of it, because one spec's file can hold either kind:
     # prime's auth.json carries an oauth entry or an api_key entry under a provider id, and an
     # api key is the same key after it is presented.
     # Only the arm this was observed on is marked: codex's auth.json states no expiry a reader
-    # can check, so marking it would trade a probe for a check too weak to replace one, and the
-    # environment-carried modes seed no file to read at all.
+    # can check, so a guard on it would refuse nothing, and the environment-carried modes seed
+    # no file to read at all.
     rotates_on_use: bool = False
     # What a human has to do when this mode's credential is not on the host yet. It is a hint
     # rather than a verdict: whether a cell is pending is decided by looking at the credential
@@ -283,6 +287,11 @@ def describe_seed(spec: CredentialSpec, body: Any) -> str:
 # provider" in bursts of near-identical ~19s failures, with the file's own expiry hours away, so
 # the margin is a floor rather than the whole story: it rules out the credential that was already
 # dead before the phase began, and the launch stagger is what addresses the rest.
+#
+# The same margin is what makes the positive probe safe to run against a rotating credential. The
+# harness reaches for a refresh only once the clock has passed the entry's expiry, so an entry with
+# a quarter of an hour left cannot be refreshed by a probe that finishes in seconds, and the rotated
+# pair that broke a launch cannot be minted inside a HOME that is about to be deleted.
 PREFLIGHT_MIN_LIFETIME_S = 900
 
 
@@ -543,9 +552,13 @@ class ControlResult:
     duration_s: float
     detail: str = ""
     # How the arm reached its answer: "probe" for a real call in an isolated HOME, "static" for a
-    # credential read rather than presented. A reader who cannot tell the two apart would take a
-    # structural pass for evidence that the credential authenticates, which it is not, so the
-    # method travels in the record beside the outcome and the detail says why it was chosen.
+    # credential read rather than presented, "static+probe" for a read that cleared the way for a
+    # call. A reader who cannot tell those apart would take a structural pass for evidence that
+    # the credential authenticates, which alone it is not, so the method travels in the record
+    # beside the outcome and the detail says what each half found. The composite is spelled out
+    # rather than folded into "probe" because the static half is what the arm did FIRST and is
+    # the whole of the arm when it fails, so a record that named only the probe would describe a
+    # call that never happened.
     method: str = "probe"
 
     def to_json(self) -> dict[str, Any]:
@@ -753,20 +766,17 @@ def run_probe(
 
 
 def _rotates_as_seeded(spec: CredentialSpec, home: Path, provider: str) -> bool:
-    """Would presenting the ONE entry this cell will present destroy the host's copy of it.
+    """Could presenting the ONE entry this cell will present destroy the host's copy of it.
 
-    ``rotates_on_use`` says the spec CAN rotate; the seeded entry says whether this cell's does.
+    ``rotates_on_use`` says the spec CAN rotate; the seeded entry says whether this cell's could.
     prime's auth.json holds either kind under a provider id, and only oauth rotates: redeeming its
     refresh token mints a new pair and retires the pair it was handed, while an api_key entry is
     presented as it stands and is the same key afterwards. So an api_key entry has nothing to
-    spend and keeps the live probe, which is the stronger arm and the only one that can catch it:
-    a key that authenticates nowhere is as well-formed on the page as one that authenticates, so
-    reading the file would pass it and record that presenting it would have consumed the host's
-    copy, which of an api key is not true.
+    spend and needs no guard in front of its probe.
 
-    A marked spec whose file states no entry type is read rather than presented, on the spec's
-    word alone. The failure this stands in front of is a preflight that breaks the credential it
-    tested, so that is the direction a guess is cheap in.
+    A marked spec whose file states no entry type is guarded on the spec's word alone. The guard
+    costs a cell nothing it was going to keep, since a credential too close to its expiry to guard
+    is one the eval fan-out would refuse minutes later anyway.
     """
     if not spec.rotates_on_use:
         return False
@@ -780,35 +790,42 @@ def _rotates_as_seeded(spec: CredentialSpec, home: Path, provider: str) -> bool:
 def static_positive_check(
     spec: CredentialSpec, home: Path, *, provider: str = "", now: float | None = None
 ) -> ControlResult:
-    """The positive arm for a credential using it would spend: read the file, never present it.
+    """The static half of the positive arm: read the file before anything presents it.
 
     Structure and expiry, against the same seeded file the cell's legs will copy, using the same
     reader the eval fan-out already trusts to refuse a phase before it spends
     (:func:`preflight_seeded_credential`). ``provider`` names the one entry the cell will present,
     resolved by the harness at the call site so this and the launch cannot drift.
 
-    What is given up is real and worth naming. A live probe proves the credential authenticates
-    against the provider today; this proves only that the file is the shape the harness reads and
-    has life left on it. What is kept is the rest of the protocol: the negative control still ran
-    first in this same HOME and still failed, so an ambient login cannot be answering for the
-    credential, and the file this reads is byte-for-byte the one every leg will present. The trade
-    is forced rather than chosen, because the live probe's evidence costs the credential itself.
+    This is a guard and not a verdict. It answers one question, which is whether presenting the
+    credential can rotate it, and the answer is no whenever the entry has more than
+    ``PREFLIGHT_MIN_LIFETIME_S`` of life left: the harness redeems a refresh token only once the
+    clock has passed the entry's expiry and presents the access token as it stands otherwise. So a
+    passing check is not evidence that the credential authenticates, it is permission to go and
+    find out, and the live probe that follows is what the cell is trusted on. A failing check is
+    the whole of the arm, because the credential it was asked about is too close to spent to
+    present safely and too close to spent to run a cell on either.
 
     ``returncode`` mirrors the outcome because no process ran to have one, and ``method`` says so.
     """
     started = time.time()
     ok, why_not = preflight_seeded_credential(spec, home, provider=provider, now=now)
-    checked = f"{spec.seed_to} is well-formed and unexpired" if ok else why_not
+    detail = (
+        (
+            f"checked statically first: {spec.seed_to} is well-formed and holds more than "
+            f"{PREFLIGHT_MIN_LIFETIME_S}s of life, so presenting it cannot reach the refresh the "
+            "harness runs on an expired credential, which would mint a new pair inside a "
+            "throwaway HOME and leave the host holding a token the provider had retired"
+        )
+        if ok
+        else f"checked statically first: {why_not}, so nothing was presented"
+    )
     return ControlResult(
         arm="",
         returncode=0 if ok else 1,
         succeeded=ok,
         duration_s=time.time() - started,
-        detail=(
-            f"checked statically: {checked}. Presenting this credential rotates it, and the "
-            "rotated pair would be written into a throwaway HOME and discarded with it, leaving "
-            "the host holding a token the provider had already retired"
-        ),
+        detail=detail,
         method="static",
     )
 
@@ -828,12 +845,17 @@ def validate_isolation(
     Order matters. The negative control runs first because it is the one that can reveal a
     broken isolation, and a positive check that runs first would look fine either way.
 
-    How the positive check runs is decided by the credential rather than by the harness's name,
-    and by the entry the cell will present rather than by the spec alone. A credential that
-    rotates on use is read instead of presented, because a probe that authenticates for real
-    consumes the host's copy of it; every other credential keeps the live probe, which is the
-    stronger arm. The negative control is untouched either way, since it presents a bogus secret
-    and there is nothing there to spend.
+    Every credential is proved by a live probe. What the credential decides is whether anything
+    has to be checked before the probe may run, and that is settled by the entry the cell will
+    present rather than by the spec or the harness's name. An entry that could rotate is read
+    first: the harness refreshes it only once its expiry has passed, so a static check that finds
+    real life left on it is what keeps the probe out of the window where authenticating would mint
+    a new pair inside a HOME about to be deleted and retire the host's copy. The credential that
+    fails that check never reaches the probe, and loses little by it: the margin is the one the
+    eval fan-out refuses a whole phase on, so an entry too close to spent to present here is one
+    this run could not have finished on anyway. The negative control is untouched either way,
+    since it presents a bogus secret with a year of stated life and there is nothing there to
+    spend or refresh.
 
     Whether the cell is pending is decided by looking at the credential now, not by a field on
     the spec. A static pending is how every prime_agent cell stayed untrusted forever: the check
@@ -894,14 +916,15 @@ def validate_isolation(
     # The one entry the cell will present, by the same resolution the launch passes as
     # --provider. Empty for every harness whose credential file holds a single login.
     provider = harness_for(harness).credential_provider(model)
-    if _rotates_as_seeded(spec, home, provider):
-        positive = static_positive_check(spec, home, provider=provider)
-        failed = f"the real credential did not pass its static check: {positive.detail}"
-        passed = (
-            "bogus credential failed in this HOME and the real credential is the shape the "
-            "harness reads with life left on it, checked by reading the seeded file rather than "
-            "by presenting it, because presenting it would have consumed the host's copy"
-        )
+    guard = (
+        static_positive_check(spec, home, provider=provider)
+        if _rotates_as_seeded(spec, home, provider)
+        else None
+    )
+    passed = "bogus credential failed and the real credential succeeded in the same HOME"
+    if guard is not None and not guard.succeeded:
+        positive = guard
+        failed = f"the real credential did not pass the check in front of its probe: {guard.detail}"
     else:
         real = {name: environ[name] for name in spec.env_names if environ.get(name)}
         positive = run_probe(
@@ -913,7 +936,14 @@ def validate_isolation(
             credential_file=(home / spec.seed_to) if spec.seed_to else None,
         )
         failed = "the real credential did not authenticate in the isolated HOME"
-        passed = "bogus credential failed and the real credential succeeded in the same HOME"
+        if guard is not None:
+            positive.method = "static+probe"
+            positive.detail = f"{guard.detail}. Then presented it: {positive.detail}"
+            passed = (
+                "bogus credential failed and the real credential authenticated in the same HOME, "
+                "presented only after a static check found enough life left on it that presenting "
+                "it could not rotate the host's copy"
+            )
     positive.arm = "positive_check"
     positive.detail = f"[{seeded_real}] {positive.detail}"
     if not positive.succeeded:
