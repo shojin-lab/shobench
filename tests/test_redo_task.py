@@ -21,7 +21,8 @@ import pytest
 from shobench import runner
 from shobench.cli import main as cli_main
 from shobench.config import load_cell_by_name, load_instruction
-from shobench.runner import REDONE_DIR, _eval_pending_ids
+from shobench.results import INCOMPLETE_SUFFIX, MISSING_CLOSURE, write_results
+from shobench.runner import REDONE_DIR, _eval_pending_ids, read_eval_phase
 from shobench.splits import load_split_by_name
 
 _SMOKE_CELL = "smoke-automationbench-claude-code"
@@ -47,7 +48,11 @@ def _settled_row_wire(task_idx: int, *, lease: str) -> str:
 
 
 def _run_with_a_measured_eval_after(tmp_path: Path) -> Path:
-    """A finished run whose eval_after holds one settled row per committed held-out id."""
+    """A finished run holding one settled row per committed held-out id, in both eval phases.
+
+    Both phases, because an artifact is complete only when each of them accounts for every id,
+    and what a redo does to a COMPLETE artifact is the thing under test below.
+    """
     run_dir = tmp_path / "run"
     (run_dir / "home").mkdir(parents=True)
     (run_dir / "work").mkdir()
@@ -69,13 +74,30 @@ def _run_with_a_measured_eval_after(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (run_dir / "rollout_stopping.json").write_text("{}", encoding="utf-8")
-    for position, task_id in enumerate(split.heldout.task_ids):
-        task_dir = run_dir / "eval_after" / f"task-{int(task_id):05d}"
-        task_dir.mkdir(parents=True)
-        (task_dir / "results.jsonl").write_text(
-            _settled_row_wire(int(task_id), lease=f"lease-{position}") + "\n", encoding="utf-8"
-        )
+    for phase in ("eval_before", "eval_after"):
+        for position, task_id in enumerate(split.heldout.task_ids):
+            task_dir = run_dir / phase / f"task-{int(task_id):05d}"
+            task_dir.mkdir(parents=True)
+            (task_dir / "results.jsonl").write_text(
+                _settled_row_wire(int(task_id), lease=f"{phase}-lease-{position}") + "\n",
+                encoding="utf-8",
+            )
     return run_dir
+
+
+def _publish_the_finished_run(run_dir: Path, results_dir: Path) -> Path:
+    """The artifact that run's own ending published: complete, quoting every held-out row."""
+    ids = [int(task_id) for task_id in _heldout_ids(run_dir)]
+    return write_results(
+        results_dir / f"{_SMOKE_CELL}.json",
+        manifest=json.loads((run_dir / "manifest.json").read_text(encoding="utf-8")),
+        phases={
+            phase: read_eval_phase(run_dir / phase, ids)
+            for phase in ("eval_before", "eval_after")
+        },
+        stopping={},
+        heldout_ids=ids,
+    )
 
 
 def _heldout_ids(run_dir: Path) -> list[str]:
@@ -172,6 +194,51 @@ def test_a_redo_sets_the_old_rows_aside_and_makes_the_id_pending_again(
             "rows_moved_to": runner.run_relative(archives[0], run_dir),
         }
     ]
+
+
+def test_a_redo_that_fails_before_the_replacement_leaves_an_honest_artifact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The move is the commitment, so the publication cannot wait for an ending that may not come.
+
+    From the moment the rows are set aside the run directory says that measurement was rejected,
+    and a results directory still holding it as a complete row of the cell contradicts it. What
+    can end a repair between the move and its own publication is ordinary: a sandbox that will
+    not come up, a server that fails, a provider limit that hard-exits the process.
+    """
+    run_dir = _run_with_a_measured_eval_after(tmp_path)
+    redo, kept = _heldout_ids(run_dir)
+    results_dir = tmp_path / "results"
+    finished = _publish_the_finished_run(run_dir, results_dir)
+    assert json.loads(finished.read_text(encoding="utf-8"))["heldout"]["complete"]
+
+    class _SandboxThatWillNotStart(_FakeSandbox):
+        def up(self) -> None:
+            raise RuntimeError("the sandbox could not be brought up")
+
+    monkeypatch.setattr(runner, "CellSandbox", _SandboxThatWillNotStart)
+    monkeypatch.setattr(runner, "_watch_cell_credential", lambda ctx, spec: None)
+
+    with pytest.raises(RuntimeError, match="could not be brought up"):
+        asyncio.run(
+            runner.rerun_eval(
+                run_dir, results_dir=results_dir, redo_tasks=[redo], capture_egress=False
+            )
+        )
+
+    # Gone by name and by body: a cell publishes one artifact, and this one can no longer
+    # account for the id it just rejected.
+    assert not finished.exists()
+    published = json.loads(
+        (results_dir / f"{_SMOKE_CELL}{INCOMPLETE_SUFFIX}").read_text(encoding="utf-8")
+    )
+    assert published["heldout"]["complete"] is False
+    assert published["heldout"]["eval_after"]["missing_task_ids"] == [int(redo)]
+    rows = {task["task_idx"]: task for task in published["eval_after"]["tasks"]}
+    assert rows[int(redo)]["closure"] == MISSING_CLOSURE
+    assert rows[int(redo)]["reward"] is None
+    # And the scalpel is still a scalpel: the id beside it is published as measured.
+    assert rows[int(kept)]["closure"] == "sealed"
 
 
 def _record_a_leg(run_dir: Path, phase: str, task_id: str, mark: str) -> dict:

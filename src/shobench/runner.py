@@ -1745,6 +1745,8 @@ STOP_POLL_S = 2.0
 # The run's whole egress capture. One process writes it and any continuation appends to it, so
 # the published summary covers the cell rather than only its last stretch.
 EGRESS_LOG = "egress.tsv"
+# What that capture summarizes to, written beside it and republished into every artifact.
+EGRESS_SUMMARY = "egress.json"
 # The exit status a suspended cell leaves. `run` cannot return it, because a suspension is the
 # one path that must not unwind, so the status is how a shell or a supervising script tells a
 # cell that is waiting for a window from one that failed. 75 is the conventional "temporary
@@ -3260,8 +3262,98 @@ class _Egress:
             # last continuation: the eval that ran before the interruption is evidence too.
             with record.open("a", encoding="utf-8") as whole:
                 whole.write(capture.log_path.read_text(encoding="utf-8", errors="ignore"))
-        self.summary = dict(egress.write_summary(record, self._run_dir / "egress.json"))
+        self.summary = dict(egress.write_summary(record, self._run_dir / EGRESS_SUMMARY))
         return self.summary
+
+
+def _recorded_phase_rows(
+    run_dir: Path, phases: Sequence[str], heldout_ids: Sequence[int]
+) -> dict[str, list[TaskResult]]:
+    """The rows a run directory already holds for these phases, read as each phase records them.
+
+    A rollout writes one flat provenance directory; an eval phase spreads its rows across
+    per-task subdirectories a flat read would miss. Omitting a phase the run recorded publishes
+    a file missing half the measurement: no requested eval tasks, no deltas, every after row
+    unpaired.
+    """
+    return {
+        phase: (
+            read_phase(run_dir / phase)
+            if phase == "rollout"
+            else read_eval_phase(run_dir / phase, heldout_ids)
+        )
+        for phase in phases
+    }
+
+
+def _carried_before_rows(
+    run_dir: Path, manifest: dict[str, Any]
+) -> tuple[list[TaskResult], str | None] | None:
+    """A bookend's carried baseline before rows and the run that measured them.
+
+    ``None`` for a run that measured its own before side, which is every run but a bookend.
+    A bookend publishes the BASELINE's before rows as its own block, labeled with the run they
+    came from, so the artifact carries its whole pairing and depends on no other file: the
+    baseline's own artifact lives under the shared cell stem and is routinely evicted by later
+    same-cell publications. The carried rows were persisted at creation; a marker-bearing run
+    whose carry is gone cannot publish self-contained and must not publish an empty before under
+    the resumed label, so it refuses.
+    """
+    if "rebookend" not in manifest:
+        return None
+    payload_path = run_dir / BASELINE_BEFORE_FILE
+    if not payload_path.is_file():
+        raise RuntimeError(
+            f"{run_dir} is a rebookend but its carried baseline rows ({BASELINE_BEFORE_FILE}) "
+            "cannot be read, so the artifact cannot be published self-contained. The file is "
+            "written at creation; restore it or recreate the bookend."
+        )
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    return (
+        [TaskResult(**row) for row in payload["rows"]],
+        str(payload.get("source_run_id") or "") or None,
+    )
+
+
+def _publish_recorded_results(
+    ctx: RunContext,
+    *,
+    manifest: dict[str, Any],
+    phases: Sequence[str],
+    results_dir: Path,
+    artifact: str | None = None,
+) -> Path:
+    """Publish the cell's artifact from what the run directory holds at this moment.
+
+    The same assembly the end of a run performs, over rows read back rather than rows just
+    produced, so a process that has changed what the record says can say it in the published
+    artifact without waiting for an ending it may never reach. An assembly that cannot account
+    for every held-out id lands under the incomplete name and evicts the complete one, which
+    :func:`shobench.results.write_results` decides from the rows themselves.
+    """
+    heldout_ids = [int(task_id) for task_id in side_for_phase(ctx.split, "eval_before").task_ids]
+    phase_rows = _recorded_phase_rows(ctx.run_dir, phases, heldout_ids)
+    stopping: dict[str, Any] = {}
+    if "rollout" in phases:
+        stopping = json.loads(
+            (ctx.run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
+        )
+        stopping["usage_limit_resumes"] = len(manifest.get("resumptions", []))
+    before_source_run_id: str | None = None
+    carried = _carried_before_rows(ctx.run_dir, manifest)
+    if carried is not None:
+        phase_rows["eval_before"], before_source_run_id = carried
+    summary = ctx.run_dir / EGRESS_SUMMARY
+    return write_results(
+        results_dir / f"{artifact or ctx.cell.name}.json",
+        manifest=manifest,
+        phases=phase_rows,
+        stopping=stopping,
+        heldout_ids=heldout_ids,
+        egress=json.loads(summary.read_text(encoding="utf-8")) if summary.is_file() else {},
+        redact=ctx.redactor.json,
+        before_source_run_id=before_source_run_id,
+    )
 
 
 async def _run_phases(
@@ -3320,18 +3412,8 @@ async def _run_phases(
     # published count is against it rather than against whatever arrived.
     heldout_ids = [int(task_id) for task_id in side_for_phase(ctx.split, "eval_before").task_ids]
     # A continuation starts from the phases the interrupted run already recorded, not from
-    # nothing. A recorded eval phase (eval_before) is read with the eval-phase reader, because
-    # its rows live in per-task subdirectories a single-directory read would miss; a recorded
-    # rollout is read flat. Omitting a recorded phase publishes a file missing half the
-    # measurement: no requested eval tasks, no deltas, every after row unpaired.
-    phase_rows: dict[str, list[TaskResult]] = {
-        phase: (
-            read_phase(ctx.run_dir / phase)
-            if phase == "rollout"
-            else read_eval_phase(ctx.run_dir / phase, heldout_ids)
-        )
-        for phase in recorded_phases
-    }
+    # nothing.
+    phase_rows = _recorded_phase_rows(ctx.run_dir, recorded_phases, heldout_ids)
     stopping: dict[str, Any] = {}
     # Phases an operator's stop kept from starting at all, named for the record.
     stopped_before: list[str] = []
@@ -3412,25 +3494,10 @@ async def _run_phases(
     manifest["ended_at"] = time.time()
     ctx.publish_json(ctx.run_dir / "manifest.json", manifest)
 
-    # A bookend publishes the BASELINE's before rows as its own block, labeled with the run
-    # they came from, so the artifact carries its whole pairing and depends on no other file:
-    # the baseline's own artifact lives under the shared cell stem and is routinely evicted
-    # by later same-cell publications. The carried rows were persisted at creation; a
-    # marker-bearing run whose carry is gone cannot publish self-contained and must not
-    # publish an empty before under the resumed label, so it refuses.
     before_source_run_id: str | None = None
-    baseline_payload_path = ctx.run_dir / BASELINE_BEFORE_FILE
-    if "rebookend" in manifest:
-        if not baseline_payload_path.is_file():
-            raise RuntimeError(
-                f"{ctx.run_dir} is a rebookend but its carried baseline rows "
-                f"({BASELINE_BEFORE_FILE}) cannot be read, so the artifact cannot be "
-                "published self-contained. The file is written at creation; restore it or "
-                "recreate the bookend."
-            )
-        payload = json.loads(baseline_payload_path.read_text(encoding="utf-8"))
-        phase_rows["eval_before"] = [TaskResult(**row) for row in payload["rows"]]
-        before_source_run_id = str(payload.get("source_run_id") or "") or None
+    carried = _carried_before_rows(ctx.run_dir, manifest)
+    if carried is not None:
+        phase_rows["eval_before"], before_source_run_id = carried
     egress_summary = observer.stop()
     results_path = write_results(
         results_dir / f"{artifact or ctx.cell.name}.json",
@@ -4139,7 +4206,8 @@ async def _rerun_eval_owned(
     already pending and needs no naming, while a settled row is complete by every test this
     runner has and would otherwise never re-run. Nothing detects which rows deserve it. The
     operator names the ids, the rows they name are moved rather than dropped
-    (:func:`set_aside_task_rows`), and the manifest records the redo beside the repair.
+    (:func:`set_aside_task_rows`), the manifest records the redo beside the repair, and the
+    artifact is republished from what the record holds after the move, before any leg runs.
     """
     if (run_dir / SUSPENSION_FILE).is_file():
         raise RuntimeError(
@@ -4324,6 +4392,20 @@ async def _rerun_eval_owned(
         {"at": time.time(), "phase": phase, **({"redone": redone} if redone else {})}
     )
     ctx.publish_json(run_dir / "manifest.json", manifest)
+    if redone:
+        # The artifact stops quoting a rejected row the moment that row moves, rather than at the
+        # end of a repair that may never reach its publication: a sandbox that will not come up,
+        # a server that fails, a provider limit that hard-exits the process. What is republished
+        # here cannot account for the ids just set aside, so it lands under the incomplete name
+        # and evicts the complete one, and every ending downstream of this line leaves a
+        # published artifact the run directory agrees with.
+        _publish_recorded_results(
+            ctx,
+            manifest=manifest,
+            phases=(*recorded_phases, phase),
+            results_dir=results_dir,
+            artifact=run_id if "rebookend" in manifest else None,
+        )
     sandbox.up()
     observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
     try:
