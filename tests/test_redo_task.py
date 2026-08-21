@@ -3,8 +3,8 @@
 ``rerun-eval --redo-task`` is the operator's scalpel. A hole in a phase is already pending and
 needs no naming, while a settled row is complete by every test the runner has and would never
 run again on its own, so an id whose measurement nobody should quote has to be named, and
-nothing detects which ids deserve it. The rows that id holds are moved rather than deleted: a
-redo says the leg measured the wrong thing, not that it never happened.
+nothing detects which ids deserve it. The rows and the trace that id holds are moved rather
+than deleted: a redo says the leg measured the wrong thing, not that it never happened.
 
 No Docker. The repair's phase runner is stood in for, because what it does with a pending id is
 already covered and what is under test here is which ids become pending.
@@ -172,6 +172,88 @@ def test_a_redo_sets_the_old_rows_aside_and_makes_the_id_pending_again(
             "rows_moved_to": runner.run_relative(archives[0], run_dir),
         }
     ]
+
+
+def _record_a_leg(run_dir: Path, phase: str, task_id: str, mark: str) -> dict:
+    """One eval leg's trace, stderr and record, written where ``run_leg`` writes them."""
+    idx = int(task_id)
+    stem = runner.leg_stem(idx, idx)
+    traces = run_dir / phase / "traces"
+    traces.mkdir(parents=True, exist_ok=True)
+    (traces / f"{stem}.stream.jsonl").write_text(f'{{"attempt": "{mark}"}}\n', encoding="utf-8")
+    (traces / f"{stem}.err.txt").write_text(f"{mark}\n", encoding="utf-8")
+    return {
+        "leg": idx,
+        "phase": phase,
+        "task_idx": idx,
+        "trace_path": f"{phase}/traces/{stem}.stream.jsonl",
+    }
+
+
+def test_a_redo_archives_the_rejected_attempts_trace_and_leg_record_with_its_rows(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The archive is the whole attempt: rows, trace, stderr, and the record that names them.
+
+    The replacement runs under the same phase, task and leg number as the attempt it replaces,
+    and ``run_leg`` opens the trace and the stderr to APPEND. A trace left in the phase would
+    hold both attempts in one file, with two leg records pointing at it and nothing saying which
+    bytes belonged to which measurement.
+    """
+    run_dir = _run_with_a_measured_eval_after(tmp_path)
+    redo, kept = _heldout_ids(run_dir)
+    rejected_leg = _record_a_leg(run_dir, "eval_after", redo, "rejected")
+    kept_leg = _record_a_leg(run_dir, "eval_after", kept, "kept")
+    (run_dir / "legs.json").write_text(json.dumps([rejected_leg, kept_leg]), encoding="utf-8")
+    stem = runner.leg_stem(int(redo), int(redo))
+    replacement = {**rejected_leg, "session_id": "the-replacement"}
+
+    async def fake_run_phases(ctx, *, manifest, phases, results_dir, observer, **kwargs):
+        # What the replacement leg does: the same computed paths, opened the same way.
+        traces = ctx.run_dir / "eval_after" / "traces"
+        traces.mkdir(parents=True, exist_ok=True)
+        with (traces / f"{stem}.stream.jsonl").open("a", encoding="utf-8") as out:
+            out.write('{"attempt": "replacement"}\n')
+        with (traces / f"{stem}.err.txt").open("a", encoding="utf-8") as err:
+            err.write("replacement\n")
+        ctx.publish_json(ctx.run_dir / "legs.json", [*ctx.leg_records(), replacement])
+        return results_dir / "cell.json"
+
+    monkeypatch.setattr(runner, "_run_phases", fake_run_phases)
+    monkeypatch.setattr(runner, "CellSandbox", _FakeSandbox)
+    monkeypatch.setattr(runner, "_watch_cell_credential", lambda ctx, spec: None)
+
+    asyncio.run(
+        runner.rerun_eval(
+            run_dir,
+            results_dir=tmp_path / "results",
+            redo_tasks=[redo],
+            capture_egress=False,
+        )
+    )
+
+    archive = next(iter((run_dir / "eval_after" / REDONE_DIR).iterdir()))
+    archived, live = archive / "traces", run_dir / "eval_after" / "traces"
+    assert (archived / f"{stem}.stream.jsonl").read_bytes() == b'{"attempt": "rejected"}\n'
+    assert (archived / f"{stem}.err.txt").read_bytes() == b"rejected\n"
+    # The replacement's trace is its own, though it was opened exactly as an appending leg
+    # opens it: the file it appended to was no longer there.
+    assert (live / f"{stem}.stream.jsonl").read_bytes() == b'{"attempt": "replacement"}\n'
+    assert (live / f"{stem}.err.txt").read_bytes() == b"replacement\n"
+    # The record went with the evidence it names, re-pointed at the archived copy.
+    moved_to = f"{runner.run_relative(archive, run_dir)}/traces/{stem}.stream.jsonl"
+    assert json.loads((archive / "legs.json").read_text(encoding="utf-8")) == [
+        {**rejected_leg, "trace_path": moved_to}
+    ]
+    # And the run's own record holds the replacement and the untouched id, with no second
+    # entry for the redone one.
+    assert json.loads((run_dir / "legs.json").read_text(encoding="utf-8")) == [
+        kept_leg,
+        replacement,
+    ]
+    # The id beside it kept its trace where it was.
+    kept_stem = runner.leg_stem(int(kept), int(kept))
+    assert (live / f"{kept_stem}.stream.jsonl").read_bytes() == b'{"attempt": "kept"}\n'
 
 
 class _FakeSandbox:

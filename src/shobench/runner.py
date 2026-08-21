@@ -1122,19 +1122,30 @@ def _eval_pending_ids(phase_dir: Path, task_ids: Sequence[str]) -> list[str]:
 # it: an archive kept in there would be deleted by the very re-run it is evidence for. The name
 # does not match ``task-*``, so nothing reading the phase reads these rows back.
 REDONE_DIR = "redone"
+# Where an archived attempt's trace and stderr sit inside its archive: the same name the phase
+# keeps them under, so the archive reads as the phase directory the attempt came from.
+ARCHIVED_TRACES = "traces"
 
 
 def set_aside_task_rows(phase_dir: Path, task_id: str | int) -> str | None:
-    """Move a held-out id's recorded rows out of the phase so the id runs again; ``None`` if none.
+    """Move a held-out id's earlier attempt out of the phase so the id runs again.
 
-    Moved, never deleted. The rows being set aside are a real measurement of a real leg, and an
-    operator redoing one is saying it measured the wrong thing, not that it never happened; the
-    published artifact stops carrying it and the record keeps it. The whole task directory goes,
-    so its trace, its runner breadcrumb and its provenance stay together, and the return value is
-    the path the manifest records it under.
+    Moved, never deleted, and ``None`` when there was nothing to move. The rows being set aside
+    are a real measurement of a real leg, and an operator redoing one is saying it measured the
+    wrong thing, not that it never happened; the published artifact stops carrying it and the
+    record keeps it.
+
+    The whole attempt goes, not only its provenance. The task directory holds its rows, its
+    runner breadcrumb and its dispenses; its trace and stderr live in the phase's shared
+    ``traces/`` directory under this id's own stem, and the replacement leg runs under the same
+    phase, task and leg number and opens those two files in append mode. Left in place, one file
+    would hold both attempts and the audit boundary this archive exists to draw would not
+    survive the first redo. They move under ``traces/`` inside the archive, the phase's own
+    layout, so a reader who knows where a trace lives in a phase knows where it lives here.
     """
     task_dir = phase_dir / f"task-{int(task_id):05d}"
-    if not task_dir.is_dir():
+    traces = sorted((phase_dir / "traces").glob(f"{task_dir.name}-leg-*"))
+    if not task_dir.is_dir() and not traces:
         return None
     stamp, nth = int(time.time()), 1
     archive = phase_dir / REDONE_DIR / f"{task_dir.name}.{stamp}"
@@ -1143,8 +1154,40 @@ def set_aside_task_rows(phase_dir: Path, task_id: str | int) -> str | None:
         nth += 1
         archive = phase_dir / REDONE_DIR / f"{task_dir.name}.{stamp}-{nth}"
     archive.parent.mkdir(parents=True, exist_ok=True)
-    task_dir.rename(archive)
+    if task_dir.is_dir():
+        task_dir.rename(archive)
+    else:
+        archive.mkdir()
+    if traces:
+        (archive / ARCHIVED_TRACES).mkdir()
+    for trace in traces:
+        trace.rename(archive / ARCHIVED_TRACES / trace.name)
     return run_relative(archive, phase_dir.parent)
+
+
+def set_aside_leg_records(
+    legs: Sequence[dict[str, Any]], *, phase: str, task_id: str | int, archive: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split a run's leg records into the ones a redo keeps and the ones it rejects.
+
+    A rejected record belongs with the attempt it describes, because the two are one piece of
+    evidence: the replacement runs under the same phase, task and leg number, so a run's
+    ``legs.json`` holding both would carry two records nothing distinguishes, pointing at a file
+    only one of them was written from. The rejected records are re-pointed at the archived
+    traces and returned for the archive to hold; the run keeps the legs whose evidence is still
+    in the phase, and the replacement leg writes a record of its own.
+    """
+    idx = int(task_id)
+    kept: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for leg in legs:
+        if leg.get("phase") != phase or leg.get("task_idx") != idx:
+            kept.append(leg)
+            continue
+        trace = str(leg.get("trace_path") or "")
+        moved = {"trace_path": f"{archive}/{ARCHIVED_TRACES}/{Path(trace).name}"} if trace else {}
+        rejected.append({**leg, **moved})
+    return kept, rejected
 
 
 # prime_agent is why the watchdog exists. Launched autonomous with no quality gate, its
@@ -4266,6 +4309,17 @@ async def _rerun_eval_owned(
     for task_id in redo:
         moved = set_aside_task_rows(run_dir / phase, task_id)
         redone.append({"task_id": int(task_id), "rows_moved_to": moved})
+        if moved is None:
+            continue
+        # The leg record follows its own evidence into the archive, so the replacement's record
+        # is the only one this run's legs.json holds for the id.
+        ctx.prior_legs, rejected = set_aside_leg_records(
+            ctx.prior_legs, phase=phase, task_id=task_id, archive=moved
+        )
+        if rejected:
+            ctx.publish_json(run_dir / moved / "legs.json", rejected)
+    if redone and legs_path.is_file():
+        ctx.publish_json(legs_path, ctx.leg_records())
     manifest.setdefault("eval_reruns", []).append(
         {"at": time.time(), "phase": phase, **({"redone": redone} if redone else {})}
     )
