@@ -1117,6 +1117,162 @@ def _eval_pending_ids(phase_dir: Path, task_ids: Sequence[str]) -> list[str]:
     ]
 
 
+# Where a redone held-out id's earlier rows go. Under the phase and beside the task directories
+# rather than inside one, because the phase runner clears a pending id's directory before it runs
+# it: an archive kept in there would be deleted by the very re-run it is evidence for. The name
+# does not match ``task-*``, so nothing reading the phase reads these rows back.
+REDONE_DIR = "redone"
+# Where an archived attempt's trace and stderr sit inside its archive: the same name the phase
+# keeps them under, so the archive reads as the phase directory the attempt came from.
+ARCHIVED_TRACES = "traces"
+
+
+def set_aside_task_rows(phase_dir: Path, task_id: str | int) -> str | None:
+    """Move a held-out id's earlier attempt out of the phase so the id runs again.
+
+    Moved, never deleted, and ``None`` when there was nothing to move. The rows being set aside
+    are a real measurement of a real leg, and an operator redoing one is saying it measured the
+    wrong thing, not that it never happened; the published artifact stops carrying it and the
+    record keeps it.
+
+    The whole attempt goes, not only its provenance. The task directory holds its rows, its
+    runner breadcrumb and its dispenses; its trace and stderr live in the phase's shared
+    ``traces/`` directory under this id's own stem, and the replacement leg runs under the same
+    phase, task and leg number and opens those two files in append mode. Left in place, one file
+    would hold both attempts and the audit boundary this archive exists to draw would not
+    survive the first redo. They move under ``traces/`` inside the archive, the phase's own
+    layout, so a reader who knows where a trace lives in a phase knows where it lives here.
+    """
+    task_dir = phase_dir / f"task-{int(task_id):05d}"
+    traces = sorted((phase_dir / "traces").glob(f"{task_dir.name}-leg-*"))
+    if not task_dir.is_dir() and not traces:
+        return None
+    stamp, nth = int(time.time()), 1
+    archive = phase_dir / REDONE_DIR / f"{task_dir.name}.{stamp}"
+    # A second redo of the same id inside one second would otherwise land on the first archive.
+    while archive.exists():
+        nth += 1
+        archive = phase_dir / REDONE_DIR / f"{task_dir.name}.{stamp}-{nth}"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    if task_dir.is_dir():
+        task_dir.rename(archive)
+    else:
+        archive.mkdir()
+    if traces:
+        (archive / ARCHIVED_TRACES).mkdir()
+    for trace in traces:
+        trace.rename(archive / ARCHIVED_TRACES / trace.name)
+    return run_relative(archive, phase_dir.parent)
+
+
+def set_aside_leg_records(
+    legs: Sequence[dict[str, Any]], *, phase: str, task_id: str | int, archive: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split a run's leg records into the ones a redo keeps and the ones it rejects.
+
+    A rejected record belongs with the attempt it describes, because the two are one piece of
+    evidence: the replacement runs under the same phase, task and leg number, so a run's
+    ``legs.json`` holding both would carry two records nothing distinguishes, pointing at a file
+    only one of them was written from. The rejected records are re-pointed at the archived
+    traces and returned for the archive to hold; the run keeps the legs whose evidence is still
+    in the phase, and the replacement leg writes a record of its own.
+    """
+    idx = int(task_id)
+    kept: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for leg in legs:
+        if leg.get("phase") != phase or leg.get("task_idx") != idx:
+            kept.append(leg)
+            continue
+        trace = str(leg.get("trace_path") or "")
+        moved = {"trace_path": f"{archive}/{ARCHIVED_TRACES}/{Path(trace).name}"} if trace else {}
+        rejected.append({**leg, **moved})
+    return kept, rejected
+
+
+def _redo_artifact_leaves(manifest: dict[str, Any], cell_name: str) -> tuple[str, str]:
+    """The two names this run's artifact can wear: the complete one and the incomplete one."""
+    stem = str(manifest["run_id"]) if "rebookend" in manifest else cell_name
+    return f"{stem}.json", f"{stem}{INCOMPLETE_SUFFIX}"
+
+
+def _artifact_of_run(path: Path, run_id: str) -> bool:
+    """Whether the entry at ``path`` is an artifact this run published.
+
+    A symlink leaf never is, whatever it points at. Publication swaps the directory entry
+    rather than writing through the link, so a redo accepted through one would republish over
+    the link and leave its target standing, complete, quoting the row just rejected.
+    """
+    if path.is_symlink():
+        return False
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    published = body.get("manifest") if isinstance(body, dict) else None
+    return isinstance(published, dict) and str(published.get("run_id") or "") == run_id
+
+
+def redo_artifact_refusal(
+    results_dir: Path, *, manifest: dict[str, Any], cell_name: str
+) -> str | None:
+    """Why a redo publishing into ``results_dir`` must not run, or ``None`` when it may.
+
+    What keeps the artifact from going on quoting a row a redo rejected is the republication
+    the redo performs the moment that row moves, and it lands in the results directory THIS
+    invocation was handed. That directory is a free parameter: ``--results`` takes any path and
+    its default is relative to the current working directory, so a redo opened from somewhere
+    else publishes an honest artifact beside the one the run actually published, and leaves the
+    original standing, complete, quoting exactly the measurement just rejected.
+
+    A run records no artifact location, so the requirement is that the directory handed in
+    already holds this run's artifact: the stem the run publishes under says which file to
+    open, and the manifest inside it says whose the file is, because an artifact of another run
+    of the same cell wears the same name and is not the one being superseded. A link wearing
+    that name is not it either, and the refusal says so, because a file that plainly exists and
+    plainly carries this run's id is otherwise a puzzling thing to be turned away over.
+    """
+    run_id = str(manifest["run_id"])
+    leaves = _redo_artifact_leaves(manifest, cell_name)
+    complete, incomplete = (results_dir / leaf for leaf in leaves)
+    if any(_artifact_of_run(path, run_id) for path in (complete, incomplete)):
+        return None
+    linked = [path.name for path in (complete, incomplete) if path.is_symlink()]
+    through_a_link = (
+        f"A symlink stands at {' and '.join(linked)}, and publication replaces the directory "
+        "entry rather than writing through the link, so redoing here would leave what it "
+        "points at complete. "
+        if linked
+        else ""
+    )
+    return (
+        f"{results_dir} holds no artifact of run {run_id}: a redo republishes over the "
+        f"artifact it supersedes, and neither {complete.name} nor {incomplete.name} is there "
+        f"with this run's id in it. {through_a_link}"
+        "Point --results at the directory this run published to."
+    )
+
+
+def evict_superseded_artifact(
+    results_dir: Path, *, manifest: dict[str, Any], cell_name: str
+) -> Path | None:
+    """Remove this run's COMPLETE artifact, answering where it was or ``None`` if it was not there.
+
+    Called before the first row moves rather than left to the republication that follows the
+    move, because the republication has a body to assemble and a filesystem to write it to, and
+    either can fail. Removed first, every ending from the move onward leaves an incomplete
+    artifact or none at all, never a complete one quoting the row this redo rejected.
+
+    Only this run's own file goes. An artifact of another run of the same cell wears exactly
+    this name, and it measures rows this redo has no standing over.
+    """
+    complete = results_dir / _redo_artifact_leaves(manifest, cell_name)[0]
+    if not _artifact_of_run(complete, str(manifest["run_id"])):
+        return None
+    complete.unlink()
+    return complete
+
+
 # prime_agent is why the watchdog exists. Launched autonomous with no quality gate, its
 # continuation check has nothing to evaluate and returns "keep going" unconditionally, so the leg
 # has no terminal condition of its own and runs until the task timeout kills it: a median
@@ -1672,6 +1828,8 @@ STOP_POLL_S = 2.0
 # The run's whole egress capture. One process writes it and any continuation appends to it, so
 # the published summary covers the cell rather than only its last stretch.
 EGRESS_LOG = "egress.tsv"
+# What that capture summarizes to, written beside it and republished into every artifact.
+EGRESS_SUMMARY = "egress.json"
 # The exit status a suspended cell leaves. `run` cannot return it, because a suspension is the
 # one path that must not unwind, so the status is how a shell or a supervising script tells a
 # cell that is waiting for a window from one that failed. 75 is the conventional "temporary
@@ -3187,8 +3345,98 @@ class _Egress:
             # last continuation: the eval that ran before the interruption is evidence too.
             with record.open("a", encoding="utf-8") as whole:
                 whole.write(capture.log_path.read_text(encoding="utf-8", errors="ignore"))
-        self.summary = dict(egress.write_summary(record, self._run_dir / "egress.json"))
+        self.summary = dict(egress.write_summary(record, self._run_dir / EGRESS_SUMMARY))
         return self.summary
+
+
+def _recorded_phase_rows(
+    run_dir: Path, phases: Sequence[str], heldout_ids: Sequence[int]
+) -> dict[str, list[TaskResult]]:
+    """The rows a run directory already holds for these phases, read as each phase records them.
+
+    A rollout writes one flat provenance directory; an eval phase spreads its rows across
+    per-task subdirectories a flat read would miss. Omitting a phase the run recorded publishes
+    a file missing half the measurement: no requested eval tasks, no deltas, every after row
+    unpaired.
+    """
+    return {
+        phase: (
+            read_phase(run_dir / phase)
+            if phase == "rollout"
+            else read_eval_phase(run_dir / phase, heldout_ids)
+        )
+        for phase in phases
+    }
+
+
+def _carried_before_rows(
+    run_dir: Path, manifest: dict[str, Any]
+) -> tuple[list[TaskResult], str | None] | None:
+    """A bookend's carried baseline before rows and the run that measured them.
+
+    ``None`` for a run that measured its own before side, which is every run but a bookend.
+    A bookend publishes the BASELINE's before rows as its own block, labeled with the run they
+    came from, so the artifact carries its whole pairing and depends on no other file: the
+    baseline's own artifact lives under the shared cell stem and is routinely evicted by later
+    same-cell publications. The carried rows were persisted at creation; a marker-bearing run
+    whose carry is gone cannot publish self-contained and must not publish an empty before under
+    the resumed label, so it refuses.
+    """
+    if "rebookend" not in manifest:
+        return None
+    payload_path = run_dir / BASELINE_BEFORE_FILE
+    if not payload_path.is_file():
+        raise RuntimeError(
+            f"{run_dir} is a rebookend but its carried baseline rows ({BASELINE_BEFORE_FILE}) "
+            "cannot be read, so the artifact cannot be published self-contained. The file is "
+            "written at creation; restore it or recreate the bookend."
+        )
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    return (
+        [TaskResult(**row) for row in payload["rows"]],
+        str(payload.get("source_run_id") or "") or None,
+    )
+
+
+def _publish_recorded_results(
+    ctx: RunContext,
+    *,
+    manifest: dict[str, Any],
+    phases: Sequence[str],
+    results_dir: Path,
+    artifact: str | None = None,
+) -> Path:
+    """Publish the cell's artifact from what the run directory holds at this moment.
+
+    The same assembly the end of a run performs, over rows read back rather than rows just
+    produced, so a process that has changed what the record says can say it in the published
+    artifact without waiting for an ending it may never reach. An assembly that cannot account
+    for every held-out id lands under the incomplete name and evicts the complete one, which
+    :func:`shobench.results.write_results` decides from the rows themselves.
+    """
+    heldout_ids = [int(task_id) for task_id in side_for_phase(ctx.split, "eval_before").task_ids]
+    phase_rows = _recorded_phase_rows(ctx.run_dir, phases, heldout_ids)
+    stopping: dict[str, Any] = {}
+    if "rollout" in phases:
+        stopping = json.loads(
+            (ctx.run_dir / ROLLOUT_STOPPING_FILE).read_text(encoding="utf-8")
+        )
+        stopping["usage_limit_resumes"] = len(manifest.get("resumptions", []))
+    before_source_run_id: str | None = None
+    carried = _carried_before_rows(ctx.run_dir, manifest)
+    if carried is not None:
+        phase_rows["eval_before"], before_source_run_id = carried
+    summary = ctx.run_dir / EGRESS_SUMMARY
+    return write_results(
+        results_dir / f"{artifact or ctx.cell.name}.json",
+        manifest=manifest,
+        phases=phase_rows,
+        stopping=stopping,
+        heldout_ids=heldout_ids,
+        egress=json.loads(summary.read_text(encoding="utf-8")) if summary.is_file() else {},
+        redact=ctx.redactor.json,
+        before_source_run_id=before_source_run_id,
+    )
 
 
 async def _run_phases(
@@ -3247,18 +3495,8 @@ async def _run_phases(
     # published count is against it rather than against whatever arrived.
     heldout_ids = [int(task_id) for task_id in side_for_phase(ctx.split, "eval_before").task_ids]
     # A continuation starts from the phases the interrupted run already recorded, not from
-    # nothing. A recorded eval phase (eval_before) is read with the eval-phase reader, because
-    # its rows live in per-task subdirectories a single-directory read would miss; a recorded
-    # rollout is read flat. Omitting a recorded phase publishes a file missing half the
-    # measurement: no requested eval tasks, no deltas, every after row unpaired.
-    phase_rows: dict[str, list[TaskResult]] = {
-        phase: (
-            read_phase(ctx.run_dir / phase)
-            if phase == "rollout"
-            else read_eval_phase(ctx.run_dir / phase, heldout_ids)
-        )
-        for phase in recorded_phases
-    }
+    # nothing.
+    phase_rows = _recorded_phase_rows(ctx.run_dir, recorded_phases, heldout_ids)
     stopping: dict[str, Any] = {}
     # Phases an operator's stop kept from starting at all, named for the record.
     stopped_before: list[str] = []
@@ -3339,25 +3577,10 @@ async def _run_phases(
     manifest["ended_at"] = time.time()
     ctx.publish_json(ctx.run_dir / "manifest.json", manifest)
 
-    # A bookend publishes the BASELINE's before rows as its own block, labeled with the run
-    # they came from, so the artifact carries its whole pairing and depends on no other file:
-    # the baseline's own artifact lives under the shared cell stem and is routinely evicted
-    # by later same-cell publications. The carried rows were persisted at creation; a
-    # marker-bearing run whose carry is gone cannot publish self-contained and must not
-    # publish an empty before under the resumed label, so it refuses.
     before_source_run_id: str | None = None
-    baseline_payload_path = ctx.run_dir / BASELINE_BEFORE_FILE
-    if "rebookend" in manifest:
-        if not baseline_payload_path.is_file():
-            raise RuntimeError(
-                f"{ctx.run_dir} is a rebookend but its carried baseline rows "
-                f"({BASELINE_BEFORE_FILE}) cannot be read, so the artifact cannot be "
-                "published self-contained. The file is written at creation; restore it or "
-                "recreate the bookend."
-            )
-        payload = json.loads(baseline_payload_path.read_text(encoding="utf-8"))
-        phase_rows["eval_before"] = [TaskResult(**row) for row in payload["rows"]]
-        before_source_run_id = str(payload.get("source_run_id") or "") or None
+    carried = _carried_before_rows(ctx.run_dir, manifest)
+    if carried is not None:
+        phase_rows["eval_before"], before_source_run_id = carried
     egress_summary = observer.stop()
     results_path = write_results(
         results_dir / f"{artifact or ctx.cell.name}.json",
@@ -4005,6 +4228,7 @@ async def rerun_eval(
     capture_egress: bool = True,
     refresh_baseline: bool = False,
     baseline_run_dir: Path | None = None,
+    redo_tasks: Sequence[str] | Sequence[int] = (),
 ) -> Path:
     """Finish an eval phase that lost tasks without a suspension, and republish.
 
@@ -4023,6 +4247,7 @@ async def rerun_eval(
             capture_egress=capture_egress,
             refresh_baseline=refresh_baseline,
             baseline_run_dir=baseline_run_dir,
+            redo_tasks=redo_tasks,
             stop=stop,
         )
 
@@ -4037,6 +4262,7 @@ async def _rerun_eval_owned(
     capture_egress: bool = True,
     refresh_baseline: bool = False,
     baseline_run_dir: Path | None = None,
+    redo_tasks: Sequence[str] | Sequence[int] = (),
     stop: EarlyEnding | None = None,
 ) -> Path:
     """The reopened run's eval_after, run under an already-held run-directory lock.
@@ -4057,6 +4283,19 @@ async def _rerun_eval_owned(
     ``refresh_baseline`` catches a bookend's carried before rows up to the baseline they were
     snapshotted from. It composes with the repair rather than replacing it: the pending legs
     still run, and a run with none pending refreshes the carry and republishes.
+
+    ``redo_tasks`` names held-out ids whose recorded rows are to be set aside and measured
+    again, which is how a leg that produced a row nobody should quote is repaired: a hole is
+    already pending and needs no naming, while a settled row is complete by every test this
+    runner has and would otherwise never re-run. Nothing detects which rows deserve it. The
+    operator names the ids, the rows they name are moved rather than dropped
+    (:func:`set_aside_task_rows`), the manifest records the redo beside the repair, and the
+    artifact is republished from what the record holds after the move, before any leg runs. That
+    republication is what supersedes the rejected row, so a redo runs only when ``results_dir``
+    is where this run's artifact is (:func:`redo_artifact_refusal`), and the complete artifact is
+    evicted before the move rather than at the republication
+    (:func:`evict_superseded_artifact`), which leaves incomplete or nothing as the only states a
+    redo can publish.
     """
     if (run_dir / SUSPENSION_FILE).is_file():
         raise RuntimeError(
@@ -4097,6 +4336,26 @@ async def _rerun_eval_owned(
         "rollout_system" if cell.eval_context == "resumed" else "eval_system"
     )
     split = load_split_by_name(cell.split)
+    # Before the drift check and long before the sandbox, because an id this run never committed
+    # to is a typo in the one command that deletes nothing but moves a measurement out of the
+    # published artifact. Refused whole: a redo of three ids where one is wrong is not two thirds
+    # of a repair.
+    redo = [str(int(task_id)) for task_id in redo_tasks]
+    committed = {str(task_id) for task_id in side_for_phase(split, phase).task_ids}
+    unknown = sorted(set(redo) - committed, key=int)
+    if unknown:
+        raise RuntimeError(
+            f"--redo-task named {unknown}, which {run_dir} never committed to measuring: its "
+            f"held-out set holds {len(committed)} ids and a redo may only name those. Nothing "
+            "has been spent."
+        )
+    if redo:
+        # The check sits here rather than at the republication, because by then the row has
+        # moved: a redo handed a directory this run never published to can only add an artifact,
+        # never supersede one, and the rejected measurement stays complete where it is.
+        refusal = redo_artifact_refusal(results_dir, manifest=manifest, cell_name=cell.name)
+        if refusal:
+            raise RuntimeError(f"{refusal} Nothing has been spent.")
     instruction = load_instruction(cell.instruction_arm)
     # The whole-file comparison, and a repaired BOOKEND gets it too, though a rebookend does
     # not: a rebookend measures every held-out task under one definition, while a repair splices
@@ -4205,8 +4464,58 @@ async def _rerun_eval_owned(
                 "tasks_upgraded": refresh["upgraded"],
             }
         )
-    manifest.setdefault("eval_reruns", []).append({"at": time.time(), "phase": phase})
+    if redo:
+        # The complete artifact goes BEFORE the first row moves, not with the republication
+        # below. From the move onward the run directory says the named row was rejected, and
+        # what can fail in between is ordinary: assembling the replacement body, writing it to a
+        # full disk. Evicted first, every one of those endings leaves an incomplete artifact or
+        # none at all, and never the complete one still quoting the rejected row. A failure of
+        # the eviction itself has moved nothing yet, so it refuses here.
+        try:
+            evict_superseded_artifact(results_dir, manifest=manifest, cell_name=cell.name)
+        except OSError as exc:
+            raise RuntimeError(
+                f"the artifact of run {run_id} in {results_dir} could not be removed ({exc}), "
+                "and a redo that cannot stop it quoting the row it rejects must not move that "
+                "row. Nothing has been spent."
+            ) from exc
+    # Set aside after every refusal above and before the phase runs: the rows move once the
+    # repair is certain to go ahead, and the ids they belonged to are pending from that moment,
+    # which is the whole of what makes the phase runner measure them again. An id that held no
+    # rows records none moved; it was already a hole and the redo only says so out loud.
+    redone: list[dict[str, Any]] = []
+    for task_id in redo:
+        moved = set_aside_task_rows(run_dir / phase, task_id)
+        redone.append({"task_id": int(task_id), "rows_moved_to": moved})
+        if moved is None:
+            continue
+        # The leg record follows its own evidence into the archive, so the replacement's record
+        # is the only one this run's legs.json holds for the id.
+        ctx.prior_legs, rejected = set_aside_leg_records(
+            ctx.prior_legs, phase=phase, task_id=task_id, archive=moved
+        )
+        if rejected:
+            ctx.publish_json(run_dir / moved / "legs.json", rejected)
+    if redone and legs_path.is_file():
+        ctx.publish_json(legs_path, ctx.leg_records())
+    manifest.setdefault("eval_reruns", []).append(
+        {"at": time.time(), "phase": phase, **({"redone": redone} if redone else {})}
+    )
     ctx.publish_json(run_dir / "manifest.json", manifest)
+    if redone:
+        # The artifact stops quoting a rejected row the moment that row moves, rather than at the
+        # end of a repair that may never reach its publication: a sandbox that will not come up,
+        # a server that fails, a provider limit that hard-exits the process. What is republished
+        # here cannot account for the ids just set aside, so it lands under the incomplete name,
+        # which the eviction above already vacated the complete one for, and every ending
+        # downstream of this line leaves a published artifact the run directory agrees with.
+        _publish_recorded_results(
+            ctx,
+            manifest=manifest,
+            phases=(*recorded_phases, phase),
+            results_dir=results_dir,
+            artifact=run_id if "rebookend" in manifest else None,
+        )
     sandbox.up()
     observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
     try:
