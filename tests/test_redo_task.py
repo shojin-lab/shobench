@@ -334,3 +334,24 @@ class _FakeSandbox:
 
     def down(self) -> None:
         pass
+
+
+def test_a_padded_or_repeated_spelling_names_the_task_once(tmp_path: Path, capsys) -> None:
+    """An id copied off a task directory (zero padded) is the task it names, and naming a task
+    twice redoes it once, so the plan stays an exact description of a --go."""
+    run_dir = _run_with_a_measured_eval_after(tmp_path)
+    redo, _kept = _heldout_ids(run_dir)
+    padded = f"{int(redo):05d}"
+
+    assert (
+        cli_main(
+            ["rerun-eval", "--run", str(run_dir), "--redo-task", padded, "--redo-task", redo]
+        )
+        == 0
+    )
+
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["redo_tasks"] == [redo]
+    assert plan["redo_tasks_with_rows_to_set_aside"] == [redo]
+    assert plan["unknown_redo_tasks"] == []
+    assert plan["tasks_a_go_would_run"] == 1

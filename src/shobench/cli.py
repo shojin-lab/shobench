@@ -326,7 +326,17 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
     )
     heldout_ids = [str(task_id) for task_id in split.heldout.task_ids]
     pending = runner._eval_pending_ids(run_dir / args.phase, heldout_ids)
-    redo = [str(task_id) for task_id in (args.redo_task or [])]
+    # Canonicalized the way the runner will read them, and first-seen unique, so the plan is an
+    # exact description of what a --go does: a zero-padded spelling copied off a task directory
+    # names the same task, and naming a task twice redoes it once.
+    redo: list[str] = []
+    for raw in args.redo_task or []:
+        try:
+            canonical = str(int(str(raw)))
+        except ValueError:
+            canonical = str(raw)
+        if canonical not in redo:
+            redo.append(canonical)
     unknown_redo = sorted(set(redo) - set(heldout_ids))
     # What a --go would set aside, named one id at a time: a redo of an id that holds no rows
     # costs a leg and moves nothing, and the two are different enough to say apart up front.
