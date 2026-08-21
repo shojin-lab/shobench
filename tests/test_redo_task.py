@@ -344,6 +344,65 @@ def test_a_redo_through_a_symlinked_artifact_is_refused(tmp_path: Path, capsys) 
     assert json.loads(published.read_text(encoding="utf-8"))["heldout"]["complete"]
 
 
+def test_the_complete_artifact_is_gone_before_the_first_row_moves(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """What a redo can leave published is an incomplete artifact or none, never a complete one.
+
+    Publishing early closed the window between the move and the end of the repair. This is the
+    window around the move itself: the archive can fail to be written, and the replacement body
+    can fail to be assembled or written. Either failure with the complete artifact still standing
+    is the contradiction the early publication exists to prevent, so the eviction leads.
+    """
+    run_dir = _run_with_a_measured_eval_after(tmp_path)
+    redo, _kept = _heldout_ids(run_dir)
+    results_dir = tmp_path / "results"
+    finished = results_dir / f"{_SMOKE_CELL}.json"
+    assert json.loads(finished.read_text(encoding="utf-8"))["heldout"]["complete"]
+    set_aside = runner.set_aside_task_rows
+
+    monkeypatch.setattr(runner, "CellSandbox", _FakeSandbox)
+    monkeypatch.setattr(runner, "_watch_cell_credential", lambda ctx, spec: None)
+
+    def _the_archive_fails(phase_dir, task_id):
+        raise OSError("the archive could not be written")
+
+    monkeypatch.setattr(runner, "set_aside_task_rows", _the_archive_fails)
+
+    with pytest.raises(OSError, match="archive could not be written"):
+        asyncio.run(
+            runner.rerun_eval(
+                run_dir, results_dir=results_dir, redo_tasks=[redo], capture_egress=False
+            )
+        )
+
+    # The eviction had already happened, so the failure at the move left nothing behind to quote
+    # the row, rather than the complete artifact that quotes it.
+    assert list(results_dir.iterdir()) == []
+    assert not (run_dir / "eval_after" / REDONE_DIR).exists()
+
+    # And the same at the other seam: the rows move, the republication fails, and there is still
+    # no complete artifact anywhere for a reader to find.
+    _publish_the_finished_run(run_dir, results_dir)
+    assert json.loads(finished.read_text(encoding="utf-8"))["heldout"]["complete"]
+    monkeypatch.setattr(runner, "set_aside_task_rows", set_aside)
+
+    def _the_publication_fails(ctx, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(runner, "_publish_recorded_results", _the_publication_fails)
+
+    with pytest.raises(OSError, match="no space left"):
+        asyncio.run(
+            runner.rerun_eval(
+                run_dir, results_dir=results_dir, redo_tasks=[redo], capture_egress=False
+            )
+        )
+
+    assert list(results_dir.iterdir()) == []
+    assert (run_dir / "eval_after" / REDONE_DIR).is_dir()
+
+
 def _record_a_leg(run_dir: Path, phase: str, task_id: str, mark: str) -> dict:
     """One eval leg's trace, stderr and record, written where ``run_leg`` writes them."""
     idx = int(task_id)

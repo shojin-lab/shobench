@@ -1253,6 +1253,26 @@ def redo_artifact_refusal(
     )
 
 
+def evict_superseded_artifact(
+    results_dir: Path, *, manifest: dict[str, Any], cell_name: str
+) -> Path | None:
+    """Remove this run's COMPLETE artifact, answering where it was or ``None`` if it was not there.
+
+    Called before the first row moves rather than left to the republication that follows the
+    move, because the republication has a body to assemble and a filesystem to write it to, and
+    either can fail. Removed first, every ending from the move onward leaves an incomplete
+    artifact or none at all, never a complete one quoting the row this redo rejected.
+
+    Only this run's own file goes. An artifact of another run of the same cell wears exactly
+    this name, and it measures rows this redo has no standing over.
+    """
+    complete = results_dir / _redo_artifact_leaves(manifest, cell_name)[0]
+    if not _artifact_of_run(complete, str(manifest["run_id"])):
+        return None
+    complete.unlink()
+    return complete
+
+
 # prime_agent is why the watchdog exists. Launched autonomous with no quality gate, its
 # continuation check has nothing to evaluate and returns "keep going" unconditionally, so the leg
 # has no terminal condition of its own and runs until the task timeout kills it: a median
@@ -4272,7 +4292,10 @@ async def _rerun_eval_owned(
     (:func:`set_aside_task_rows`), the manifest records the redo beside the repair, and the
     artifact is republished from what the record holds after the move, before any leg runs. That
     republication is what supersedes the rejected row, so a redo runs only when ``results_dir``
-    is where this run's artifact is (:func:`redo_artifact_refusal`).
+    is where this run's artifact is (:func:`redo_artifact_refusal`), and the complete artifact is
+    evicted before the move rather than at the republication
+    (:func:`evict_superseded_artifact`), which leaves incomplete or nothing as the only states a
+    redo can publish.
     """
     if (run_dir / SUSPENSION_FILE).is_file():
         raise RuntimeError(
@@ -4441,6 +4464,21 @@ async def _rerun_eval_owned(
                 "tasks_upgraded": refresh["upgraded"],
             }
         )
+    if redo:
+        # The complete artifact goes BEFORE the first row moves, not with the republication
+        # below. From the move onward the run directory says the named row was rejected, and
+        # what can fail in between is ordinary: assembling the replacement body, writing it to a
+        # full disk. Evicted first, every one of those endings leaves an incomplete artifact or
+        # none at all, and never the complete one still quoting the rejected row. A failure of
+        # the eviction itself has moved nothing yet, so it refuses here.
+        try:
+            evict_superseded_artifact(results_dir, manifest=manifest, cell_name=cell.name)
+        except OSError as exc:
+            raise RuntimeError(
+                f"the artifact of run {run_id} in {results_dir} could not be removed ({exc}), "
+                "and a redo that cannot stop it quoting the row it rejects must not move that "
+                "row. Nothing has been spent."
+            ) from exc
     # Set aside after every refusal above and before the phase runs: the rows move once the
     # repair is certain to go ahead, and the ids they belonged to are pending from that moment,
     # which is the whole of what makes the phase runner measure them again. An id that held no
@@ -4468,9 +4506,9 @@ async def _rerun_eval_owned(
         # The artifact stops quoting a rejected row the moment that row moves, rather than at the
         # end of a repair that may never reach its publication: a sandbox that will not come up,
         # a server that fails, a provider limit that hard-exits the process. What is republished
-        # here cannot account for the ids just set aside, so it lands under the incomplete name
-        # and evicts the complete one, and every ending downstream of this line leaves a
-        # published artifact the run directory agrees with.
+        # here cannot account for the ids just set aside, so it lands under the incomplete name,
+        # which the eviction above already vacated the complete one for, and every ending
+        # downstream of this line leaves a published artifact the run directory agrees with.
         _publish_recorded_results(
             ctx,
             manifest=manifest,
