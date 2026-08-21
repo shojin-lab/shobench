@@ -1190,6 +1190,42 @@ def set_aside_leg_records(
     return kept, rejected
 
 
+def redo_artifact_refusal(
+    results_dir: Path, *, manifest: dict[str, Any], cell_name: str
+) -> str | None:
+    """Why a redo publishing into ``results_dir`` must not run, or ``None`` when it may.
+
+    What keeps the artifact from going on quoting a row a redo rejected is the republication
+    the redo performs the moment that row moves, and it lands in the results directory THIS
+    invocation was handed. That directory is a free parameter: ``--results`` takes any path and
+    its default is relative to the current working directory, so a redo opened from somewhere
+    else publishes an honest artifact beside the one the run actually published, and leaves the
+    original standing, complete, quoting exactly the measurement just rejected.
+
+    A run records no artifact location, so the requirement is that the directory handed in
+    already holds this run's artifact: the stem the run publishes under says which file to
+    open, and the manifest inside it says whose the file is, because an artifact of another run
+    of the same cell wears the same name and is not the one being superseded.
+    """
+    run_id = str(manifest["run_id"])
+    stem = run_id if "rebookend" in manifest else cell_name
+    complete = results_dir / f"{stem}.json"
+    incomplete = complete.with_name(complete.stem + INCOMPLETE_SUFFIX)
+    for path in (complete, incomplete):
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        published = body.get("manifest") if isinstance(body, dict) else None
+        if isinstance(published, dict) and str(published.get("run_id") or "") == run_id:
+            return None
+    return (
+        f"{results_dir} holds no artifact of run {run_id}: a redo republishes over the "
+        f"artifact it supersedes, and neither {complete.name} nor {incomplete.name} is there "
+        "with this run's id in it. Point --results at the directory this run published to."
+    )
+
+
 # prime_agent is why the watchdog exists. Launched autonomous with no quality gate, its
 # continuation check has nothing to evaluate and returns "keep going" unconditionally, so the leg
 # has no terminal condition of its own and runs until the task timeout kills it: a median
@@ -4207,7 +4243,9 @@ async def _rerun_eval_owned(
     runner has and would otherwise never re-run. Nothing detects which rows deserve it. The
     operator names the ids, the rows they name are moved rather than dropped
     (:func:`set_aside_task_rows`), the manifest records the redo beside the repair, and the
-    artifact is republished from what the record holds after the move, before any leg runs.
+    artifact is republished from what the record holds after the move, before any leg runs. That
+    republication is what supersedes the rejected row, so a redo runs only when ``results_dir``
+    is where this run's artifact is (:func:`redo_artifact_refusal`).
     """
     if (run_dir / SUSPENSION_FILE).is_file():
         raise RuntimeError(
@@ -4261,6 +4299,13 @@ async def _rerun_eval_owned(
             f"held-out set holds {len(committed)} ids and a redo may only name those. Nothing "
             "has been spent."
         )
+    if redo:
+        # The check sits here rather than at the republication, because by then the row has
+        # moved: a redo handed a directory this run never published to can only add an artifact,
+        # never supersede one, and the rejected measurement stays complete where it is.
+        refusal = redo_artifact_refusal(results_dir, manifest=manifest, cell_name=cell.name)
+        if refusal:
+            raise RuntimeError(f"{refusal} Nothing has been spent.")
     instruction = load_instruction(cell.instruction_arm)
     # The whole-file comparison, and a repaired BOOKEND gets it too, though a rebookend does
     # not: a rebookend measures every held-out task under one definition, while a repair splices

@@ -304,7 +304,9 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
     ``--redo-task`` adds ids to that count: a settled row is complete by every test the runner
     has, so an id whose measurement the operator does not accept has to be named. The plan lists
     exactly which ids a ``--go`` would redo and which of them hold rows it would set aside, and
-    an id the run never committed to blocks the ``--go`` rather than being ignored.
+    an id the run never committed to blocks the ``--go`` rather than being ignored. So does a
+    ``--results`` directory holding no artifact of this run, since a redo there could not
+    supersede the measurement it rejects.
 
     With ``--refresh-baseline`` the plan also names what catching the bookend's carried before
     rows up to its baseline would add, upgrade and refuse, from the same function the spending
@@ -346,6 +348,14 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
         if task_id not in unknown_redo
         if (run_dir / args.phase / f"task-{int(task_id):05d}").is_dir()
     ]
+    # Whether a --go could supersede this run's artifact where it was published, or would only
+    # add one beside it. Read here as well as by the runner so the plan carries the refusal and
+    # an operator pointed at the wrong directory learns it without spending.
+    redo_refusal = (
+        runner.redo_artifact_refusal(Path(args.results), manifest=manifest, cell_name=cell.name)
+        if redo
+        else None
+    )
     missing_required = [name for name in cell.required_env if not os.environ.get(name)]
     plan = {
         "run_dir": str(run_dir),
@@ -357,6 +367,7 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
         "redo_tasks": redo,
         "redo_tasks_with_rows_to_set_aside": redo_with_rows,
         "unknown_redo_tasks": unknown_redo,
+        "redo_artifact_refusal": redo_refusal,
         "tasks_a_go_would_run": len(set(pending) | (set(redo) - set(unknown_redo))),
         "suspension_present": (run_dir / runner.SUSPENSION_FILE).is_file(),
         "rollout_terminus_present": (run_dir / "rollout_stopping.json").is_file(),
@@ -388,6 +399,10 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
             "not hold. Nothing was spent.",
             file=sys.stderr,
         )
+        return 1
+    if redo_refusal:
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(f"\nBLOCKED: {redo_refusal} Nothing was spent.", file=sys.stderr)
         return 1
     if missing_required:
         print(json.dumps(plan, indent=2), file=sys.stderr)

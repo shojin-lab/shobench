@@ -52,6 +52,10 @@ def _run_with_a_measured_eval_after(tmp_path: Path) -> Path:
 
     Both phases, because an artifact is complete only when each of them accounts for every id,
     and what a redo does to a COMPLETE artifact is the thing under test below.
+
+    The run's ending is published too, into ``tmp_path / "results"``, the directory the repairs
+    below hand in: a run that ended has an artifact somewhere, and a redo runs only where that
+    artifact is.
     """
     run_dir = tmp_path / "run"
     (run_dir / "home").mkdir(parents=True)
@@ -82,6 +86,7 @@ def _run_with_a_measured_eval_after(tmp_path: Path) -> Path:
                 _settled_row_wire(int(task_id), lease=f"{phase}-lease-{position}") + "\n",
                 encoding="utf-8",
             )
+    _publish_the_finished_run(run_dir, tmp_path / "results")
     return run_dir
 
 
@@ -209,7 +214,7 @@ def test_a_redo_that_fails_before_the_replacement_leaves_an_honest_artifact(
     run_dir = _run_with_a_measured_eval_after(tmp_path)
     redo, kept = _heldout_ids(run_dir)
     results_dir = tmp_path / "results"
-    finished = _publish_the_finished_run(run_dir, results_dir)
+    finished = results_dir / f"{_SMOKE_CELL}.json"
     assert json.loads(finished.read_text(encoding="utf-8"))["heldout"]["complete"]
 
     class _SandboxThatWillNotStart(_FakeSandbox):
@@ -239,6 +244,63 @@ def test_a_redo_that_fails_before_the_replacement_leaves_an_honest_artifact(
     assert rows[int(redo)]["reward"] is None
     # And the scalpel is still a scalpel: the id beside it is published as measured.
     assert rows[int(kept)]["closure"] == "sealed"
+
+
+def test_a_redo_is_refused_where_this_run_never_published(tmp_path: Path, capsys) -> None:
+    """A redo supersedes an artifact by republishing over it, so it runs only where that one is.
+
+    The results directory is a free parameter: ``--results`` takes any path and its default is
+    relative to the current working directory, while a run records nowhere the artifact it
+    published. Pointed anywhere else, the early republication lands BESIDE that artifact and
+    leaves it complete, still quoting the row the operator just rejected, which is the whole of
+    what publishing early was for. So the requirement is checked before a row moves, and an
+    operator who cannot meet it pays nothing to find out.
+    """
+    run_dir = _run_with_a_measured_eval_after(tmp_path)
+    redo, _kept = _heldout_ids(run_dir)
+    published = tmp_path / "results" / f"{_SMOKE_CELL}.json"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    where_it_published = ["--results", str(tmp_path / "results")]
+    args = ["rerun-eval", "--run", str(run_dir), "--redo-task", redo]
+
+    # The redo is refused nothing where the artifact it would supersede actually is.
+    assert cli_main([*args, *where_it_published]) == 0
+    assert json.loads(capsys.readouterr().out)["redo_artifact_refusal"] is None
+
+    # Anywhere else, the plan carries the refusal, naming both spellings of the stem this run
+    # publishes under and the directory that was searched for them.
+    assert cli_main([*args, "--results", str(elsewhere)]) == 0
+    refusal = json.loads(capsys.readouterr().out)["redo_artifact_refusal"]
+    assert f"{_SMOKE_CELL}.json" in refusal
+    assert f"{_SMOKE_CELL}{INCOMPLETE_SUFFIX}" in refusal
+    assert str(elsewhere) in refusal
+
+    # And a --go stops on it, before the move it would otherwise have made.
+    assert cli_main([*args, "--results", str(elsewhere), "--go"]) == 1
+    assert "holds no artifact of run" in capsys.readouterr().err
+    with pytest.raises(RuntimeError, match="holds no artifact of run"):
+        asyncio.run(
+            runner.rerun_eval(
+                run_dir, results_dir=elsewhere, redo_tasks=[redo], capture_egress=False
+            )
+        )
+    assert not (run_dir / "eval_after" / REDONE_DIR).exists()
+    assert (run_dir / "eval_after" / f"task-{int(redo):05d}" / "results.jsonl").is_file()
+    assert list(elsewhere.iterdir()) == []
+    # The artifact the run really has says what it always said, rather than being contradicted
+    # by a run directory that had moved on without it.
+    assert json.loads(published.read_text(encoding="utf-8"))["heldout"]["complete"]
+
+    # An artifact of ANOTHER run of this cell wears exactly this name, and the name is not what
+    # is being asked for.
+    another = json.loads(published.read_text(encoding="utf-8"))
+    another["manifest"]["run_id"] = "r-2"
+    (elsewhere / f"{_SMOKE_CELL}.json").write_text(json.dumps(another), encoding="utf-8")
+
+    assert cli_main([*args, "--results", str(elsewhere), "--go"]) == 1
+    assert "holds no artifact of run" in capsys.readouterr().err
+    assert not (run_dir / "eval_after" / REDONE_DIR).exists()
 
 
 def _record_a_leg(run_dir: Path, phase: str, task_id: str, mark: str) -> dict:
