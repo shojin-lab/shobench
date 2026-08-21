@@ -303,6 +303,47 @@ def test_a_redo_is_refused_where_this_run_never_published(tmp_path: Path, capsys
     assert not (run_dir / "eval_after" / REDONE_DIR).exists()
 
 
+def test_a_redo_through_a_symlinked_artifact_is_refused(tmp_path: Path, capsys) -> None:
+    """A link wearing the artifact's name is not the artifact, however well its body reads.
+
+    Publication swaps the directory entry and follows nothing, so a redo accepted through a link
+    replaces the link with its own incomplete artifact and leaves the file the link pointed at
+    exactly as it was: complete, still quoting the row the operator just rejected. That is the
+    wrong-directory failure again, reached through a directory that looked right.
+    """
+    run_dir = _run_with_a_measured_eval_after(tmp_path)
+    redo, _kept = _heldout_ids(run_dir)
+    published = tmp_path / "results" / f"{_SMOKE_CELL}.json"
+    through_a_link = tmp_path / "linked"
+    through_a_link.mkdir()
+    link = through_a_link / f"{_SMOKE_CELL}.json"
+    link.symlink_to(published)
+    args = ["rerun-eval", "--run", str(run_dir), "--redo-task", redo]
+
+    # The plan says no before anything is spent, and says symlink, because a file that plainly
+    # exists and plainly carries this run's id is otherwise a puzzling thing to be turned away
+    # over.
+    assert cli_main([*args, "--results", str(through_a_link)]) == 0
+    refusal = json.loads(capsys.readouterr().out)["redo_artifact_refusal"]
+    assert "symlink" in refusal
+    assert f"{_SMOKE_CELL}.json" in refusal
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        asyncio.run(
+            runner.rerun_eval(
+                run_dir, results_dir=through_a_link, redo_tasks=[redo], capture_egress=False
+            )
+        )
+
+    # Nothing moved, nothing was published beside the link, and the artifact the link points at
+    # is the one it always was.
+    assert not (run_dir / "eval_after" / REDONE_DIR).exists()
+    assert (run_dir / "eval_after" / f"task-{int(redo):05d}" / "results.jsonl").is_file()
+    assert link.is_symlink()
+    assert sorted(path.name for path in through_a_link.iterdir()) == [f"{_SMOKE_CELL}.json"]
+    assert json.loads(published.read_text(encoding="utf-8"))["heldout"]["complete"]
+
+
 def _record_a_leg(run_dir: Path, phase: str, task_id: str, mark: str) -> dict:
     """One eval leg's trace, stderr and record, written where ``run_leg`` writes them."""
     idx = int(task_id)

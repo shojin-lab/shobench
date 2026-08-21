@@ -1190,6 +1190,29 @@ def set_aside_leg_records(
     return kept, rejected
 
 
+def _redo_artifact_leaves(manifest: dict[str, Any], cell_name: str) -> tuple[str, str]:
+    """The two names this run's artifact can wear: the complete one and the incomplete one."""
+    stem = str(manifest["run_id"]) if "rebookend" in manifest else cell_name
+    return f"{stem}.json", f"{stem}{INCOMPLETE_SUFFIX}"
+
+
+def _artifact_of_run(path: Path, run_id: str) -> bool:
+    """Whether the entry at ``path`` is an artifact this run published.
+
+    A symlink leaf never is, whatever it points at. Publication swaps the directory entry
+    rather than writing through the link, so a redo accepted through one would republish over
+    the link and leave its target standing, complete, quoting the row just rejected.
+    """
+    if path.is_symlink():
+        return False
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    published = body.get("manifest") if isinstance(body, dict) else None
+    return isinstance(published, dict) and str(published.get("run_id") or "") == run_id
+
+
 def redo_artifact_refusal(
     results_dir: Path, *, manifest: dict[str, Any], cell_name: str
 ) -> str | None:
@@ -1205,24 +1228,28 @@ def redo_artifact_refusal(
     A run records no artifact location, so the requirement is that the directory handed in
     already holds this run's artifact: the stem the run publishes under says which file to
     open, and the manifest inside it says whose the file is, because an artifact of another run
-    of the same cell wears the same name and is not the one being superseded.
+    of the same cell wears the same name and is not the one being superseded. A link wearing
+    that name is not it either, and the refusal says so, because a file that plainly exists and
+    plainly carries this run's id is otherwise a puzzling thing to be turned away over.
     """
     run_id = str(manifest["run_id"])
-    stem = run_id if "rebookend" in manifest else cell_name
-    complete = results_dir / f"{stem}.json"
-    incomplete = complete.with_name(complete.stem + INCOMPLETE_SUFFIX)
-    for path in (complete, incomplete):
-        try:
-            body = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        published = body.get("manifest") if isinstance(body, dict) else None
-        if isinstance(published, dict) and str(published.get("run_id") or "") == run_id:
-            return None
+    leaves = _redo_artifact_leaves(manifest, cell_name)
+    complete, incomplete = (results_dir / leaf for leaf in leaves)
+    if any(_artifact_of_run(path, run_id) for path in (complete, incomplete)):
+        return None
+    linked = [path.name for path in (complete, incomplete) if path.is_symlink()]
+    through_a_link = (
+        f"A symlink stands at {' and '.join(linked)}, and publication replaces the directory "
+        "entry rather than writing through the link, so redoing here would leave what it "
+        "points at complete. "
+        if linked
+        else ""
+    )
     return (
         f"{results_dir} holds no artifact of run {run_id}: a redo republishes over the "
         f"artifact it supersedes, and neither {complete.name} nor {incomplete.name} is there "
-        "with this run's id in it. Point --results at the directory this run published to."
+        f"with this run's id in it. {through_a_link}"
+        "Point --results at the directory this run published to."
     )
 
 
