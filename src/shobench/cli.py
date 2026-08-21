@@ -301,6 +301,11 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
     spends nothing. The eval phase runner re-runs only the pending ids, so the plan's count is
     exactly what a ``--go`` will pay for.
 
+    ``--redo-task`` adds ids to that count: a settled row is complete by every test the runner
+    has, so an id whose measurement the operator does not accept has to be named. The plan lists
+    exactly which ids a ``--go`` would redo and which of them hold rows it would set aside, and
+    an id the run never committed to blocks the ``--go`` rather than being ignored.
+
     With ``--refresh-baseline`` the plan also names what catching the bookend's carried before
     rows up to its baseline would add, upgrade and refuse, from the same function the spending
     path acts on.
@@ -321,6 +326,16 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
     )
     heldout_ids = [str(task_id) for task_id in split.heldout.task_ids]
     pending = runner._eval_pending_ids(run_dir / args.phase, heldout_ids)
+    redo = [str(task_id) for task_id in (args.redo_task or [])]
+    unknown_redo = sorted(set(redo) - set(heldout_ids))
+    # What a --go would set aside, named one id at a time: a redo of an id that holds no rows
+    # costs a leg and moves nothing, and the two are different enough to say apart up front.
+    redo_with_rows = [
+        task_id
+        for task_id in redo
+        if task_id not in unknown_redo
+        if (run_dir / args.phase / f"task-{int(task_id):05d}").is_dir()
+    ]
     missing_required = [name for name in cell.required_env if not os.environ.get(name)]
     plan = {
         "run_dir": str(run_dir),
@@ -329,6 +344,10 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
         "heldout_ids": len(heldout_ids),
         "already_complete": len(heldout_ids) - len(pending),
         "pending": len(pending),
+        "redo_tasks": redo,
+        "redo_tasks_with_rows_to_set_aside": redo_with_rows,
+        "unknown_redo_tasks": unknown_redo,
+        "tasks_a_go_would_run": len(set(pending) | (set(redo) - set(unknown_redo))),
         "suspension_present": (run_dir / runner.SUSPENSION_FILE).is_file(),
         "rollout_terminus_present": (run_dir / "rollout_stopping.json").is_file(),
         "rollout_ever_ran": (run_dir / "rollout").is_dir(),
@@ -352,6 +371,14 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
         print(json.dumps(plan, indent=2))
         print("\nDry plan. Re-run with --go to spend.", file=sys.stderr)
         return 0
+    if unknown_redo:
+        print(json.dumps(plan, indent=2), file=sys.stderr)
+        print(
+            f"\nBLOCKED: --redo-task named {unknown_redo}, which this run's held-out set does "
+            "not hold. Nothing was spent.",
+            file=sys.stderr,
+        )
+        return 1
     if missing_required:
         print(json.dumps(plan, indent=2), file=sys.stderr)
         print(
@@ -385,6 +412,7 @@ def _cmd_rerun_eval(args: argparse.Namespace) -> int:
             capture_egress=not args.no_egress,
             refresh_baseline=args.refresh_baseline,
             baseline_run_dir=Path(args.baseline) if args.baseline else None,
+            redo_tasks=redo,
         )
     )
     print(f"results: {results_path}")
@@ -1064,6 +1092,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=(
             "the baseline run directory --refresh-baseline re-reads; defaults to the sibling "
             "named by the manifest's baseline_run_id"
+        ),
+    )
+    rerun.add_argument(
+        "--redo-task",
+        action="append",
+        metavar="TASK_ID",
+        help=(
+            "a held-out id to measure again: its rows in this phase are moved aside and the leg "
+            "re-runs. Repeatable. Nothing detects which ids need it; the operator names them"
         ),
     )
     rerun.add_argument("--go", action="store_true", help="actually re-run the holes (real spend)")

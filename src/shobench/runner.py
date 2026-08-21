@@ -1117,6 +1117,36 @@ def _eval_pending_ids(phase_dir: Path, task_ids: Sequence[str]) -> list[str]:
     ]
 
 
+# Where a redone held-out id's earlier rows go. Under the phase and beside the task directories
+# rather than inside one, because the phase runner clears a pending id's directory before it runs
+# it: an archive kept in there would be deleted by the very re-run it is evidence for. The name
+# does not match ``task-*``, so nothing reading the phase reads these rows back.
+REDONE_DIR = "redone"
+
+
+def set_aside_task_rows(phase_dir: Path, task_id: str | int) -> str | None:
+    """Move a held-out id's recorded rows out of the phase so the id runs again; ``None`` if none.
+
+    Moved, never deleted. The rows being set aside are a real measurement of a real leg, and an
+    operator redoing one is saying it measured the wrong thing, not that it never happened; the
+    published artifact stops carrying it and the record keeps it. The whole task directory goes,
+    so its trace, its runner breadcrumb and its provenance stay together, and the return value is
+    the path the manifest records it under.
+    """
+    task_dir = phase_dir / f"task-{int(task_id):05d}"
+    if not task_dir.is_dir():
+        return None
+    stamp, nth = int(time.time()), 1
+    archive = phase_dir / REDONE_DIR / f"{task_dir.name}.{stamp}"
+    # A second redo of the same id inside one second would otherwise land on the first archive.
+    while archive.exists():
+        nth += 1
+        archive = phase_dir / REDONE_DIR / f"{task_dir.name}.{stamp}-{nth}"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    task_dir.rename(archive)
+    return run_relative(archive, phase_dir.parent)
+
+
 # prime_agent is why the watchdog exists. Launched autonomous with no quality gate, its
 # continuation check has nothing to evaluate and returns "keep going" unconditionally, so the leg
 # has no terminal condition of its own and runs until the task timeout kills it: a median
@@ -4005,6 +4035,7 @@ async def rerun_eval(
     capture_egress: bool = True,
     refresh_baseline: bool = False,
     baseline_run_dir: Path | None = None,
+    redo_tasks: Sequence[str] | Sequence[int] = (),
 ) -> Path:
     """Finish an eval phase that lost tasks without a suspension, and republish.
 
@@ -4023,6 +4054,7 @@ async def rerun_eval(
             capture_egress=capture_egress,
             refresh_baseline=refresh_baseline,
             baseline_run_dir=baseline_run_dir,
+            redo_tasks=redo_tasks,
             stop=stop,
         )
 
@@ -4037,6 +4069,7 @@ async def _rerun_eval_owned(
     capture_egress: bool = True,
     refresh_baseline: bool = False,
     baseline_run_dir: Path | None = None,
+    redo_tasks: Sequence[str] | Sequence[int] = (),
     stop: EarlyEnding | None = None,
 ) -> Path:
     """The reopened run's eval_after, run under an already-held run-directory lock.
@@ -4057,6 +4090,13 @@ async def _rerun_eval_owned(
     ``refresh_baseline`` catches a bookend's carried before rows up to the baseline they were
     snapshotted from. It composes with the repair rather than replacing it: the pending legs
     still run, and a run with none pending refreshes the carry and republishes.
+
+    ``redo_tasks`` names held-out ids whose recorded rows are to be set aside and measured
+    again, which is how a leg that produced a row nobody should quote is repaired: a hole is
+    already pending and needs no naming, while a settled row is complete by every test this
+    runner has and would otherwise never re-run. Nothing detects which rows deserve it. The
+    operator names the ids, the rows they name are moved rather than dropped
+    (:func:`set_aside_task_rows`), and the manifest records the redo beside the repair.
     """
     if (run_dir / SUSPENSION_FILE).is_file():
         raise RuntimeError(
@@ -4097,6 +4137,19 @@ async def _rerun_eval_owned(
         "rollout_system" if cell.eval_context == "resumed" else "eval_system"
     )
     split = load_split_by_name(cell.split)
+    # Before the drift check and long before the sandbox, because an id this run never committed
+    # to is a typo in the one command that deletes nothing but moves a measurement out of the
+    # published artifact. Refused whole: a redo of three ids where one is wrong is not two thirds
+    # of a repair.
+    redo = [str(int(task_id)) for task_id in redo_tasks]
+    committed = {str(task_id) for task_id in side_for_phase(split, phase).task_ids}
+    unknown = sorted(set(redo) - committed, key=int)
+    if unknown:
+        raise RuntimeError(
+            f"--redo-task named {unknown}, which {run_dir} never committed to measuring: its "
+            f"held-out set holds {len(committed)} ids and a redo may only name those. Nothing "
+            "has been spent."
+        )
     instruction = load_instruction(cell.instruction_arm)
     # The whole-file comparison, and a repaired BOOKEND gets it too, though a rebookend does
     # not: a rebookend measures every held-out task under one definition, while a repair splices
@@ -4205,7 +4258,17 @@ async def _rerun_eval_owned(
                 "tasks_upgraded": refresh["upgraded"],
             }
         )
-    manifest.setdefault("eval_reruns", []).append({"at": time.time(), "phase": phase})
+    # Set aside after every refusal above and before the phase runs: the rows move once the
+    # repair is certain to go ahead, and the ids they belonged to are pending from that moment,
+    # which is the whole of what makes the phase runner measure them again. An id that held no
+    # rows records none moved; it was already a hole and the redo only says so out loud.
+    redone: list[dict[str, Any]] = []
+    for task_id in redo:
+        moved = set_aside_task_rows(run_dir / phase, task_id)
+        redone.append({"task_id": int(task_id), "rows_moved_to": moved})
+    manifest.setdefault("eval_reruns", []).append(
+        {"at": time.time(), "phase": phase, **({"redone": redone} if redone else {})}
+    )
     ctx.publish_json(run_dir / "manifest.json", manifest)
     sandbox.up()
     observer = _Egress(_start_egress(sandbox, run_dir) if capture_egress else None, run_dir)
